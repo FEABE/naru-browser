@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Light Browser local fixture</title>
+    <style>
+      :root { font: 18px system-ui; color: #172238; background: #f5f7fb; }
+      body { max-width: 720px; margin: 48px auto; padding: 24px; }
+      main { background: white; padding: 32px; border-radius: 16px; }
+      label { display: block; margin: 18px 0 6px; }
+      input, button { font: inherit; padding: 10px; }
+      button { cursor: pointer; }
+      output { display: block; margin: 18px 0; }
+      .note { color: #506078; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Light Browser local fixture</h1>
+      <p class="note">Local browser verification with synthetic test data.</p>
+      <form action="/search" method="get" autocomplete="off">
+        <label for="query">Search query</label>
+        <input id="query" name="q" type="search" autocomplete="off">
+        <button type="submit">Search fixture</button>
+      </form>
+      <output id="search-result" aria-live="polite">No search yet.</output>
+      <button id="counter" type="button">Increment counter</button>
+      <output id="click-result" aria-live="polite">Clicks: 0</output>
+      <label for="password">Fixture password</label>
+      <input id="password" type="password" value="FAKE_PASSWORD_FOR_TEST_ONLY" autocomplete="off">
+      <button id="disable-target" type="button">Disable target</button>
+      <button id="target" type="button">Target button</button>
+      <input type="hidden" value="HIDDEN_VALUE_MUST_NOT_BE_EXPOSED">
+      <button type="button" hidden>Hidden button must not be exposed</button>
+    </main>
+    <script>
+      // Isolated-world evaluation must not reuse this page-owned global.
+      Object.defineProperty(window, "__lightBrowserBridge", {
+        value: { read() { return { text: "MAIN_WORLD_BRIDGE_MUST_NOT_BE_USED" }; } },
+        configurable: false,
+      });
+      const query = new URL(location.href).searchParams.get("q");
+      if (query !== null) {
+        document.title = "Fixture search results";
+        document.querySelector("#query").value = query;
+        document.querySelector("#search-result").textContent = `Search result: ${query}`;
+      }
+      let clicks = 0;
+      document.querySelector("#counter").addEventListener("click", () => {
+        document.querySelector("#click-result").textContent = `Clicks: ${++clicks}`;
+      });
+      document.querySelector("#disable-target").addEventListener("click", () => {
+        document.querySelector("#target").disabled = true;
+      });
+    </script>
+  </body>
+</html>
