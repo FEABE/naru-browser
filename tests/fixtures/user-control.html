@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="ko">
+<meta charset="utf-8">
+<title>Naru 사용자 제어 검증</title>
+<style>
+  body { margin: 48px; color: #203b45; background: #eff8f6; font: 18px system-ui; }
+  main { max-width: 760px; }
+  button, input { font: inherit; padding: 12px; margin: 12px 0; }
+  input { display: block; width: 420px; }
+  pre { padding: 16px; background: white; border: 1px solid #c9ddda; }
+  .spacer { height: 1600px; background: linear-gradient(#eff8f6, #c9e6dd); }
+</style>
+<main>
+  <h1>Naru 사용자 제어 검증</h1>
+  <p>이 페이지는 로컬 입력 검사 전용입니다. 외부로 정보를 전송하지 않습니다.</p>
+  <button id="counter">버튼 누르기</button>
+  <label>검증 입력 <input id="entry" aria-label="검증 입력" autocomplete="off"></label>
+  <pre id="receipt" aria-live="polite"></pre>
+  <p><a href="?label=Navigation">다음 검증 페이지</a></p>
+  <p>아래쪽으로 스크롤하면 페이지 스크롤 값이 갱신됩니다.</p>
+  <div class="spacer"></div>
+  <p>스크롤 검증 끝</p>
+</main>
+<script>
+  const pageLabel = new URLSearchParams(location.search).get('label')?.slice(0, 80);
+  if (pageLabel) {
+    document.title = `Naru 검증 · ${pageLabel}`;
+    document.querySelector('h1').textContent = document.title;
+  }
+  const receipt = { clicks: 0, clickTrusted: null, inputEvents: 0, inputTrusted: null, scrollY: 0 };
+  const show = () => document.querySelector('#receipt').textContent = JSON.stringify(receipt, null, 2);
+  document.querySelector('#counter').addEventListener('click', event => {
+    receipt.clicks += 1;
+    receipt.clickTrusted = event.isTrusted;
+    show();
+  });
+  document.querySelector('#entry').addEventListener('input', event => {
+    receipt.inputEvents += 1;
+    receipt.inputTrusted = event.isTrusted;
+    show();
+  });
+  addEventListener('scroll', () => { receipt.scrollY = scrollY; show(); });
+  show();
+</script>
+</html>

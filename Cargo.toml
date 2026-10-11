@@ -18,7 +18,7 @@ base64 = { version = "0.22", optional = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6.3", optional = true }
 objc2-foundation = { version = "0.3.2", optional = true }
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSEvent", "NSResponder", "NSRunningApplication"], optional = true }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["objc2-core-foundation", "NSAppearance", "NSCell", "NSFontDescriptor", "NSColor", "NSFont", "NSScrollView", "NSClipView", "NSImage", "NSImageView", "NSApplication", "NSEvent", "NSResponder", "NSRunningApplication", "NSButton", "NSControl", "NSGraphics", "NSMenu", "NSMenuItem", "NSPopUpButton", "NSTextField", "NSView", "NSWindow"], optional = true }
 
 [[bin]]
 name = "light-browser"

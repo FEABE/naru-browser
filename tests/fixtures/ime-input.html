@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Naru 한글 조합 입력 검증</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 20px; color: #213b49; background: #f1f7f5; font: 16px system-ui; }
+    main { width: 100%; max-width: 760px; margin: auto; }
+    h1 { font-size: 24px; margin: 0 0 12px; }
+    p { line-height: 1.5; }
+    label { display: block; font-weight: 650; }
+    input { display: block; width: 100%; min-width: 0; margin: 8px 0 12px; padding: 12px; font: 20px system-ui; }
+    button { padding: 10px 16px; font: inherit; }
+    pre, li { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px ui-monospace, monospace; }
+    pre { padding: 12px; background: white; border: 1px solid #bcd3c9; }
+    ol { margin: 0; padding-left: 28px; }
+    li { margin: 6px 0; padding: 8px; background: white; border-left: 3px solid #58997b; }
+    @media (max-width: 420px) { body { padding: 12px; } h1 { font-size: 20px; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Naru 한글 조합 입력 검증</h1>
+  <p>한글 입력기로 직접 입력하고 조합 중 Enter와 Esc를 확인합니다. 붙여넣기와 신뢰된 입력만으로 실제 조합을 입증하지 않습니다. 조합 이벤트와 입력 종류를 함께 확인하세요.</p>
+  <label for="entry">본문 조합 입력</label>
+  <input id="entry" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="privacy">
+  <button id="reset" type="button">입력과 기록 초기화</button>
+  <p id="privacy">입력값은 이 입력칸에만 남습니다. 기록에는 문자 대신 UTF-16 길이와 이벤트 상태를 표시하며 저장하거나 전송하지 않습니다. 페이지 내 찾기용 고정 문구: 한글검증표식.</p>
+  <h2>누적 횟수와 현재 상태</h2>
+  <pre id="summary" aria-label="입력 이벤트 누적 상태"></pre>
+  <h2>최근 이벤트 20개</h2>
+  <ol id="events" aria-label="최근 입력 이벤트"></ol>
+</main>
+<script>
+  const entry = document.querySelector('#entry');
+  const summary = document.querySelector('#summary');
+  const list = document.querySelector('#events');
+  const types = ['focus', 'blur', 'compositionstart', 'compositionupdate', 'compositionend', 'beforeinput', 'input', 'keydown', 'keyup'];
+  const namedKeys = new Set(['Enter', 'Escape', 'Tab', 'Backspace', 'Delete', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Process', 'Unidentified', 'Shift', 'Control', 'Alt', 'Meta']);
+  let counts = Object.fromEntries(types.map(type => [type, 0]));
+  let recent = [];
+  let total = 0;
+  let composing = false;
+  let resets = 0;
+  let resetTrusted = null;
+  let started = performance.now();
+
+  function show() {
+    summary.textContent = JSON.stringify({ total, counts, retained: recent.length, compositionActive: composing, focused: document.activeElement === entry, valueLength: entry.value.length, resets, resetTrusted }, null, 2);
+    list.replaceChildren(...recent.map(record => {
+      const row = document.createElement('li');
+      row.textContent = JSON.stringify(record);
+      return row;
+    }));
+  }
+
+  function record(event) {
+    if (event.type === 'compositionstart') composing = true;
+    if (event.type === 'compositionend') composing = false;
+    counts[event.type] += 1;
+    const receipt = {
+      seq: ++total,
+      ms: Math.round(performance.now() - started),
+      type: event.type,
+      isTrusted: event.isTrusted,
+      isComposing: typeof event.isComposing === 'boolean' ? event.isComposing : null,
+      compositionActive: composing,
+      valueLength: entry.value.length
+    };
+    if (typeof event.data === 'string') receipt.dataLength = event.data.length;
+    if (typeof event.inputType === 'string') receipt.inputType = event.inputType.slice(0, 64);
+    if (event.type === 'keydown' || event.type === 'keyup') {
+      receipt.key = namedKeys.has(event.key) ? event.key : 'text-or-other';
+      // Record only the fixed reopen chord, never arbitrary typed characters.
+      if (event.metaKey && event.shiftKey && event.code === 'KeyT') {
+        receipt.reopenChord = { code: event.code, latin: event.key.toLowerCase() === 't', hangul: event.key === 'ㅅ' || event.key === 'ㅆ' };
+      }
+      receipt.imeKeyCode229 = event.keyCode === 229;
+      receipt.modifiers = { meta: event.metaKey, shift: event.shiftKey, control: event.ctrlKey, alt: event.altKey };
+    }
+    recent.push(receipt);
+    if (recent.length > 20) recent.shift();
+    show();
+  }
+
+  for (const type of types) entry.addEventListener(type, record);
+  document.querySelector('#reset').addEventListener('click', event => {
+    entry.value = '';
+    counts = Object.fromEntries(types.map(type => [type, 0]));
+    recent = [];
+    total = 0;
+    composing = false;
+    resets += 1;
+    resetTrusted = event.isTrusted;
+    started = performance.now();
+    show();
+  });
+  show();
+</script>
+</body>
+</html>

@@ -115,7 +115,7 @@ class BrowserCli:
                     return page
             else:
                 code = response.get("error", {}).get("code")
-                if code not in ("PAGE_LOADING", "PAGE_SCRIPT_ERROR", "CONTEXT_UNAVAILABLE", "FRAME_UNAVAILABLE"):
+                if code not in ("PAGE_LOADING", "PAGE_CHANGED", "PAGE_SCRIPT_ERROR", "CONTEXT_UNAVAILABLE", "FRAME_UNAVAILABLE"):
                     raise CheckFailed(f"read: {code or 'UNKNOWN_ERROR'}")
             # Only idempotent reads are retried; click, fill and Enter run once.
             time.sleep(0.1)
@@ -163,10 +163,11 @@ def run(args):
 
         old_counter_ref = element(page, "Increment counter")["ref"]
         page = cli.success("read", tab)["page"]
+        cli.success("wait", tab, "dom")  # Readiness checks must preserve current refs.
         cli.error("STALE_REF", "click", tab, old_counter_ref)
         cli.success("click", tab, element(page, "Increment counter")["ref"])
         page = cli.wait_for_page(tab, lambda value: "Clicks: 1" in value.get("text", ""), "button event")
-        checks.append("refs expire after read and DOM click reaches page handlers")
+        checks.append("refs expire after read, survive wait, and DOM click reaches page handlers")
 
         target_ref = element(page, "Target button")["ref"]
         cli.success("click", tab, element(page, "Disable target")["ref"])

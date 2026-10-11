@@ -2,9 +2,14 @@ use cef::application_mac::{CefAppProtocol, CrAppControlProtocol, CrAppProtocol};
 use objc2::{
     ClassType, DefinedClass, MainThreadMarker, define_class, extern_methods, msg_send,
     rc::Retained,
-    runtime::{AnyObject, Bool, NSObjectProtocol},
+    runtime::{AnyObject, Bool, NSObjectProtocol, Sel},
+    sel,
 };
-use objc2_app_kit::{NSApp, NSApplication, NSApplicationActivationPolicy, NSEvent};
+use objc2_app_kit::{
+    NSApp, NSApplication, NSApplicationActivationPolicy, NSApplicationDidUnhideNotification,
+    NSEvent,
+};
+use objc2_foundation::{NSNotification, NSNotificationCenter};
 use std::cell::Cell;
 
 #[derive(Default)]
@@ -22,13 +27,28 @@ define_class!(
         #[unsafe(method(sendEvent:))]
         unsafe fn send_event(&self, event: &NSEvent) {
             let previous = self.ivars().handling_event.replace(Bool::YES);
-            let _: () = unsafe { msg_send![super(self), sendEvent:event] };
+            if !crate::control_panel::handle_shortcut(event) {
+                crate::control_panel::observe_page_input(event);
+                let _: () = unsafe { msg_send![super(self), sendEvent:event] };
+            }
             self.ivars().handling_event.set(previous);
+        }
+
+        #[unsafe(method(sendAction:to:from:))]
+        unsafe fn send_action(&self, action: Sel, target: Option<&AnyObject>, sender: Option<&AnyObject>) -> bool {
+            // Keep AppKit's original action, validation and responder routing.
+            crate::control_panel::observe_page_menu_action(action, sender);
+            unsafe { msg_send![super(self), sendAction: action, to: target, from: sender] }
         }
 
         #[unsafe(method(terminate:))]
         unsafe fn terminate(&self, _sender: Option<&AnyObject>) {
             crate::browser::close_all();
+        }
+
+        #[unsafe(method(refreshPanelAfterUnhide:))]
+        fn refresh_panel_after_unhide(&self, _notification: &NSNotification) {
+            crate::browser::notify_panel();
         }
     }
 
@@ -59,4 +79,14 @@ pub fn setup() {
     let marker = MainThreadMarker::new().expect("App startup must run on the main thread");
     assert!(NSApp(marker).isKindOfClass(LightBrowserApplication::class()));
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+    // Observe this application's unhide without replacing CEF's app delegate.
+    // The singleton application outlives the observer registration.
+    unsafe {
+        NSNotificationCenter::defaultCenter().addObserver_selector_name_object(
+            &app,
+            sel!(refreshPanelAfterUnhide:),
+            Some(NSApplicationDidUnhideNotification),
+            Some(&app),
+        );
+    }
 }

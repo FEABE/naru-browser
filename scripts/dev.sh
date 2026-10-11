@@ -43,6 +43,7 @@ else
 fi
 target_root="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
 python3 scripts/bundle-macos.py --target-dir "$target_root/$build_profile" --cef-path "$CEF_PATH"
+python3 scripts/cleanup-build.py --target-dir "$target_root" --profile "$build_profile"
 
 if [[ "$run_app" == 1 ]]; then
   exec "$repo_root/dist/Light Browser.app/Contents/MacOS/light-browser" "$@"

@@ -5,7 +5,9 @@ Example:
   python3 tests/restart_smoke.py --app 'dist/Light Browser.app' \
       --cli target/debug/lightbrowser --data-dir .local-data/restart-new
 
-The data directory must not exist, even if empty. It is retained for diagnosis.
+The data directory must not exist, even if empty. Successful runs remove their
+profile-v1 but keep reports, logs and screenshots. Failed runs retain the profile;
+use --keep-profile to retain it after success as well.
 No external sites, existing profiles, Keychain approval automation, or browser
 security/storage overrides are used. Any macOS approval must be handled by the user.
 """
@@ -17,6 +19,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import shutil
 import subprocess
 import sys
 import threading
@@ -145,10 +148,39 @@ def stop_app(cli, process):
     require(code == 0, f"App shutdown returned code {code}")
 
 
+def validate_owned_directory(data_dir, identity, token):
+    require(not data_dir.is_symlink() and data_dir.resolve(strict=True) == data_dir,
+            "cleanup: data directory is a symlink or its resolved path changed")
+    current = data_dir.stat()
+    require(data_dir.is_dir() and (current.st_dev, current.st_ino) == identity,
+            "cleanup: data directory identity changed")
+    marker = data_dir / ".restart-smoke-owner.json"
+    require(not marker.is_symlink(), "cleanup: owner marker is a symlink")
+    owner = json.loads(marker.read_text(encoding="utf-8"))
+    require(owner == {"test": "restart_smoke", "run": token},
+            "cleanup: owner marker does not match this run")
+
+
+def cleanup_owned_profile(data_dir, identity, token, processes):
+    require(len(processes) == 2 and all(process.poll() == 0 for process in processes),
+            "cleanup: both test processes must have confirmed successful exits")
+    validate_owned_directory(data_dir, identity, token)
+    profile = data_dir / "profile-v1"
+    require(not profile.is_symlink() and profile.is_dir(),
+            "cleanup: profile-v1 is missing, not a directory, or a symlink")
+    # rmtree does not follow symlinks within the owned profile. Never remove the
+    # data directory itself: evidence and unrelated siblings must remain intact.
+    shutil.rmtree(profile)
+    return {"path": str(profile), "removed": True}
+
+
 def run(args):
     report = {"ok": False, "scope": "two app launches with one new local fixture profile", "cycles": []}
     data_dir = args.data_dir.absolute()
     created = False
+    directory_identity = None
+    token = None
+    processes = []
     process = None
     server = None
     server_thread = None
@@ -164,6 +196,8 @@ def run(args):
         require(len(os.fsencode(data_dir / "control.sock")) < 104, "Data directory is too long for a macOS Unix socket")
         data_dir.mkdir(mode=0o700)
         created = True
+        directory_stat = data_dir.stat()
+        directory_identity = (directory_stat.st_dev, directory_stat.st_ino)
         token = uuid.uuid4().hex
         (data_dir / ".restart-smoke-owner.json").write_text(
             json.dumps({"test": "restart_smoke", "run": token}), encoding="utf-8")
@@ -182,6 +216,7 @@ def run(args):
             log = log_path.open("wb")
             process = subprocess.Popen([str(executable)], env=environment,
                                        stdout=log, stderr=subprocess.STDOUT)
+            processes.append(process)
             wait_ready(cli, process, data_dir / "control.sock")
             smoke_report = run_smoke(SimpleNamespace(cli=cli_path, data_dir=data_dir,
                                                     artifacts_dir=data_dir / f"cycle-{cycle}"))
@@ -203,26 +238,66 @@ def run(args):
     except (CheckFailed, OSError, ValueError, KeyError, TypeError) as error:
         report["error"] = str(error)
     finally:
+        cleanup_errors = []
         if process is not None and process.poll() is None:
             # Failure cleanup targets only the exact subprocess created above.
             # A forced stop never counts as successful persistence verification.
             report["ok"] = False
             report["forcedCleanup"] = True
-            process.terminate()
             try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired) as error:
+                cleanup_errors.append("process cleanup: " + str(error))
+        cleanup_steps = []
         if log:
-            log.close()
+            cleanup_steps.append(("log close", log.close))
         if server:
-            server.shutdown()
-            server.server_close()
+            cleanup_steps.extend((("HTTP shutdown", server.shutdown), ("HTTP close", server.server_close)))
         if server_thread:
-            server_thread.join(timeout=2)
+            cleanup_steps.append(("HTTP thread join", lambda: server_thread.join(timeout=2)))
+        for name, operation in cleanup_steps:
+            try:
+                operation()
+            except (OSError, RuntimeError) as error:
+                cleanup_errors.append(name + ": " + str(error))
+        if cleanup_errors:
+            report["ok"] = False
         if created:
-            (data_dir / "restart-report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+            report["profileCleanup"] = {
+                "path": str(data_dir / "profile-v1"), "removed": False,
+                "reason": "kept_by_request" if report["ok"] and getattr(args, "keep_profile", False)
+                          else "kept_after_failure",
+            }
+            if report["ok"] and not getattr(args, "keep_profile", False):
+                try:
+                    require(len(report["cycles"]) == 2 and
+                            all(cycle.get("gracefulShutdown") is True for cycle in report["cycles"]),
+                            "cleanup: two graceful shutdowns were not confirmed")
+                    report["profileCleanup"] = cleanup_owned_profile(data_dir, directory_identity, token, processes)
+                except (CheckFailed, OSError, ValueError) as error:
+                    report["profileCleanup"]["reason"] = "cleanup_failed"
+                    cleanup_errors.append(str(error))
+            if cleanup_errors:
+                report["ok"] = False
+                report["cleanupErrors"] = cleanup_errors
+            try:
+                # Do not write the report into a replacement or redirected path
+                # after a failed ownership check. The JSON stdout still survives.
+                validate_owned_directory(data_dir, directory_identity, token)
+                report_path = data_dir / "restart-report.json"
+                require(not report_path.is_symlink(), "cleanup: report path is a symlink")
+                report_path.write_text(
+                    json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+            except (CheckFailed, OSError, ValueError) as error:
+                report["ok"] = False
+                if str(error) not in cleanup_errors:
+                    cleanup_errors.append(str(error))
+                report["cleanupErrors"] = cleanup_errors
     return report
 
 
@@ -231,6 +306,8 @@ def main():
     parser.add_argument("--app", type=Path, required=True, help="App bundle or its main executable")
     parser.add_argument("--cli", type=Path, required=True, help="Public lightbrowser CLI executable")
     parser.add_argument("--data-dir", type=Path, required=True, help="New dedicated directory; existing paths are refused")
+    parser.add_argument("--keep-profile", action="store_true",
+                        help="Keep the owned profile after successful verification for diagnosis")
     args = parser.parse_args()
     if sys.platform != "darwin":
         parser.error("This app restart test requires macOS")

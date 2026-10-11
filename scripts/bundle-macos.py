@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 from cef_config import CEF_VERSION
 
@@ -142,6 +143,44 @@ def is_macho(path):
         )
 
 
+def stop_previous_app(destination):
+    # NSRunningApplication targets a PID and requests normal Cocoa termination.
+    # Match its executable path too: another checkout can share our bundle ID.
+    executable = str(destination / "Contents/MacOS" / MAIN_BINARY)
+    script = r'''
+ObjC.import('AppKit');
+function run(argv) {
+    const apps = $.NSRunningApplication.runningApplicationsWithBundleIdentifier(argv[0]);
+    const matched = [];
+    for (let i = 0; i < apps.count; i++) {
+        const app = apps.objectAtIndex(i);
+        if (ObjC.unwrap(app.executableURL.path) === argv[1]) {
+            if (!app.terminate) throw new Error('The previous app refused to quit.');
+            matched.push(app.processIdentifier);
+        }
+    }
+    return JSON.stringify(matched);
+}
+'''
+    result = subprocess.run(["/usr/bin/osascript", "-l", "JavaScript", "-", APP_ID, executable],
+                            input=script, text=True, capture_output=True, timeout=20)
+    if result.returncode:
+        raise ValueError("Cannot safely stop the previous app: " + result.stderr.strip())
+    pids = json.loads(result.stdout)
+    deadline = time.monotonic() + 15
+    for pid in pids:
+        while True:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            if time.monotonic() >= deadline:
+                raise ValueError("The previous app is still running; close its windows first.")
+            time.sleep(0.1)
+    if pids:
+        print("Stopped previous app before replacing its bundle.", file=sys.stderr)
+
+
 def bundle(target_dir, cef_path, output_dir):
     for name in (MAIN_BINARY, HELPER_BINARY, CLI_BINARY):
         if not (target_dir / name).is_file():
@@ -189,6 +228,7 @@ def bundle(target_dir, cef_path, output_dir):
             shutil.copy2(license_file, app / "Contents/Resources/CEF-LICENSE.txt")
         sign(app)
         subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)], check=True)
+        stop_previous_app(destination)
         # Retain the previous generated bundle until the replacement has verified.
         previous = Path(temporary) / "previous.app"
         if destination.exists():

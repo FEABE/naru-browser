@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <title>Naru 페이지 안 찾기 검증</title>
+  <style>
+    body { margin: 40px; color: #183b55; background: #edf6ff; font: 19px system-ui; }
+    main { max-width: 840px; }
+    section { padding: 24px; border: 2px solid #86b6d6; background: #fff; }
+    .gap { height: 900px; border-left: 4px solid #b8d5e9; margin: 28px 12px; }
+    .marker { font-weight: 700; }
+    input { display: block; width: 320px; padding: 12px; margin-top: 8px; font: inherit; }
+    pre { padding: 16px; background: #dcebf6; white-space: pre-wrap; }
+    iframe { display: block; width: 100%; height: 310px; border: 3px solid #8263ad; margin: 28px 0; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Naru 페이지 안 찾기 검증</h1>
+  <p>자체 로컬 문서입니다. 구역 번호와 화면 위치로 검색 이동을 확인합니다.</p>
+  <p><a id="next-page" href="user-control.html?label=FindNext">다음 검증 문서로 이동</a></p>
+  <label>본문 입력 확인
+    <input id="entry" aria-label="본문 입력 확인" autocomplete="off" spellcheck="false">
+  </label>
+  <pre id="receipt" aria-live="polite"></pre>
+
+  <section id="top">
+    <h2>A 구역, 문서 위쪽</h2>
+    <p>영문 첫 위치: <span class="marker">needle</span></p>
+    <p>영문 두 번째 위치: <span class="marker">needle</span></p>
+    <p>한글 첫 위치: <span class="marker">검색표식</span></p>
+  </section>
+  <div class="gap" aria-hidden="true"></div>
+
+  <section id="middle">
+    <h2>B 구역, 긴 스크롤 뒤</h2>
+    <p>영문 세 번째 위치: <span class="marker">needle</span></p>
+    <p>한글 두 번째 위치: <span class="marker">검색표식</span></p>
+  </section>
+  <iframe id="child-frame" title="같은 출처 하위 문서" src="find-in-page-frame.html"></iframe>
+  <div class="gap" aria-hidden="true"></div>
+
+  <section id="lower">
+    <h2>C 구역, 문서 아래쪽</h2>
+    <p>영문 네 번째 위치: <span class="marker">needle</span></p>
+    <p>한글 세 번째 위치: <span class="marker">검색표식</span></p>
+  </section>
+  <div class="gap" aria-hidden="true"></div>
+
+  <section id="bottom">
+    <h2>D 구역, 문서 끝</h2>
+    <p>영문 다섯 번째 위치: <span class="marker">needle</span></p>
+    <p>영문 여섯 번째 위치: <span class="marker">needle</span></p>
+    <p>한글 네 번째 위치: <span class="marker">검색표식</span></p>
+  </section>
+</main>
+<script>
+  const receipt = { focuses: 0, inputs: 0, inputTrusted: null, inputLength: 0, scrollY: 0 };
+  const entry = document.querySelector('#entry');
+  const show = () => document.querySelector('#receipt').textContent = JSON.stringify(receipt, null, 2);
+  entry.addEventListener('focus', () => { receipt.focuses += 1; show(); });
+  entry.addEventListener('input', event => {
+    receipt.inputs += 1;
+    receipt.inputTrusted = event.isTrusted;
+    receipt.inputLength = entry.value.length;
+    show();
+  });
+  addEventListener('scroll', () => { receipt.scrollY = scrollY; show(); });
+  show();
+</script>
+</body>
+</html>

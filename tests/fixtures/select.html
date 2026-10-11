@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Naru native select fixture</title>
+  <style>
+    body { margin: 24px; font: 16px system-ui; color: #183832; background: #f2f7f5; }
+    label, fieldset, .row { display: block; margin: 12px 0; }
+    select, button, [role="combobox"] { min-width: 180px; padding: 6px; font: inherit; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; background: white; padding: 12px; }
+  </style>
+</head>
+<body>
+  <h1>Native HTML select fixture</h1>
+  <p>Local synthetic DOM actions only. Receipts contain indices, counts and event trust, never stored form data.</p>
+  <label>Normal choice
+    <select id="normal" aria-label="Normal choice">
+      <option value="alpha" selected>Alpha</option>
+      <option value="beta">Beta</option>
+      <option value="">Empty value</option>
+      <option value="  padded  ">Exact spaces</option>
+      <option id="unicode-option">UTF-16 boundary</option>
+      <option id="long-label" value="long-label">Long label</option>
+      <option value="disabled" disabled>Disabled option</option>
+      <optgroup label="Disabled group" disabled><option value="group-disabled">Grouped disabled option</option></optgroup>
+      <option value="hidden-option" hidden>HIDDEN_OPTION_LABEL</option>
+      <optgroup label="Hidden group" hidden><option value="group-hidden">HIDDEN_GROUP_OPTION_LABEL</option></optgroup>
+    </select>
+  </label>
+  <label>Duplicate choice
+    <select id="duplicate" aria-label="Duplicate choice">
+      <option value="safe" selected>Safe</option><option value="duplicate">First duplicate</option><option value="duplicate">Second duplicate</option>
+    </select>
+  </label>
+  <label>Multiple choice
+    <select id="multiple" aria-label="Multiple choice" multiple>
+      <option value="alpha" selected>Alpha</option><option value="beta">Beta</option>
+    </select>
+  </label>
+  <label>Disabled select
+    <select id="disabled" aria-label="Disabled select" disabled>
+      <option value="alpha" selected>Alpha</option><option value="beta">Beta</option>
+    </select>
+  </label>
+  <fieldset disabled><legend>Disabled fieldset</legend>
+    <select id="fieldset" aria-label="Fieldset select"><option value="alpha" selected>Alpha</option><option value="beta">Beta</option></select>
+  </fieldset>
+  <label id="hidden-container">Hide after read
+    <select id="hide-later" aria-label="Hide after read"><option value="alpha" selected>Alpha</option><option value="beta">Beta</option></select>
+  </label>
+  <button id="hide-target" type="button">Hide select after read</button>
+  <label>Replace select on focus
+    <select id="replace-select" aria-label="Replace select on focus"><option value="alpha" selected>Alpha</option><option value="beta">Beta</option></select>
+  </label>
+  <label>Replace option on focus
+    <select id="replace-option" aria-label="Replace option on focus"><option value="alpha" selected>Alpha</option><option value="beta">Beta</option></select>
+  </label>
+  <div class="row"><div role="combobox" tabindex="0" aria-label="Custom choice">Custom controls are unsupported</div></div>
+  <label>Oversize value
+    <select id="oversize-value" aria-label="Oversize value"><option value="alpha" selected>Alpha</option><option id="too-long-option">Too long</option></select>
+  </label>
+  <label>Over limit choice<select id="over-limit" aria-label="Over limit choice"></select></label>
+  <pre id="receipt" aria-label="Selection event receipt"></pre>
+  <button id="refresh-focus" type="button">Refresh focus diagnostic</button>
+  <pre id="focus-receipt" aria-label="Focus diagnostic receipt"></pre>
+  <script>
+    document.querySelector('#unicode-option').value = '😀'.repeat(512);
+    document.querySelector('#too-long-option').value = '😀'.repeat(513);
+    document.querySelector('#long-label').textContent = 'L'.repeat(300);
+    const overLimit = document.querySelector('#over-limit');
+    for (let index = 0; index < 501; index += 1) {
+      overLimit.add(new Option(`Option ${index}`, `v${index}`));
+    }
+    const counts = { input: 0, change: 0 };
+    const replacements = { select: 0, option: 0 };
+    const events = [];
+    const focusCounts = { normal: 0, 'replace-select': 0, 'replace-option': 0 };
+    function showFocus() {
+      const active = document.activeElement;
+      const knownIds = ['normal', 'replace-select', 'replace-option', 'refresh-focus'];
+      const state = { focusCounts, hasFocus: document.hasFocus(), visibilityState: document.visibilityState,
+        activeElement: knownIds.includes(active?.id) ? active.id : (active === document.body ? 'body' : 'other'),
+        replacements: { ...replacements } };
+      document.querySelector('#focus-receipt').textContent = `FOCUS_STATE_BEGIN ${encodeURIComponent(JSON.stringify(state))} FOCUS_STATE_END`;
+    }
+    document.addEventListener('focus', event => {
+      if (Object.hasOwn(focusCounts, event.target.id)) focusCounts[event.target.id] += 1;
+    }, true);
+    // CLI DOM click calls click(), not focus(). Refresh only this separate marker;
+    // selection receipts and the active element are not changed by this handler.
+    document.querySelector('#refresh-focus').addEventListener('click', showFocus);
+    function show() {
+      const selections = {};
+      for (const select of document.querySelectorAll('select')) {
+        selections[select.id] = Array.from(select.selectedOptions, option => option.index);
+      }
+      const state = { selections, counts, events, replacements };
+      document.querySelector('#receipt').textContent = `SELECT_STATE_BEGIN ${encodeURIComponent(JSON.stringify(state))} SELECT_STATE_END`;
+    }
+    for (const type of ['input', 'change']) {
+      document.addEventListener(type, event => {
+        if (!(event.target instanceof HTMLSelectElement)) return;
+        counts[type] += 1;
+        events.push({ type, target: event.target.id, trusted: event.isTrusted,
+          index: event.target.selectedIndex, valueLength: event.target.value.length });
+        if (events.length > 6) events.shift();
+        show();
+      });
+    }
+    document.querySelector('#hide-target').addEventListener('click', () => {
+      document.querySelector('#hidden-container').hidden = true;
+      show();
+    });
+    document.querySelector('#replace-select').addEventListener('focus', event => {
+      event.target.replaceWith(event.target.cloneNode(true));
+      replacements.select += 1;
+      show();
+    }, { once: true });
+    document.querySelector('#replace-option').addEventListener('focus', event => {
+      const option = event.target.options[1];
+      option.replaceWith(option.cloneNode(true));
+      replacements.option += 1;
+      show();
+    }, { once: true });
+    show();
+    showFocus();
+  </script>
+</body>
+</html>

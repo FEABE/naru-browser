@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>Naru native tab check</title>
+<style>body{font:20px system-ui;margin:48px;background:#e8f0ff}a,input,button{font:inherit;margin:16px 0;display:block}input[type=checkbox]{display:inline}</style>
+<h1>Naru native tab check</h1>
+<p>This local fixture checks trusted native popup and beforeunload behavior.</p>
+<a href="single-window.html?popup=1" target="_blank">Open native popup</a>
+<button onclick="window.open('single-window.html?popup=script', '_blank')">Open scripted popup</button>
+<label><input type="checkbox" id="guard"> Ask before closing</label>
+<input aria-label="Preserved text" placeholder="Preserved text">
+<script>document.querySelector('#guard').addEventListener('change',e=>{window.onbeforeunload=e.target.checked?(event)=>{event.preventDefault();event.returnValue='';}:null;});</script>
+</html>

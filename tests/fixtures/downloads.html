@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="ko">
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; form-action 'none'; base-uri 'none'">
+<title>Naru 다운로드 검증</title>
+<style>
+  body { margin: 40px; max-width: 760px; background: #eff8f6; color: #203b45; font: 18px system-ui; }
+  a, label { display: block; margin: 24px 0; }
+  pre { padding: 16px; background: white; white-space: pre-wrap; overflow-wrap: anywhere; }
+</style>
+<h1>Naru 다운로드 검증</h1>
+<p>로컬 검증용 파일입니다. 파일 선택 결과는 이 화면에만 표시하고 전송하지 않습니다.</p>
+<a href="/small.bin" download>작은 파일 저장</a>
+<a href="/slow.bin" download>느린 파일 저장</a>
+<a href="/broken.bin" download>중간에 끊기는 파일 저장</a>
+<label>로컬 파일 선택 <input type="file" id="file" aria-label="로컬 파일 선택" accept=".bin,.txt" multiple></label>
+<pre id="receipt">선택한 파일 없음</pre>
+<pre id="clicks">클릭 기록 없음</pre>
+<label><input type="checkbox" id="guard"> 탭을 닫기 전에 확인</label>
+<script>
+  const clicks = [];
+  for (const link of document.querySelectorAll('a[download]')) {
+    link.addEventListener('click', event => {
+      clicks.push({ file: link.pathname, trusted: event.isTrusted, activation: navigator.userActivation.isActive });
+      if (clicks.length > 6) clicks.shift();
+      document.querySelector('#clicks').textContent = 'DOWNLOAD_CLICKS ' + JSON.stringify(clicks);
+    });
+  }
+  document.querySelector('#file').addEventListener('change', event => {
+    const files = Array.from(event.target.files).slice(0, 4).map(file => ({ name: file.name.slice(0, 256), size: file.size }));
+    document.querySelector('#receipt').textContent = JSON.stringify({ files, trusted: event.isTrusted });
+  });
+  window.addEventListener('beforeunload', event => {
+    if (!document.querySelector('#guard').checked) return;
+    event.preventDefault();
+    event.returnValue = '';
+  });
+</script>
+</html>

@@ -1,9 +1,26 @@
+pub mod address;
+pub mod bookmarks;
 pub mod cli;
+pub mod closed_pages;
 pub mod config;
+pub mod downloads;
+pub mod page_find;
 pub mod protocol;
+pub mod resources;
+pub mod spaces;
+pub mod tab_search;
+pub mod tasks;
 
 #[cfg(feature = "browser")]
+pub mod bookmark_runtime;
+#[cfg(feature = "browser")]
 pub mod browser;
+#[cfg(feature = "browser")]
+pub mod capture;
+#[cfg(all(feature = "browser", target_os = "macos"))]
+pub mod control_panel;
+#[cfg(feature = "browser")]
+pub mod download_runtime;
 #[cfg(all(feature = "browser", target_os = "macos"))]
 pub mod mac;
 
