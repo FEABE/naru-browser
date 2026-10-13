@@ -24,7 +24,7 @@ v2 첫 실제 검사는 로컬 HTTP commit 전 WAIT_TIMEOUT으로 끝났으며 �
 
 숨긴 Chromium 권한 요청은 CEF에 전달되기 전에는 앱에서 알 수 없다. 대기 상한 4개는 앱이 받은 콜백에만 적용된다. 제어권 변경 뒤 같은 문서의 새 권한 요청도 reload가 필요할 수 있다. 권한 해제 설정 UI, 모든 수명 경합과 실제 동시 상한, 허용 뒤 저장, 외부 사이트, Preseller 내장과 전체 Naru 완성은 남아 있다.
 
-비공개 GitHub 업로드 요청에 따라 `FEABE/naru-browser`의 PRIVATE와 ADMIN 권한, 개발 브랜치의 기존 원격 커밋 `37a8f549b28887cc5c3d91a0c4590e57753afb25`를 다시 확인했다. 변경 11개와 추적 파일을 점검했으며 프로필, 쿠키, DB, 비밀 파일, 앱 번들과 생성물은 업로드 대상에 없다. 로컬 검증 자료는 ignore된 artifacts에 유지한다. 소스, 테스트, 문서를 기존 `codex/navigation-readiness`에 올리는 범위이며 main 변경이나 배포는 포함하지 않는다. 최종 원격 SHA와 비공개 설정은 푸시 후 다시 확인한다.
+비공개 GitHub 업로드 요청에 따라 `FEABE/naru-browser`의 PRIVATE와 ADMIN 권한, 개발 브랜치의 기존 원격 커밋 `37a8f549b28887cc5c3d91a0c4590e57753afb25`를 다시 확인했다. 변경 11개와 추적 파일을 점검했으며 프로필, 쿠키, DB, 비밀 파일, 앱 번들과 생성물은 업로드 대상에 없다. 로컬 검증 자료는 ignore된 artifacts에 유지한다. 소스, 테스트, 문서를 기존 `codex/navigation-readiness`에 올리는 범위이며 main 변경이나 배포는 포함하지 않는다. 소스 커밋 `9e0d6ba9d34640583a9ab844c65969eb269c9256`의 푸시가 성공했고 로컬 HEAD와 원격 개발 브랜치 SHA의 일치를 확인했다. GitHub 재조회에서도 `isPrivate: true`, `visibility: PRIVATE`였다. 이 업로드 확인 문장도 같은 개발 브랜치에 후속 문서 커밋으로 반영한다.
 
 ## 2026-10-13, GitHub 비공개 업로드 상태 확인
 
