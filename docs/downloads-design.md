@@ -1,6 +1,8 @@
 # 다운로드 구현과 검증 계획
 
-기준일: 2026-10-11. 현재 검증 대상은 `downloads-v4`이며 앱 SHA-256은 `e91508161347b45b6de4a32652915c828cf1aef949dffa8f14696bf97d42e471`다. Rust 검사 164개와 전체 타깃 검사, release 빌드를 통과했다. 사용자 키체인 승인 후 같은 ID의 실제 재시도, 실패 표시, 정상 저장과 진행 중 취소를 확인했다. 같은 최종 앱의 기존 CEF 회귀 32개와 재시작·정리도 통과했다. 모든 동시성·외부 서비스 검증이 끝났다는 뜻은 아니다. 이전 Rust 162개 통과는 두 FFI 수정 전인 v1 소스의 결과다.
+기준일: 2026-10-13. 현재 검증 대상은 연속 다운로드 권한 v2이며 앱 SHA-256은 `8f6ca43ccee08f37594d366b474530de9b4b7626814126db832834a474d08be3`다. Rust 174개, 전체 타깃 검사, format과 release 빌드를 통과했다. 첫 HTTP의 승인 대기가 해소된 뒤 같은 바이너리에서 로컬 HTTP 완료, 네이티브 권한 카드의 배치와 취소, 권한 수명 회귀 4개와 기존 CEF 회귀 32개를 확인했다. 실제 허용과 저장은 이 v2에서 아직 검증하지 않았다. 숨겨진 탭의 자동 권한 표시는 미완료다.
+
+파일 저장과 재시도에 관한 아래 v4 기록은 이전 `downloads-v4` 앱 SHA-256 `e91508161347b45b6de4a32652915c828cf1aef949dffa8f14696bf97d42e471`의 결과다. 이 버전은 Rust 164개와 전체 타깃 검사, release 빌드를 통과했다. 같은 ID의 실제 재시도, 실패 표시, 정상 저장과 진행 중 취소, 기존 CEF 회귀 32개와 재시작을 확인했다. 권한 v2의 검증 결과와 합산하지 않는다. 이전 Rust 162개 통과는 두 FFI 수정 전인 다운로드 v1 소스의 결과다.
 
 작업 시작 시 `BrowserClient`에는 DownloadHandler가 없었으며 설치된 CEF 156의 공개 계약상 Alloy 브라우저는 이 경우 다운로드를 취소한다. 파일 업로드 선택창은 별도의 DialogHandler가 없어 CEF 기본 구현에 위임한다.
 
@@ -65,7 +67,7 @@ v3 앱 SHA-256 `83522cdfce1f959f6b0ec3bf7baa276f08e193618b9e82c035fd61477a58ae89
 ## 확인된 결함과 남은 검증
 
 - v3의 실패 응답 오표시는 v4의 같은 ID 재시도와 `Interrupted` 표시로 수정 결과를 확인했다. 검증 범위는 해당 로컬 fixture다.
-- 이전 v2에서 합성 클릭의 연속 다운로드가 접수되지 않았다. MULTIPLE_DOWNLOADS 권한 콜백 진입을 아직 관찰하지 않아 원인은 확정하지 않았다. 전역 자동 허용을 적용하지 않았으며 명시적 권한 UI가 후속 과제다.
+- 이전 다운로드 v2에서 합성 클릭의 연속 다운로드가 접수되지 않았다. 후속 권한 v1과 v2에서 실제 MULTIPLE_DOWNLOADS 콜백과 명시적 권한 UI를 확인했다. 숨긴 탭의 콜백은 Chromium이 표시를 보류하므로 배경 자동 알림은 아직 구현되지 않았다. 상세한 재현과 수정 검증은 아래 연속 다운로드 권한 절에 기록한다.
 - 다운로드 패널을 열 때 AppKit의 음수 width와 height 경고가 관찰됐다. 초기 빈 라벨 생성 경로를 후보로 검토했으나 경고의 호출 스택을 확인하지 못했다. 라벨 생성 변경은 보류했으며 원인이나 표시 영향이 해결됐다고 판단하지 않는다.
 - v3에서 확인한 배경 화면 보존, 저장창을 연 상태의 인계, beforeunload 흐름을 v4에서 다시 확인해야 한다. 별도 작업 중지, 해제, 완료와 앱 종료 중인 전송의 콜백 경합도 남아 있다.
 - v4의 Rust 164개와 전체 타깃 검사, release 빌드, 위 네이티브 흐름은 통과했다. 기존 CEF 회귀 32개와 v4 재시작 검증도 통과했다.
@@ -74,6 +76,49 @@ v3 앱 SHA-256 `83522cdfce1f959f6b0ec3bf7baa276f08e193618b9e82c035fd61477a58ae89
 ## 근거
 
 설치 버전의 `.cache/cef/156.0.1/cef_macos_aarch64/include/cef_client.h`, `cef_download_handler.h`, `cef_download_item.h`, `cef_browser.h`, `cef_dialog_handler.h`와 현재 Rust 바인딩을 기준으로 한다. 공개 헤더의 콜백 계약, 순수 모델 검사, 로컬 CEF 실행, 네이티브 UI 확인을 구분한다. 수정과 후속 실행 결과가 나오면 해당 버전의 증거로 갱신한다.
+
+## 연속 다운로드 권한, 2026-10-13
+
+기존 v4 바이너리에서 배경 AI 탭의 작은 파일과 느린 파일 링크를 CLI로 연속 클릭했다. 두 클릭은 모두 `trusted: false`, `activation: false`였으며 dispatch 응답은 성공했다. 서버에는 작은 파일 요청 한 번만 도착했고 느린 파일 요청은 0회였다. 사용자 공간과 원래 탭 1은 유지됐고 다운로드 목록에는 대기 한 개가 표시됐다. 이 단계에서는 권한 콜백이 없어 원인을 확정하지 않는다. 재현과 정상 종료 결과는 `artifacts/download-permission-baseline.json`에 있다.
+
+설치 버전과 일치하는 CEF 커밋 및 Chromium 156 소스를 확인했다. [CEF 권한 콜백](https://raw.githubusercontent.com/chromiumembedded/cef/8db2f36735f06aacaf1bab832cb08da9d9445c55/libcef/browser/permission_prompt.cc)은 `AcceptThisTime`을 노출하지 않는다. [Chromium 다운로드 결정](https://raw.githubusercontent.com/chromium/chromium/156.0.8078.17/chrome/browser/download/download_permission_request.cc)과 [다운로드 제한 처리](https://raw.githubusercontent.com/chromium/chromium/156.0.8078.17/chrome/browser/download/download_request_limiter.cc)에 따르면 ACCEPT는 요청 origin의 여러 파일 다운로드를 허용하는 사이트 설정을 저장한다. DENY는 차단 설정을 저장하고 IGNORE는 설정 변경 없이 현재 대기를 취소한다.
+
+따라서 허용을 일회성 허용으로 표시하지 않는다. UI는 사이트 origin과 요청 공간을 표시하고 다른 공간에도 적용됨을 안내한다. 취소에는 IGNORE를 사용한다. 이미 허용한 사이트 권한을 조회하거나 되돌리는 설정 UI는 아직 없다. 사이트 설정과 별개로 각 파일은 기존 다운로드 목록에서 저장 위치를 선택해야 한다.
+
+권한 대기는 최대 4개이고 별도 저장소나 worker를 두지 않는다. 표시용 origin은 2,048바이트, 요청 공간 설명은 80자로 제한하며 전체 다운로드 URL은 보관하지 않는다. 요청의 탭, 문서 epoch, 작업 소유자와 revision을 검증하고 실제 문서 변경, 명시적 탐색, 제어권 변경, 탭 종료와 CEF dismiss에서 만료한다. 파일 응답이나 HTTP 204도 `OnBeforeBrowse`를 거칠 수 있으므로 이 콜백만으로 문서가 교체됐다고 판단하지 않는다. 허용과 취소 콜백은 큐에서 먼저 꺼낸 뒤 호출해 동기 dismiss 재진입을 처리한다. 실제 연결과 검증 결과는 아래 후속 기록에서 구분한다.
+
+### 첫 실제 검증에서 발견한 범위와 결함
+
+권한 v1 앱 SHA-256은 `5ab749c4117553e92283a0fa1837a7e1241c17ac3cda7fd4bea3071a4931f285`다. 빌드와 Rust 172개 검사를 통과했고 추가 키체인 대기 없이 로컬 HTTP를 열었다. 보이는 AI 공간에서 두 번째 합성 다운로드를 요청하자 실제 CEF `OnShowPermissionPrompt`가 mask 16384로 호출됐다. 사용자 공간으로 돌아와도 대기를 유지했고 다운로드 목록의 네이티브 카드에서 origin, 출처, 사이트 설정 저장 안내와 취소를 확인했다. 이번 요청 취소 버튼은 해당 카드를 제거했다.
+
+반면 숨겨진 AI 탭은 첫 파일 접수 뒤 시간을 두고 두 번째를 요청해도 Naru 권한 개수가 0이었다. 해당 공간을 명시적으로 표시하자 CEF 콜백과 대기 한 개가 나타났다. Chromium의 [PermissionRequestManager](https://raw.githubusercontent.com/chromium/chromium/156.0.8078.17/components/permissions/permission_request_manager.cc)는 비활성 탭이면 CEF prompt 생성 전에 표시를 보류한다. 따라서 `awaitingPermission`은 Naru에 전달된 요청의 개수이며 Chromium 내부의 숨겨진 대기까지 셌다는 뜻이 아니다. 자동 공간 전환이나 전역 권한 허용으로 이 제한을 우회하지 않는다. 배경 요청만으로 사용자 공간에 권한 알림을 표시하는 동작은 미완료다.
+
+v1의 초기 `download_permissions_smoke.py` 실행은 숨겨진 탭에서도 즉시 Naru 권한 대기가 나타난다는 전제 때문에 실패했다. 작업과 탭, 서버 정리는 통과했지만 기능 검사 통과로 세지 않는다. 근거는 `artifacts/download-permission-v1-smoke.json`이다. 이후 숨긴 요청을 handoff로 중지하고 공간을 표시하면 이전 요청이 paused 소유자로 다시 나타나는 결함도 재현했다. `artifacts/download-permission-v1-hidden-revoke.json`에서 중지 직후 대기 0개, 공간 표시 후 대기 1개를 확인했다. 실제 카드의 내부 라벨이 역순으로 배치된 문제도 발견해 수정 대상으로 남겼다. 이 버전을 연속 다운로드 해결 완료로 표시하지 않는다.
+
+### v2 보완과 실행 상태
+
+`CanDownload`에서 문서별 최초 다운로드 요청의 소유자를 기록한다. 요청 이력이 있는 문서의 제어권이 바뀌면 취소 상태를 유지하며, 늦은 `OnShowPermissionPrompt`를 IGNORE한다. 새 요청이 들어와도 이전 소유자를 덮어쓰지 않는다. 실제 문서 commit에서만 이 기록을 초기화한다. 콜백에 요청 식별자가 없어 같은 문서의 새 요청까지 보수적으로 취소될 수 있으며, 같은 문서의 주소 변경과 중지도 여기에 포함된다. 이때 필요한 작업은 사용자가 새로 고친 뒤 다시 시작한다. 탭마다 작은 기록 하나만 보관하며 URL이나 새로운 타이머를 추가하지 않는다. 4개 상한은 Naru에 전달된 권한 큐의 제한이고 Chromium 내부의 아직 전달되지 않은 대기까지 제한한 증거는 아니다.
+
+v2는 Rust 174개, 전체 타깃 Cargo 검사, format과 release 빌드를 통과했다. 두 카드의 내부 좌표도 AppKit의 아래쪽 원점에 맞게 보정했다. 최종 앱 SHA-256은 `8f6ca43ccee08f37594d366b474530de9b4b7626814126db832834a474d08be3`다. 최초 로컬 CEF 하네스는 HTTP commit 전 `WAIT_TIMEOUT`으로 멈췄고 새 SecurityAgent가 실행됐다. `artifacts/download-permission-v2-smoke.json`은 기능 검사가 시작되지 않은 실패 기록이다. 이후 승인 대기가 해소됐고 재빌드 없이 같은 바이너리의 로컬 HTTP `complete`를 확인했다. 근거는 `artifacts/download-permission-v2-approval-probe.json`이다. 재서명 후 키체인 승인이 다시 필요해지는 문제까지 해결한 결과는 아니다.
+
+승인 후 첫 하네스는 인계와 탐색 2개 사례를 통과한 뒤 paused 작업 탭을 unscoped CLI로 읽으려다 `TASK_REQUIRED`로 실패했다. 이는 작업 범위 보호에 맞지 않는 검사 전제였으며 제품 권한을 완화하지 않았다. `artifacts/download-permission-v2-smoke-after-allow.json`의 전체 결과는 실패로 유지한다. 해당 resume 사례는 네이티브 fixture 버튼으로 확인할 대상으로 분리했다.
+
+최종 하네스 `artifacts/download-permission-v2-smoke-final.json`은 exit 0, 빈 stderr와 `ok: true`로 권한 수명 4개 사례와 정리 1개 항목을 통과했다. 검사자가 자체 공간을 명시적으로 표시해야 Chromium 권한 요청이 전달된다는 조건을 포함한다.
+
+- 이미 전달된 요청은 사용자 공간으로 돌아와도 대기하며, handoff 후 권한과 파일 저장 대기가 0개가 됐다. 이전 revision의 클릭도 거절됐다.
+- 문서 탐색 후 이전 권한이 사라졌고 작업 완료 시 먼저 접수한 파일 저장 대기도 정리됐다.
+- 숨겨진 사용자 요청을 adopt한 뒤 해당 작업 공간을 표시해도 3초간 반복 조회한 상태에서 권한 대기가 나타나지 않았다. 작업 완료는 빌린 탭을 보존했고, 검사 소유 탭을 명시적으로 닫자 파일 저장 대기가 정리됐다.
+- 숨겨진 AI 요청을 handoff한 뒤 paused 공간을 표시해도 3초간 반복 조회한 상태에서 권한 대기가 나타나지 않았다.
+
+네 사례에서 느린 두 번째 파일의 서버 요청은 0회였다. 검사 소유 작업 4개와 탭을 종료했고 원래 사용자 탭 1, 다운로드 상태 0개와 fixture 서버 스레드 종료를 확인했다. 이 결과는 숨긴 탭의 자동 권한 알림이나 모든 순간의 네이티브 화면을 검증한 증거가 아니다. paused 탭의 네이티브 요청 후 resume 검사는 보고서의 `notRun`에 남아 있다.
+
+별도 네이티브 검사에서는 일반 attachment 탐색 링크로 첫 작은 파일의 저장 대기를 만든 뒤 두 번째 느린 파일을 요청했다. 클릭 직후 조회는 `PAGE_LOADING`이었지만 이후 비동기 `OnShowPermissionPrompt` mask 16384와 권한 대기 1개를 확인했다. 사용자 공간으로 돌아와도 대기가 유지됐다. 최종 카드의 제목, origin, 출처, 설명과 버튼이 위에서 아래로 정상 배치된 화면을 확인했고 **이번 요청 취소**를 누르자 카드가 사라지며 권한은 0개, 포커스는 닫기 버튼으로 이동했다. 검사 작업을 끝낸 뒤 원래 사용자 탭 1과 다운로드 0개를 확인했다. 요청과 로컬 페이지 기록은 `artifacts/download-permission-v2-native.json`, 네이티브 확인과 전체 검증 범위는 `artifacts/download-permission-v2-validation.json`에 있다.
+
+같은 v2 바이너리의 기존 CEF 회귀도 select 10개, tasks 6개, spaces 10개, single_window 6개를 모두 통과했다. 네 묶음의 exit는 0이며 stderr는 비어 있다. 생성한 작업 9개를 종료하고 원래 사용자 탭 1, 다운로드와 대기 요청, 캡처, 탭 생성 예약 0개를 확인했다. 근거는 `artifacts/download-permission-v2-suite.json`과 `artifacts/download-permission-v2-suite-state.json`이다. 권한 회귀 4개와 구분한 기존 기능의 로컬 CEF 결과다.
+
+검사 후 별도 다운로드 fixture 서버를 정상 종료했고 최신 앱 한 개와 원래 사용자 빈 탭 1만 유지했다. v2 빌드에서 Cargo 중간 파일 4,332개, 2.5GiB를 정리했으며 확인 시점의 target은 2.8MiB, dist는 335MiB였다. 사용자 프로필을 보존했고 이번 v2 검사에서는 파일을 저장하지 않았다. 정리 근거는 `artifacts/download-permission-v2-validation.json`과 `artifacts/download-permission-v2-final-state.json`이다.
+
+실제 허용과 파일 저장, paused 상태의 네이티브 요청 후 resume, 일반 attachment 중단 링크, 같은 바이너리의 재시작은 v2에서 아직 검증하지 않았다. 새 모의 DOM 검사, 외부 사이트와 메모리 표본도 없다. 숨은 탭의 자동 알림, 사이트 권한 해제 UI, 제어권 변경 후 같은 문서에서 새 권한 요청을 구분하는 기능은 남아 있다.
 
 ## v4 빌드와 승인 상태
 

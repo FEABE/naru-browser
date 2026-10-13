@@ -1,5 +1,31 @@
 # Naru 작업 기록
 
+## 2026-10-13, 연속 다운로드 권한 처리와 비공개 업로드 준비
+
+독립 브라우저 개발을 이어가며 이전에 남긴 연속 합성 다운로드 미접수를 조사했다. 기존 v4 바이너리의 자체 로컬 페이지에서 첫 파일만 서버에 도착하고 두 번째 파일은 클릭 성공 응답 뒤에도 요청되지 않는 현상을 재현했다. 이후 실제 CEF MULTIPLE_DOWNLOADS 콜백의 진입을 확인했다. 최초 재현 근거는 `artifacts/download-permission-baseline.json`이다.
+
+`src/download_permissions.rs`와 `src/download_permission_runtime.rs`에 최대 4개의 권한 대기를 추가했다. 정확한 MULTIPLE_DOWNLOADS 요청만 받고 origin과 출처를 제한된 길이로 보관한다. 허용은 해당 사이트 설정을 저장하고 이번 요청 취소는 IGNORE로 설정 변경 없이 취소한다. `src/browser.rs`에서 문서와 최초 소유권을 재검증하고 탐색, 중지, 인계, 재개, adopt, release, 종료와 CEF dismiss를 연결했다. 콜백은 큐에서 제거한 뒤 borrow 밖에서 호출한다. CLI status에는 다운로드, 저장 위치 대기, 권한 대기 개수를 추가했다.
+
+첫 구현의 실제 검사에서 숨긴 Chromium 요청이 인계 뒤 늦게 전달되면 새 소유자의 권한 요청으로 보이는 결함을 발견했다. 최초 CanDownload 시점의 소유권을 보관하고 제어권 변경 뒤에는 같은 문서에서 다시 허용하지 않도록 수정했다. 실제 문서 commit에서만 provenance를 초기화한다. 다운로드와 HTTP 204로 끝나는 provisional 탐색은 실제 문서 교체와 구분한다. 네이티브 화면에서 뒤집혀 표시되던 카드의 자식 좌표도 수정했다.
+
+`src/control_panel.rs`의 기존 다운로드 패널에 origin, 요청 출처, 다른 공간과 공유되는 사이트 설정의 의미, 허용과 이번 요청 취소 버튼을 연결했다. 자동으로 패널이나 공간을 열지 않으며 닫힌 패널에서는 개수만 읽는다. 카드 참조는 닫을 때 해제하고 단조 증가 토큰과 실제 버튼을 함께 확인해 오래된 동작을 거절한다. 별도 창, 웹 renderer, worker, DB는 추가하지 않았다. README, 다운로드 설계와 제품 계획을 갱신했다.
+
+최종 v2의 Rust 단위 검사 174개, 전체 타깃 Cargo 검사, format과 diff 검사, release 빌드가 통과했다. 기존 test 전용 dead_code 경고 2개는 남는다. 근거는 `artifacts/download-permission-v2-rust-tests.log`, `-check.log`, `-fmt.log`, `-build.log`다. 앱 SHA-256은 `8f6ca43ccee08f37594d366b474530de9b4b7626814126db832834a474d08be3`, CLI는 `c530aca66d43799ea254e052bc1557ade91f7cfeb1eab2be1cf4582530152d5e`다. 새 모의 DOM 검사는 실행하지 않았다.
+
+v2 첫 실제 검사는 로컬 HTTP commit 전 WAIT_TIMEOUT으로 끝났으며 새 SecurityAgent를 확인해 직접 승인을 요청했다. 뒤이어 같은 바이너리에서 HTTP complete와 commit을 확인해 검증을 재개했다. 두 번째 하네스는 인계와 탐색 검사를 통과한 뒤 paused 탭의 unscoped read에서 TASK_REQUIRED로 실패했다. 제품의 정상 보호를 잘못 사용한 하네스였으므로 자동 resume 사례를 제외하고 미실행 항목으로 기록했다. 최초 실패 자료는 유지했다.
+
+수정한 `tests/download_permissions_smoke.py`는 실제 로컬 CEF에서 인계, 문서 탐색, 사용자 탭 adopt, 숨긴 요청의 인계 4가지를 통과했다. 정리 검사까지 checks 5개, exit 0, stderr 0, cleanupVerified true다. 작업을 직접 표시해야 숨긴 Chromium 요청이 CEF 콜백에 도달하는 조건을 명시했다. 배경 요청의 자동 알림 성공으로 세지 않는다. `artifacts/download-permission-v2-smoke-final.json`에 원래 사용자 탭과 선택 보존, 대기 0개, 자체 서버 종료를 기록했다. 앱 로그에서 adopt와 숨긴 요청 인계 후의 실제 늦은 OnShow 진입도 확인했다.
+
+동일 v2에서 기존 회귀 select 10개, tasks 6개, spaces 10개, single_window 6개, 총 32개가 exit 0으로 통과했다. 각 검사와 실행기의 정리 확인도 통과했다. 결과는 `artifacts/download-permission-v2-suite.json`, `-suite-state.json`, `-runner.log`다. 합성 CLI 입력을 사용하는 로컬 CEF 검사이며 외부 서비스 검증이 아니다.
+
+네이티브 UI 확인에서는 자체 attachment 링크의 첫 파일이 저장 대기에 들어갔다. 두 번째 클릭 직후에는 PAGE_LOADING이었으나 이후 기존 문서가 유지되고 권한 콜백 mask 16384와 대기 1개가 확인됐다. 사용자 공간으로 돌아와도 대기는 유지됐다. 최종 v2 화면에서 카드 제목, origin, 출처, 설명, 버튼이 위에서 아래 순서로 배치됐으며 이번 요청 취소를 누르면 카드와 권한 대기가 사라지고 닫기 버튼으로 포커스가 복귀했다. 허용 클릭, 그 뒤 실제 파일 저장, paused 사용자 요청의 native 입력 후 재개는 이번 v2에서 실행하지 않았다. 이를 위한 로컬 fixture 버튼은 준비했지만 성공 결과로 세지 않는다.
+
+검증용 작업과 탭은 모두 정리했고 원래 사용자 빈 탭 1, user 공간, 다운로드와 권한과 저장 대기 0개, wait와 캡처와 탭 생성 예약 0개를 확인했다. 자체 fixture PID 37571은 SIGTERM 뒤 exit 0으로 종료했다. 이전 앱은 정상 종료했고 최신 v2 메인 PID 44130 하나를 유지한다. 빌드 때마다 중간물 4,332개와 2.5GiB를 정리했으며 dist에는 최신 앱 하나, target/release에는 실행 파일 세 개만 남았다. target 2.8MiB, dist 335MiB, 검증 자료 13MiB, CEF 캐시 339MiB다. 이번 v2에서는 다운로드를 디스크에 저장하지 않았고 사용자 프로필과 기존 탭을 보존했다. 새 메모리 측정이나 같은 바이너리 재시작 검사는 하지 않았다.
+
+숨긴 Chromium 권한 요청은 CEF에 전달되기 전에는 앱에서 알 수 없다. 대기 상한 4개는 앱이 받은 콜백에만 적용된다. 제어권 변경 뒤 같은 문서의 새 권한 요청도 reload가 필요할 수 있다. 권한 해제 설정 UI, 모든 수명 경합과 실제 동시 상한, 허용 뒤 저장, 외부 사이트, Preseller 내장과 전체 Naru 완성은 남아 있다.
+
+비공개 GitHub 업로드 요청에 따라 `FEABE/naru-browser`의 PRIVATE와 ADMIN 권한, 개발 브랜치의 기존 원격 커밋 `37a8f549b28887cc5c3d91a0c4590e57753afb25`를 다시 확인했다. 변경 11개와 추적 파일을 점검했으며 프로필, 쿠키, DB, 비밀 파일, 앱 번들과 생성물은 업로드 대상에 없다. 로컬 검증 자료는 ignore된 artifacts에 유지한다. 소스, 테스트, 문서를 기존 `codex/navigation-readiness`에 올리는 범위이며 main 변경이나 배포는 포함하지 않는다. 최종 원격 SHA와 비공개 설정은 푸시 후 다시 확인한다.
+
 ## 2026-10-13, GitHub 비공개 업로드 상태 확인
 
 현재 프로젝트를 GitHub에 비공개로 올려 달라는 요청에 따라 로컬과 원격을 조회했다. `FEABE/naru-browser`는 `visibility: PRIVATE`, `isPrivate: true`이며 현재 계정의 권한은 ADMIN이다. 개발 브랜치 `codex/navigation-readiness`의 원격 커밋과 로컬 HEAD는 모두 `93ae7e91eb0f8c4c1d3f1b4f7103c41971b83c4c`로 일치했다. 소스는 이미 업로드된 상태이고 시작 시 미커밋 변경은 없었다.

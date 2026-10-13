@@ -54,6 +54,9 @@ impl Reply {
 #[derive(Default)]
 struct Navigation {
     epoch: u64,
+    // Main-document identity excludes provisional requests that become downloads.
+    document_epoch: u64,
+    download_permission_provenance: crate::download_permissions::Provenance,
     requested_url: String,
     provisional: bool,
     committed: bool,
@@ -163,6 +166,8 @@ impl Navigation {
         self.provisional = false;
         self.intent_pending = false;
         self.incomplete = false;
+        self.document_epoch += 1;
+        self.download_permission_provenance = Default::default();
         self.committed = true;
         self.document_available = false;
         self.main_load_complete = false;
@@ -457,6 +462,7 @@ struct State {
 thread_local! { static STATE: RefCell<State> = RefCell::new(State::default()); }
 
 pub fn clear() {
+    crate::download_permission_runtime::clear();
     crate::download_runtime::clear();
     STATE.with(|state| *state.borrow_mut() = State::default());
 }
@@ -464,6 +470,80 @@ pub fn clear() {
 pub(crate) struct DownloadContext {
     pub scope: Option<TaskScope>,
     pub source: String,
+}
+
+pub(crate) struct DownloadPermissionContext {
+    pub target: crate::download_permissions::Target,
+    pub source: String,
+}
+
+pub(crate) fn download_permission_context(tab: i32) -> Result<DownloadPermissionContext, String> {
+    let download = download_context(tab)?;
+    let target = STATE.with(|state| {
+        let state = state.borrow();
+        let page = state
+            .tabs
+            .get(&tab)
+            .filter(|page| !page.rejected_creation && page.navigation.renderer_exit.is_none())
+            .ok_or_else(|| "다운로드를 요청한 페이지를 사용할 수 없습니다.".to_owned())?;
+        let target = crate::download_permissions::Target {
+            tab,
+            epoch: page.navigation.document_epoch,
+            owner: link_owner(&state.tasks, tab),
+        };
+        if !page
+            .navigation
+            .download_permission_provenance
+            .permits(&target)
+        {
+            return Err(
+                "페이지의 제어권이 변경되어 이전 다운로드 권한 요청을 취소했습니다.".to_owned(),
+            );
+        }
+        Ok::<_, String>(target)
+    })?;
+    Ok(DownloadPermissionContext {
+        target,
+        source: download.source,
+    })
+}
+
+fn record_download_permission_attempt(tab: i32) -> Result<(), String> {
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let owner = link_owner(&state.tasks, tab);
+        let page = state
+            .tabs
+            .get_mut(&tab)
+            .filter(|page| !page.rejected_creation && page.navigation.renderer_exit.is_none())
+            .ok_or_else(|| "다운로드를 요청한 페이지를 사용할 수 없습니다.".to_owned())?;
+        page.navigation.download_permission_provenance.record(
+            crate::download_permissions::Target {
+                tab,
+                epoch: page.navigation.document_epoch,
+                owner,
+            },
+        );
+        Ok(())
+    })
+}
+
+fn revoke_download_permission_provenance(tab: i32) {
+    STATE.with(|state| {
+        if let Some(page) = state.borrow_mut().tabs.get_mut(&tab) {
+            page.navigation.download_permission_provenance.revoke();
+        }
+    });
+}
+
+pub(crate) fn validate_download_permission(
+    target: &crate::download_permissions::Target,
+) -> Result<(), String> {
+    let current = download_permission_context(target.tab)?;
+    if &current.target != target {
+        return Err("페이지나 탭의 제어권이 변경되어 다운로드 권한 요청이 만료되었습니다.".into());
+    }
+    Ok(())
 }
 
 /// Capture ownership without retaining a browser or the source URL.
@@ -1473,6 +1553,7 @@ fn control_detached(tab: i32) {
 }
 
 fn renderer_terminated(tab: i32, reason: Json) {
+    crate::download_permission_runtime::cancel_tab(tab);
     let (pending, waits) = STATE.with(|state| {
         let mut state = state.borrow_mut();
         state.page_find.invalidate(tab);
@@ -1530,6 +1611,7 @@ fn task_result<T: serde::Serialize>(result: Result<T, TaskError>, reply: &Reply)
 // Revoke work on the UI thread before allowing another controller to resume.
 // A dispatched mutation cannot be undone, so its reply records an unknown outcome.
 fn revoke_task_requests(task: &str, only_tab: Option<i32>) {
+    crate::download_permission_runtime::cancel_task(task, only_tab);
     crate::download_runtime::cancel_task(task, only_tab);
     let matches = |reply: &Reply, tab: i32| {
         reply.scope.as_ref().is_some_and(|scope| scope.task == task)
@@ -1576,19 +1658,24 @@ fn revoke_task_requests(task: &str, only_tab: Option<i32>) {
 }
 
 fn expire_tab_refs(tabs: impl IntoIterator<Item = i32>) {
+    let tabs = tabs.into_iter().collect::<Vec<_>>();
     let stopped = STATE.with(|state| {
         let mut state = state.borrow_mut();
         let mut stopped = None;
-        for id in tabs {
+        for &id in &tabs {
             if state.page_find.invalidate(id) {
                 stopped = state.tabs.get(&id).map(|tab| tab.browser.clone());
             }
             if let Some(tab) = state.tabs.get_mut(&id) {
                 tab.navigation.epoch += 1;
+                tab.navigation.download_permission_provenance.revoke();
             }
         }
         stopped
     });
+    for id in tabs {
+        crate::download_permission_runtime::cancel_tab(id);
+    }
     if let Some(host) = stopped.and_then(|browser| browser.host()) {
         host.stop_finding(1);
     }
@@ -1762,6 +1849,17 @@ fn handle_task(command: &Command, reply: Reply) {
     }
 }
 
+fn status_json() -> Json {
+    let (active_downloads, awaiting_save) = crate::download_runtime::activity();
+    let awaiting_permission = crate::download_permission_runtime::pending_count();
+    STATE.with(|state| {
+        let state = state.borrow();
+        json!({"app":"Light Browser","engine":"CEF/Chromium","cef":String::from_utf8_lossy(&sys::CEF_VERSION[..sys::CEF_VERSION.len()-1]),"cefApi":sys::CEF_API_VERSION_LAST,"version":env!("CARGO_PKG_VERSION"),"tabs":state.tabs.len(),"pendingWaits":state.waits.len(),"sandbox":true,"externalDebugPort":false,"controlPanel":"embedded","windowMode":"single","activeTab":state.spaces.active_tab(),"activeSpace":state.spaces.active_space(),"overview":state.spaces.overview(),
+            "downloads":{"active":active_downloads,"awaitingSave":awaiting_save,"awaitingPermission":awaiting_permission},
+            "resources":{"automationTabLimit":MAX_AUTOMATION_TABS,"taskTabLimit":crate::tasks::MAX_TASK_TABS,"pendingTabCreations":state.creations.len(),"captureLimit":1,"capturesInFlight":state.captures.len()}})
+    })
+}
+
 fn handle(command: &Command, reply: Reply) {
     let observed = match command {
         Command::TaskRun { command, .. } => command.as_ref(),
@@ -1809,14 +1907,32 @@ fn handle(command: &Command, reply: Reply) {
     match command {
         Command::Spaces => reply.ok(spaces_json(reply.scope.as_ref())),
         Command::SpaceShow { space } => {
-            if reply.scope.is_some() { reply.error("SPACE_UI_REQUIRES_UNSCOPED", "Task commands cannot switch the user's visible space."); return; }
-            if !STATE.with(|state| state.borrow().spaces.contains(space)) { reply.error("SPACE_NOT_FOUND", "No space has that ID."); return; }
-            if let Err(error) = shell_action(ShellAction::SelectSpace(space.clone())) { reply.error("SPACE_UNAVAILABLE", &error); return; }
+            if reply.scope.is_some() {
+                reply.error(
+                    "SPACE_UI_REQUIRES_UNSCOPED",
+                    "Task commands cannot switch the user's visible space.",
+                );
+                return;
+            }
+            if !STATE.with(|state| state.borrow().spaces.contains(space)) {
+                reply.error("SPACE_NOT_FOUND", "No space has that ID.");
+                return;
+            }
+            if let Err(error) = shell_action(ShellAction::SelectSpace(space.clone())) {
+                reply.error("SPACE_UNAVAILABLE", &error);
+                return;
+            }
             crate::control_panel::show();
             reply.ok(spaces_json(None));
         }
         Command::SpaceOverview => {
-            if reply.scope.is_some() { reply.error("SPACE_UI_REQUIRES_UNSCOPED", "Task commands cannot switch the user's visible space."); return; }
+            if reply.scope.is_some() {
+                reply.error(
+                    "SPACE_UI_REQUIRES_UNSCOPED",
+                    "Task commands cannot switch the user's visible space.",
+                );
+                return;
+            }
             let _ = shell_action(ShellAction::ShowOverview(true));
             crate::control_panel::show();
             reply.ok(spaces_json(None));
@@ -1824,124 +1940,292 @@ fn handle(command: &Command, reply: Reply) {
         Command::Panel => {
             crate::control_panel::show();
             reply.ok(json!({"panel":"embedded","shown":true,"windowMode":"single"}));
-        },
-        Command::Status => reply.ok(STATE.with(|state| {
-            let state = state.borrow();
-            json!({"app":"Light Browser","engine":"CEF/Chromium","cef":String::from_utf8_lossy(&sys::CEF_VERSION[..sys::CEF_VERSION.len()-1]),"cefApi":sys::CEF_API_VERSION_LAST,"version":env!("CARGO_PKG_VERSION"),"tabs":state.tabs.len(),"pendingWaits":state.waits.len(),"sandbox":true,"externalDebugPort":false,"controlPanel":"embedded","windowMode":"single","activeTab":state.spaces.active_tab(),"activeSpace":state.spaces.active_space(),"overview":state.spaces.overview(),
-                "resources":{"automationTabLimit":MAX_AUTOMATION_TABS,"taskTabLimit":crate::tasks::MAX_TASK_TABS,"pendingTabCreations":state.creations.len(),"captureLimit":1,"capturesInFlight":state.captures.len()}})
-        })),
+        }
+        Command::Status => reply.ok(status_json()),
         Command::Tabs => reply.ok(STATE.with(|state| {
             let state = state.borrow();
-            let tabs = state.tabs.values().filter_map(|tab| {
-                if tab.rejected_creation { return None; }
-                let owner = state.tasks.owner(tab.browser.identifier());
-                if reply.scope.as_ref().is_some_and(|scope| owner.as_ref().is_none_or(|(id,_)| *id != scope.task)) { return None; }
-                let mut info = tab_info(tab);
-                info["active"] = json!(state.spaces.active_tab() == Some(tab.browser.identifier()));
-                info["space"] = json!(state.spaces.tab_space(tab.browser.identifier()).unwrap_or(USER_SPACE));
-                info["task"] = owner.map(|(id,origin)| json!({"id":id,"origin":origin})).unwrap_or(Json::Null);
-                Some(info)
-            }).collect::<Vec<_>>();
+            let tabs =
+                state
+                    .tabs
+                    .values()
+                    .filter_map(|tab| {
+                        if tab.rejected_creation {
+                            return None;
+                        }
+                        let owner = state.tasks.owner(tab.browser.identifier());
+                        if reply.scope.as_ref().is_some_and(|scope| {
+                            owner.as_ref().is_none_or(|(id, _)| *id != scope.task)
+                        }) {
+                            return None;
+                        }
+                        let mut info = tab_info(tab);
+                        info["active"] =
+                            json!(state.spaces.active_tab() == Some(tab.browser.identifier()));
+                        info["space"] = json!(
+                            state
+                                .spaces
+                                .tab_space(tab.browser.identifier())
+                                .unwrap_or(USER_SPACE)
+                        );
+                        info["task"] = owner
+                            .map(|(id, origin)| json!({"id":id,"origin":origin}))
+                            .unwrap_or(Json::Null);
+                        Some(info)
+                    })
+                    .collect::<Vec<_>>();
             json!({"tabs":tabs})
         })),
         Command::Open { url } => {
-            if !valid_url(url) { reply.error("INVALID_URL", "Only an absolute HTTP(S) URL without control characters is accepted."); return; }
+            if !valid_url(url) {
+                reply.error(
+                    "INVALID_URL",
+                    "Only an absolute HTTP(S) URL without control characters is accepted.",
+                );
+                return;
+            }
             let reservation = match reserve_creation(reply.scope.clone(), None) {
                 Ok(ticket) => ticket,
-                Err(error) => { reply.error(error.code,error.message); return; }
+                Err(error) => {
+                    reply.error(error.code, error.message);
+                    return;
+                }
             };
             if let Some(browser) = create_browser(url, reply.scope.clone(), Some(reservation)) {
-                let info = STATE.with(|state| state.borrow().tabs.get(&browser.identifier()).filter(|tab| !tab.rejected_creation).map(tab_info));
-                if let Some(info) = info { reply.ok(info); }
-                else { reply.error("OPEN_FAILED", "The created tab is unavailable."); }
+                let info = STATE.with(|state| {
+                    state
+                        .borrow()
+                        .tabs
+                        .get(&browser.identifier())
+                        .filter(|tab| !tab.rejected_creation)
+                        .map(tab_info)
+                });
+                if let Some(info) = info {
+                    reply.ok(info);
+                } else {
+                    reply.error("OPEN_FAILED", "The created tab is unavailable.");
+                }
             } else {
-                STATE.with(|state| { state.borrow_mut().creations.release(reservation); });
+                STATE.with(|state| {
+                    state.borrow_mut().creations.release(reservation);
+                });
                 reply.error("OPEN_FAILED", "Chromium could not create a browser tab.");
             }
         }
         other => {
             let tab_id = match other {
-                Command::Read { tab } | Command::Click { tab, .. } | Command::Fill { tab, .. } | Command::Select { tab, .. } |
-                Command::Press { tab, .. } | Command::Close { tab } | Command::Screenshot { tab, .. } | Command::Wait {tab,..} |
-                Command::Navigate {tab,..} | Command::Back {tab} | Command::Forward {tab} | Command::Reload {tab} |
-                Command::Stop {tab} | Command::Scroll {tab,..} => *tab,
+                Command::Read { tab }
+                | Command::Click { tab, .. }
+                | Command::Fill { tab, .. }
+                | Command::Select { tab, .. }
+                | Command::Press { tab, .. }
+                | Command::Close { tab }
+                | Command::Screenshot { tab, .. }
+                | Command::Wait { tab, .. }
+                | Command::Navigate { tab, .. }
+                | Command::Back { tab }
+                | Command::Forward { tab }
+                | Command::Reload { tab }
+                | Command::Stop { tab }
+                | Command::Scroll { tab, .. } => *tab,
                 _ => unreachable!(),
             };
-            let browser = STATE.with(|state| state.borrow().tabs.get(&tab_id).map(|tab| tab.browser.clone()));
-            let Some(browser) = browser else { reply.error("TAB_NOT_FOUND", "No browser tab has that ID."); return; };
-            if !matches!(other,Command::Navigate {..}|Command::Back {..}|Command::Forward {..}|Command::Reload {..}|Command::Close {..}|Command::Stop {..}|Command::Wait {..}) {
+            let browser = STATE.with(|state| {
+                state
+                    .borrow()
+                    .tabs
+                    .get(&tab_id)
+                    .map(|tab| tab.browser.clone())
+            });
+            let Some(browser) = browser else {
+                reply.error("TAB_NOT_FOUND", "No browser tab has that ID.");
+                return;
+            };
+            if !matches!(
+                other,
+                Command::Navigate { .. }
+                    | Command::Back { .. }
+                    | Command::Forward { .. }
+                    | Command::Reload { .. }
+                    | Command::Close { .. }
+                    | Command::Stop { .. }
+                    | Command::Wait { .. }
+            ) {
                 let unavailable = STATE.with(|state| {
                     let state = state.borrow();
                     let tab = &state.tabs[&tab_id];
-                    tab.navigation.renderer_exit.as_ref().map(|_|tab_info(tab))
+                    tab.navigation.renderer_exit.as_ref().map(|_| tab_info(tab))
                 });
                 if let Some(info) = unavailable {
-                    reply.error_details("RENDERER_TERMINATED","The renderer has not recovered. Reload, then wait for the new document.",json!({"tab":tab_id,"state":info,"outcomeUnknown":false}));
+                    reply.error_details(
+                        "RENDERER_TERMINATED",
+                        "The renderer has not recovered. Reload, then wait for the new document.",
+                        json!({"tab":tab_id,"state":info,"outcomeUnknown":false}),
+                    );
                     return;
                 }
             }
-            if reply.scope.is_some() && !matches!(other, Command::Wait {..} | Command::Screenshot {..}) {
-                let busy = STATE.with(|state| state.borrow().pending.values().any(|pending|
-                    pending.tab == tab_id && matches!(pending.evaluation, Evaluation::Page {..})));
-                if busy { reply.error("TAB_BUSY", "A page operation is still in flight. Inspect its result before continuing."); return; }
+            if reply.scope.is_some()
+                && !matches!(other, Command::Wait { .. } | Command::Screenshot { .. })
+            {
+                let busy = STATE.with(|state| {
+                    state.borrow().pending.values().any(|pending| {
+                        pending.tab == tab_id
+                            && matches!(pending.evaluation, Evaluation::Page { .. })
+                    })
+                });
+                if busy {
+                    reply.error("TAB_BUSY", "A page operation is still in flight. Inspect its result before continuing.");
+                    return;
+                }
             }
             match other {
-                Command::Navigate {..} | Command::Back {..} | Command::Forward {..} | Command::Reload {..} => {
+                Command::Navigate { .. }
+                | Command::Back { .. }
+                | Command::Forward { .. }
+                | Command::Reload { .. } => {
                     navigate(&browser, other, reply);
                 }
-                Command::Stop {..} => {
+                Command::Stop { .. } => {
                     stop_loading(&browser);
                     reply.ok(json!({"tab":tab_id,"stopRequested":true}));
                 }
-                Command::Wait {until,timeout_ms,..} => {
-                    if !(1..=30_000).contains(timeout_ms) { reply.error("INVALID_ARGUMENTS", "Wait timeout must be 1 to 30000 milliseconds."); return; }
+                Command::Wait {
+                    until, timeout_ms, ..
+                } => {
+                    if !(1..=30_000).contains(timeout_ms) {
+                        reply.error(
+                            "INVALID_ARGUMENTS",
+                            "Wait timeout must be 1 to 30000 milliseconds.",
+                        );
+                        return;
+                    }
                     let token = reply.token;
-                    STATE.with(|state| { state.borrow_mut().waits.insert(token, Waiter {
-                        tab:tab_id,until:*until,timeout_ms:*timeout_ms,started:Instant::now(),probe_in_flight:false,reply
-                    }); });
+                    STATE.with(|state| {
+                        state.borrow_mut().waits.insert(
+                            token,
+                            Waiter {
+                                tab: tab_id,
+                                until: *until,
+                                timeout_ms: *timeout_ms,
+                                started: Instant::now(),
+                                probe_in_flight: false,
+                                reply,
+                            },
+                        );
+                    });
                     poll_wait(token);
                 }
                 Command::Close { .. } => {
                     reply.ok(json!({"tab":tab_id,"closeRequested":true}));
-                    if let Some(host) = browser.host() { host.close_browser(0); }
+                    if let Some(host) = browser.host() {
+                        host.close_browser(0);
+                    }
                 }
                 Command::Screenshot { path, .. } => {
                     if !Path::new(path).is_absolute() || Path::new(path).exists() {
-                        reply.error("INVALID_PATH", "Use an absolute path to a new PNG file."); return;
+                        reply.error("INVALID_PATH", "Use an absolute path to a new PNG file.");
+                        return;
                     }
-                    dispatch(&browser, "Page.captureScreenshot", json!({"format":"png","captureBeyondViewport":false}), Pending { tab:tab_id, epoch:0,evaluation:Evaluation::Page{mutation:false},reply, step:Step::Screenshot(path.clone()) });
+                    dispatch(
+                        &browser,
+                        "Page.captureScreenshot",
+                        json!({"format":"png","captureBeyondViewport":false}),
+                        Pending {
+                            tab: tab_id,
+                            epoch: 0,
+                            evaluation: Evaluation::Page { mutation: false },
+                            reply,
+                            step: Step::Screenshot(path.clone()),
+                        },
+                    );
                 }
                 _ => {
                     let epoch = STATE.with(|state| {
                         let state = state.borrow();
                         let tab = state.tabs.get(&tab_id)?;
-                        if tab.navigation.provisional || !tab.navigation.committed || !tab.navigation.document_available {
-                            reply.error_details("PAGE_LOADING", "The current main document is not available yet.", json!({"tab":tab_id,"state":tab_info(tab)}));
+                        if tab.navigation.provisional
+                            || !tab.navigation.committed
+                            || !tab.navigation.document_available
+                        {
+                            reply.error_details(
+                                "PAGE_LOADING",
+                                "The current main document is not available yet.",
+                                json!({"tab":tab_id,"state":tab_info(tab)}),
+                            );
                             None
-                        } else { Some(tab.navigation.epoch) }
+                        } else {
+                            Some(tab.navigation.epoch)
+                        }
                     });
-                    let Some(epoch) = epoch else { return; };
+                    let Some(epoch) = epoch else {
+                        return;
+                    };
                     let invocation = match other {
                         Command::Read { .. } => "window.__lightBrowserBridge.read()".to_owned(),
-                        Command::Click { reference, .. } => action_expression("click", reference, None, epoch, &reply),
-                        Command::Fill { reference, text, .. } => action_expression("fill", reference, Some(("text",text)), epoch, &reply),
-                        Command::Select { reference, value, .. } => action_expression("select", reference, Some(("value",value)), epoch, &reply),
-                        Command::Press { reference, key, .. } => {
-                            if key != "Enter" { reply.error("UNSUPPORTED_KEY", "The first version supports Enter only."); return; }
-                            action_expression("press", reference, Some(("key",key)), epoch, &reply)
+                        Command::Click { reference, .. } => {
+                            action_expression("click", reference, None, epoch, &reply)
                         }
-                        Command::Scroll {x,y,..} => {
-                            if !(-10000..=10000).contains(x) || !(-10000..=10000).contains(y) {
-                                reply.error("INVALID_SCROLL", "Scroll offsets must be between -10000 and 10000 CSS pixels."); return;
+                        Command::Fill {
+                            reference, text, ..
+                        } => action_expression(
+                            "fill",
+                            reference,
+                            Some(("text", text)),
+                            epoch,
+                            &reply,
+                        ),
+                        Command::Select {
+                            reference, value, ..
+                        } => action_expression(
+                            "select",
+                            reference,
+                            Some(("value", value)),
+                            epoch,
+                            &reply,
+                        ),
+                        Command::Press { reference, key, .. } => {
+                            if key != "Enter" {
+                                reply.error(
+                                    "UNSUPPORTED_KEY",
+                                    "The first version supports Enter only.",
+                                );
+                                return;
                             }
-                            format!("window.__lightBrowserBridge.act({})",json!({"action":"scroll","x":x,"y":y}))
+                            action_expression("press", reference, Some(("key", key)), epoch, &reply)
+                        }
+                        Command::Scroll { x, y, .. } => {
+                            if !(-10000..=10000).contains(x) || !(-10000..=10000).contains(y) {
+                                reply.error(
+                                    "INVALID_SCROLL",
+                                    "Scroll offsets must be between -10000 and 10000 CSS pixels.",
+                                );
+                                return;
+                            }
+                            format!(
+                                "window.__lightBrowserBridge.act({})",
+                                json!({"action":"scroll","x":x,"y":y})
+                            )
                         }
                         _ => unreachable!(),
                     };
-                    if invocation.is_empty() { return; }
+                    if invocation.is_empty() {
+                        return;
+                    }
                     let expression = format!("(()=>{{{DOM_BRIDGE}\nreturn {invocation};}})()");
-                    dispatch(&browser, "Page.getFrameTree", json!({}), Pending { tab:tab_id, epoch,
-                        evaluation:Evaluation::Page {mutation:!matches!(other, Command::Read{..})},reply, step:Step::Frame(expression) });
+                    dispatch(
+                        &browser,
+                        "Page.getFrameTree",
+                        json!({}),
+                        Pending {
+                            tab: tab_id,
+                            epoch,
+                            evaluation: Evaluation::Page {
+                                mutation: !matches!(other, Command::Read { .. }),
+                            },
+                            reply,
+                            step: Step::Frame(expression),
+                        },
+                    );
                 }
             }
         }
@@ -1949,6 +2233,8 @@ fn handle(command: &Command, reply: Reply) {
 }
 
 fn stop_loading(browser: &Browser) {
+    revoke_download_permission_provenance(browser.identifier());
+    crate::download_permission_runtime::cancel_tab(browser.identifier());
     invalidate_page_find(browser.identifier());
     STATE.with(|state| {
         if let Some(tab) = state.borrow_mut().tabs.get_mut(&browser.identifier()) {
@@ -2022,6 +2308,8 @@ fn navigate(browser: &Browser, command: &Command, reply: Reply) {
     if !started {
         return;
     }
+    revoke_download_permission_provenance(tab_id);
+    crate::download_permission_runtime::cancel_tab(tab_id);
     invalidate_page_find(tab_id);
     match command {
         Command::Navigate { url, .. } => frame
@@ -2448,6 +2736,7 @@ wrap_client! {
         fn focus_handler(&self) -> Option<FocusHandler> { Some(TabFocusHandler::new()) }
         fn find_handler(&self) -> Option<FindHandler> { Some(PageFindHandler::new()) }
         fn download_handler(&self) -> Option<DownloadHandler> { Some(FileDownloadHandler::new()) }
+        fn permission_handler(&self) -> Option<PermissionHandler> { Some(FilePermissionHandler::new()) }
     }
 }
 wrap_life_span_handler! {
@@ -2547,6 +2836,7 @@ wrap_life_span_handler! {
         }
         fn do_close(&self, browser: Option<&mut Browser>) -> i32 {
             if let Some(browser) = browser {
+                crate::download_permission_runtime::cancel_tab(browser.identifier());
                 crate::download_runtime::cancel_tab(browser.identifier());
                 invalidate_page_find(browser.identifier());
                 // Unload approval has completed. Tear down only this native
@@ -2568,6 +2858,7 @@ wrap_life_span_handler! {
         fn on_before_close(&self, browser: Option<&mut Browser>) {
             let Some(browser)=browser else{return;};
             let id=browser.identifier();
+            crate::download_permission_runtime::cancel_tab(id);
             crate::download_runtime::cancel_tab(id);
             // The main frame is valid until this callback returns (CEF 156).
             // Read before the STATE borrow; never retain CEF objects as history.
@@ -2598,7 +2889,10 @@ wrap_download_handler! {
     struct FileDownloadHandler;
     impl DownloadHandler {
         fn can_download(&self, browser:Option<&mut Browser>, _url:Option<&CefString>, _request_method:Option<&CefString>) -> i32 {
-            i32::from(browser.is_some_and(|browser| crate::download_runtime::can_accept(browser.identifier())))
+            i32::from(browser.is_some_and(|browser| {
+                let tab = browser.identifier();
+                crate::download_runtime::can_accept(tab) && record_download_permission_attempt(tab).is_ok()
+            }))
         }
         fn on_before_download(&self, browser:Option<&mut Browser>, download_item:Option<&mut DownloadItem>, suggested_name:Option<&CefString>, callback:Option<&mut BeforeDownloadCallback>) -> i32 {
             let (Some(browser),Some(item),Some(callback))=(browser,download_item,callback) else{return 0;};
@@ -2608,6 +2902,23 @@ wrap_download_handler! {
             if let Some(item)=download_item {
                 crate::download_runtime::updated(browser.map(|browser|browser.identifier()),item,callback.as_deref());
             }
+        }
+    }
+}
+wrap_permission_handler! {
+    struct FilePermissionHandler;
+    impl PermissionHandler {
+        fn on_show_permission_prompt(&self, browser:Option<&mut Browser>, prompt_id:u64,
+            requesting_origin:Option<&CefString>, requested_permissions:u32,
+            callback:Option<&mut PermissionPromptCallback>) -> i32 {
+            let tab = browser.map(|browser| browser.identifier());
+            eprintln!("download permission=show tab={tab:?} prompt={prompt_id} mask={requested_permissions}");
+            i32::from(crate::download_permission_runtime::show(tab, prompt_id,
+                requesting_origin, requested_permissions, callback.as_deref()))
+        }
+        fn on_dismiss_permission_prompt(&self, browser:Option<&mut Browser>, prompt_id:u64,
+            _result:PermissionRequestResult) {
+            crate::download_permission_runtime::dismissed(browser.map(|browser| browser.identifier()), prompt_id);
         }
     }
 }
@@ -2639,7 +2950,7 @@ wrap_display_handler! {
     impl DisplayHandler {
         fn on_address_change(&self,browser:Option<&mut Browser>,frame:Option<&mut Frame>,url:Option<&CefString>) {
             if frame.is_none_or(|frame| frame.is_main()==0) { return; }
-            if let Some(browser) = browser { invalidate_page_find(browser.identifier()); STATE.with(|state| {
+            if let Some(browser) = browser { revoke_download_permission_provenance(browser.identifier()); crate::download_permission_runtime::cancel_tab(browser.identifier()); invalidate_page_find(browser.identifier()); STATE.with(|state| {
                 if let Some(tab) = state.borrow_mut().tabs.get_mut(&browser.identifier()) {
                     let nav = &mut tab.navigation;
                     let url = url.map(ToString::to_string).unwrap_or_default();
@@ -2755,7 +3066,7 @@ wrap_load_handler! {
         fn on_load_start(&self,browser:Option<&mut Browser>,frame:Option<&mut Frame>,_transition_type:TransitionType) {
             let Some(frame) = frame.filter(|frame| frame.is_main()!=0) else { return; };
             let url = CefString::from(&frame.url()).to_string();
-            if let Some(browser) = browser { invalidate_page_find(browser.identifier()); STATE.with(|state| {
+            if let Some(browser) = browser { crate::download_permission_runtime::cancel_tab(browser.identifier()); invalidate_page_find(browser.identifier()); STATE.with(|state| {
                 if let Some(tab) = state.borrow_mut().tabs.get_mut(&browser.identifier()) {
                     // A restored document may commit without OnBeforeBrowse.
                     tab.navigation.commit(&url);
@@ -2805,6 +3116,129 @@ wrap_dev_tools_message_observer! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn download_permission_expires_on_ownership_revision_document_and_tab_failure() {
+        clear();
+        // A refcounted inert CEF browser lets this test exercise actual STATE
+        // validation without loading Chromium or allocating native views.
+        let raw = cef::rc::RcImpl::new(unsafe { std::mem::zeroed::<sys::_cef_browser_t>() }, ());
+        let browser = cef::rc::ConvertReturnValue::wrap_result(raw.cast::<sys::_cef_browser_t>());
+        STATE.with(|state| {
+            state.borrow_mut().tabs.insert(
+                7,
+                Tab {
+                    browser,
+                    title: String::new(),
+                    rejected_creation: false,
+                    _devtools: None,
+                    navigation: Navigation {
+                        epoch: 1,
+                        ..Default::default()
+                    },
+                },
+            );
+        });
+        let next_document = || {
+            STATE.with(|state| {
+                state
+                    .borrow_mut()
+                    .tabs
+                    .get_mut(&7)
+                    .unwrap()
+                    .navigation
+                    .commit("https://example.test/new")
+            });
+            record_download_permission_attempt(7).unwrap();
+            download_permission_context(7).unwrap().target
+        };
+        assert!(download_permission_context(7).is_err());
+        record_download_permission_attempt(7).unwrap();
+        let user = download_permission_context(7).unwrap().target;
+        assert!(validate_download_permission(&user).is_ok());
+        let scope = STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let task = state.tasks.create("download permission").unwrap();
+            let scope = TaskScope {
+                task: task.id,
+                revision: task.revision,
+            };
+            state.tasks.attach(&scope, 7, Origin::Borrowed).unwrap();
+            scope
+        });
+        // Even without an epoch change, an unscoped approval cannot follow adoption.
+        assert!(validate_download_permission(&user).is_err());
+        assert!(download_permission_context(7).is_err());
+        record_download_permission_attempt(7).unwrap();
+        assert!(download_permission_context(7).is_err());
+        let active = next_document();
+        assert!(validate_download_permission(&active).is_ok());
+        let paused = STATE.with(|state| state.borrow_mut().tasks.handoff(&scope).unwrap());
+        assert!(validate_download_permission(&active).is_err());
+        expire_tab_refs([7]);
+        assert!(download_permission_context(7).is_err());
+        let human = next_document();
+        assert!(validate_download_permission(&human).is_ok());
+        STATE.with(|state| {
+            state
+                .borrow_mut()
+                .tasks
+                .resume(&TaskScope {
+                    task: paused.id,
+                    revision: paused.revision,
+                })
+                .unwrap()
+        });
+        assert!(validate_download_permission(&human).is_err());
+        expire_tab_refs([7]);
+        assert!(download_permission_context(7).is_err());
+        let current = next_document();
+        STATE.with(|state| {
+            state
+                .borrow_mut()
+                .tabs
+                .get_mut(&7)
+                .unwrap()
+                .navigation
+                .begin(None)
+        });
+        // A provisional navigation may become an attachment or 204. It does
+        // not invalidate the same document's permission prompt by itself.
+        assert!(validate_download_permission(&current).is_ok());
+        STATE.with(|state| {
+            state
+                .borrow_mut()
+                .tabs
+                .get_mut(&7)
+                .unwrap()
+                .navigation
+                .commit("https://example.test/new")
+        });
+        assert!(validate_download_permission(&current).is_err());
+        assert!(download_permission_context(7).is_err());
+        record_download_permission_attempt(7).unwrap();
+        let loading = download_permission_context(7).unwrap().target;
+        assert!(validate_download_permission(&loading).is_ok());
+        STATE.with(|state| {
+            state
+                .borrow_mut()
+                .tabs
+                .get_mut(&7)
+                .unwrap()
+                .navigation
+                .renderer_failed(json!({"status":"crashed"}))
+        });
+        assert!(validate_download_permission(&loading).is_err());
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let page = state.tabs.get_mut(&7).unwrap();
+            page.navigation.renderer_exit = None;
+            page.rejected_creation = true;
+        });
+        assert!(download_permission_context(7).is_err());
+        clear();
+        assert!(validate_download_permission(&loading).is_err());
+    }
 
     #[test]
     fn reopen_is_user_space_only_and_does_not_transfer_ai_control() {

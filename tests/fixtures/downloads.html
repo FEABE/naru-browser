@@ -6,26 +6,36 @@
 <style>
   body { margin: 40px; max-width: 760px; background: #eff8f6; color: #203b45; font: 18px system-ui; }
   a, label { display: block; margin: 24px 0; }
+  button { font: inherit; padding: 10px 16px; }
   pre { padding: 16px; background: white; white-space: pre-wrap; overflow-wrap: anywhere; }
 </style>
 <h1>Naru 다운로드 검증</h1>
 <p>로컬 검증용 파일입니다. 파일 선택 결과는 이 화면에만 표시하고 전송하지 않습니다.</p>
+<button type="button" id="two-downloads">두 파일 연속 요청</button>
 <a href="/small.bin" download>작은 파일 저장</a>
 <a href="/slow.bin" download>느린 파일 저장</a>
 <a href="/broken.bin" download>중간에 끊기는 파일 저장</a>
+<a href="/small.bin">attachment 탐색 작은 파일</a>
+<a href="/slow.bin">attachment 탐색 느린 파일</a>
+<a href="/broken.bin">attachment 탐색 중단 파일</a>
 <label>로컬 파일 선택 <input type="file" id="file" aria-label="로컬 파일 선택" accept=".bin,.txt" multiple></label>
 <pre id="receipt">선택한 파일 없음</pre>
 <pre id="clicks">클릭 기록 없음</pre>
 <label><input type="checkbox" id="guard"> 탭을 닫기 전에 확인</label>
 <script>
   const clicks = [];
-  for (const link of document.querySelectorAll('a[download]')) {
+  for (const link of document.querySelectorAll('a[href$=".bin"]')) {
     link.addEventListener('click', event => {
       clicks.push({ file: link.pathname, trusted: event.isTrusted, activation: navigator.userActivation.isActive });
       if (clicks.length > 6) clicks.shift();
       document.querySelector('#clicks').textContent = 'DOWNLOAD_CLICKS ' + JSON.stringify(clicks);
     });
   }
+  document.querySelector('#two-downloads').addEventListener('click', () => {
+    const links = document.querySelectorAll('a[download]');
+    links[0].click();
+    setTimeout(() => links[1].click(), 100);
+  });
   document.querySelector('#file').addEventListener('change', event => {
     const files = Array.from(event.target.files).slice(0, 4).map(file => ({ name: file.name.slice(0, 256), size: file.size }));
     document.querySelector('#receipt').textContent = JSON.stringify({ files, trusted: event.isTrusted });
