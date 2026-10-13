@@ -1,5 +1,13 @@
 # Naru 작업 기록
 
+## 2026-10-13, GitHub 비공개 업로드 상태 확인
+
+현재 프로젝트를 GitHub에 비공개로 올려 달라는 요청에 따라 로컬과 원격을 조회했다. `FEABE/naru-browser`는 `visibility: PRIVATE`, `isPrivate: true`이며 현재 계정의 권한은 ADMIN이다. 개발 브랜치 `codex/navigation-readiness`의 원격 커밋과 로컬 HEAD는 모두 `93ae7e91eb0f8c4c1d3f1b4f7103c41971b83c4c`로 일치했다. 소스는 이미 업로드된 상태이고 시작 시 미커밋 변경은 없었다.
+
+이번 변경은 이 작업 기록뿐이다. 제품 코드와 공개 범위를 변경하지 않는다. 기본 브랜치 main은 유지하고 같은 개발 브랜치에 확인 기록을 반영한다. `git status`, `git diff --check`, GitHub 공개 범위와 원격 커밋 조회를 실행했다. 최초 제한 환경에서는 GitHub 연결이 실패했으며 네트워크 권한을 적용한 조회에서 위 결과를 확인했다.
+
+앱 동작을 바꾸지 않아 Rust 단위 검사, 모의 DOM 검사, 로컬 CEF 통합 검사, 네이티브 UI 확인, 외부 사이트 검증은 다시 실행하지 않았다. 이번 확인은 업로드 상태에 대한 것이며 브라우저 전체 완성이나 배포 검증을 의미하지 않는다. 새 빌드나 앱 실행, 임시 서버 및 빌드 생성물 추가는 없고 사용자 프로필과 탭 데이터도 변경하지 않았다. 기존 미구현 범위는 제품 계획에 유지한다.
+
 ## 2026-10-11, GitHub 비공개 저장소 업로드 요청
 
 사용자가 현재 Naru를 Git에 비공개로 올려 달라고 명시 요청했다. origin은 `https://github.com/FEABE/naru-browser.git`이며 GitHub 조회에서 visibility PRIVATE·isPrivate true·쓰기 권한 ADMIN을 확인했다. 원격 main은 초기 커밋 `0d1ce47a048399f014f6276caa9ddb45ccfc5d41`이고 현재 로컬 브랜치는 `codex/navigation-readiness`다. 기존 개발 브랜치 이름으로 현재 소스·테스트·문서와 로컬 작업 규칙을 업로드하는 범위다.
