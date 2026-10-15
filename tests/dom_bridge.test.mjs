@@ -240,6 +240,14 @@ function fixture() {
   class KeyboardEvent extends Event {
     constructor(type, options) { super(type, options); this.key = options.key; }
   }
+  document.defaultView = window;
+  document.URL = "https://example.test/";
+  window.document = document;
+  window.location = { href: document.URL };
+  Object.assign(window, {
+    HTMLInputElement: Input, HTMLTextAreaElement: TextArea,
+    HTMLSelectElement: Select, HTMLOptionElement: Option, Event, KeyboardEvent,
+  });
   const context = vm.createContext({
     window, document, location: { href: "https://example.test/" }, crypto: webcrypto,
     HTMLInputElement: Input, HTMLTextAreaElement: TextArea,
@@ -321,6 +329,48 @@ test("fill uses the native value setter and stops if focus replaces the element"
   input.onFocus = () => { input.isConnected = false; };
   assert.equal(f.bridge.act({ action: "fill", ref, text: "replacement" }).ok, false);
   assert.equal(input.value, "hello");
+});
+
+for (const type of ["checkbox", "radio", "button", "submit", "reset", "image", "hidden", "file"]) {
+  test(`fill stops before the native write when focus changes an input to ${type}`, () => {
+    const f = fixture();
+    const input = f.add("INPUT", { type: "text" });
+    input.value = "before";
+    const prototype = Object.getPrototypeOf(input);
+    const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
+    let writes = 0;
+    Object.defineProperty(prototype, "value", {
+      ...descriptor,
+      set(value) { writes += 1; descriptor.set.call(this, value); },
+    });
+    const ref = f.bridge.read().interactive[0].ref;
+    input.onFocus = () => { input.type = type; };
+
+    const result = f.bridge.act({ action: "fill", ref, text: "replacement" });
+
+    assert.equal(writes, 0, "fill must reject the changed type before calling the native setter");
+    assert.equal(input.value, "before");
+    assert.deepEqual(input.events, []);
+    assert.equal(result.error, "ELEMENT_UNAVAILABLE");
+  });
+}
+
+test("fill preserves supported text, textarea and text/password focus conversions", () => {
+  for (const [tagName, before, after] of [
+    ["INPUT", "text", "text"], ["TEXTAREA", "text", "text"],
+    ["INPUT", "text", "password"], ["INPUT", "password", "text"],
+  ]) {
+    const f = fixture();
+    const element = f.add(tagName, { type: before });
+    const ref = f.bridge.read().interactive[0].ref;
+    if (tagName === "INPUT") element.onFocus = () => { element.type = after; };
+
+    const result = f.bridge.act({ action: "fill", ref, text: "replacement" });
+
+    assert.equal(result.ok, true, `${tagName} ${before} to ${after}`);
+    assert.equal(element.value, "replacement");
+    assert.deepEqual(element.events, ["input", "change"]);
+  }
 });
 
 test("Enter respects cancelled keydown and reports a form submission request separately", () => {
@@ -904,5 +954,255 @@ test("select snapshots cap options per element and per read without reading late
     assert.deepEqual(Array.from(page.interactive, (item) => item.options.length), [40, 40, 40, 40, 40, 40, 0]);
     assert.equal(page.interactive.reduce((total, item) => total + item.options.length, 0), 240);
     assert.equal(page.interactive.every((item) => item.optionsTruncated), true);
+  }
+});
+
+
+// Independent document/Window doubles model embedding identity, not browser SOP,
+// isolated-world wrappers or real iframe rendering. Those need a CEF run.
+function embed(parent, attributes = {}, container = parent.document.body) {
+  const frame = parent.add("IFRAME", attributes, container);
+  const child = fixture();
+  child.document.body.textContent = "";
+  frame.contentDocument = child.document;
+  frame.contentWindow = child.window;
+  child.window.frameElement = frame;
+  return { frame, child };
+}
+
+test("same-origin frames expose bounded context and flat refs with nested shadow labels", () => {
+  const f = fixture();
+  const { child } = embed(f, { title: "Embedded form" });
+  child.document.title = "Child title";
+  child.document.URL = "https://example.test/child";
+  child.text("Child paragraph");
+  const input = child.add("INPUT", { "aria-label": "Child input" });
+  const secret = child.add("INPUT", { type: "password", "aria-label": "Child password" });
+  secret.value = "must-not-disclose";
+  const select = child.add("SELECT", { "aria-label": "Child choice" });
+  child.add("OPTION", { value: "a" }, select).textContent = "Alpha";
+  child.add("OPTION", { value: "b" }, select).textContent = "Beta";
+  const nested = embed(child, { title: "Nested frame" });
+  const host = nested.child.add("DIV");
+  const shadow = host.attachShadow({ mode: "open" });
+  const label = nested.child.add("SPAN", { id: "label" }, shadow);
+  label.textContent = "Nested shadow action";
+  const button = nested.child.add("BUTTON", { "aria-labelledby": "label" }, shadow);
+  child.window.Event = class extends child.window.Event {
+    constructor(...args) { super(...args); this.realm = "child"; }
+  };
+  child.window.KeyboardEvent = class extends child.window.KeyboardEvent {
+    constructor(...args) { super(...args); this.realm = "child"; }
+  };
+  input.onEvent = (event) => assert.equal(event.realm, "child");
+  const inputPrototype = child.window.HTMLInputElement.prototype;
+  const nativeValue = Object.getOwnPropertyDescriptor(inputPrototype, "value");
+  let childWrites = 0;
+  Object.defineProperty(inputPrototype, "value", {
+    ...nativeValue, set(value) { childWrites += 1; nativeValue.set.call(this, value); },
+  });
+  const page = f.bridge.read();
+  assert.equal(page.frames.length, 2);
+  assert.equal(page.frames[0].status, "accessible");
+  assert.equal(page.frames[0].parent, "main");
+  assert.equal(page.frames[0].title, "Child title");
+  assert.equal(page.frames[0].url, "https://example.test/child");
+  assert.equal(page.frames[1].parent, page.frames[0].id);
+  assert.match(page.text, /Child paragraph/);
+  assert.match(page.text, /Nested shadow action/);
+  assert.ok(!JSON.stringify(page).includes("must-not-disclose"));
+  const item = (label) => page.interactive.find((entry) => entry.label === label);
+  assert.equal(item("Child input").frame, page.frames[0].id);
+  assert.equal(item("Nested shadow action").frame, page.frames[1].id);
+  assert.equal(f.bridge.act({ action: "fill", ref: item("Child input").ref, text: "changed" }).ok, true);
+  assert.equal(input.value, "changed");
+  assert.equal(childWrites, 1);
+  assert.equal(f.bridge.act({ action: "select", ref: item("Child choice").ref, value: "b" }).ok, true);
+  assert.equal(select.value, "b");
+  assert.equal(f.bridge.act({ action: "click", ref: item("Nested shadow action").ref }).ok, true);
+  assert.equal(button.clicked, 1);
+  let submitted = 0;
+  input.form = { requestSubmit() { submitted += 1; } };
+  assert.equal(f.bridge.act({ action: "press", ref: item("Child input").ref, key: "Enter" }).formSubmissionRequested, true);
+  assert.equal(submitted, 1);
+  assert.equal(page.viewport.width, f.window.innerWidth);
+  f.bridge.act({ action: "scroll", y: 100 });
+  assert.equal(f.window.scrollY, 100);
+  assert.equal(child.window.scrollY, 0);
+});
+
+test("frame labels remain document-local despite duplicate ids", () => {
+  const f = fixture();
+  f.add("SPAN", { id: "same" }).textContent = "Parent label";
+  f.add("BUTTON", { "aria-labelledby": "same" });
+  const { child } = embed(f);
+  child.add("SPAN", { id: "same" }).textContent = "Child label";
+  child.add("BUTTON", { "aria-labelledby": "same" });
+  const labels = f.bridge.read().interactive.map((entry) => entry.label);
+  assert.ok(labels.includes("Parent label"));
+  assert.ok(labels.includes("Child label"));
+});
+
+test("frame refs reject detached, replaced and inaccessible embedding documents", () => {
+  const mutations = [
+    (frame) => frame.remove(),
+    (frame) => { frame.contentDocument = fixture().document; },
+    (frame) => { frame.contentDocument = null; },
+    (frame) => Object.defineProperty(frame, "contentDocument", { get() { throw new Error("private page exception"); } }),
+  ];
+  for (const mutate of mutations) {
+    const f = fixture();
+    const { frame, child } = embed(f);
+    const button = child.add("BUTTON", { "aria-label": "Frame button" });
+    const ref = f.bridge.read().interactive.find((entry) => entry.label === "Frame button").ref;
+    mutate(frame);
+    const result = f.bridge.act({ action: "click", ref });
+    assert.equal(result.error, "STALE_REF");
+    assert.equal(button.clicked, undefined);
+    assert.ok(!JSON.stringify(result).includes("private page exception"));
+  }
+});
+
+test("frame availability includes embedding ancestors, zero size and disabled state", () => {
+  const mutations = [
+    (frame) => { frame.hidden = true; },
+    (frame) => { frame.inert = true; },
+    (frame) => frame.setAttribute("aria-hidden", "true"),
+    (frame) => frame.setAttribute("aria-disabled", "true"),
+    (frame) => { frame.style.display = "none"; },
+    (frame) => { frame.rects = []; },
+  ];
+  for (const mutate of mutations) {
+    const f = fixture();
+    const { frame, child } = embed(f);
+    const nested = embed(child);
+    const input = nested.child.add("INPUT", { "aria-label": "Nested editable" });
+    const ref = f.bridge.read().interactive.find((entry) => entry.label === "Nested editable").ref;
+    mutate(frame);
+    assert.equal(f.bridge.act({ action: "fill", ref, text: "must-not-write" }).error, "ELEMENT_UNAVAILABLE");
+    assert.equal(input.value, "");
+    assert.deepEqual(input.events, []);
+    const next = f.bridge.read().interactive;
+    if (frame.getAttribute("aria-disabled") === "true") {
+      assert.equal(next.find((entry) => entry.label === "Nested editable").disabled, true);
+    } else {
+      assert.ok(!next.some((entry) => entry.label === "Nested editable"));
+    }
+  }
+});
+
+test("focus and key handlers cannot redirect frame refs to another document", () => {
+  for (const action of ["fill", "select", "press"]) {
+    const f = fixture();
+    const { frame, child } = embed(f);
+    const element = child.add(action === "select" ? "SELECT" : "INPUT", { "aria-label": "Target" });
+    if (action === "select") {
+      child.add("OPTION", { value: "a" }, element);
+      child.add("OPTION", { value: "b" }, element);
+    }
+    const ref = f.bridge.read().interactive.find((entry) => entry.label === "Target").ref;
+    element.onFocus = () => { frame.contentDocument = fixture().document; };
+    const result = f.bridge.act({ action, ref, text: "must-not-write", value: "b", key: "Enter" });
+    assert.equal(result.error, "ELEMENT_UNAVAILABLE");
+    assert.deepEqual(element.events, []);
+    assert.equal(element.value, action === "select" ? "a" : "");
+  }
+  const f = fixture();
+  const { frame, child } = embed(f);
+  const input = child.add("INPUT");
+  let submitted = 0;
+  input.form = { requestSubmit() { submitted += 1; } };
+  input.onEvent = (event) => { if (event.type === "keydown") frame.contentDocument = null; };
+  const ref = f.bridge.read().interactive[0].ref;
+  const result = f.bridge.act({ action: "press", ref, key: "Enter" });
+  assert.equal(result.formSubmissionRequested, false);
+  assert.equal(submitted, 0);
+  assert.deepEqual(input.events, ["keydown"]);
+});
+
+test("unavailable frames are explicit and metadata access stops at sixteen slots", () => {
+  const f = fixture();
+  let lateReads = 0;
+  for (let index = 0; index < 18; index += 1) {
+    const frame = f.add("IFRAME", { title: `Frame ${index}` });
+    Object.defineProperty(frame, "contentDocument", { get() {
+      if (index >= 16) lateReads += 1;
+      if (index % 2) throw new Error("IFRAME_ACCESS_EXCEPTION_SENTINEL");
+      return null;
+    } });
+  }
+  const page = f.bridge.read();
+  assert.equal(page.frames.length, 16);
+  assert.ok(page.frames.every((frame) => frame.status === "unavailable"));
+  assert.ok(page.frames.every((frame) => frame.url === undefined && frame.title === undefined));
+  assert.equal(page.truncated.frames, true);
+  assert.equal(lateReads, 0);
+  assert.ok(!JSON.stringify(page).includes("IFRAME_ACCESS_EXCEPTION_SENTINEL"));
+});
+
+test("nested frame depth and global text, input and option budgets stay bounded", () => {
+  const f = fixture();
+  let parent = f;
+  for (let index = 0; index < 10; index += 1) parent = embed(parent).child;
+  parent.add("BUTTON", { "aria-label": "Too deep" });
+  let page = f.bridge.read();
+  assert.equal(page.frames.filter((entry) => entry.status === "accessible").length, 8);
+  assert.equal(page.frames.at(-1).status, "limit");
+  assert.equal(page.truncated.frameDepth, true);
+  assert.ok(!page.interactive.some((entry) => entry.label === "Too deep"));
+  const bounded = fixture();
+  for (let index = 0; index < 4; index += 1) {
+    const { child } = embed(bounded);
+    child.text("x".repeat(5000));
+    for (let button = 0; button < 40; button += 1) child.add("BUTTON");
+  }
+  page = bounded.bridge.read();
+  assert.ok(page.text.length <= 12000);
+  assert.equal(page.interactive.length, 120);
+  assert.equal(page.truncated.text, true);
+  assert.equal(page.truncated.interactive, true);
+  const options = fixture();
+  for (let index = 0; index < 8; index += 1) {
+    const { child } = embed(options);
+    const select = child.add("SELECT");
+    for (let option = 0; option < 50; option += 1) child.add("OPTION", { value: String(option) }, select);
+  }
+  page = options.bridge.read();
+  assert.equal(page.interactive.reduce((total, item) => total + (item.options?.length || 0), 0), 240);
+});
+
+test("frame references keep original documents and expire on a new read", () => {
+  const f = fixture();
+  const a = embed(f);
+  const b = embed(f);
+  const input = a.child.add("INPUT", { "aria-label": "Moved field" });
+  const old = f.bridge.read().interactive[0].ref;
+  const current = f.bridge.read().interactive[0].ref;
+  assert.equal(f.bridge.act({ action: "fill", ref: old, text: "old" }).error, "STALE_REF");
+  // Model adoptNode: both destination frames remain connected and accessible.
+  b.child.document.body.append(input);
+  input.ownerDocument = b.child.document;
+  assert.equal(f.bridge.act({ action: "fill", ref: current, text: "must-not-follow" }).error, "STALE_REF");
+  assert.equal(input.value, "");
+});
+
+
+test("frame changes after input report partial dispatch and stop the old change event", () => {
+  for (const action of ["fill", "select"]) {
+    const f = fixture();
+    const { frame, child } = embed(f);
+    const element = child.add(action === "fill" ? "INPUT" : "SELECT");
+    if (action === "select") {
+      child.add("OPTION", { value: "a" }, element);
+      child.add("OPTION", { value: "b" }, element);
+    }
+    element.onEvent = (event) => { if (event.type === "input") frame.contentDocument = null; };
+    const ref = f.bridge.read().interactive[0].ref;
+    const result = f.bridge.act({ action, ref, text: "written", value: "b" });
+    assert.equal(result.ok, true);
+    assert.equal(result.trusted, false);
+    assert.match(result.detail, /input.*dispatched/i);
+    assert.deepEqual(element.events, ["input"]);
+    assert.equal(element.value, action === "fill" ? "written" : "b");
   }
 });

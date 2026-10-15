@@ -108,9 +108,40 @@ disabled.setAttribute('aria-disabled', 'true');
 shadow(disabled, '<button>Disabled host action</button>');
 shadow(host('closed-host'), '<p>CLOSED_ROOT_TEXT_MUST_NOT_BE_EXPOSED</p><button>Closed root action</button>', 'closed');
 const frame = document.createElement('iframe');
-frame.title = 'Excluded embedded document';
+frame.title = 'Opaque embedded document';
+frame.setAttribute('sandbox', '');
 frame.srcdoc = '<!doctype html><p>IFRAME_TEXT_MUST_NOT_BE_EXPOSED</p><button>Iframe action</button>';
 mount.append(frame);
+const readableFrame = document.createElement('iframe');
+readableFrame.title = 'Readable child form';
+readableFrame.srcdoc = '<!doctype html><title>Readable child</title><body></body>';
+readableFrame.addEventListener('load', () => {
+  const doc = readableFrame.contentDocument;
+  doc.body.innerHTML = '<p>Readable child paragraph</p><form><label>Frame query<input name="query"></label>' +
+    '<label>Frame password<input type="password" value="SHADOW_FAKE_PASSWORD_MUST_NOT_BE_EXPOSED"></label>' +
+    '<label>Frame choice<select><option value="a">Alpha</option><option value="b">Beta</option></select></label>' +
+    '</form><p id="receipt">No child action</p>';
+  const query = doc.querySelector('[name=query]');
+  const choice = doc.querySelector('select');
+  query.addEventListener('input', () => { doc.getElementById('receipt').textContent = 'Frame input: ' + query.value; });
+  choice.addEventListener('change', () => { doc.getElementById('receipt').textContent = 'Frame choice: ' + choice.value; });
+  doc.querySelector('form').addEventListener('submit', event => {
+    event.preventDefault(); doc.getElementById('receipt').textContent = 'Frame submitted: ' + query.value;
+  });
+  const nested = doc.createElement('iframe');
+  nested.srcdoc = '<!doctype html><body></body>';
+  nested.addEventListener('load', () => {
+    const childHost = nested.contentDocument.createElement('div');
+    nested.contentDocument.body.append(childHost);
+    const childRoot = childHost.attachShadow({mode:'open'});
+    childRoot.innerHTML = '<button>Frame shadow action</button>';
+    childRoot.querySelector('button').addEventListener('click', event => { event.target.textContent = 'Frame shadow clicked'; });
+    const receipt = document.createElement('p'); receipt.textContent = 'FRAME_FIXTURE_READY'; mount.append(receipt);
+  }, {once:true});
+  doc.body.append(nested);
+}, {once:true});
+mount.append(readableFrame);
+control('Remove readable frame', () => readableFrame.remove());
 '''
 
 CAP_SCRIPTS = {
@@ -157,7 +188,7 @@ def poll(read, ready, message):
 
 def run(args):
     cli = BrowserCli(args.cli.resolve(), args.data_dir.resolve())
-    report = {"ok": False, "scope": "real CEF open Shadow DOM through local CLI fixtures", "checks": []}
+    report = {"ok": False, "scope": "real CEF open Shadow DOM and accessible iframe DOM through local CLI fixtures", "checks": []}
     initial = set()
     task = None
     tab = None
@@ -236,7 +267,7 @@ def run(args):
         tab = opened["tab"]
         require(isinstance(tab, int) and tab not in initial, "Open did not create a distinct fixture tab")
         command("wait", tab, "load", 5000)
-        page = read()
+        page = poll(read, lambda value: "FRAME_FIXTURE_READY" in value.get("text", ""), "Iframe fixture did not finish loading")
         require("Open shadow visible text" in page["text"] and "Nested shadow visible text" in page["text"],
                 "Open or nested Shadow DOM text is missing")
         element(page, "Shadow query")
@@ -295,6 +326,29 @@ def run(args):
         page = read()
         require("Mutable host target" not in json.dumps(page), "Inert host still exposes its shadow target")
         report["checks"].append("without another read, removed refs fail stale and hidden/disabled/inert host refs fail unavailable")
+
+        page = read()
+        require(any(frame.get("status") == "unavailable" for frame in page.get("frames", [])),
+                "Opaque sandbox frame was not reported as unavailable")
+        require("Readable child paragraph" in page["text"], "Same-origin frame text is missing")
+        require(element(page, "Frame query").get("frame"), "Frame input lacks context metadata")
+        require("value" not in element(page, "Frame password"), "Frame password leaked its value")
+        command("fill", tab, element(page, "Frame query")["ref"], QUERY)
+        page = read()
+        require(f"Frame input: {QUERY}" in page["text"], "Child-realm input event did not reach its page handler")
+        command("select", tab, element(page, "Frame choice")["ref"], "b")
+        page = read()
+        require("Frame choice: b" in page["text"], "Child-realm select change did not reach its page handler")
+        command("press", tab, element(page, "Frame query")["ref"], "Enter")
+        page = read()
+        require(f"Frame submitted: {QUERY}" in page["text"], "Child form submit handler did not run")
+        click(page, "Frame shadow action")
+        page = read()
+        element(page, "Frame shadow clicked")
+        removed_frame_ref = element(page, "Frame query")["ref"]
+        click(page, "Remove readable frame")
+        command("fill", tab, removed_frame_ref, "must-not-write", expected="STALE_REF")
+        report["checks"].append("same-origin and nested frame text, child-realm fill/select/Enter/click, password omission and detached-frame ref rejection")
 
         item_page = navigate(origin + "/caps/items")
         require(len(item_page["interactive"]) == 120 and item_page["truncated"].get("interactive") is True,

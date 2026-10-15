@@ -7,6 +7,7 @@ Example:
 
 Uses a local HTTP fixture and closes only its own tab. The script does not
 launch the app, create or delete profiles, or navigate existing user tabs.
+The failure fixture accepts its HTTP request, then closes without a response.
 """
 
 import argparse
@@ -27,6 +28,7 @@ class Gate:
     def __init__(self):
         self.requested = threading.Event()
         self.release = threading.Event()
+        self.failure_requested = threading.Event()
 
 
 def fixture(page):
@@ -52,6 +54,15 @@ def make_handler(gate):
             elif path in ("/a", "/b"):
                 released = True
                 body = fixture(path[-1].upper())
+            elif path == "/empty-response":
+                gate.failure_requested.set()
+                self.close_connection = True
+                try:
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                self.connection.close()
+                return
             elif path == "/no-content":
                 self.send_response(204)
                 self.send_header("Cache-Control", "no-store")
@@ -154,7 +165,7 @@ def run(args):
     initial_tabs = set()
     owned_tabs = []
     gate = Gate()
-    server = server_thread = refused_socket = None
+    server = server_thread = None
     try:
         require(cli.success("status").get("engine") == "CEF/Chromium", "Expected running CEF app")
         initial_tabs = {value["tab"] for value in cli.success("tabs")["tabs"]}
@@ -206,20 +217,24 @@ def run(args):
         scroll_and_check(cli, tab, -80, -240, 80, 240)
         checks.append("same-document dom/load waits and real horizontal/vertical viewport scrolling")
 
-        refused_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        refused_socket.bind(("127.0.0.1", 0))
-        failed_url = f"http://127.0.0.1:{refused_socket.getsockname()[1]}/refused"
+        # Exercise a received request with no response, not platform-dependent
+        # connection refusal from a bound socket that has not called listen.
+        failed_url = origin + "/empty-response"
         request_navigation(cli, "navigate", tab, failed_url)
+        report["emptyResponseRequested"] = gate.failure_requested.wait(10)
+        require(report["emptyResponseRequested"], "Browser did not request the empty-response fixture")
         details = details_for(cli.request("wait", tab, "load", 10000), "NAVIGATION_FAILED")
         failed_state = details.get("state", {})
         failure = failed_state.get("navigation", {}).get("error")
-        require(failed_state.get("tab") == tab and isinstance(failure, dict) and failure.get("failedUrl") == failed_url,
-                "Failed navigation lost its tab or requested URL")
+        require(failed_state.get("tab") == tab and isinstance(failure, dict) and
+                type(failure.get("code")) is int and failure["code"] < 0 and
+                isinstance(failure.get("text"), str) and failure["text"] and failure.get("failedUrl") == failed_url,
+                "Failed navigation lost its tab, Chromium code/text, or requested URL")
         wait_navigation_stopped(cli, tab)
         request_navigation(cli, "navigate", tab, url_a)
         page_a = wait_page(cli, tab, url_a)
         require(page_a.get("title") == "Controls A", "Navigation did not recover from the connection failure")
-        checks.append("same-tab recovery from a refused localhost navigation")
+        checks.append("same-tab recovery from an observed local empty-response navigation")
 
         request_navigation(cli, "navigate", tab, origin + "/no-content")
         no_content = cli.request("wait", tab, "load", 10000)
@@ -291,8 +306,6 @@ def run(args):
         if cleanup_errors:
             report["ok"] = False
             report["cleanupErrors"] = cleanup_errors
-        if refused_socket:
-            refused_socket.close()
         if server:
             server.shutdown()
             server.server_close()

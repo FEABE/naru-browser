@@ -7,6 +7,7 @@ Example:
 
 Only localhost fixtures and tabs created here are used. The script does not
 launch the app, create profiles, or change existing tabs.
+The failure fixture accepts its HTTP request, then closes without a response.
 """
 
 import argparse
@@ -34,6 +35,7 @@ class Gates:
         self.main_release = threading.Event()
         self.frame_requested = threading.Event()
         self.frame_release = threading.Event()
+        self.failure_requested = threading.Event()
 
     def release(self):
         self.main_release.set()
@@ -53,6 +55,15 @@ def make_handler(gates):
                 gates.frame_requested.set()
                 released = gates.frame_release.wait(30)
                 body = b"<!doctype html><html><body>Iframe finished</body></html>"
+            elif path == "/empty-response":
+                gates.failure_requested.set()
+                self.close_connection = True
+                try:
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                self.connection.close()
+                return
             else:
                 self.send_response(204)
                 self.end_headers()
@@ -116,7 +127,7 @@ def run(args):
     initial_tabs = set()
     gates = Gates()
     pool = ThreadPoolExecutor(max_workers=3)
-    server = server_thread = refused_socket = None
+    server = server_thread = None
     try:
         initial_status = cli.success("status")
         require(initial_status.get("engine") == "CEF/Chromium", "Expected running CEF app")
@@ -206,13 +217,13 @@ def run(args):
         require(loaded["url"] == url, "Completed navigation URL changed")
         checks.append("load timeout preserves the tab and state; later load wait succeeds after iframe release")
 
-        # Reserve a local TCP port without listening: connections are refused,
-        # and another test cannot acquire the port between allocation and open.
-        refused_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        refused_socket.bind(("127.0.0.1", 0))
-        failed_url = f"http://127.0.0.1:{refused_socket.getsockname()[1]}/refused"
-        failed = completed(pool.submit(open_owned, failed_url), RESPONSIVE_SECONDS, "open to a refused local port")
+        # Closing a received HTTP request without any response does not depend
+        # on the OS behavior of a bound TCP socket that has not called listen.
+        failed_url = f"http://127.0.0.1:{server.server_port}/empty-response"
+        failed = completed(pool.submit(open_owned, failed_url), RESPONSIVE_SECONDS, "open to the empty-response fixture")
         failed_tab = failed["tab"]
+        report["emptyResponseRequested"] = gates.failure_requested.wait(10)
+        require(report["emptyResponseRequested"], "Browser did not request the empty-response fixture")
         details = error_details(cli.request("wait", failed_tab, "load", 10000), "NAVIGATION_FAILED")
         failure = tab_state(details.get("state"), failed_tab)["error"]
         require(isinstance(failure, dict) and type(failure.get("code")) is int and failure["code"] < 0 and
@@ -223,7 +234,7 @@ def run(args):
         repeated = error_details(cli.request("wait", failed_tab, "dom", 1000), "NAVIGATION_FAILED")
         require(tab_state(repeated.get("state"), failed_tab)["error"] == failure,
                 "A later wait lost the navigation error")
-        checks.append("refused localhost navigation retains tab ID and Chromium error in wait and tabs")
+        checks.append("observed local empty-response navigation retains tab ID and Chromium error in wait and tabs")
         report["ok"] = True
     except (CheckFailed, OSError, KeyError, TypeError, ValueError) as error:
         report["error"] = str(error)
@@ -254,8 +265,6 @@ def run(args):
         if cleanup_errors:
             report["ok"] = False
             report["cleanupErrors"] = cleanup_errors
-        if refused_socket:
-            refused_socket.close()
         if server:
             server.shutdown()
             server.server_close()

@@ -20,6 +20,7 @@ query parameter. This harness never controls an app or serves arbitrary files.
 /ime-input.html serves the fixed local composition event receipt fixture.
 /single-window.html serves the existing native popup/beforeunload fixture.
 /select.html serves the fixed native HTML select and event receipt fixture.
+/start-page.html serves the native start-page navigation and blank-popup fixture.
 /state records HTTP activity, not document readiness or screenshot success.
 Its gate "completed" count means the wait ended, not that the browser loaded it.
 Native UI and CLI observations must establish those separately; slow or missing
@@ -42,7 +43,7 @@ GATE_NAMES = ("headers", "image")
 GET_PATHS = (
     "/fast", "/delayed-headers", "/delayed-image", "/image.svg",
     "/user-control.html", "/find-in-page.html", "/find-in-page-frame.html", "/ime-input.html",
-    "/single-window.html", "/select.html", "/state",
+    "/single-window.html", "/select.html", "/start-page.html", "/state",
 )
 
 
@@ -77,6 +78,9 @@ PAGES = {
     ).read_bytes(),
     "/select.html": (
         Path(__file__).resolve().parent / "fixtures" / "select.html"
+    ).read_bytes(),
+    "/start-page.html": (
+        Path(__file__).resolve().parent / "fixtures" / "start-page.html"
     ).read_bytes(),
 }
 IMAGE = b"""<svg xmlns="http://www.w3.org/2000/svg" width="240" height="120">

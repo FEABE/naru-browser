@@ -7,6 +7,37 @@ pub const MAX_PENDING: usize = 4;
 pub const MAX_ORIGIN_BYTES: usize = 2048;
 const MAX_SOURCE_CHARS: usize = 80;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SiteSetting {
+    Allowed,
+    Ask,
+    Blocked,
+    Unknown,
+}
+
+/// Derive one exact HTTP(S) origin from a live page URL. Never turn an invalid
+/// or opaque URL into an empty scope, which CEF treats as a global setting.
+pub(crate) fn site_origin(value: &str) -> Result<String, &'static str> {
+    let invalid = "현재 사이트 주소를 확인할 수 없습니다.";
+    let normalized = crate::address::normalize_url(value).map_err(|_| invalid)?;
+    let (scheme, rest) = normalized.split_once("://").ok_or(invalid)?;
+    let authority = rest.split(['/', '?', '#']).next().ok_or(invalid)?;
+    if !authority.is_ascii() {
+        return Err(invalid);
+    }
+    let authority = authority.to_ascii_lowercase();
+    // CEF supplies canonical URLs, but pending permission origins may include
+    // an explicit default port. Match those without merging distinct ports.
+    let authority = authority
+        .strip_suffix(if scheme == "https" { ":443" } else { ":80" })
+        .unwrap_or(&authority);
+    let origin = format!("{scheme}://{authority}");
+    if origin.len() > MAX_ORIGIN_BYTES {
+        return Err(invalid);
+    }
+    Ok(origin)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Target {
     pub tab: i32,
@@ -121,6 +152,10 @@ impl Model {
         self.requests.remove(&token)
     }
 
+    pub fn get(&self, token: u64) -> Option<&Request> {
+        self.requests.get(&token)
+    }
+
     pub fn take_matching(&mut self, matches: impl Fn(&Request) -> bool) -> Vec<Request> {
         let tokens = self
             .requests
@@ -162,6 +197,39 @@ mod tests {
             epoch: 7,
             owner: None,
         }
+    }
+
+    #[test]
+    fn site_origin_preserves_scheme_and_nondefault_port_without_url_details() {
+        assert_eq!(
+            site_origin("HTTPS://EXAMPLE.test:443/a?q=secret#part"),
+            Ok("https://example.test".into())
+        );
+        assert_eq!(
+            site_origin("http://example.test:80/a"),
+            Ok("http://example.test".into())
+        );
+        assert_eq!(
+            site_origin("https://example.test:8443/a"),
+            Ok("https://example.test:8443".into())
+        );
+        assert_eq!(
+            site_origin("https://[::1]:443/a"),
+            Ok("https://[::1]".into())
+        );
+        assert_eq!(site_origin("http://[::80]/a"), Ok("http://[::80]".into()));
+        for value in [
+            "",
+            "about:blank",
+            "data:text/plain,a",
+            "file:///tmp/a",
+            "https://user:password@example.test",
+            "https://example.test:bad",
+            "https://예시.test/a",
+        ] {
+            assert!(site_origin(value).is_err(), "{value}");
+        }
+        assert!(site_origin(&format!("https://{}.test", "a".repeat(MAX_ORIGIN_BYTES))).is_err());
     }
 
     #[test]

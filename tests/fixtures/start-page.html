@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="ko"><meta charset="utf-8"><title>Naru 시작 화면 검증</title>
+<style>body{font:20px system-ui;margin:48px;background:#eef4ff;color:#233047}button,input{display:block;font:inherit;margin:20px 0}</style>
+<h1>시작 화면에서 탐색했습니다</h1>
+<p>이 문서는 자체 로컬 검증 페이지입니다.</p>
+<input aria-label="페이지 입력" placeholder="페이지 입력">
+<button id="popup">내용이 있는 about:blank 팝업 열기</button>
+<script>
+document.querySelector('#popup').addEventListener('click', () => {
+  const popup = window.open('about:blank', '_blank');
+  if (!popup) return;
+  const doc = popup.document;
+  doc.title = 'Naru 내용이 있는 빈 주소 팝업';
+  const title = doc.createElement('h1');
+  title.textContent = '팝업 본문이 보여야 합니다';
+  const input = doc.createElement('input');
+  input.setAttribute('aria-label', '팝업 입력');
+  doc.body.append(title, input);
+});
+</script></html>

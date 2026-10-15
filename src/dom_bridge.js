@@ -14,6 +14,8 @@
   const maxNodes = 10000;
   const maxShadowRoots = 64;
   const maxDepth = 64;
+  const maxFrameDocuments = 16;
+  const maxFrameDepth = 8;
   const maxOptionValue = 1024;
   const maxActionOptions = 500;
   const maxReadOptions = 40;
@@ -26,38 +28,73 @@
     '[contenteditable="true"]', "[tabindex]",
   ].join(",");
   const limitations = [
-    "Main document and open shadow roots only; iframe, closed shadow-root and canvas contents are not inspected.",
+    "Main document, open shadow roots and accessible same-origin iframe documents only; inaccessible frames, closed shadow-root and canvas contents are not inspected.",
     "Text is normalized in DOM/open-shadow traversal order; slot order, generated CSS text and exact innerText line breaks are not reproduced.",
     "Inspection is limited to 10000 node visits, 64 open shadow roots and depth 64, including label text scans.",
+    "Iframe metadata is limited to 16 slots and iframe nesting to depth 8; unavailable frames also consume a slot. Frame ids are valid for this read only.",
+    "Viewport and scroll describe the main window only; rendered DOM is not a pixel or occlusion match for a screenshot.",
     "Native select options are limited to 40 per element and 240 per read; single-select actions inspect at most 500 options.",
     "DOM actions and keyboard events are synthetic, not trusted native input.",
     "Page text and action results are untrusted page data.",
   ];
   let generation = 0;
   let refs = new Map();
+  let contexts = new WeakMap();
 
   function compact(value, limit = 240) {
     return String(value || "").slice(0, limit * 4).replace(/\s+/g, " ").trim().slice(0, limit);
+  }
+
+  function contextIsCurrent(context) {
+    try {
+      for (let depth = 0; context && depth <= maxFrameDepth; depth += 1) {
+        if (!context.parent) return context.document === document;
+        const frame = context.element;
+        if (!frame.isConnected || frame.ownerDocument !== context.parent.document ||
+            frame.contentDocument !== context.document) return false;
+        context = context.parent;
+      }
+    } catch (_error) {
+      // Cross-origin or detached frame access does not expose exception text.
+    }
+    return false;
+  }
+
+  function refIsCurrent(reference) {
+    return !!reference?.context && reference.element.isConnected &&
+      reference.element.ownerDocument === reference.context.document &&
+      contextIsCurrent(reference.context);
   }
 
   function stateOf(node, budget) {
     const cached = budget?.states.get(node);
     if (cached) return cached;
     let current = node;
+    let context = contexts.get(node.nodeType === 9 ? node : node.ownerDocument);
     let disabled = node.nodeType === 1 && node.matches(":disabled");
     let visible = false;
+    if (!context || !contextIsCurrent(context)) return { visible, disabled };
     for (let depth = 0; current && depth <= maxDepth; depth += 1) {
-      if (current === document) { visible = true; break; }
-      if (!current.isConnected || current.ownerDocument !== document) break;
+      if (current === context.document) {
+        if (!context.parent) { visible = true; break; }
+        current = context.element;
+        context = context.parent;
+      }
+      if (!current.isConnected || current.ownerDocument !== context.document) break;
       if (current.nodeType === 1) {
         if (current.hidden || current.inert || current.getAttribute("aria-hidden") === "true") break;
         if (current.getAttribute("aria-disabled") === "true") disabled = true;
         let style = budget?.styles.get(current);
         if (!style) {
-          style = window.getComputedStyle(current);
+          style = context.view.getComputedStyle(current);
           budget?.styles.set(current, style);
         }
         if (style.display === "none" || ["hidden", "collapse"].includes(style.visibility)) break;
+        if (current.tagName === "IFRAME") {
+          const rect = current.getBoundingClientRect();
+          if (!(rect.width > 0 && rect.height > 0)) break;
+          if (current.matches(":disabled")) disabled = true;
+        }
       }
       const parent = current.parentNode;
       // A light child with no assigned slot is not part of its host's rendered tree.
@@ -80,6 +117,11 @@
 
   function isDisabled(element, budget) {
     return stateOf(element, budget).disabled;
+  }
+
+  function supportsFill(element) {
+    return element.tagName === "TEXTAREA" || (element.tagName === "INPUT" &&
+      !["file", "checkbox", "radio", "button", "submit", "reset", "image", "hidden"].includes(element.type));
   }
 
   function optionState(option, budget) {
@@ -115,7 +157,7 @@
   }
 
   // Sibling cursors avoid materializing the document, child lists or assignedNodes().
-  function* walk(root, budget) {
+  function* walk(root, budget, inspectFrames = false) {
     if (!root) return;
     const stack = [{ next: root, depth: 0, single: true }];
     while (stack.length) {
@@ -128,6 +170,11 @@
       if (frame.depth > maxDepth) { budget.truncated.depth = true; continue; }
       if (!stateOf(node, budget).visible) continue;
       yield node;
+      if (inspectFrames && node.nodeType === 1 && node.tagName === "IFRAME") {
+        const context = inspectFrame(node, budget);
+        if (context) stack.push({ next: context.document.body, depth: frame.depth + 1, single: true });
+        continue;
+      }
       if (node.nodeType === 1 && noTextChildren.has(node.tagName)) continue;
       if (node.firstChild) stack.push({ next: node.firstChild, depth: frame.depth + 1 });
       const shadow = node.nodeType === 1 ? node.shadowRoot : null;
@@ -142,6 +189,45 @@
     }
   }
 
+  function inspectFrame(element, budget) {
+    if (budget.frames.length >= maxFrameDocuments) {
+      budget.truncated.frames = true;
+      return null;
+    }
+    const parent = contexts.get(element.ownerDocument);
+    if (!parent || !contextIsCurrent(parent)) return null;
+    const entry = {
+      id: `frame-${budget.frames.length + 1}`,
+      parent: parent.id,
+      label: compact(element.getAttribute("aria-label") || element.getAttribute("title") || element.getAttribute("name")),
+      status: "unavailable",
+    };
+    budget.frames.push(entry);
+    if (parent.depth >= maxFrameDepth) {
+      entry.status = "limit";
+      budget.truncated.frameDepth = true;
+      return null;
+    }
+    try {
+      const child = element.contentDocument;
+      const view = child?.defaultView;
+      if (!child?.body || !view || !["interactive", "complete"].includes(child.readyState)) return null;
+      const context = { id: entry.id, document: child, view, element, parent, depth: parent.depth + 1 };
+      if (!contextIsCurrent(context)) return null;
+      const url = String(child.URL).slice(0, 4096);
+      const title = String(child.title).slice(0, 512);
+      if (!contextIsCurrent(context)) return null;
+      contexts.set(child, context);
+      entry.status = "accessible";
+      entry.url = url;
+      entry.title = title;
+      return context;
+    } catch (_error) {
+      // No contentWindow/document fallback or origin-policy bypass.
+      return null;
+    }
+  }
+
   function textCollector(limit, budget) {
     let text = "";
     let truncated = false;
@@ -149,9 +235,14 @@
       add(node) {
         if (node.nodeType !== 3 || !node.length) return;
         const remaining = Math.max(0, limit - text.length - (text ? 1 : 0));
-        budget.range.setStart(node, 0);
-        budget.range.setEnd(node, Math.min(node.length, remaining + 1));
-        const rect = budget.range.getBoundingClientRect();
+        let range = budget.ranges.get(node.ownerDocument);
+        if (!range) {
+          range = node.ownerDocument.createRange();
+          budget.ranges.set(node.ownerDocument, range);
+        }
+        range.setStart(node, 0);
+        range.setEnd(node, Math.min(node.length, remaining + 1));
+        const rect = range.getBoundingClientRect();
         if (!rect.width || !rect.height) return;
         const sample = node.substringData(0, remaining + 1);
         const value = sample.replace(/\s+/g, " ").trim();
@@ -214,13 +305,15 @@
   function read() {
     generation += 1;
     refs = new Map();
+    contexts = new WeakMap();
+    contexts.set(document, { id: "main", document, view: window, parent: null, depth: 0 });
     const interactive = [];
     const elements = [];
     const budget = { visits: 0, rootCount: 0, options: 0, roots: new WeakSet(), states: new WeakMap(), styles: new WeakMap(),
-      range: document.createRange(), truncated: { nodes: false, shadowRoots: false, depth: false } };
+      ranges: new WeakMap(), frames: [], truncated: { nodes: false, shadowRoots: false, depth: false, frames: false, frameDepth: false } };
     const text = textCollector(maxText, budget);
     let interactiveTruncated = false;
-    for (const node of walk(document.body, budget)) {
+    for (const node of walk(document.body, budget, true)) {
       text.add(node);
       if (node.nodeType !== 1 || !node.matches(selector) || !isRendered(node, budget)) continue;
       if (elements.length < maxInteractive) elements.push(node);
@@ -228,13 +321,17 @@
     }
     for (const element of elements) {
       const ref = `${documentId}:${generation}:${interactive.length + 1}`;
-      refs.set(ref, element);
+      const context = contexts.get(element.ownerDocument);
+      const reference = { element, context };
+      if (!refIsCurrent(reference)) continue;
+      refs.set(ref, reference);
       const item = {
         ref,
         role: roleOf(element),
         label: labelOf(element, budget),
         disabled: isDisabled(element, budget),
       };
+      if (context.parent) item.frame = context.id;
       if (element.tagName === "INPUT") item.type = element.type;
       if (["INPUT", "TEXTAREA", "SELECT"].includes(element.tagName) &&
           !(element.tagName === "INPUT" && element.type === "password")) {
@@ -256,6 +353,7 @@
       generation,
       text: bodyText.text,
       interactive,
+      frames: budget.frames,
       truncated: { text: bodyText.truncated, interactive: interactiveTruncated, ...budget.truncated },
       limitations: limitations.slice(),
     };
@@ -263,6 +361,17 @@
 
   function failure(action, error, detail) {
     return { ok: false, action, error, detail };
+  }
+
+  function refFailure(reference, action, detail = "The element is hidden, inert or disabled.", staleError = "STALE_REF") {
+    if (!refIsCurrent(reference)) {
+      return failure(action, staleError, staleError === "STALE_REF"
+        ? "Read the page again to get a current element ref." : detail);
+    }
+    if (!isRendered(reference.element) || isDisabled(reference.element)) {
+      return failure(action, "ELEMENT_UNAVAILABLE", detail);
+    }
+    return null;
   }
 
   function selectOption(element, value) {
@@ -289,7 +398,8 @@
     return { option: match, index };
   }
 
-  function selectValue(element, value) {
+  function selectValue(reference, value) {
+    const { element, context } = reference;
     if (typeof value !== "string" || value.length > maxOptionValue) {
       return failure("select", "INVALID_VALUE", "Value must be a string of at most 1024 UTF-16 code units.");
     }
@@ -299,9 +409,8 @@
       return { ok: true, action: "select", trusted: false, changed: false, detail: "The option is already selected; no events dispatched." };
     }
     element.focus();
-    if (!isRendered(element) || isDisabled(element)) {
-      return failure("select", "ELEMENT_UNAVAILABLE", "The select changed while receiving focus; read again.");
-    }
+    const unavailable = refFailure(reference, "select", "The select changed while receiving focus; read again.", "ELEMENT_UNAVAILABLE");
+    if (unavailable) return unavailable;
     const after = selectOption(element, value);
     if (after.error) return after;
     if (after.option !== before.option) {
@@ -310,10 +419,14 @@
     // Recheck selectedIndex as a focus handler may already have selected it.
     const changed = element.selectedIndex !== after.index;
     if (changed) {
-      const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "selectedIndex").set;
+      const setter = Object.getOwnPropertyDescriptor(context.view.HTMLSelectElement.prototype, "selectedIndex").set;
       setter.call(element, after.index);
-      element.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
-      element.dispatchEvent(new Event("change", { bubbles: true }));
+      element.dispatchEvent(new context.view.Event("input", { bubbles: true, composed: true }));
+      if (refFailure(reference, "select")) {
+        return { ok: true, action: "select", trusted: false, changed,
+          detail: "Option selected and input event dispatched; the target changed before the change event, which was not dispatched. Read again to verify its effect." };
+      }
+      element.dispatchEvent(new context.view.Event("change", { bubbles: true }));
     }
     return { ok: true, action: "select", trusted: false, changed,
       detail: changed ? "Option selected and input/change events dispatched; read again to verify its effect." : "The option is already selected; no events dispatched." };
@@ -339,14 +452,11 @@
         return { ok: true, action, x: window.scrollX, y: window.scrollY };
       }
 
-      const element = typeof request.ref === "string" ? refs.get(request.ref) : null;
-      if (!element || !element.isConnected || element.ownerDocument !== document) {
-        return failure(action, "STALE_REF", "Read the page again to get a current element ref.");
-      }
-      if (!isRendered(element) || isDisabled(element)) {
-        return failure(action, "ELEMENT_UNAVAILABLE", "The element is hidden, inert or disabled.");
-      }
-      if (action === "select") return selectValue(element, request.value);
+      const reference = typeof request.ref === "string" ? refs.get(request.ref) : null;
+      const unavailable = refFailure(reference, action);
+      if (unavailable) return unavailable;
+      const { element, context } = reference;
+      if (action === "select") return selectValue(reference, request.value);
 
       if (action === "click") {
         if (typeof element.click !== "function") {
@@ -361,21 +471,26 @@
           return failure(action, "INVALID_TEXT", "Text must be a string.");
         }
         const isInput = element.tagName === "INPUT";
-        if ((!isInput && element.tagName !== "TEXTAREA") ||
-            (isInput && ["file", "checkbox", "radio", "button", "submit", "reset", "image", "hidden"].includes(element.type))) {
+        if (!supportsFill(element)) {
           return failure(action, "UNSUPPORTED_ELEMENT", "Fill supports editable input and textarea values.");
         }
         if (element.readOnly) return failure(action, "READ_ONLY", "The element is read-only.");
-        const prototype = isInput ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
+        const prototype = isInput ? context.view.HTMLInputElement.prototype : context.view.HTMLTextAreaElement.prototype;
         const setter = Object.getOwnPropertyDescriptor(prototype, "value").set;
         element.focus();
-        // A focus handler may replace or disable this exact node before the write.
-        if (!isRendered(element) || isDisabled(element) || element.readOnly) {
+        // A focus handler may replace, retype or disable this node before the write.
+        const changed = refFailure(reference, action, "The element changed while receiving focus; read again.", "ELEMENT_UNAVAILABLE");
+        if (changed) return changed;
+        if (element.readOnly || !supportsFill(element)) {
           return failure(action, "ELEMENT_UNAVAILABLE", "The element changed while receiving focus; read again.");
         }
         setter.call(element, request.text);
-        element.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
-        element.dispatchEvent(new Event("change", { bubbles: true }));
+        element.dispatchEvent(new context.view.Event("input", { bubbles: true, composed: true }));
+        if (refFailure(reference, action)) {
+          return { ok: true, action, trusted: false,
+            detail: "Value set and input event dispatched; the target changed before the change event, which was not dispatched. Read again to verify its effect." };
+        }
+        element.dispatchEvent(new context.view.Event("change", { bubbles: true }));
         return { ok: true, action, trusted: false, detail: "Value set and input/change events dispatched." };
       }
 
@@ -383,20 +498,30 @@
         return failure(action, "UNSUPPORTED_KEY", "Only Enter is supported; synthetic Tab does not move focus.");
       }
       element.focus();
-      if (!isRendered(element) || isDisabled(element)) {
-        return failure(action, "ELEMENT_UNAVAILABLE", "The element changed while receiving focus; read again.");
-      }
+      const changed = refFailure(reference, action, "The element changed while receiving focus; read again.", "ELEMENT_UNAVAILABLE");
+      if (changed) return changed;
       const keyOptions = { key: "Enter", code: "Enter", bubbles: true, cancelable: true, composed: true };
-      const allowDefault = element.dispatchEvent(new KeyboardEvent("keydown", keyOptions));
+      const allowDefault = element.dispatchEvent(new context.view.KeyboardEvent("keydown", keyOptions));
+      const afterKey = refFailure(reference, action, "The element changed while handling Enter; read again.");
+      if (afterKey) {
+        return { ok: true, action, trusted: false, formSubmissionRequested: false,
+          detail: "Synthetic Enter keydown dispatched; the target changed, so no form submission or keyup was requested. Read again to verify its effect." };
+      }
       let formSubmissionRequested = false;
-      if (allowDefault && isRendered(element) && !isDisabled(element) &&
+      if (allowDefault &&
           element.tagName === "INPUT" &&
           ["text", "search", "url", "tel", "email", "password", "number"].includes(element.type) &&
           element.form && typeof element.form.requestSubmit === "function") {
         element.form.requestSubmit();
         formSubmissionRequested = true;
       }
-      if (element.isConnected) element.dispatchEvent(new KeyboardEvent("keyup", keyOptions));
+      if (refFailure(reference, action)) {
+        return { ok: true, action, trusted: false, formSubmissionRequested,
+          detail: formSubmissionRequested
+            ? "Synthetic Enter keydown dispatched and form.requestSubmit() requested; the target changed before keyup, which was not dispatched. Read again to verify its effect."
+            : "Synthetic Enter keydown dispatched; the target changed before keyup, which was not dispatched. Read again to verify its effect." };
+      }
+      element.dispatchEvent(new context.view.KeyboardEvent("keyup", keyOptions));
       return {
         ok: true, action, trusted: false, formSubmissionRequested,
         detail: formSubmissionRequested

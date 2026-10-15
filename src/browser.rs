@@ -1,9 +1,11 @@
 use crate::capture::{MAX_CAPTURE_RESULT_BYTES, save_png_base64};
 use crate::control_panel::{ShellAction, ShellSnapshot, ShellTab};
 use crate::page_find::{Request as FindRequest, State as FindState, Target as FindTarget};
+use crate::page_recovery::{PageFailure, PageRecoveryTarget};
 use crate::protocol::{self, Command, Request, Response, TaskScope, WaitUntil};
 use crate::resources::{MAX_AUTOMATION_TABS, ResourceBudget};
 use crate::spaces::{Spaces, USER_SPACE};
+use crate::start_page::StartPageTarget;
 use crate::tasks::{Origin, Registry, Status, TaskError};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use cef::*;
@@ -51,11 +53,162 @@ impl Reply {
     }
 }
 
+#[derive(Clone, Copy)]
+struct HistoryCreation {
+    generation: Option<u64>,
+    staged: bool,
+}
+
+impl HistoryCreation {
+    fn new(staged: bool) -> Self {
+        Self {
+            generation: crate::history_runtime::generation(),
+            staged,
+        }
+    }
+}
+
+#[derive(Default)]
+struct HistoryObservation {
+    // Some(None) retains an ineligible/revoked navigation across redirects.
+    attempt: Option<Option<u64>>,
+    document: Option<HistoryDocument>,
+    queued: bool,
+    staged: bool,
+    revoked: bool,
+}
+
+struct HistoryDocument {
+    generation: u64,
+    epoch: u64,
+    successful_http: bool,
+    address: String,
+    title: Option<String>,
+    recorded: Option<(String, String)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HistoryAction {
+    generation: u64,
+    document_epoch: u64,
+    url: String,
+    title: String,
+    update_title: bool,
+}
+
+impl HistoryObservation {
+    fn begin(&mut self, generation: Option<u64>, explicit: bool) {
+        if explicit || self.attempt.is_none() {
+            self.attempt = Some(generation);
+            self.revoked = false;
+        }
+        if explicit {
+            self.document = None;
+        }
+    }
+
+    fn revoke(&mut self) {
+        self.revoked = true;
+        if let Some(attempt) = &mut self.attempt {
+            *attempt = None;
+        }
+        self.document = None;
+    }
+
+    fn commit(&mut self, epoch: u64, url: &str, fallback: Option<u64>) {
+        // A late commit without a new navigation start cannot reclassify an
+        // AI document after release, even after loading=false cleared attempt.
+        let generation = self
+            .attempt
+            .unwrap_or(if self.revoked { None } else { fallback });
+        let address = crate::address::normalize_url(url).ok();
+        self.document = generation
+            .zip(address)
+            .map(|(generation, address)| HistoryDocument {
+                generation,
+                epoch,
+                successful_http: false,
+                address,
+                title: None,
+                recorded: None,
+            });
+    }
+
+    fn title_changed(&mut self, value: &str) {
+        if let Some(document) = &mut self.document {
+            let title: String = value
+                .chars()
+                .filter(|ch| !ch.is_control())
+                .take(256)
+                .collect();
+            let title = title.trim();
+            document.title = (!title.is_empty()).then(|| title.to_owned());
+        }
+    }
+
+    fn address_changed(&mut self, url: &str) {
+        // The old document's title cannot label a new URL. A later title event
+        // can update the accepted visit without counting another visit.
+        if let Some(document) = &mut self.document {
+            if let Ok(url) = crate::address::normalize_url(url) {
+                if document.address != url {
+                    document.title = None;
+                    document.address = url;
+                }
+            }
+        }
+    }
+
+    fn action(&self, url: String) -> Option<HistoryAction> {
+        if self.staged {
+            return None;
+        }
+        let document = self.document.as_ref()?;
+        if !document.successful_http {
+            return None;
+        }
+        let title = document
+            .title
+            .clone()
+            .unwrap_or_else(|| url.chars().take(256).collect());
+        let update_title = document
+            .recorded
+            .as_ref()
+            .is_some_and(|recorded| recorded.0 == url);
+        if document
+            .recorded
+            .as_ref()
+            .is_some_and(|recorded| recorded.0 == url && recorded.1 == title)
+        {
+            return None;
+        }
+        Some(HistoryAction {
+            generation: document.generation,
+            document_epoch: document.epoch,
+            url,
+            title,
+            update_title,
+        })
+    }
+
+    fn accepted(&mut self, action: &HistoryAction) {
+        if let Some(document) = &mut self.document {
+            if document.generation == action.generation && document.epoch == action.document_epoch {
+                document.recorded = Some((action.url.clone(), action.title.clone()));
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct Navigation {
+    history: HistoryObservation,
     epoch: u64,
     // Main-document identity excludes provisional requests that become downloads.
     document_epoch: u64,
+    // Explicit navigation/control changes invalidate a file's source link;
+    // provisional attachment requests must not hide earlier source links.
+    download_source_generation: u64,
     download_permission_provenance: crate::download_permissions::Provenance,
     requested_url: String,
     provisional: bool,
@@ -67,10 +220,120 @@ struct Navigation {
     stop_pending: bool,
     incomplete: bool,
     error: Option<Json>,
+    // One moved error for a same-URL automatic retry; never exposed while the
+    // retry is pending. CEF does not identify its internal error-page requests.
+    automatic_retry_error: Option<Json>,
     renderer_exit: Option<Json>,
     recovering: bool,
 }
 impl Navigation {
+    fn concrete_error_matches(error: &Json, url: &str) -> bool {
+        !url.is_empty()
+            && error
+                .get("code")
+                .and_then(Json::as_i64)
+                .and_then(|code| i32::try_from(code).ok())
+                .is_some_and(|code| code != Errorcode::ABORTED.get_raw())
+            && error.get("failedUrl").and_then(Json::as_str) == Some(url)
+    }
+
+    fn load_failed(&mut self, code: i32, text: &str, failed_url: &str) {
+        self.history.revoke();
+        if self.renderer_exit.is_some() && !self.recovering {
+            return;
+        }
+        self.provisional = false;
+        let retry_error = self.automatic_retry_error.take();
+        if code == Errorcode::ABORTED.get_raw() && self.stopped {
+            return;
+        }
+        if code == Errorcode::ABORTED.get_raw()
+            && self.requested_url == failed_url
+            && retry_error
+                .as_ref()
+                .is_some_and(|error| Self::concrete_error_matches(error, failed_url))
+        {
+            self.error = retry_error;
+            return;
+        }
+        if code == Errorcode::ABORTED.get_raw()
+            && self
+                .error
+                .as_ref()
+                .is_some_and(|error| Self::concrete_error_matches(error, failed_url))
+        {
+            // CEF can deliver errors from both DidFinishNavigation and
+            // DidFailLoad. A trailing abort must not replace a concrete error
+            // for the same URL; a new begin still clears the previous failure.
+            return;
+        }
+        self.error = Some(json!({"code": code, "text": text, "failedUrl": failed_url}));
+    }
+
+    fn trace_load_event(
+        &self,
+        event: &str,
+        tab: i32,
+        code: Option<i32>,
+        url: &str,
+        browse: Option<(bool, bool, u32)>,
+    ) {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !ENABLED.get_or_init(|| {
+            std::env::var_os("NARU_NAVIGATION_DIAGNOSTICS").is_some_and(|value| value == "1")
+        }) {
+            return;
+        }
+        let previous_code = self
+            .error
+            .as_ref()
+            .and_then(|error| error.get("code"))
+            .and_then(Json::as_i64);
+        let previous_url_matches = self
+            .error
+            .as_ref()
+            .and_then(|error| error.get("failedUrl"))
+            .and_then(Json::as_str)
+            == Some(url);
+        let candidate_code = self
+            .automatic_retry_error
+            .as_ref()
+            .and_then(|error| error.get("code"))
+            .and_then(Json::as_i64);
+        let candidate_url_matches = self
+            .automatic_retry_error
+            .as_ref()
+            .and_then(|error| error.get("failedUrl"))
+            .and_then(Json::as_str)
+            == Some(url);
+        // Diagnostics deliberately contain no page URL or error text.
+        eprintln!(
+            "navigation event={event} tab={tab} epoch={} code={code:?} previous_code={previous_code:?} candidate_code={candidate_code:?} requested_url_match={} previous_failed_url_match={previous_url_matches} candidate_failed_url_match={candidate_url_matches} user_gesture={:?} is_redirect={:?} transition={:?}",
+            self.epoch,
+            self.requested_url == url,
+            browse.map(|value| value.0),
+            browse.map(|value| value.1),
+            browse.map(|value| value.2),
+        );
+    }
+
+    fn page_failure(&self, loading: bool) -> Option<PageFailure> {
+        if self.recovering || self.provisional {
+            return None;
+        }
+        // A failed renderer recovery can finish through stop/204/no commit.
+        // Keep recovery available even if the old renderer's loading flag lags.
+        if self.renderer_exit.is_some() {
+            return Some(PageFailure::Renderer);
+        }
+        if self.stopped || self.stop_pending || self.intent_pending || loading {
+            return None;
+        }
+        let code = self.error.as_ref()?.get("code")?.as_i64()?;
+        let code = i32::try_from(code).ok()?;
+        (code != Errorcode::ABORTED.get_raw()).then_some(PageFailure::Load { code })
+    }
+
     fn preview_ready(&self) -> bool {
         self.committed
             && self.document_available
@@ -100,12 +363,38 @@ impl Navigation {
         self.stop_pending = false;
         self.incomplete = false;
         self.error = None;
+        self.automatic_retry_error = None;
         self.recovering = self.renderer_exit.is_some();
         if let Some(url) = url {
             self.requested_url = url.to_owned();
         }
     }
+    fn begin_browse(&mut self, url: &str, user_gesture: bool, is_redirect: bool, transition: u32) {
+        // An explicit native/CLI begin has already cleared both errors. For
+        // otherwise indistinguishable same-URL automatic retries, keep only a
+        // private candidate until a matching abort. A successful commit or any
+        // known new navigation boundary discards it.
+        let candidate = self.error.take().or(self.automatic_retry_error.take());
+        let preserve = !user_gesture
+            && !is_redirect
+            && transition
+                & (TransitionType::IS_REDIRECT_MASK.get_raw()
+                    | TransitionType::FORWARD_BACK_FLAG.get_raw())
+                == 0
+            && !self.stopped
+            && !self.stop_pending
+            && self.renderer_exit.is_none()
+            && self.requested_url == url
+            && candidate
+                .as_ref()
+                .is_some_and(|error| Self::concrete_error_matches(error, url));
+        self.begin(Some(url));
+        if preserve {
+            self.automatic_retry_error = candidate;
+        }
+    }
     fn finish_loading(&mut self) {
+        self.automatic_retry_error = None;
         if self.renderer_exit.is_some() {
             // A recovery attempt can end without committing (204, stop, or
             // network failure). Keep the failure, but allow another attempt.
@@ -121,6 +410,7 @@ impl Navigation {
         self.stop_pending = false;
     }
     fn renderer_failed(&mut self, reason: Json) {
+        self.history.revoke();
         self.epoch += 1;
         self.renderer_exit = Some(reason);
         self.recovering = false;
@@ -133,6 +423,7 @@ impl Navigation {
         self.stop_pending = false;
         self.incomplete = false;
         self.error = None;
+        self.automatic_retry_error = None;
     }
     fn renderer_status(&self) -> &'static str {
         if self.renderer_exit.is_none() {
@@ -152,13 +443,10 @@ impl Navigation {
         if !self.stop_pending {
             self.stopped = false;
         }
-        if self
-            .error
-            .as_ref()
-            .is_some_and(|error| error["failedUrl"].as_str() != Some(url))
-        {
-            self.error = None;
-        }
+        // CEF only emits OnLoadStart for a successful new-document commit.
+        // A later error callback will record a failure after that commit.
+        self.error = None;
+        self.automatic_retry_error = None;
         if !self.provisional {
             self.requested_url = url.to_owned();
         }
@@ -177,8 +465,29 @@ struct Tab {
     browser: Browser,
     title: String,
     rejected_creation: bool,
+    // Only startup/native NewTab may cover a blank document with native UI.
+    // Popup and CLI documents retain their normal CEF surface.
+    native_start_page: bool,
+    // Last confirmed native mute setting, not evidence of audible playback.
+    audio_muted: Option<bool>,
     _devtools: Option<Registration>,
     navigation: Navigation,
+}
+impl Tab {
+    fn start_page_ready(&self, loading: bool) -> bool {
+        self.native_start_page
+            && !self.rejected_creation
+            && !loading
+            && self.navigation.requested_url == "about:blank"
+            && !self.navigation.recovering
+            && self.navigation.preview_ready()
+    }
+
+    fn observe_start_page_url(&mut self, url: &str) {
+        // Once used as a web page, returning to about:blank must not cover
+        // page-generated content or revive the discarded native input draft.
+        self.native_start_page &= url == "about:blank";
+    }
 }
 #[derive(Clone, Copy)]
 enum Evaluation {
@@ -470,6 +779,7 @@ pub fn clear() {
 pub(crate) struct DownloadContext {
     pub scope: Option<TaskScope>,
     pub source: String,
+    pub source_target: crate::downloads::SourceTarget,
 }
 
 pub(crate) struct DownloadPermissionContext {
@@ -531,6 +841,7 @@ fn record_download_permission_attempt(tab: i32) -> Result<(), String> {
 fn revoke_download_permission_provenance(tab: i32) {
     STATE.with(|state| {
         if let Some(page) = state.borrow_mut().tabs.get_mut(&tab) {
+            page.navigation.download_source_generation += 1;
             page.navigation.download_permission_provenance.revoke();
         }
     });
@@ -550,13 +861,17 @@ pub(crate) fn validate_download_permission(
 pub(crate) fn download_context(tab: i32) -> Result<DownloadContext, String> {
     STATE.with(|state| {
         let state = state.borrow();
-        if !state
+        let page = state
             .tabs
             .get(&tab)
-            .is_some_and(|tab| !tab.rejected_creation)
-        {
-            return Err("다운로드를 요청한 탭이 닫혔습니다.".into());
-        }
+            .filter(|tab| !tab.rejected_creation)
+            .ok_or_else(|| "다운로드를 요청한 탭이 닫혔습니다.".to_owned())?;
+        let source_target = crate::downloads::SourceTarget {
+            tab,
+            generation: page.navigation.download_source_generation,
+            document_epoch: page.navigation.document_epoch,
+            owner: link_owner(&state.tasks, tab),
+        };
         let task = state
             .tasks
             .owner(tab)
@@ -568,7 +883,21 @@ pub(crate) fn download_context(tab: i32) -> Result<DownloadContext, String> {
                     task: task.id,
                     revision: task.revision,
                 }),
-                source: format!("{} · 탭 {}", task.name, tab),
+                source: format!(
+                    "{}, 탭 {}",
+                    task.name.chars().take(48).collect::<String>(),
+                    tab
+                ),
+                source_target,
+            }),
+            Some(task) if task.status == Status::Paused => Ok(DownloadContext {
+                scope: None,
+                source: format!(
+                    "{}, 사용자 제어, 탭 {}",
+                    task.name.chars().take(48).collect::<String>(),
+                    tab
+                ),
+                source_target,
             }),
             Some(task) if task.status != Status::Paused => {
                 Err("마무리 중인 작업에서는 다운로드를 받을 수 없습니다.".into())
@@ -576,9 +905,166 @@ pub(crate) fn download_context(tab: i32) -> Result<DownloadContext, String> {
             _ => Ok(DownloadContext {
                 scope: None,
                 source: format!("사용자 · 탭 {tab}"),
+                source_target,
             }),
         }
     })
+}
+
+/// A source link is independent of the file's lifetime and permission prompt.
+/// It never substitutes a newer document or controller for the captured one.
+pub(crate) fn validate_download_source(
+    target: &crate::downloads::SourceTarget,
+) -> Result<(), String> {
+    STATE.with(|state| {
+        let state = state.borrow();
+        let current = state.spaces.tab_space(target.tab).is_some()
+            && link_owner(&state.tasks, target.tab) == target.owner
+            && state.tabs.get(&target.tab).is_some_and(|tab| {
+                !tab.rejected_creation
+                    && tab.navigation.renderer_exit.is_none()
+                    && tab.navigation.document_epoch == target.document_epoch
+                    && tab.navigation.download_source_generation == target.generation
+            });
+        if current {
+            Ok(())
+        } else {
+            Err("다운로드를 요청한 탭이나 페이지의 제어권이 변경되었습니다.".into())
+        }
+    })
+}
+
+pub(crate) fn reveal_download_source(
+    target: &crate::downloads::SourceTarget,
+) -> Result<i32, String> {
+    validate_download_source(target)?;
+    // No CEF or AppKit call separates validation from the existing selector's
+    // live space lookup. Selection alone never hands off the source AI task.
+    shell_action(ShellAction::SelectSearchTab(target.tab))?;
+    Ok(target.tab)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TabAudioTarget {
+    pub tab: i32,
+    pub space: String,
+    pub navigation_epoch: u64,
+    owner: Option<(TaskScope, Status)>,
+}
+
+fn validate_tab_audio_state(state: &State, target: &TabAudioTarget) -> Result<(), String> {
+    let current = !state.spaces.overview()
+        && state.spaces.active_tab() == Some(target.tab)
+        && state.spaces.active_space() == target.space
+        && state.spaces.tab_space(target.tab) == Some(target.space.as_str())
+        && link_owner(&state.tasks, target.tab) == target.owner
+        && state.tabs.get(&target.tab).is_some_and(|tab| {
+            !tab.rejected_creation
+                && tab.navigation.renderer_exit.is_none()
+                && tab.navigation.epoch == target.navigation_epoch
+        });
+    if current {
+        Ok(())
+    } else {
+        Err("음소거할 탭이나 페이지의 제어권이 바뀌었습니다. 메뉴를 다시 열어 주세요.".into())
+    }
+}
+
+pub(crate) fn capture_tab_audio_target(
+    tab: i32,
+    space: &str,
+    navigation_epoch: u64,
+) -> Result<TabAudioTarget, String> {
+    STATE.with(|slot| {
+        let state = slot.borrow();
+        let target = TabAudioTarget {
+            tab,
+            space: space.to_owned(),
+            navigation_epoch,
+            owner: link_owner(&state.tasks, tab),
+        };
+        validate_tab_audio_state(&state, &target)?;
+        Ok(target)
+    })
+}
+
+fn validate_tab_audio_target(target: &TabAudioTarget) -> Result<(), String> {
+    STATE.with(|slot| validate_tab_audio_state(&slot.borrow(), target))
+}
+
+fn tab_audio_host(target: &TabAudioTarget) -> Result<BrowserHost, String> {
+    let browser = STATE.with(|slot| {
+        let state = slot.borrow();
+        validate_tab_audio_state(&state, target)?;
+        Ok::<_, String>(state.tabs[&target.tab].browser.clone())
+    })?;
+    // Both the host getter and audio getter can call CEF. Neither crosses STATE.
+    let host = browser
+        .host()
+        .ok_or_else(|| "이 탭의 음소거 설정을 읽을 수 없습니다.".to_owned())?;
+    validate_tab_audio_target(target)?;
+    Ok(host)
+}
+
+fn record_tab_audio(target: &TabAudioTarget, muted: bool) -> Result<(), String> {
+    let changed = STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        validate_tab_audio_state(&state, target)?;
+        let tab = state.tabs.get_mut(&target.tab).unwrap();
+        let changed = tab.audio_muted != Some(muted);
+        tab.audio_muted = Some(muted);
+        Ok::<_, String>(changed)
+    })?;
+    if changed {
+        notify_panel();
+    }
+    Ok(())
+}
+
+pub(crate) fn read_tab_audio(target: &TabAudioTarget) -> Result<bool, String> {
+    let host = tab_audio_host(target)?;
+    let muted = host.is_audio_muted() != 0;
+    record_tab_audio(target, muted)?;
+    Ok(muted)
+}
+
+pub(crate) fn set_tab_audio_muted(
+    target: &TabAudioTarget,
+    expected: bool,
+    muted: bool,
+    still_current: impl Fn() -> bool,
+) -> Result<bool, String> {
+    let ui_changed = || "음소거 메뉴의 대상이 바뀌었습니다. 메뉴를 다시 열어 주세요.".to_owned();
+    if !still_current() {
+        return Err(ui_changed());
+    }
+    let host = tab_audio_host(target)?;
+    let before = host.is_audio_muted() != 0;
+    record_tab_audio(target, before)?;
+    if before != expected {
+        return Err("탭의 음소거 상태가 바뀌었습니다. 메뉴를 다시 열어 주세요.".into());
+    }
+    if !still_current() {
+        return Err(ui_changed());
+    }
+    validate_tab_audio_target(target)?;
+    // Muting this WebContents is browser chrome, not page input or AI handoff.
+    host.set_audio_muted(i32::from(muted));
+    // A native callback can close the tab during the setter. Do not query the
+    // retained host after OnBeforeClose has removed its live tab.
+    validate_tab_audio_target(target).map_err(|_| {
+        "음소거 변경을 요청했지만 탭이 바뀌어 결과를 확인하지 못했습니다.".to_owned()
+    })?;
+    let actual = host.is_audio_muted() != 0;
+    if record_tab_audio(target, actual).is_err() {
+        return Err("음소거 변경을 요청했지만 탭이 바뀌어 결과를 확인하지 못했습니다.".into());
+    }
+    if actual != muted {
+        return Err("음소거 변경을 요청했지만 설정에 반영되지 않았습니다.".into());
+    }
+    // Chromium's audio device update is asynchronous. This confirms its native
+    // requested setting, not when the physical speaker reaches silence.
+    Ok(actual)
 }
 
 pub(crate) fn validate_download(tab: i32, scope: Option<&TaskScope>) -> Result<(), String> {
@@ -648,6 +1134,7 @@ pub fn shell_snapshot() -> ShellSnapshot {
                                 task: task.id,
                                 revision: task.revision,
                             });
+                    let loading = tab.browser.is_loading() != 0;
                     ShellTab {
                         id: *id,
                         navigation_epoch: tab.navigation.epoch,
@@ -656,8 +1143,11 @@ pub fn shell_snapshot() -> ShellSnapshot {
                         url: tab.navigation.requested_url.clone(),
                         can_go_back: tab.browser.can_go_back() != 0,
                         can_go_forward: tab.browser.can_go_forward() != 0,
-                        loading: tab.browser.is_loading() != 0,
+                        loading,
                         crashed: tab.navigation.renderer_exit.is_some(),
+                        audio_muted: tab.audio_muted,
+                        failure: tab.navigation.page_failure(loading),
+                        start_page: tab.start_page_ready(loading),
                         task_status,
                         stop_scope,
                     }
@@ -950,6 +1440,216 @@ fn page_find_reply(tab: i32, identifier: i32, count: i32, ordinal: i32, final_up
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CurrentPageTarget {
+    pub tab: i32,
+    pub space: String,
+    pub navigation_epoch: u64,
+    pub url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DownloadSiteTarget {
+    pub page: CurrentPageTarget,
+    pub document_epoch: u64,
+    pub owner: Option<(TaskScope, Status)>,
+}
+
+fn validate_current_page_state(state: &State, target: &CurrentPageTarget) -> Result<(), String> {
+    crate::address::normalize_url(&target.url).map_err(|error| error.to_string())?;
+    let valid = !state.spaces.overview()
+        && state.spaces.active_space() == target.space
+        && state.spaces.active_tab() == Some(target.tab)
+        && state.spaces.tab_space(target.tab) == Some(target.space.as_str())
+        && state.tabs.get(&target.tab).is_some_and(|tab| {
+            let navigation = &tab.navigation;
+            !tab.rejected_creation
+                && navigation.epoch == target.navigation_epoch
+                && navigation.requested_url == target.url
+                && navigation.committed
+                && navigation.document_available
+                && !navigation.provisional
+                && !navigation.intent_pending
+                && !navigation.recovering
+                && navigation.error.is_none()
+                && navigation.renderer_exit.is_none()
+        });
+    if !valid {
+        return Err("현재 페이지가 바뀌었습니다. 페이지를 확인한 뒤 다시 시도하세요.".into());
+    }
+    Ok(())
+}
+
+/// Native menu validation reads state only; it never queries CEF or changes AI control.
+pub(crate) fn validate_current_page_target(target: &CurrentPageTarget) -> Result<(), String> {
+    STATE.with(|state| validate_current_page_state(&state.borrow(), target))
+}
+
+fn validate_current_page_source(
+    state: &State,
+    target: &CurrentPageTarget,
+    owner: &Option<(TaskScope, Status)>,
+    ui_current: bool,
+) -> Result<(), String> {
+    if !ui_current {
+        return Err("현재 페이지 화면이 바뀌었습니다. 다시 시도하세요.".into());
+    }
+    validate_current_page_state(state, target)?;
+    if link_owner(&state.tasks, target.tab) != *owner {
+        return Err("현재 페이지의 제어권이 바뀌었습니다. 다시 시도하세요.".into());
+    }
+    Ok(())
+}
+
+fn current_page_address(target: &CurrentPageTarget, frame_url: &str) -> Result<String, String> {
+    let expected = crate::address::normalize_url(&target.url).map_err(|error| error.to_string())?;
+    let actual = crate::address::normalize_url(frame_url).map_err(|error| error.to_string())?;
+    if actual != expected {
+        return Err("페이지 주소가 바뀌었습니다. 페이지를 확인한 뒤 다시 시도하세요.".into());
+    }
+    Ok(actual)
+}
+
+fn read_current_page_address(
+    browser: &Browser,
+    target: &CurrentPageTarget,
+) -> Result<String, String> {
+    let frame = browser
+        .main_frame()
+        .ok_or_else(|| "페이지 주소를 읽을 수 없습니다.".to_owned())?;
+    current_page_address(target, &CefString::from(&frame.url()).to_string())
+}
+
+/// Capture native setting identity without querying CEF or changing AI control.
+pub(crate) fn capture_download_site_target(
+    page: &CurrentPageTarget,
+) -> Result<DownloadSiteTarget, String> {
+    STATE.with(|state| {
+        let state = state.borrow();
+        validate_current_page_state(&state, page)?;
+        Ok(DownloadSiteTarget {
+            page: page.clone(),
+            document_epoch: state.tabs.get(&page.tab).unwrap().navigation.document_epoch,
+            owner: link_owner(&state.tasks, page.tab),
+        })
+    })
+}
+
+fn validate_download_site_state(state: &State, target: &DownloadSiteTarget) -> Result<(), String> {
+    // Native overlay visibility is checked by the caller. Reuse the same live
+    // page and ownership checks without imposing the menu's no-overlay rule.
+    validate_current_page_source(state, &target.page, &target.owner, true)?;
+    if state
+        .tabs
+        .get(&target.page.tab)
+        .unwrap()
+        .navigation
+        .document_epoch
+        != target.document_epoch
+    {
+        return Err("현재 페이지의 문서가 바뀌었습니다. 다시 시도하세요.".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_download_site_target(target: &DownloadSiteTarget) -> Result<(), String> {
+    STATE.with(|state| validate_download_site_state(&state.borrow(), target))
+}
+
+/// Read the actual main-frame URL, then reject any reentrant document or owner
+/// change. Callers must revalidate again after their own CEF/UI calls.
+pub(crate) fn read_download_site_page(
+    target: &DownloadSiteTarget,
+) -> Result<(Browser, String), String> {
+    let browser = STATE.with(|state| {
+        let state = state.borrow();
+        validate_download_site_state(&state, target)?;
+        Ok::<_, String>(state.tabs.get(&target.page.tab).unwrap().browser.clone())
+    })?;
+    let url = read_current_page_address(&browser, &target.page)?;
+    validate_download_site_target(target)?;
+    Ok((browser, url))
+}
+
+fn can_discard_user_staging(state: &State, tab: i32, source: Option<i32>) -> bool {
+    Some(tab) != source && state.tabs.contains_key(&tab) && is_unowned_user_tab(state, tab)
+}
+
+fn discard_user_staging(browser: &Browser, tab: i32, source: Option<i32>) {
+    if !STATE.with(|state| can_discard_user_staging(&state.borrow(), tab, source)) {
+        return;
+    }
+    let Some(host) = browser.host() else {
+        return;
+    };
+    // Even host lookup may reenter. An adopted or moved destination now belongs
+    // to its new owner; only our still-unowned staged user tab may be closed.
+    let close = STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        if !can_discard_user_staging(&state, tab, source) {
+            return false;
+        }
+        // A never-accepted destination must not enter recent closed-tab history.
+        state.tabs.get_mut(&tab).unwrap().rejected_creation = true;
+        true
+    });
+    if close {
+        host.close_browser(1);
+    }
+}
+
+/// Open only the current HTTP(S) address in a new user tab, without AI handoff.
+pub(crate) fn open_current_page_in_user_tab(target: &CurrentPageTarget) -> Result<(), String> {
+    let (browser, owner) = STATE.with(|state| {
+        let state = state.borrow();
+        validate_current_page_state(&state, target)?;
+        Ok::<_, String>((
+            state.tabs.get(&target.tab).unwrap().browser.clone(),
+            link_owner(&state.tasks, target.tab),
+        ))
+    })?;
+    // CEF calls stay outside every STATE borrow. The address editor's draft and
+    // the previously requested URL cannot substitute for this live frame URL.
+    let url = read_current_page_address(&browser, target)?;
+    let ui_current = crate::control_panel::current_page_target_is_current(target);
+    STATE
+        .with(|state| validate_current_page_source(&state.borrow(), target, &owner, ui_current))?;
+    // Stage hidden: attachment failure or a reentrant source change must not
+    // select a half-created tab or disturb the source space's saved selection.
+    let created = create_user_staging(&url)
+        .ok_or_else(|| "주소를 열 새 탭을 만들 수 없습니다.".to_owned())?;
+    let tab = created.identifier();
+    let result = read_current_page_address(&browser, target)
+        .and_then(|_| {
+            // A CEF call can open a native overlay or IME composition without
+            // changing navigation state. Query UI outside STATE, then recheck
+            // source identity immediately before selecting the new user tab.
+            let ui_current = crate::control_panel::current_page_target_is_current(target);
+            STATE.with(|state| {
+                let state = state.borrow();
+                validate_current_page_source(&state, target, &owner, ui_current)?;
+                if tab == target.tab
+                    || !is_unowned_user_tab(&state, tab)
+                    || !state
+                        .tabs
+                        .get(&tab)
+                        .is_some_and(|tab| !tab.rejected_creation)
+                {
+                    return Err("새 탭을 브라우저 창에 연결할 수 없습니다.".to_owned());
+                }
+                Ok(())
+            })
+        })
+        .and_then(|()| select_user_tab(tab));
+    if result.is_ok() {
+        accept_user_staging(tab);
+    }
+    if result.is_err() {
+        discard_user_staging(&created, tab, Some(target.tab));
+    }
+    result
+}
+
 /// Capture the current main-frame address, never a pending address-bar edit.
 pub(crate) fn bookmark_page(tab: i32) -> Result<(String, String), String> {
     let (browser, title) = STATE
@@ -969,6 +1669,146 @@ pub(crate) fn bookmark_page(tab: i32) -> Result<(String, String), String> {
     let url = CefString::from(&frame.url()).to_string();
     let url = crate::address::normalize_url(&url).map_err(|error| error.to_string())?;
     Ok((url, title))
+}
+
+fn accept_user_staging(id: i32) {
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        if is_unowned_user_tab(&state, id) {
+            if let Some(tab) = state.tabs.get_mut(&id).filter(|tab| !tab.rejected_creation) {
+                tab.navigation.history.staged = false;
+            }
+        }
+    });
+    queue_history_observation(id);
+}
+
+fn history_page_ready(state: &State, id: i32, epoch: u64, document_epoch: u64) -> bool {
+    is_unowned_user_tab(state, id)
+        && state.tabs.get(&id).is_some_and(|tab| {
+            !tab.rejected_creation
+                && !tab.navigation.history.staged
+                && tab.navigation.epoch == epoch
+                && tab.navigation.document_epoch == document_epoch
+                && tab.navigation.preview_ready()
+                && !tab.navigation.recovering
+                && tab
+                    .navigation
+                    .history
+                    .document
+                    .as_ref()
+                    .is_some_and(|document| document.epoch == document_epoch)
+        })
+}
+
+fn queue_history_observation(id: i32) {
+    let queued = STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(tab) = state.tabs.get_mut(&id) else {
+            return false;
+        };
+        let history = &mut tab.navigation.history;
+        if history.queued || history.document.is_none() {
+            return false;
+        }
+        history.queued = true;
+        true
+    });
+    if !queued {
+        return;
+    }
+    #[cfg(not(test))]
+    {
+        let mut task = HistoryObservationTask::new(id);
+        if post_task(ThreadId::UI, Some(&mut task)) != 0 {
+            return;
+        }
+    }
+    STATE.with(|state| {
+        if let Some(tab) = state.borrow_mut().tabs.get_mut(&id) {
+            tab.navigation.history.queued = false;
+        }
+    });
+}
+
+fn observe_history(id: i32) {
+    let source = STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let tab = state.tabs.get_mut(&id)?;
+        tab.navigation.history.queued = false;
+        let epoch = tab.navigation.epoch;
+        let document_epoch = tab.navigation.document_epoch;
+        if !history_page_ready(&state, id, epoch, document_epoch) {
+            return None;
+        }
+        let tab = &state.tabs[&id];
+        Some((tab.browser.clone(), epoch, document_epoch))
+    });
+    let Some((browser, epoch, document_epoch)) = source else {
+        return;
+    };
+    // A same-document address notification can precede a real commit in the
+    // same CEF turn. Defer and verify both identities and the live frame URL.
+    if browser.is_loading() != 0 {
+        return;
+    }
+    let Some(frame) = browser.main_frame() else {
+        return;
+    };
+    let Ok(url) = crate::address::normalize_url(&CefString::from(&frame.url()).to_string()) else {
+        return;
+    };
+    let action = STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        if !history_page_ready(&state, id, epoch, document_epoch) {
+            return None;
+        }
+        let tab = state.tabs.get_mut(&id)?;
+        if crate::address::normalize_url(&tab.navigation.requested_url)
+            .ok()
+            .as_deref()
+            != Some(url.as_str())
+        {
+            return None;
+        }
+        // A settled same-document navigation has no LoadEnd/loading callback.
+        tab.navigation.history.attempt = None;
+        tab.navigation.history.action(url)
+    });
+    let Some(action) = action else {
+        return;
+    };
+    // Runtime writes/notifications may reenter. Never retain STATE across them.
+    let accepted = if action.update_title {
+        crate::history_runtime::update_title(
+            action.generation,
+            action.url.clone(),
+            action.title.clone(),
+        )
+    } else {
+        crate::history_runtime::record(action.generation, action.url.clone(), action.title.clone())
+    };
+    if accepted {
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            if history_page_ready(&state, id, epoch, document_epoch) {
+                state
+                    .tabs
+                    .get_mut(&id)
+                    .unwrap()
+                    .navigation
+                    .history
+                    .accepted(&action);
+            }
+        });
+    }
+}
+
+wrap_task! {
+    struct HistoryObservationTask { tab: i32 }
+    impl Task {
+        fn execute(&self) { observe_history(self.tab); }
+    }
 }
 
 fn is_unowned_user_tab(state: &State, tab: i32) -> bool {
@@ -1003,22 +1843,29 @@ pub(crate) fn reopen_closed_page() -> Result<(), String> {
     let entry = STATE
         .with(|state| state.borrow_mut().closed_pages.begin_reopen())
         .ok_or_else(|| "다시 열 수 있는 탭이 없습니다.".to_owned())?;
-    let result =
-        create_browser_with_context(&entry.url, None, None, None, Some(USER_SPACE.into()), true)
-            .ok_or_else(|| "닫은 탭을 다시 만들 수 없습니다.".to_owned())
-            .and_then(|browser| {
-                let tab = browser.identifier();
-                if !STATE.with(|state| {
-                    state
-                        .borrow()
-                        .tabs
-                        .get(&tab)
-                        .is_some_and(|tab| !tab.rejected_creation)
-                }) {
-                    return Err("새 탭을 브라우저 창에 연결할 수 없습니다.".into());
-                }
-                select_bookmark_tab(tab)
-            });
+    let result = create_browser_with_context(
+        &entry.url,
+        None,
+        None,
+        None,
+        Some(USER_SPACE.into()),
+        true,
+        false,
+    )
+    .ok_or_else(|| "닫은 탭을 다시 만들 수 없습니다.".to_owned())
+    .and_then(|browser| {
+        let tab = browser.identifier();
+        if !STATE.with(|state| {
+            state
+                .borrow()
+                .tabs
+                .get(&tab)
+                .is_some_and(|tab| !tab.rejected_creation)
+        }) {
+            return Err("새 탭을 브라우저 창에 연결할 수 없습니다.".into());
+        }
+        select_user_tab(tab)
+    });
     STATE.with(|state| {
         state
             .borrow_mut()
@@ -1040,11 +1887,11 @@ fn prefer_bookmark_tab(active: Option<i32>, candidates: impl Iterator<Item = i32
     first
 }
 
-fn select_bookmark_tab(tab: i32) -> Result<(), String> {
+fn select_user_tab(tab: i32) -> Result<(), String> {
     STATE.with(|state| {
         let mut state = state.borrow_mut();
         if !is_unowned_user_tab(&state, tab) {
-            return Err("북마크를 열 사용자 탭을 찾을 수 없습니다.".to_owned());
+            return Err("열려는 사용자 탭을 찾을 수 없습니다.".to_owned());
         }
         state.spaces.show(USER_SPACE);
         state.spaces.select_tab(tab);
@@ -1057,12 +1904,48 @@ fn select_bookmark_tab(tab: i32) -> Result<(), String> {
 
 /// Native bookmark input opens the user's space without handing off an AI task.
 pub(crate) fn open_bookmark_url(url: &str) -> Result<(), String> {
+    open_saved_user_url(url, || true)
+}
+
+pub(crate) fn open_history_url(url: &str, still_current: impl Fn() -> bool) -> Result<(), String> {
+    open_saved_user_url(url, still_current)
+}
+
+fn user_open_selection(state: &State) -> (String, Option<i32>, bool) {
+    (
+        state.spaces.active_space().to_owned(),
+        state.spaces.active_tab(),
+        state.spaces.overview(),
+    )
+}
+
+fn validate_saved_user_destination(
+    state: &State,
+    tab: i32,
+    selection: &(String, Option<i32>, bool),
+    still_current: bool,
+) -> Result<(), String> {
+    if !still_current
+        || user_open_selection(state) != *selection
+        || !is_unowned_user_tab(state, tab)
+        || !state
+            .tabs
+            .get(&tab)
+            .is_some_and(|tab| !tab.rejected_creation)
+    {
+        return Err("열려는 항목이나 현재 화면이 바뀌었습니다. 다시 시도하세요.".into());
+    }
+    Ok(())
+}
+
+fn open_saved_user_url(url: &str, still_current: impl Fn() -> bool) -> Result<(), String> {
     let url = crate::address::normalize_url(url).map_err(|error| error.to_string())?;
-    let existing = STATE.with(|state| {
+    if !still_current() {
+        return Err("열려는 항목이 더 이상 없습니다.".into());
+    }
+    let (selection, existing) = STATE.with(|state| {
         let state = state.borrow();
-        // BTreeMap iteration supplies the stable first match. A failed renderer
-        // or navigation cannot provide a usable existing bookmark destination.
-        prefer_bookmark_tab(
+        let existing = prefer_bookmark_tab(
             state.spaces.active_tab(),
             state.tabs.iter().filter_map(|(&id, tab)| {
                 (is_unowned_user_tab(&state, id)
@@ -1070,25 +1953,188 @@ pub(crate) fn open_bookmark_url(url: &str) -> Result<(), String> {
                     && tab.navigation.can_reuse_bookmark(&url))
                 .then_some(id)
             }),
-        )
+        );
+        (user_open_selection(&state), existing)
     });
     if let Some(tab) = existing {
-        return select_bookmark_tab(tab);
+        let current = still_current();
+        STATE.with(|state| -> Result<(), String> {
+            let state = state.borrow();
+            validate_saved_user_destination(&state, tab, &selection, current)?;
+            if !state.tabs[&tab].navigation.can_reuse_bookmark(&url) {
+                return Err("열려는 페이지가 바뀌었습니다. 다시 시도하세요.".into());
+            }
+            Ok(())
+        })?;
+        return select_user_tab(tab);
     }
-    let browser =
-        create_browser_with_context(&url, None, None, None, Some(USER_SPACE.into()), true)
-            .ok_or_else(|| "북마크를 열 새 탭을 만들 수 없습니다.".to_owned())?;
+    if !still_current() {
+        return Err("열려는 항목이 더 이상 없습니다.".into());
+    }
+    // Saved URLs stage in the background too, so a failed attachment or a
+    // history clear during CEF creation preserves the original selection.
+    let browser = create_user_staging(&url)
+        .ok_or_else(|| "주소를 열 새 탭을 만들 수 없습니다.".to_owned())?;
     let tab = browser.identifier();
-    if !STATE.with(|state| {
+    let current = still_current();
+    let result = STATE
+        .with(|state| validate_saved_user_destination(&state.borrow(), tab, &selection, current))
+        .and_then(|()| select_user_tab(tab));
+    if result.is_ok() {
+        accept_user_staging(tab);
+    }
+    if result.is_err() {
+        discard_user_staging(&browser, tab, selection.1);
+    }
+    result
+}
+
+fn validate_sidebar_close(state: &State, tab: i32, expected_space: &str) -> Result<(), String> {
+    if state.spaces.overview()
+        || state.spaces.active_space() != expected_space
+        || state.spaces.tab_space(tab) != Some(expected_space)
+        || !state
+            .tabs
+            .get(&tab)
+            .is_some_and(|tab| !tab.rejected_creation)
+    {
+        return Err("The tab is no longer in the displayed space.".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn close_tab_from_sidebar(tab: i32, expected_space: &str) -> Result<(), String> {
+    // The native row can outlive an adoption/release until the coalesced UI
+    // refresh. Validate live membership before handing control away from AI.
+    // Both steps run on the UI thread; no CEF call crosses this STATE borrow.
+    STATE.with(|state| validate_sidebar_close(&state.borrow(), tab, expected_space))?;
+    shell_action(ShellAction::CloseTab(tab))
+}
+
+pub(crate) fn select_tab_from_sidebar(tab: i32, expected_space: &str) -> Result<(), String> {
+    // A coalesced native snapshot can retain a moved or closed tab. Validate
+    // live membership before any selection, focus, or shell synchronization.
+    // Overview is allowed: selecting a live tab exits it through SelectTab.
+    STATE.with(|state| {
+        let state = state.borrow();
+        if state.spaces.active_space() != expected_space
+            || state.spaces.tab_space(tab) != Some(expected_space)
+            || !state
+                .tabs
+                .get(&tab)
+                .is_some_and(|tab| !tab.rejected_creation)
+        {
+            return Err("The tab is no longer in the displayed space.".to_owned());
+        }
+        Ok(())
+    })?;
+    // Both steps run synchronously on the UI thread without intervening CEF
+    // or AppKit calls. Reuse selection's existing no-handoff path.
+    shell_action(ShellAction::SelectTab(tab))
+}
+
+fn validate_recovery_state(
+    state: &State,
+    target: &PageRecoveryTarget,
+    loading: bool,
+) -> Result<(), String> {
+    let current = !state.spaces.overview()
+        && state.spaces.active_tab() == Some(target.tab)
+        && state.spaces.active_space() == target.space
+        && state.spaces.tab_space(target.tab) == Some(target.space.as_str())
+        && state.tabs.get(&target.tab).is_some_and(|tab| {
+            !tab.rejected_creation
+                && tab.navigation.epoch == target.navigation_epoch
+                && tab.navigation.page_failure(loading) == Some(target.failure)
+        });
+    if !current {
+        return Err("페이지 상태가 바뀌었습니다. 현재 페이지를 확인해 주세요.".into());
+    }
+    Ok(())
+}
+
+fn recovery_loading(tab: i32) -> Result<bool, String> {
+    let browser = STATE.with(|state| {
         state
             .borrow()
             .tabs
             .get(&tab)
-            .is_some_and(|tab| !tab.rejected_creation)
-    }) {
-        return Err("새 탭을 브라우저 창에 연결할 수 없습니다.".into());
+            .filter(|tab| !tab.rejected_creation)
+            .map(|tab| tab.browser.clone())
+    });
+    // Even a read-only CEF call stays outside the STATE borrow.
+    browser
+        .map(|browser| browser.is_loading() != 0)
+        .ok_or_else(|| "페이지가 닫혔습니다.".into())
+}
+
+pub(crate) fn validate_failed_page_target(target: &PageRecoveryTarget) -> Result<(), String> {
+    let loading = recovery_loading(target.tab)?;
+    STATE.with(|state| validate_recovery_state(&state.borrow(), target, loading))
+}
+
+pub(crate) fn retry_failed_page(target: &PageRecoveryTarget) -> Result<(), String> {
+    validate_failed_page_target(target)?;
+    // Address correction remains available for a terminated renderer whose
+    // loading flag lags. Retry must not enter Reload's loading-stop toggle.
+    if recovery_loading(target.tab)? {
+        return Err("페이지가 아직 로딩 중입니다. 잠시 후 다시 시도해 주세요.".into());
     }
-    select_bookmark_tab(tab)
+    // The native Reload path hands off only this tab's current AI owner and
+    // preserves browser-level renderer recovery without requiring a live frame.
+    shell_action(ShellAction::Reload(target.tab))
+}
+
+fn validate_start_page_state(
+    state: &State,
+    target: &StartPageTarget,
+    loading: bool,
+    main_frame_is_blank: bool,
+) -> Result<(), String> {
+    let current = main_frame_is_blank
+        && !state.spaces.overview()
+        && state.spaces.active_tab() == Some(target.tab)
+        && state.spaces.active_space() == target.space
+        && state.spaces.tab_space(target.tab) == Some(target.space.as_str())
+        && state.tabs.get(&target.tab).is_some_and(|tab| {
+            tab.navigation.epoch == target.navigation_epoch && tab.start_page_ready(loading)
+        });
+    if !current {
+        return Err("탭 상태가 바뀌었습니다. 현재 탭을 확인해 주세요.".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_start_page_target(target: &StartPageTarget) -> Result<(), String> {
+    let browser = STATE.with(|state| {
+        state
+            .borrow()
+            .tabs
+            .get(&target.tab)
+            .filter(|tab| !tab.rejected_creation)
+            .map(|tab| tab.browser.clone())
+    });
+    let browser = browser.ok_or_else(|| "탭이 닫혔습니다.".to_owned())?;
+    // Query CEF outside the STATE borrow, then revalidate the current identity.
+    let loading = browser.is_loading() != 0;
+    let main_frame_is_blank = browser
+        .main_frame()
+        .is_some_and(|frame| CefString::from(&frame.url()).to_string() == "about:blank");
+    STATE.with(|state| {
+        validate_start_page_state(&state.borrow(), target, loading, main_frame_is_blank)
+    })
+}
+
+pub(crate) fn navigate_from_start_page(
+    target: &StartPageTarget,
+    input: &str,
+) -> Result<(), String> {
+    // Empty/invalid input and stale controls must never hand off an AI task.
+    let Some(url) = crate::address::resolve(input).map_err(|error| error.to_string())? else {
+        return Ok(());
+    };
+    validate_start_page_target(target)?;
+    shell_action(ShellAction::Navigate(target.tab, url))
 }
 
 pub fn shell_action(action: ShellAction) -> Result<(), String> {
@@ -1147,7 +2193,7 @@ pub fn shell_action(action: ShellAction) -> Result<(), String> {
             // Explicit native chrome input takes control before creating a human tab.
             handoff_space_if_active(&space)?;
             STATE.with(|state| state.borrow_mut().spaces.set_overview(false));
-            create_browser_with_context("about:blank", None, None, None, Some(space), true)
+            create_browser_with_context("about:blank", None, None, None, Some(space), true, true)
                 .ok_or_else(|| "Cannot create a tab.".to_owned())?;
             crate::control_panel::focus_address();
             return Ok(());
@@ -1255,6 +2301,9 @@ pub fn close_all() {
 }
 
 pub fn focus_tab(id: i32) {
+    if crate::control_panel::focus_start_page_if_visible(id) {
+        return;
+    }
     let browser = STATE.with(|state| state.borrow().tabs.get(&id).map(|tab| tab.browser.clone()));
     if let Some(host) = browser.and_then(|browser| browser.host()) {
         host.set_focus(1);
@@ -1668,7 +2717,10 @@ fn expire_tab_refs(tabs: impl IntoIterator<Item = i32>) {
             }
             if let Some(tab) = state.tabs.get_mut(&id) {
                 tab.navigation.epoch += 1;
+                tab.navigation.download_source_generation += 1;
                 tab.navigation.download_permission_provenance.revoke();
+                tab.navigation.history.revoke();
+                tab.navigation.history.staged = false;
             }
         }
         stopped
@@ -2238,6 +3290,8 @@ fn stop_loading(browser: &Browser) {
     invalidate_page_find(browser.identifier());
     STATE.with(|state| {
         if let Some(tab) = state.borrow_mut().tabs.get_mut(&browser.identifier()) {
+            tab.navigation.automatic_retry_error = None;
+            tab.navigation.history.revoke();
             if tab.navigation.provisional || browser.is_loading() != 0 {
                 tab.navigation.epoch += 1;
                 tab.navigation.stopped = true;
@@ -2285,8 +3339,10 @@ fn navigate(browser: &Browser, command: &Command, reply: Reply) {
         reply.error("FRAME_UNAVAILABLE", "Main frame is unavailable.");
         return;
     }
+    let history_generation = crate::history_runtime::generation();
     let started = STATE.with(|state| {
         let mut state = state.borrow_mut();
+        let history_generation = history_generation.filter(|_| is_unowned_user_tab(&state, tab_id));
         let Some(tab) = state.tabs.get_mut(&tab_id) else {
             return false;
         };
@@ -2302,7 +3358,11 @@ fn navigate(browser: &Browser, command: &Command, reply: Reply) {
             return false;
         }
         // Set the barrier before CEF can queue any asynchronous callbacks.
+        if let Some(url) = url {
+            tab.observe_start_page_url(url);
+        }
         tab.navigation.begin(url);
+        tab.navigation.history.begin(history_generation, true);
         true
     });
     if !started {
@@ -2410,7 +3470,7 @@ fn create_browser_with_link(
     link: Option<LinkCreation>,
 ) -> Option<Browser> {
     let foreground = scope.is_none() && link.as_ref().is_none_or(|link| link.foreground);
-    create_browser_with_context(url, scope, reservation, link, None, foreground)
+    create_browser_with_context(url, scope, reservation, link, None, foreground, false)
 }
 
 fn create_browser_with_context(
@@ -2420,6 +3480,42 @@ fn create_browser_with_context(
     link: Option<LinkCreation>,
     space: Option<String>,
     foreground: bool,
+    native_start_page: bool,
+) -> Option<Browser> {
+    create_browser_with_history(
+        url,
+        scope,
+        reservation,
+        link,
+        space,
+        foreground,
+        native_start_page,
+        HistoryCreation::new(false),
+    )
+}
+
+fn create_user_staging(url: &str) -> Option<Browser> {
+    create_browser_with_history(
+        url,
+        None,
+        None,
+        None,
+        Some(USER_SPACE.into()),
+        false,
+        false,
+        HistoryCreation::new(true),
+    )
+}
+
+fn create_browser_with_history(
+    url: &str,
+    scope: Option<TaskScope>,
+    reservation: Option<u64>,
+    link: Option<LinkCreation>,
+    space: Option<String>,
+    foreground: bool,
+    native_start_page: bool,
+    history: HistoryCreation,
 ) -> Option<Browser> {
     let parent = crate::control_panel::create_parent().ok()?;
     let space = space
@@ -2440,8 +3536,16 @@ fn create_browser_with_context(
         let state = state.borrow();
         state.spaces.overview() || state.spaces.active_space() != space || !foreground
     }));
-    let mut client =
-        BrowserClient::new(url.to_owned(), scope, reservation, link, space, foreground);
+    let mut client = BrowserClient::new(
+        url.to_owned(),
+        scope,
+        reservation,
+        link,
+        space,
+        foreground,
+        native_start_page && url == "about:blank",
+        history,
+    );
     browser_host_create_browser_sync(
         Some(&WindowInfo {
             runtime_style: RuntimeStyle::ALLOY,
@@ -2489,16 +3593,25 @@ fn dispatch(browser: &Browser, method: &str, params: Json, pending: Pending) {
         JsonParserOptions::default(),
     )
     .and_then(|value| value.dictionary());
-    let id = STATE.with(|state| {
+    let (id, start_page_revoked) = STATE.with(|state| {
         let mut state = state.borrow_mut();
         state.next_message += 1;
         let id = state.next_message;
         if capture {
             state.captures.insert(id, pending.tab);
         }
+        // Reads, screenshots and action preparation leave native input alone.
+        // An actual page mutation gives the CEF document its visible surface.
+        let start_page_revoked = matches!(pending.step, Step::Evaluate)
+            && matches!(pending.evaluation, Evaluation::Page { mutation: true })
+            && state
+                .tabs
+                .get_mut(&pending.tab)
+                .is_some_and(|tab| std::mem::replace(&mut tab.native_start_page, false));
         state.pending.insert(id, pending);
-        id
+        (id, start_page_revoked)
     });
+    let _refresh = PanelRefresh(start_page_revoked);
     if host.execute_dev_tools_method(id, Some(&CefString::from(method)), dictionary.as_mut()) == 0 {
         if let Some(pending) = complete_control_request(id) {
             pending_error(
@@ -2643,7 +3756,10 @@ fn devtools_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) {
                     })
                 });
                 if !within_deadline {
-                    // The independent timer returns the error and current tab state.
+                    // For ReadyState, pending_error only releases this completed
+                    // probe. The timer still owns the failure and state snapshot;
+                    // a navigation that clears the error can issue a fresh probe.
+                    pending_error(&pending, "PAGE_LOADING", "The DOM is not ready.");
                     return;
                 }
                 let ready = matches!(value.as_str(), Some("interactive" | "complete"));
@@ -2719,17 +3835,17 @@ wrap_browser_process_handler! {
         fn on_context_initialized(&self) {
             // The shell retains its native views before startup temporaries drain.
             objc2::rc::autoreleasepool(|_| {
-                if create_browser("about:blank", None, None).is_none() { quit_message_loop(); }
+                if create_browser_with_context("about:blank", None, None, None, None, true, true).is_none() { quit_message_loop(); }
                 else { crate::control_panel::show(); }
             });
         }
-        fn default_client(&self) -> Option<Client> { Some(BrowserClient::new(String::new(), None, None, None, USER_SPACE.into(), true)) }
+        fn default_client(&self) -> Option<Client> { Some(BrowserClient::new(String::new(), None, None, None, USER_SPACE.into(), true, false, HistoryCreation::new(false))) }
     }
 }
 wrap_client! {
-    struct BrowserClient { requested_url: String, scope: Option<TaskScope>, reservation: Option<u64>, link: Option<LinkCreation>, space: String, foreground: bool }
+    struct BrowserClient { requested_url: String, scope: Option<TaskScope>, reservation: Option<u64>, link: Option<LinkCreation>, space: String, foreground: bool, native_start_page: bool, history: HistoryCreation }
     impl Client {
-        fn life_span_handler(&self) -> Option<LifeSpanHandler> { Some(LifeHandler::new(self.requested_url.clone(), self.scope.clone(), self.reservation, self.link.clone(), self.space.clone(), self.foreground)) }
+        fn life_span_handler(&self) -> Option<LifeSpanHandler> { Some(LifeHandler::new(self.requested_url.clone(), self.scope.clone(), self.reservation, self.link.clone(), self.space.clone(), self.foreground, self.native_start_page, self.history)) }
         fn display_handler(&self) -> Option<DisplayHandler> { Some(TitleHandler::new()) }
         fn load_handler(&self) -> Option<LoadHandler> { Some(PageLoadHandler::new()) }
         fn request_handler(&self) -> Option<RequestHandler> { Some(NavigationHandler::new()) }
@@ -2740,7 +3856,7 @@ wrap_client! {
     }
 }
 wrap_life_span_handler! {
-    struct LifeHandler { requested_url: String, scope: Option<TaskScope>, reservation: Option<u64>, link: Option<LinkCreation>, space: String, foreground: bool }
+    struct LifeHandler { requested_url: String, scope: Option<TaskScope>, reservation: Option<u64>, link: Option<LinkCreation>, space: String, foreground: bool, native_start_page: bool, history: HistoryCreation }
     impl LifeSpanHandler {
         fn on_before_popup(&self,browser:Option<&mut Browser>,_frame:Option<&mut Frame>,popup_id:i32,
             target_url:Option<&CefString>,_target_frame_name:Option<&CefString>,target_disposition:WindowOpenDisposition,
@@ -2781,7 +3897,7 @@ wrap_life_span_handler! {
             window_info.hidden = i32::from(!foreground || STATE.with(|state| {
                 let state = state.borrow(); state.spaces.overview() || state.spaces.active_space() != space
             }));
-            *client = Some(BrowserClient::new(target_url.map(ToString::to_string).unwrap_or_default(),scope,reservation,link,space,foreground));
+            *client = Some(BrowserClient::new(target_url.map(ToString::to_string).unwrap_or_default(),scope,reservation,link,space,foreground,false,HistoryCreation::new(false)));
             0
         }
         fn on_before_popup_aborted(&self, browser:Option<&mut Browser>, popup_id:i32) {
@@ -2794,7 +3910,7 @@ wrap_life_span_handler! {
             _extra_info:Option<&mut Option<DictionaryValue>>, _use_default_window:Option<&mut i32>) {
             // CEF otherwise inherits the opener's already-consumed reservation.
             // Developer tools opened by the user are not task-created windows.
-            if let Some(client) = client { *client = Some(BrowserClient::new(String::new(),None,None,None,USER_SPACE.into(),false)); }
+            if let Some(client) = client { *client = Some(BrowserClient::new(String::new(),None,None,None,USER_SPACE.into(),false,false,HistoryCreation::new(false))); }
             if let (Some(info), Ok(parent)) = (window_info, crate::control_panel::create_parent()) {
                 info.parent_view = parent.cast();
                 info.runtime_style = RuntimeStyle::ALLOY;
@@ -2809,8 +3925,10 @@ wrap_life_span_handler! {
                     let reserved = self.reservation.is_none_or(|ticket|state.creations.release(ticket));
                     let attached = current && reserved && self.scope.as_ref().is_none_or(|scope|state.tasks.attach(scope,browser.identifier(),Origin::Created).is_ok());
                     if attached { state.spaces.insert(browser.identifier(), &self.space, self.foreground); }
-                    state.tabs.insert(browser.identifier(),Tab {browser:browser.clone(),title:String::new(),rejected_creation:!attached,_devtools:None,
-                        navigation:Navigation { requested_url:self.requested_url.clone(),..Default::default() } });
+                    state.tabs.insert(browser.identifier(),Tab {browser:browser.clone(),title:String::new(),rejected_creation:!attached,native_start_page:self.native_start_page,audio_muted:None,_devtools:None,
+                        navigation:Navigation { requested_url:self.requested_url.clone(), history: HistoryObservation {
+                            attempt: Some(self.history.generation.filter(|_| self.space == USER_SPACE && self.scope.is_none())), staged: self.history.staged, ..Default::default()
+                        }, ..Default::default() } });
                     attached
                 });
                 if !accepted {
@@ -2925,12 +4043,18 @@ wrap_permission_handler! {
 wrap_focus_handler! {
     struct TabFocusHandler;
     impl FocusHandler {
-        fn on_set_focus(&self, browser: Option<&mut Browser>, _source: FocusSource) -> i32 {
+        fn on_set_focus(&self, browser: Option<&mut Browser>, source: FocusSource) -> i32 {
             // Reading or loading a hidden tab must not steal native keyboard focus.
-            i32::from(crate::control_panel::search_is_open() || crate::control_panel::page_find_is_editing() || browser.is_some_and(|browser| STATE.with(|state| {
+            let tab = browser.map(|browser| browser.identifier());
+            let deny = crate::control_panel::search_is_open() || crate::control_panel::page_find_is_editing() || tab.is_some_and(crate::control_panel::start_page_is_visible) || tab.is_some_and(|tab| STATE.with(|state| {
                 let state = state.borrow();
-                state.spaces.overview() || state.spaces.active_tab() != Some(browser.identifier())
-            })))
+                state.spaces.overview() || state.spaces.active_tab() != Some(tab)
+            }));
+            crate::control_panel::trace_focus("cef-set", tab, Some(source.get_raw()), Some(deny));
+            i32::from(deny)
+        }
+        fn on_got_focus(&self, browser: Option<&mut Browser>) {
+            crate::control_panel::trace_focus("cef-got", browser.map(|browser| browser.identifier()), None, None);
         }
     }
 }
@@ -2952,10 +4076,12 @@ wrap_display_handler! {
             if frame.is_none_or(|frame| frame.is_main()==0) { return; }
             if let Some(browser) = browser { revoke_download_permission_provenance(browser.identifier()); crate::download_permission_runtime::cancel_tab(browser.identifier()); invalidate_page_find(browser.identifier()); STATE.with(|state| {
                 if let Some(tab) = state.borrow_mut().tabs.get_mut(&browser.identifier()) {
-                    let nav = &mut tab.navigation;
                     let url = url.map(ToString::to_string).unwrap_or_default();
+                    tab.observe_start_page_url(&url);
+                    let nav = &mut tab.navigation;
                     if !nav.stop_pending { nav.stopped = false; }
                     nav.epoch += 1;
+                    nav.history.address_changed(&url);
                     nav.requested_url = url;
                     // Only a new main-frame commit clears renderer failure.
                     if nav.renderer_exit.is_some() { return; }
@@ -2968,10 +4094,15 @@ wrap_display_handler! {
                         nav.incomplete = false;
                     }
                 }
-            }); notify_panel(); }
+            }); queue_history_observation(browser.identifier()); notify_panel(); }
         }
         fn on_title_change(&self,browser:Option<&mut Browser>,title:Option<&CefString>) {
-            if let Some(browser)=browser {STATE.with(|state| {if let Some(tab)=state.borrow_mut().tabs.get_mut(&browser.identifier()) {tab.title=title.map(|title|title.to_string().chars().take(512).collect()).unwrap_or_default();}});notify_panel();}
+            if let Some(browser)=browser {STATE.with(|state| {if let Some(tab)=state.borrow_mut().tabs.get_mut(&browser.identifier()) {
+                tab.title=title.map(|title|title.to_string().chars().take(512).collect()).unwrap_or_default();
+                if !tab.navigation.provisional && !tab.navigation.intent_pending {
+                    tab.navigation.history.title_changed(&tab.title);
+                }
+            }});queue_history_observation(browser.identifier());notify_panel();}
         }
     }
 }
@@ -3021,15 +4152,21 @@ wrap_request_handler! {
                     "message":error_string.map(|value|value.to_string().chars().take(240).collect::<String>()).unwrap_or_default()}));
             }
         }
-        fn on_before_browse(&self,browser:Option<&mut Browser>,frame:Option<&mut Frame>,request:Option<&mut cef::Request>,_user_gesture:i32,_is_redirect:i32) -> i32 {
+        fn on_before_browse(&self,browser:Option<&mut Browser>,frame:Option<&mut Frame>,request:Option<&mut cef::Request>,user_gesture:i32,is_redirect:i32) -> i32 {
             if frame.is_some_and(|frame| frame.is_main()!=0) {
                 if let Some(browser) = browser {
                     invalidate_page_find(browser.identifier());
+                    let (url, transition) = request.map(|request| (CefString::from(&request.url()).to_string(), request.transition_type().get_raw())).unwrap_or_default();
+                    let generation = crate::history_runtime::generation();
                     STATE.with(|state| {
-                        if let Some(tab) = state.borrow_mut().tabs.get_mut(&browser.identifier()) {
+                        let mut state = state.borrow_mut();
+                        let generation = generation.filter(|_| is_unowned_user_tab(&state, browser.identifier()));
+                        if let Some(tab) = state.tabs.get_mut(&browser.identifier()) {
+                            tab.observe_start_page_url(&url);
                             let nav = &mut tab.navigation;
-                            let url = request.map(|request| CefString::from(&request.url()).to_string()).unwrap_or_default();
-                            nav.begin(Some(&url));
+                            nav.trace_load_event("browse-begin", browser.identifier(), None, &url, Some((user_gesture != 0, is_redirect != 0, transition)));
+                            nav.begin_browse(&url, user_gesture != 0, is_redirect != 0, transition);
+                            nav.history.begin(generation, false);
                             // Preserve the current document until a new one commits.
                             // An aborted request, download or 204 may keep that document.
                         }
@@ -3060,20 +4197,27 @@ wrap_load_handler! {
             if let Some(browser)=browser {STATE.with(|state| {
                 if let Some(tab)=state.borrow_mut().tabs.get_mut(&browser.identifier()) {
                     tab.navigation.finish_loading();
+                    tab.navigation.history.attempt = None;
                 }
-            });notify_panel();}
+            });queue_history_observation(browser.identifier());notify_panel();}
         }
         fn on_load_start(&self,browser:Option<&mut Browser>,frame:Option<&mut Frame>,_transition_type:TransitionType) {
             let Some(frame) = frame.filter(|frame| frame.is_main()!=0) else { return; };
             let url = CefString::from(&frame.url()).to_string();
+            let generation = crate::history_runtime::generation();
             if let Some(browser) = browser { crate::download_permission_runtime::cancel_tab(browser.identifier()); invalidate_page_find(browser.identifier()); STATE.with(|state| {
-                if let Some(tab) = state.borrow_mut().tabs.get_mut(&browser.identifier()) {
+                let mut state = state.borrow_mut();
+                let generation = generation.filter(|_| is_unowned_user_tab(&state, browser.identifier()));
+                if let Some(tab) = state.tabs.get_mut(&browser.identifier()) {
+                    tab.observe_start_page_url(&url);
                     // A restored document may commit without OnBeforeBrowse.
+                    tab.navigation.trace_load_event("load-start", browser.identifier(), None, &url, None);
                     tab.navigation.commit(&url);
+                    tab.navigation.history.commit(tab.navigation.document_epoch, &url, generation);
                 }
             }); notify_panel(); }
         }
-        fn on_load_end(&self,browser:Option<&mut Browser>,frame:Option<&mut Frame>,_http_status_code:i32) {
+        fn on_load_end(&self,browser:Option<&mut Browser>,frame:Option<&mut Frame>,http_status_code:i32) {
             if frame.is_none_or(|frame| frame.is_main()==0) { return; }
             if let Some(browser) = browser { STATE.with(|state| {
                 if let Some(tab) = state.borrow_mut().tabs.get_mut(&browser.identifier()) {
@@ -3081,21 +4225,21 @@ wrap_load_handler! {
                         tab.navigation.main_load_complete = true;
                         // Includes restored documents that have no new-document callback.
                         tab.navigation.document_available = true;
+                        if let Some(document) = &mut tab.navigation.history.document {
+                            document.successful_http = (200..=599).contains(&http_status_code) && tab.navigation.error.is_none();
+                        }
                     }
                 }
-            }); notify_panel(); }
+            }); queue_history_observation(browser.identifier()); notify_panel(); }
         }
         fn on_load_error(&self,browser:Option<&mut Browser>,frame:Option<&mut Frame>,error_code:Errorcode,error_text:Option<&CefString>,failed_url:Option<&CefString>) {
             if frame.is_none_or(|frame| frame.is_main()==0) { return; }
             if let Some(browser)=browser {STATE.with(|state| {
                 if let Some(tab)=state.borrow_mut().tabs.get_mut(&browser.identifier()) {
-                    if tab.navigation.renderer_exit.is_some() && !tab.navigation.recovering { return; }
-                    tab.navigation.provisional = false;
-                    if !(tab.navigation.stopped && sys::cef_errorcode_t::from(error_code)==sys::cef_errorcode_t::ERR_ABORTED) {
-                        tab.navigation.error = Some(json!({"code":error_code.get_raw(),
-                            "text":error_text.map(ToString::to_string).unwrap_or_default(),
-                            "failedUrl":failed_url.map(ToString::to_string).unwrap_or_default()}));
-                    }
+                    let failed_url = failed_url.map(ToString::to_string).unwrap_or_default();
+                    let error_text = error_text.map(ToString::to_string).unwrap_or_default();
+                    tab.navigation.trace_load_event("load-error", browser.identifier(), Some(error_code.get_raw()), &failed_url, None);
+                    tab.navigation.load_failed(error_code.get_raw(), &error_text, &failed_url);
                 }
             });notify_panel();}
         }
@@ -3117,6 +4261,713 @@ wrap_dev_tools_message_observer! {
 mod tests {
     use super::*;
 
+    fn native_blank_tab() -> Tab {
+        // Inert refcounted CEF handles keep these state guards independent of
+        // Chromium and AppKit. Successful navigation is a native smoke check.
+        let raw = cef::rc::RcImpl::new(unsafe { std::mem::zeroed::<sys::_cef_browser_t>() }, ());
+        Tab {
+            browser: cef::rc::ConvertReturnValue::wrap_result(raw.cast::<sys::_cef_browser_t>()),
+            title: String::new(),
+            rejected_creation: false,
+            native_start_page: true,
+            audio_muted: None,
+            _devtools: None,
+            navigation: Navigation {
+                epoch: 4,
+                requested_url: "about:blank".into(),
+                committed: true,
+                document_available: true,
+                main_load_complete: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[derive(Default)]
+    struct AudioFixture {
+        muted: std::cell::Cell<bool>,
+        writes: RefCell<Vec<bool>>,
+        reads: std::cell::Cell<usize>,
+        ignore_write: std::cell::Cell<bool>,
+        on_read: std::cell::Cell<Option<fn()>>,
+        on_write: std::cell::Cell<Option<fn()>>,
+    }
+
+    fn audio_tab(fixture: &std::rc::Rc<AudioFixture>) -> Tab {
+        type Shared = std::rc::Rc<AudioFixture>;
+        unsafe extern "C" fn read(raw: *mut sys::_cef_browser_host_t) -> i32 {
+            let fixture = cef::rc::RcImpl::<sys::_cef_browser_host_t, Shared>::get(raw)
+                .interface
+                .clone();
+            fixture.reads.set(fixture.reads.get() + 1);
+            if let Some(callback) = fixture.on_read.take() {
+                callback();
+            }
+            i32::from(fixture.muted.get())
+        }
+        unsafe extern "C" fn write(raw: *mut sys::_cef_browser_host_t, muted: i32) {
+            let fixture = cef::rc::RcImpl::<sys::_cef_browser_host_t, Shared>::get(raw)
+                .interface
+                .clone();
+            fixture.writes.borrow_mut().push(muted != 0);
+            if !fixture.ignore_write.get() {
+                fixture.muted.set(muted != 0);
+            }
+            if let Some(callback) = fixture.on_write.take() {
+                callback();
+            }
+        }
+        unsafe extern "C" fn host(raw: *mut sys::_cef_browser_t) -> *mut sys::_cef_browser_host_t {
+            let host = cef::rc::RcImpl::<sys::_cef_browser_t, BrowserHost>::get(raw)
+                .interface
+                .clone();
+            host.into()
+        }
+        let mut raw_host = unsafe { std::mem::zeroed::<sys::_cef_browser_host_t>() };
+        raw_host.is_audio_muted = Some(read);
+        raw_host.set_audio_muted = Some(write);
+        let raw_host = cef::rc::RcImpl::new(raw_host, fixture.clone());
+        let host_value: BrowserHost =
+            cef::rc::ConvertReturnValue::wrap_result(raw_host.cast::<sys::_cef_browser_host_t>());
+        let mut raw_browser = unsafe { std::mem::zeroed::<sys::_cef_browser_t>() };
+        raw_browser.get_host = Some(host);
+        let raw_browser = cef::rc::RcImpl::new(raw_browser, host_value);
+        let mut tab = native_blank_tab();
+        tab.browser =
+            cef::rc::ConvertReturnValue::wrap_result(raw_browser.cast::<sys::_cef_browser_t>());
+        tab
+    }
+
+    fn setup_audio() -> (std::rc::Rc<AudioFixture>, TabAudioTarget) {
+        clear();
+        let fixture = std::rc::Rc::new(AudioFixture::default());
+        STATE.with(|slot| {
+            let mut state = slot.borrow_mut();
+            state.tabs.insert(7, audio_tab(&fixture));
+            state.spaces.insert(7, USER_SPACE, true);
+        });
+        let target = capture_tab_audio_target(7, USER_SPACE, 4).unwrap();
+        (fixture, target)
+    }
+
+    #[test]
+    fn tab_audio_changes_only_selected_webcontents_without_ai_handoff() {
+        let (fixture, _) = setup_audio();
+        let other = std::rc::Rc::new(AudioFixture::default());
+        let space = STATE.with(|slot| {
+            let mut state = slot.borrow_mut();
+            let task = state.tasks.create("audio").unwrap();
+            let scope = TaskScope {
+                task: task.id.clone(),
+                revision: task.revision,
+            };
+            state.tasks.attach(&scope, 7, Origin::Borrowed).unwrap();
+            let tasks = state.tasks.list();
+            state.spaces.update_tasks(&tasks);
+            state.spaces.adopt(7, &scope.task);
+            state.spaces.show(&scope.task);
+            state.tabs.insert(8, audio_tab(&other));
+            state.spaces.insert(8, USER_SPACE, false);
+            task.id
+        });
+        let snapshot = || {
+            STATE.with(|slot| {
+                let state = slot.borrow();
+                json!({"tasks": state.tasks.list(), "spaces": state.spaces.views(),
+                "active": state.spaces.active_space(), "selected": state.spaces.active_tab(),
+                "epoch": state.tabs[&7].navigation.epoch,
+                "url": state.tabs[&7].navigation.requested_url})
+            })
+        };
+        let before = snapshot();
+        let target = capture_tab_audio_target(7, &space, 4).unwrap();
+        assert!(!read_tab_audio(&target).unwrap());
+        assert!(set_tab_audio_muted(&target, false, true, || true).unwrap());
+        assert!(!set_tab_audio_muted(&target, true, false, || true).unwrap());
+        assert_eq!(*fixture.writes.borrow(), [true, false]);
+        assert!(other.writes.borrow().is_empty());
+        assert_eq!(other.reads.get(), 0);
+        assert_eq!(snapshot(), before);
+        STATE.with(|slot| assert_eq!(slot.borrow().tabs[&7].audio_muted, Some(false)));
+        clear();
+    }
+
+    #[test]
+    fn tab_audio_rejects_stale_selection_document_owner_and_failed_tabs() {
+        let changes: [fn(&mut State); 7] = [
+            |state| {
+                state.spaces.set_overview(true);
+            },
+            |state| {
+                state.spaces.insert(8, USER_SPACE, true);
+            },
+            |state| {
+                state.tabs.get_mut(&7).unwrap().navigation.epoch += 1;
+            },
+            |state| {
+                state.tabs.get_mut(&7).unwrap().rejected_creation = true;
+            },
+            |state| {
+                state.tabs.get_mut(&7).unwrap().navigation.renderer_exit =
+                    Some(json!({"status":"crashed"}));
+            },
+            |state| {
+                state.tabs.remove(&7);
+            },
+            |state| {
+                let task = state.tasks.create("new owner").unwrap();
+                state
+                    .tasks
+                    .attach(
+                        &TaskScope {
+                            task: task.id,
+                            revision: task.revision,
+                        },
+                        7,
+                        Origin::Borrowed,
+                    )
+                    .unwrap();
+            },
+        ];
+        for change in changes {
+            let (fixture, target) = setup_audio();
+            STATE.with(|slot| change(&mut slot.borrow_mut()));
+            assert!(read_tab_audio(&target).is_err());
+            assert!(set_tab_audio_muted(&target, false, true, || true).is_err());
+            assert_eq!(fixture.reads.get(), 0);
+            assert!(fixture.writes.borrow().is_empty());
+        }
+        let (_, target) = setup_audio();
+        STATE.with(|slot| {
+            slot.borrow_mut().tabs.insert(7, native_blank_tab());
+        });
+        assert!(
+            read_tab_audio(&target)
+                .unwrap_err()
+                .contains("읽을 수 없습니다")
+        );
+        clear();
+    }
+
+    #[test]
+    fn tab_audio_revalidates_after_native_getter_and_ui_changes() {
+        let (fixture, target) = setup_audio();
+        fixture.on_read.set(Some(|| {
+            STATE.with(|slot| {
+                slot.borrow_mut().tabs.get_mut(&7).unwrap().navigation.epoch += 1;
+            })
+        }));
+        assert!(set_tab_audio_muted(&target, false, true, || true).is_err());
+        assert!(fixture.writes.borrow().is_empty());
+        let (fixture, target) = setup_audio();
+        let checks = std::cell::Cell::new(0);
+        assert!(
+            set_tab_audio_muted(&target, false, true, || {
+                checks.set(checks.get() + 1);
+                checks.get() == 1
+            })
+            .is_err()
+        );
+        assert_eq!(checks.get(), 2);
+        assert!(fixture.writes.borrow().is_empty());
+        fixture.muted.set(true);
+        assert!(set_tab_audio_muted(&target, false, false, || true).is_err());
+        assert!(fixture.writes.borrow().is_empty());
+        STATE.with(|slot| assert_eq!(slot.borrow().tabs[&7].audio_muted, Some(true)));
+        clear();
+    }
+
+    #[test]
+    fn tab_audio_reports_unconfirmed_write_and_never_reads_closed_host() {
+        let (fixture, target) = setup_audio();
+        fixture.ignore_write.set(true);
+        let error = set_tab_audio_muted(&target, false, true, || true).unwrap_err();
+        assert!(error.contains("요청했지만 설정에 반영되지"));
+        assert_eq!(*fixture.writes.borrow(), [true]);
+        STATE.with(|slot| assert_eq!(slot.borrow().tabs[&7].audio_muted, Some(false)));
+        let (fixture, target) = setup_audio();
+        fixture.on_write.set(Some(|| {
+            STATE.with(|slot| {
+                slot.borrow_mut().tabs.remove(&7);
+            })
+        }));
+        let error = set_tab_audio_muted(&target, false, true, || true).unwrap_err();
+        assert!(error.contains("요청했지만 탭이 바뀌어"));
+        assert_eq!(*fixture.writes.borrow(), [true]);
+        assert_eq!(fixture.reads.get(), 1);
+        clear();
+    }
+
+    #[test]
+    fn start_page_requires_native_provenance_and_a_settled_blank_document() {
+        assert!(native_blank_tab().start_page_ready(false));
+        assert!(!native_blank_tab().start_page_ready(true));
+        let changes: [fn(&mut Tab); 14] = [
+            |tab| tab.native_start_page = false,
+            |tab| tab.rejected_creation = true,
+            |tab| tab.navigation.requested_url = "about:blank#content".into(),
+            |tab| tab.navigation.committed = false,
+            |tab| tab.navigation.document_available = false,
+            |tab| tab.navigation.main_load_complete = false,
+            |tab| tab.navigation.provisional = true,
+            |tab| tab.navigation.intent_pending = true,
+            |tab| tab.navigation.stopped = true,
+            |tab| tab.navigation.stop_pending = true,
+            |tab| tab.navigation.incomplete = true,
+            |tab| tab.navigation.error = Some(json!({"code": -3})),
+            |tab| tab.navigation.renderer_exit = Some(json!({"status": "crashed"})),
+            |tab| tab.navigation.recovering = true,
+        ];
+        for change in changes {
+            let mut tab = native_blank_tab();
+            change(&mut tab);
+            assert!(!tab.start_page_ready(false));
+        }
+        let mut tab = native_blank_tab();
+        tab.observe_start_page_url("https://example.test/");
+        tab.observe_start_page_url("about:blank");
+        assert!(!tab.start_page_ready(false));
+    }
+
+    #[test]
+    fn start_page_revalidates_selection_document_and_creation_before_handoff() {
+        clear();
+        let scope = STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let task = state.tasks.create("start page owner").unwrap();
+            let scope = TaskScope {
+                task: task.id,
+                revision: task.revision,
+            };
+            state.tasks.attach(&scope, 7, Origin::Borrowed).unwrap();
+            let tasks = state.tasks.list();
+            state.spaces.update_tasks(&tasks);
+            state.spaces.insert(7, &scope.task, false);
+            state.spaces.insert(8, USER_SPACE, false);
+            state.spaces.show(&scope.task);
+            state.tabs.insert(7, native_blank_tab());
+            scope
+        });
+        let target = StartPageTarget {
+            tab: 7,
+            space: scope.task.clone(),
+            navigation_epoch: 4,
+        };
+        let validate = |target: &StartPageTarget, loading, blank| {
+            STATE.with(|state| validate_start_page_state(&state.borrow(), target, loading, blank))
+        };
+        assert!(validate(&target, false, true).is_ok());
+        assert!(validate(&target, true, true).is_err());
+        assert!(validate(&target, false, false).is_err());
+        for stale in [
+            StartPageTarget {
+                tab: 8,
+                ..target.clone()
+            },
+            StartPageTarget {
+                space: USER_SPACE.into(),
+                ..target.clone()
+            },
+            StartPageTarget {
+                navigation_epoch: 3,
+                ..target.clone()
+            },
+        ] {
+            assert!(validate(&stale, false, true).is_err());
+        }
+        STATE.with(|state| state.borrow_mut().spaces.set_overview(true));
+        assert!(validate(&target, false, true).is_err());
+        STATE.with(|state| state.borrow_mut().spaces.show(USER_SPACE));
+        assert!(validate(&target, false, true).is_err());
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.spaces.show(&scope.task);
+            state.tabs.get_mut(&7).unwrap().rejected_creation = true;
+        });
+        assert!(validate(&target, false, true).is_err());
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let tab = state.tabs.get_mut(&7).unwrap();
+            tab.rejected_creation = false;
+            // A native/CLI blank reload preserves provenance but invalidates
+            // the old form, including after the same blank document settles.
+            tab.navigation.begin(None);
+            assert!(tab.native_start_page);
+            tab.navigation.commit("about:blank");
+            tab.navigation.document_available = true;
+            tab.navigation.main_load_complete = true;
+        });
+        assert!(validate(&target, false, true).is_err());
+        let current = STATE.with(|state| StartPageTarget {
+            navigation_epoch: state.borrow().tabs[&7].navigation.epoch,
+            ..target.clone()
+        });
+        assert!(validate(&current, false, true).is_ok());
+        for input in [
+            "javascript:alert(1)",
+            "https://user:secret@example.test/",
+            "http://",
+        ] {
+            assert!(navigate_from_start_page(&current, input).is_err());
+        }
+        assert!(navigate_from_start_page(&current, "  ").is_ok());
+        // The inert browser has no actual main frame; no owner may be handed
+        // off merely because the cached/tracked document still looks blank.
+        assert!(navigate_from_start_page(&current, "example.test").is_err());
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let task = state.tasks.info(&scope.task).unwrap();
+            assert_eq!(task.status, Status::Active);
+            assert_eq!(task.revision, scope.revision);
+            assert_eq!(state.spaces.active_space(), scope.task);
+            assert_eq!(state.spaces.active_tab(), Some(7));
+            state.spaces.release(7);
+        });
+        assert!(validate(&current, false, true).is_err());
+        clear();
+        assert!(validate_start_page_target(&current).is_err());
+    }
+
+    #[test]
+    fn page_failure_only_projects_settled_concrete_load_errors() {
+        let failed = || Navigation {
+            error: Some(
+                json!({"code": -105, "text": "raw detail", "failedUrl": "https://example.test/"}),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            failed().page_failure(false),
+            Some(PageFailure::Load { code: -105 })
+        );
+        assert_eq!(failed().page_failure(true), None);
+        for change in [
+            |nav: &mut Navigation| nav.provisional = true,
+            |nav: &mut Navigation| nav.recovering = true,
+            |nav: &mut Navigation| nav.intent_pending = true,
+            |nav: &mut Navigation| nav.stop_pending = true,
+            |nav: &mut Navigation| nav.stopped = true,
+        ] {
+            let mut nav = failed();
+            change(&mut nav);
+            assert_eq!(nav.page_failure(false), None);
+        }
+        for code in [
+            json!(Errorcode::ABORTED.get_raw()),
+            json!("-105"),
+            json!(-105.5),
+            json!(i64::MAX),
+            Json::Null,
+        ] {
+            let mut nav = failed();
+            nav.error = Some(json!({"code": code}));
+            assert_eq!(nav.page_failure(false), None);
+        }
+        let mut nav = Navigation::default();
+        assert_eq!(nav.page_failure(false), None);
+        nav.begin(None);
+        nav.finish_loading();
+        assert!(nav.incomplete);
+        assert_eq!(nav.page_failure(false), None);
+    }
+
+    #[test]
+    fn renderer_failure_remains_recoverable_after_an_uncommitted_stopped_retry() {
+        let mut nav = Navigation::default();
+        nav.renderer_failed(json!({"status": "crashed"}));
+        assert_eq!(nav.page_failure(false), Some(PageFailure::Renderer));
+        assert_eq!(nav.page_failure(true), Some(PageFailure::Renderer));
+        nav.begin(None);
+        assert_eq!(nav.page_failure(false), None);
+        nav.stopped = true;
+        nav.finish_loading();
+        assert_eq!(nav.page_failure(false), Some(PageFailure::Renderer));
+        nav.begin(None);
+        nav.commit("https://example.test/recovered");
+        nav.finish_loading();
+        assert_eq!(nav.page_failure(false), None);
+    }
+
+    #[test]
+    fn trailing_abort_preserves_only_the_same_urls_concrete_failure() {
+        let url = "https://example.test/failed";
+        let other = "https://example.test/other";
+        let mut nav = Navigation::default();
+        nav.begin(Some(url));
+        nav.load_failed(-324, "ERR_EMPTY_RESPONSE", url);
+        nav.load_failed(Errorcode::ABORTED.get_raw(), "ERR_ABORTED", url);
+        nav.finish_loading();
+        assert_eq!(
+            nav.page_failure(false),
+            Some(PageFailure::Load { code: -324 })
+        );
+        assert_eq!(nav.error.as_ref().unwrap()["text"], "ERR_EMPTY_RESPONSE");
+        nav.load_failed(Errorcode::ABORTED.get_raw(), "ERR_ABORTED", other);
+        assert_eq!(nav.page_failure(false), None);
+        nav.begin(Some(url));
+        nav.load_failed(-324, "ERR_EMPTY_RESPONSE", url);
+        nav.begin(Some(url));
+        assert!(nav.error.is_none());
+        nav.load_failed(Errorcode::ABORTED.get_raw(), "ERR_ABORTED", url);
+        nav.finish_loading();
+        assert_eq!(nav.page_failure(false), None);
+        nav.begin(Some(url));
+        nav.load_failed(-324, "ERR_EMPTY_RESPONSE", url);
+        nav.commit(other);
+        assert!(nav.error.is_none());
+        nav.stopped = true;
+        nav.load_failed(Errorcode::ABORTED.get_raw(), "ERR_ABORTED", other);
+        assert!(nav.error.is_none());
+    }
+
+    #[test]
+    fn automatic_same_url_browse_hides_candidate_until_a_matching_abort() {
+        let url = "https://example.test/failed";
+        let mut nav = Navigation::default();
+        nav.begin(Some(url));
+        nav.load_failed(-324, "ERR_EMPTY_RESPONSE", url);
+        let failed_epoch = nav.epoch;
+        for _ in 0..2 {
+            nav.begin_browse(url, false, false, TransitionType::RELOAD.get_raw());
+            // poll_wait only examines public error, so an ongoing retry does
+            // not immediately report the previous NAVIGATION_FAILED result.
+            assert!(nav.error.is_none());
+            assert!(nav.automatic_retry_error.is_some());
+            assert!(nav.provisional && nav.intent_pending);
+            assert_eq!(nav.page_failure(false), None);
+        }
+        assert!(nav.epoch > failed_epoch);
+        nav.load_failed(Errorcode::ABORTED.get_raw(), "ERR_ABORTED", url);
+        nav.finish_loading();
+        assert!(nav.automatic_retry_error.is_none());
+        assert_eq!(
+            nav.page_failure(false),
+            Some(PageFailure::Load { code: -324 })
+        );
+        assert_eq!(nav.error.as_ref().unwrap()["text"], "ERR_EMPTY_RESPONSE");
+    }
+
+    #[test]
+    fn new_navigation_boundaries_discard_an_automatic_retry_candidate() {
+        let url = "https://example.test/failed";
+        let other = "https://example.test/other";
+        for (next_url, gesture, redirect, transition) in [
+            (url, true, false, 0),
+            (url, false, true, 0),
+            (other, false, false, 0),
+            (
+                url,
+                false,
+                false,
+                TransitionType::CLIENT_REDIRECT_FLAG.get_raw(),
+            ),
+            (
+                url,
+                false,
+                false,
+                TransitionType::SERVER_REDIRECT_FLAG.get_raw(),
+            ),
+            (
+                url,
+                false,
+                false,
+                TransitionType::FORWARD_BACK_FLAG.get_raw(),
+            ),
+        ] {
+            let mut nav = Navigation::default();
+            nav.begin(Some(url));
+            nav.load_failed(-324, "ERR_EMPTY_RESPONSE", url);
+            nav.begin_browse(url, false, false, 0);
+            nav.begin_browse(next_url, gesture, redirect, transition);
+            assert!(nav.error.is_none() && nav.automatic_retry_error.is_none());
+            nav.load_failed(Errorcode::ABORTED.get_raw(), "ERR_ABORTED", next_url);
+            nav.finish_loading();
+            assert_eq!(nav.page_failure(false), None);
+        }
+        for next in [None, Some(url), Some(other)] {
+            let mut nav = Navigation::default();
+            nav.begin(Some(url));
+            nav.load_failed(-324, "ERR_EMPTY_RESPONSE", url);
+            nav.begin_browse(url, false, false, 0);
+            nav.begin(next);
+            assert!(nav.error.is_none() && nav.automatic_retry_error.is_none());
+        }
+    }
+
+    #[test]
+    fn successful_commit_clears_both_visible_and_pending_load_failures() {
+        let url = "https://example.test/failed";
+        for automatic in [false, true] {
+            let mut nav = Navigation::default();
+            nav.begin(Some(url));
+            nav.load_failed(-324, "ERR_EMPTY_RESPONSE", url);
+            if automatic {
+                nav.begin_browse(url, false, false, 0);
+            }
+            nav.commit(url);
+            nav.finish_loading();
+            assert!(nav.error.is_none() && nav.automatic_retry_error.is_none());
+            assert_eq!(nav.page_failure(false), None);
+            nav.begin_browse(url, false, false, 0);
+            nav.load_failed(Errorcode::ABORTED.get_raw(), "ERR_ABORTED", url);
+            nav.finish_loading();
+            assert_eq!(nav.page_failure(false), None);
+        }
+    }
+
+    #[test]
+    fn automatic_retry_candidate_does_not_survive_other_terminal_events() {
+        let url = "https://example.test/failed";
+        let pending = || {
+            let mut nav = Navigation::default();
+            nav.begin(Some(url));
+            nav.load_failed(-324, "ERR_EMPTY_RESPONSE", url);
+            nav.begin_browse(url, false, false, 0);
+            nav
+        };
+        let mut nav = pending();
+        nav.load_failed(-105, "ERR_NAME_NOT_RESOLVED", url);
+        nav.finish_loading();
+        assert!(nav.automatic_retry_error.is_none());
+        assert_eq!(
+            nav.page_failure(false),
+            Some(PageFailure::Load { code: -105 })
+        );
+        let mut nav = pending();
+        nav.load_failed(
+            Errorcode::ABORTED.get_raw(),
+            "ERR_ABORTED",
+            "https://example.test/other",
+        );
+        nav.finish_loading();
+        assert!(nav.automatic_retry_error.is_none());
+        assert_eq!(nav.page_failure(false), None);
+        let mut nav = pending();
+        nav.finish_loading();
+        assert!(nav.error.is_none() && nav.automatic_retry_error.is_none());
+        assert!(nav.incomplete);
+        let mut nav = pending();
+        nav.stopped = true;
+        nav.load_failed(Errorcode::ABORTED.get_raw(), "ERR_ABORTED", url);
+        nav.finish_loading();
+        assert!(nav.error.is_none() && nav.automatic_retry_error.is_none());
+        let mut nav = pending();
+        nav.renderer_failed(json!({"status":"crashed"}));
+        assert!(nav.error.is_none() && nav.automatic_retry_error.is_none());
+        nav.begin(None);
+        nav.load_failed(Errorcode::ABORTED.get_raw(), "ERR_ABORTED", url);
+        nav.finish_loading();
+        assert_eq!(nav.page_failure(false), Some(PageFailure::Renderer));
+    }
+
+    #[test]
+    fn stale_recovery_targets_and_loading_renderer_retry_do_not_handoff() {
+        clear();
+        let browser = |loading| {
+            unsafe extern "C" fn still_loading(_: *mut sys::_cef_browser_t) -> i32 {
+                1
+            }
+            let mut raw = unsafe { std::mem::zeroed::<sys::_cef_browser_t>() };
+            if loading {
+                raw.is_loading = Some(still_loading);
+            }
+            let raw = cef::rc::RcImpl::new(raw, ());
+            cef::rc::ConvertReturnValue::wrap_result(raw.cast::<sys::_cef_browser_t>())
+        };
+        let scope = STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let task = state.tasks.create("recovery owner").unwrap();
+            let scope = TaskScope {
+                task: task.id,
+                revision: task.revision,
+            };
+            state.tasks.attach(&scope, 7, Origin::Borrowed).unwrap();
+            let tasks = state.tasks.list();
+            state.spaces.update_tasks(&tasks);
+            state.spaces.insert(7, &scope.task, false);
+            state.spaces.insert(8, USER_SPACE, false);
+            state.spaces.show(&scope.task);
+            state.tabs.insert(
+                7,
+                Tab {
+                    browser: browser(false),
+                    title: String::new(),
+                    rejected_creation: false,
+                    native_start_page: false,
+                    audio_muted: None,
+                    _devtools: None,
+                    navigation: Navigation {
+                        epoch: 4,
+                        error: Some(json!({"code": -105})),
+                        ..Default::default()
+                    },
+                },
+            );
+            scope
+        });
+        let target = PageRecoveryTarget {
+            tab: 7,
+            navigation_epoch: 4,
+            space: scope.task.clone(),
+            failure: PageFailure::Load { code: -105 },
+        };
+        assert!(validate_failed_page_target(&target).is_ok());
+        for stale in [
+            PageRecoveryTarget {
+                tab: 8,
+                ..target.clone()
+            },
+            PageRecoveryTarget {
+                navigation_epoch: 3,
+                ..target.clone()
+            },
+            PageRecoveryTarget {
+                space: USER_SPACE.into(),
+                ..target.clone()
+            },
+            PageRecoveryTarget {
+                failure: PageFailure::Renderer,
+                ..target.clone()
+            },
+        ] {
+            assert!(retry_failed_page(&stale).is_err());
+        }
+        STATE.with(|state| state.borrow_mut().spaces.set_overview(true));
+        assert!(retry_failed_page(&target).is_err());
+        STATE.with(|state| state.borrow_mut().spaces.show(USER_SPACE));
+        assert!(retry_failed_page(&target).is_err());
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.spaces.show(&scope.task);
+            state.tabs.get_mut(&7).unwrap().rejected_creation = true;
+        });
+        assert!(retry_failed_page(&target).is_err());
+        let renderer = STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let tab = state.tabs.get_mut(&7).unwrap();
+            tab.rejected_creation = false;
+            tab.browser = browser(true);
+            tab.navigation.renderer_failed(json!({"status": "crashed"}));
+            PageRecoveryTarget {
+                navigation_epoch: tab.navigation.epoch,
+                failure: PageFailure::Renderer,
+                ..target.clone()
+            }
+        });
+        assert!(validate_failed_page_target(&renderer).is_ok());
+        assert!(retry_failed_page(&renderer).is_err());
+        STATE.with(|state| {
+            let state = state.borrow();
+            let task = state.tasks.info(&scope.task).unwrap();
+            assert_eq!(task.status, Status::Active);
+            assert_eq!(task.revision, scope.revision);
+            assert_eq!(state.spaces.active_space(), scope.task);
+            assert_eq!(state.spaces.active_tab(), Some(7));
+        });
+        clear();
+        assert!(validate_failed_page_target(&target).is_err());
+    }
+
     #[test]
     fn download_permission_expires_on_ownership_revision_document_and_tab_failure() {
         clear();
@@ -3131,6 +4982,8 @@ mod tests {
                     browser,
                     title: String::new(),
                     rejected_creation: false,
+                    native_start_page: false,
+                    audio_muted: None,
                     _devtools: None,
                     navigation: Navigation {
                         epoch: 1,
@@ -3238,6 +5091,143 @@ mod tests {
         assert!(download_permission_context(7).is_err());
         clear();
         assert!(validate_download_permission(&loading).is_err());
+    }
+
+    #[test]
+    fn download_source_reveal_preserves_control_and_survives_attachment_intents() {
+        clear();
+        let page = || {
+            let mut tab = native_blank_tab();
+            tab.navigation.document_epoch = 7;
+            tab
+        };
+        let scope = STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let task = state.tasks.create(&"긴".repeat(64)).unwrap();
+            let scope = TaskScope {
+                task: task.id,
+                revision: task.revision,
+            };
+            let tasks = state.tasks.list();
+            state.spaces.update_tasks(&tasks);
+            state.tabs.insert(7, page());
+            state.tabs.insert(8, page());
+            state.spaces.insert(7, &scope.task, false);
+            state.spaces.insert(8, USER_SPACE, true);
+            state.tasks.attach(&scope, 7, Origin::Created).unwrap();
+            scope
+        });
+        let snapshot = || {
+            STATE.with(|state| {
+                let state = state.borrow();
+                json!({"spaces":state.spaces.views(), "active":state.spaces.active_space(),
+                    "overview":state.spaces.overview(), "tasks":state.tasks.list()})
+            })
+        };
+        let context = download_context(7).unwrap();
+        assert_eq!(context.scope, Some(scope.clone()));
+        assert!(context.source.chars().count() <= 80);
+        assert!(context.source.ends_with("탭 7"));
+        let target = context.source_target;
+        // Source viewing does not require a CanDownload permission attempt.
+        assert!(download_permission_context(7).is_err());
+        assert!(validate_download_source(&target).is_ok());
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let nav = &mut state.tabs.get_mut(&7).unwrap().navigation;
+            nav.begin_browse("https://example.test/file-one", false, false, 0);
+            nav.begin_browse("https://example.test/file-two", false, false, 0);
+            assert!(nav.provisional && nav.intent_pending);
+            assert!(nav.epoch > 4);
+            state.spaces.set_overview(true);
+        });
+        assert!(validate_download_source(&target).is_ok());
+        let tasks = STATE.with(|state| state.borrow().tasks.list());
+        assert_eq!(reveal_download_source(&target), Ok(7));
+        STATE.with(|state| {
+            let state = state.borrow();
+            assert_eq!(state.spaces.active_space(), scope.task);
+            assert_eq!(state.spaces.active_tab(), Some(7));
+            assert!(!state.spaces.overview());
+            assert_eq!(state.tasks.list(), tasks);
+        });
+        STATE.with(|state| state.borrow_mut().spaces.show(USER_SPACE));
+        let reject_unchanged = |target: &crate::downloads::SourceTarget| {
+            let before = snapshot();
+            assert!(validate_download_source(target).is_err());
+            assert!(reveal_download_source(target).is_err());
+            assert_eq!(snapshot(), before);
+        };
+        for change in [
+            (|tab: &mut Tab| tab.navigation.document_epoch += 1) as fn(&mut Tab),
+            |tab| tab.navigation.renderer_exit = Some(json!({"status":"crashed"})),
+            |tab| tab.rejected_creation = true,
+        ] {
+            STATE.with(|state| change(state.borrow_mut().tabs.get_mut(&7).unwrap()));
+            reject_unchanged(&target);
+            STATE.with(|state| state.borrow_mut().tabs.insert(7, page()));
+        }
+        STATE.with(|state| state.borrow_mut().spaces.remove(7));
+        reject_unchanged(&target);
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.spaces.insert(7, &scope.task, false);
+            state.tabs.remove(&7);
+        });
+        reject_unchanged(&target);
+        STATE.with(|state| state.borrow_mut().tabs.insert(7, page()));
+        // This shared boundary is called by explicit native/CLI navigation,
+        // stop, and main-frame address changes, unlike attachment BeforeBrowse.
+        revoke_download_permission_provenance(7);
+        reject_unchanged(&target);
+        let current = download_context(7).unwrap().source_target;
+        assert!(validate_download_source(&current).is_ok());
+        let paused = STATE.with(|state| state.borrow_mut().tasks.handoff(&scope).unwrap());
+        reject_unchanged(&current);
+        expire_tab_refs([7]);
+        let paused_context = download_context(7).unwrap();
+        assert_eq!(paused_context.scope, None);
+        assert!(paused_context.source.contains("사용자 제어"));
+        assert!(paused_context.source.ends_with("탭 7"));
+        assert!(paused_context.source.chars().count() <= 80);
+        let paused_target = paused_context.source_target;
+        assert_eq!(paused_target.owner.as_ref().unwrap().1, Status::Paused);
+        assert!(validate_download_source(&paused_target).is_ok());
+        let resumed = STATE.with(|state| {
+            state
+                .borrow_mut()
+                .tasks
+                .resume(&TaskScope {
+                    task: paused.id,
+                    revision: paused.revision,
+                })
+                .unwrap()
+        });
+        reject_unchanged(&paused_target);
+        // File Save As scope deliberately remains independent of this link.
+        assert!(validate_download(7, paused_context.scope.as_ref()).is_ok());
+        let resumed_scope = TaskScope {
+            task: resumed.id,
+            revision: resumed.revision,
+        };
+        let user_target = download_context(8).unwrap().source_target;
+        STATE.with(|state| {
+            state
+                .borrow_mut()
+                .tasks
+                .attach(&resumed_scope, 8, Origin::Borrowed)
+                .unwrap();
+        });
+        reject_unchanged(&user_target);
+        expire_tab_refs([8]);
+        STATE.with(|state| {
+            state.borrow_mut().tasks.release(&resumed_scope, 8).unwrap();
+        });
+        expire_tab_refs([8]);
+        reject_unchanged(&user_target);
+        let fresh_user = download_context(8).unwrap().source_target;
+        assert!(validate_download_source(&fresh_user).is_ok());
+        clear();
     }
 
     #[test]
@@ -3719,8 +5709,8 @@ mod tests {
             state.spaces.show(&scope.task);
             scope
         });
-        assert!(select_bookmark_tab(7).is_err());
-        select_bookmark_tab(8).unwrap();
+        assert!(select_user_tab(7).is_err());
+        select_user_tab(8).unwrap();
         STATE.with(|state| {
             let state = state.borrow();
             assert_eq!(state.spaces.active_space(), USER_SPACE);
@@ -3748,8 +5738,8 @@ mod tests {
                 .attach(&scope, 8, Origin::Borrowed)
                 .unwrap()
         });
-        assert!(select_bookmark_tab(8).is_err());
-        assert!(select_bookmark_tab(99).is_err());
+        assert!(select_user_tab(8).is_err());
+        assert!(select_user_tab(99).is_err());
         assert_eq!(
             prefer_bookmark_tab(Some(8), [4, 8, 12].into_iter()),
             Some(8)
@@ -3759,6 +5749,722 @@ mod tests {
             Some(4)
         );
         assert_eq!(prefer_bookmark_tab(Some(7), [].into_iter()), None);
+        clear();
+    }
+
+    #[test]
+    fn history_observer_keeps_navigation_generation_and_fresh_titles() {
+        let first = "https://example.test/first";
+        let next = "https://example.test/next#section";
+        let mut history = HistoryObservation::default();
+        history.begin(Some(4), true);
+        history.begin(Some(5), false); // redirect after a clear cannot upgrade it
+        history.commit(2, first, Some(5));
+        assert!(history.action(first.into()).is_none()); // no successful HTTP end
+        history.document.as_mut().unwrap().successful_http = true;
+        let initial = history.action(first.into()).unwrap();
+        assert_eq!(initial.generation, 4);
+        assert_eq!(initial.title, first);
+        assert!(!initial.update_title);
+        history.accepted(&initial);
+        assert!(history.action(first.into()).is_none());
+        history.title_changed(" Fresh\n title ");
+        let title = history.action(first.into()).unwrap();
+        assert_eq!(title.title, "Fresh title");
+        assert!(title.update_title);
+        history.accepted(&title);
+        history.address_changed(next);
+        let spa = history.action(next.into()).unwrap();
+        assert_eq!(spa.generation, 4); // old document cannot revive a cleared generation
+        assert_eq!(spa.document_epoch, 2);
+        assert_eq!(spa.title, next);
+        assert!(!spa.update_title);
+        history.accepted(&spa);
+        history.begin(Some(5), true);
+        history.commit(3, next, Some(5));
+        history.document.as_mut().unwrap().successful_http = true;
+        assert_eq!(history.action(next.into()).unwrap().generation, 5);
+        assert_eq!(history.action(next.into()).unwrap().title, next);
+        history.staged = true;
+        assert!(history.action(next.into()).is_none());
+        history.staged = false;
+        assert!(history.action(next.into()).is_some());
+        history.revoke();
+        history.commit(4, next, Some(9));
+        assert!(history.document.is_none()); // release/late commit cannot promote revoked provenance
+        history.attempt = None;
+        history.revoke();
+        history.commit(5, next, Some(9));
+        assert!(history.document.is_none());
+        history.begin(Some(9), false);
+        history.commit(6, next, Some(9));
+        assert!(history.document.is_some());
+        history.begin(Some(9), true);
+        history.commit(7, "about:blank", Some(9));
+        assert!(history.document.is_none());
+    }
+
+    #[test]
+    fn history_collection_requires_live_user_document_and_revokes_transfer() {
+        clear();
+        let url = "https://example.test/history";
+        let scope = STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let task = state.tasks.create("history excluded AI").unwrap();
+            let scope = TaskScope {
+                task: task.id,
+                revision: task.revision,
+            };
+            let tasks = state.tasks.list();
+            state.spaces.update_tasks(&tasks);
+            let mut tab = native_blank_tab();
+            tab.navigation.requested_url = url.into();
+            tab.navigation.history.begin(Some(8), true);
+            tab.navigation.history.commit(0, url, Some(8));
+            tab.navigation
+                .history
+                .document
+                .as_mut()
+                .unwrap()
+                .successful_http = true;
+            state.tabs.insert(7, tab);
+            state.spaces.insert(7, USER_SPACE, true);
+            // Collection does not depend on which space the user is viewing.
+            state.spaces.show(&scope.task);
+            assert!(history_page_ready(&state, 7, 4, 0));
+            assert!(!history_page_ready(&state, 7, 5, 0));
+            assert!(!history_page_ready(&state, 7, 4, 1));
+            state.tabs.get_mut(&7).unwrap().navigation.history.staged = true;
+            assert!(!history_page_ready(&state, 7, 4, 0));
+            state.tabs.get_mut(&7).unwrap().navigation.history.staged = false;
+            state.tabs.get_mut(&7).unwrap().rejected_creation = true;
+            assert!(!history_page_ready(&state, 7, 4, 0));
+            state.tabs.get_mut(&7).unwrap().rejected_creation = false;
+            state.tasks.attach(&scope, 7, Origin::Borrowed).unwrap();
+            assert!(!history_page_ready(&state, 7, 4, 0));
+            state.spaces.adopt(7, &scope.task);
+            scope
+        });
+        expire_tab_refs([7]);
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.tasks.release(&scope, 7).unwrap();
+            state.spaces.release(7);
+            let nav = &mut state.tabs.get_mut(&7).unwrap().navigation;
+            assert!(nav.history.document.is_none());
+            nav.history.commit(1, url, Some(9));
+            assert!(nav.history.document.is_none());
+            nav.history.begin(Some(9), true);
+            nav.history.commit(1, url, Some(9));
+            nav.history.document.as_mut().unwrap().successful_http = true;
+            nav.load_failed(-324, "network failure", url);
+            assert!(nav.history.document.is_none());
+            nav.history.begin(Some(9), true);
+            nav.history.commit(1, url, Some(9));
+            nav.renderer_failed(json!({"status":"crashed"}));
+            assert!(nav.history.document.is_none());
+            state.tabs.remove(&7);
+            assert!(!history_page_ready(&state, 7, 5, 0));
+        });
+        clear();
+    }
+
+    #[test]
+    fn saved_history_open_rechecks_clear_and_preserves_ai_control() {
+        clear();
+        let url = "https://example.test/saved";
+        let scope = STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let task = state.tasks.create("saved page source").unwrap();
+            let scope = TaskScope {
+                task: task.id,
+                revision: task.revision,
+            };
+            let tasks = state.tasks.list();
+            state.spaces.update_tasks(&tasks);
+            state.tabs.insert(7, native_blank_tab());
+            state.spaces.insert(7, &scope.task, false);
+            state.tasks.attach(&scope, 7, Origin::Created).unwrap();
+            let mut target = native_blank_tab();
+            target.navigation.requested_url = url.into();
+            state.tabs.insert(8, target);
+            state.spaces.insert(8, USER_SPACE, false);
+            state.spaces.show(&scope.task);
+            scope
+        });
+        let before = STATE.with(|state| user_open_selection(&state.borrow()));
+        assert!(open_history_url(url, || false).is_err());
+        let calls = std::cell::Cell::new(0);
+        assert!(
+            open_history_url(url, || {
+                calls.set(calls.get() + 1);
+                calls.get() == 1
+            })
+            .is_err()
+        );
+        STATE.with(|state| {
+            let state = state.borrow();
+            assert_eq!(user_open_selection(&state), before);
+            assert!(validate_saved_user_destination(&state, 8, &before, true).is_ok());
+            assert!(validate_saved_user_destination(&state, 8, &before, false).is_err());
+        });
+        open_history_url(url, || true).unwrap();
+        STATE.with(|state| {
+            let state = state.borrow();
+            assert_eq!(state.spaces.active_space(), USER_SPACE);
+            assert_eq!(state.spaces.active_tab(), Some(8));
+            let task = state.tasks.info(&scope.task).unwrap();
+            assert_eq!(task.status, Status::Active);
+            assert_eq!(task.revision, scope.revision);
+            assert_eq!(
+                state
+                    .spaces
+                    .views()
+                    .iter()
+                    .find(|space| space.id == scope.task)
+                    .unwrap()
+                    .selected_tab,
+                Some(7)
+            );
+        });
+        clear();
+    }
+
+    #[test]
+    fn current_page_address_requires_the_same_explicit_web_address() {
+        let target = CurrentPageTarget {
+            tab: 7,
+            space: USER_SPACE.into(),
+            navigation_epoch: 4,
+            url: "HTTPS://example.test/current".into(),
+        };
+        assert_eq!(
+            current_page_address(&target, "https://example.test/current").unwrap(),
+            "https://example.test/current"
+        );
+        for url in [
+            "https://example.test/other",
+            "about:blank",
+            "data:text/html,content",
+            "https://user:password@example.test/current",
+        ] {
+            assert!(current_page_address(&target, url).is_err());
+        }
+        let mut unsupported = target;
+        unsupported.url = "about:blank".into();
+        assert!(current_page_address(&unsupported, "about:blank").is_err());
+    }
+
+    #[test]
+    fn download_site_target_rechecks_document_and_owner_without_changing_selection() {
+        clear();
+        let page = || {
+            let mut tab = native_blank_tab();
+            tab.native_start_page = false;
+            tab.navigation.requested_url = "https://example.test/current".into();
+            tab.navigation.document_epoch = 11;
+            tab
+        };
+        let scope = STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let task = state.tasks.create("download setting source").unwrap();
+            let scope = TaskScope {
+                task: task.id,
+                revision: task.revision,
+            };
+            let tasks = state.tasks.list();
+            state.spaces.update_tasks(&tasks);
+            state.tabs.insert(7, page());
+            state.spaces.insert(7, &scope.task, false);
+            state.tasks.attach(&scope, 7, Origin::Created).unwrap();
+            state.tabs.insert(8, page());
+            state.spaces.insert(8, USER_SPACE, false);
+            state.spaces.show(&scope.task);
+            scope
+        });
+        let source = CurrentPageTarget {
+            tab: 7,
+            space: scope.task.clone(),
+            navigation_epoch: 4,
+            url: "https://example.test/current".into(),
+        };
+        let snapshot = || {
+            STATE.with(|state| {
+                let state = state.borrow();
+                json!({"spaces":state.spaces.views(), "active":state.spaces.active_space(),
+                    "overview":state.spaces.overview(), "tasks":state.tasks.list()})
+            })
+        };
+        let before = snapshot();
+        let target = capture_download_site_target(&source).unwrap();
+        assert_eq!(target.document_epoch, 11);
+        assert_eq!(target.owner, Some((scope.clone(), Status::Active)));
+        assert!(validate_download_site_target(&target).is_ok());
+        // The inert handle has no main frame. A read failure must not hand off
+        // the task, navigate, or select another tab to obtain setting context.
+        assert!(read_download_site_page(&target).is_err());
+        assert_eq!(snapshot(), before);
+        let reject_unchanged = |target: &DownloadSiteTarget| {
+            let before = snapshot();
+            assert!(validate_download_site_target(target).is_err());
+            assert!(read_download_site_page(target).is_err());
+            assert_eq!(snapshot(), before);
+        };
+        for change in [
+            (|tab: &mut Tab| tab.navigation.document_epoch += 1) as fn(&mut Tab),
+            |tab| tab.navigation.epoch += 1,
+            |tab| tab.navigation.requested_url = "https://example.test/other".into(),
+            |tab| tab.navigation.provisional = true,
+            |tab| tab.rejected_creation = true,
+        ] {
+            STATE.with(|state| change(state.borrow_mut().tabs.get_mut(&7).unwrap()));
+            reject_unchanged(&target);
+            STATE.with(|state| state.borrow_mut().tabs.insert(7, page()));
+        }
+        STATE.with(|state| state.borrow_mut().spaces.set_overview(true));
+        assert!(capture_download_site_target(&source).is_err());
+        reject_unchanged(&target);
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.spaces.set_overview(false);
+            state.spaces.show(USER_SPACE);
+        });
+        reject_unchanged(&target);
+        STATE.with(|state| state.borrow_mut().spaces.show(&scope.task));
+        let paused = STATE.with(|state| state.borrow_mut().tasks.handoff(&scope).unwrap());
+        reject_unchanged(&target);
+        let paused_target = capture_download_site_target(&source).unwrap();
+        assert_eq!(paused_target.owner.as_ref().unwrap().1, Status::Paused);
+        assert!(validate_download_site_target(&paused_target).is_ok());
+        let resumed = STATE.with(|state| {
+            state
+                .borrow_mut()
+                .tasks
+                .resume(&TaskScope {
+                    task: paused.id,
+                    revision: paused.revision,
+                })
+                .unwrap()
+        });
+        reject_unchanged(&paused_target);
+        reject_unchanged(&target);
+        let resumed_scope = TaskScope {
+            task: resumed.id,
+            revision: resumed.revision,
+        };
+        STATE.with(|state| state.borrow_mut().spaces.show(USER_SPACE));
+        let user_source = CurrentPageTarget {
+            tab: 8,
+            space: USER_SPACE.into(),
+            ..source
+        };
+        let user_target = capture_download_site_target(&user_source).unwrap();
+        assert_eq!(user_target.owner, None);
+        STATE.with(|state| {
+            state
+                .borrow_mut()
+                .tasks
+                .attach(&resumed_scope, 8, Origin::Borrowed)
+                .unwrap();
+        });
+        // Ownership changes invalidate even before the space mapping catches up.
+        reject_unchanged(&user_target);
+        expire_tab_refs([8]);
+        STATE.with(|state| {
+            state.borrow_mut().tasks.release(&resumed_scope, 8).unwrap();
+        });
+        expire_tab_refs([8]);
+        // The existing transfer boundary also prevents a None -> owned -> None
+        // round trip from reviving an old setting action on the same document.
+        reject_unchanged(&user_target);
+        STATE.with(|state| {
+            let state = state.borrow();
+            assert_eq!(state.spaces.active_tab(), Some(8));
+            assert_eq!(state.tasks.info(&resumed_scope.task).unwrap().revision, 3);
+        });
+        clear();
+    }
+
+    #[test]
+    fn current_page_open_guards_preserve_source_control_and_staged_selection() {
+        clear();
+        let page = || {
+            let mut tab = native_blank_tab();
+            tab.native_start_page = false;
+            tab.navigation.requested_url = "https://example.test/current".into();
+            tab
+        };
+        let (scope_a, scope_b) = STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let a = state.tasks.create("current page source").unwrap();
+            let b = state.tasks.create("unrelated background task").unwrap();
+            let scope_a = TaskScope {
+                task: a.id,
+                revision: a.revision,
+            };
+            let scope_b = TaskScope {
+                task: b.id,
+                revision: b.revision,
+            };
+            let tasks = state.tasks.list();
+            state.spaces.update_tasks(&tasks);
+            for (id, space) in [
+                (7, scope_a.task.as_str()),
+                (8, USER_SPACE),
+                (9, scope_b.task.as_str()),
+            ] {
+                state.tabs.insert(id, page());
+                state.spaces.insert(id, space, false);
+            }
+            state.tasks.attach(&scope_a, 7, Origin::Created).unwrap();
+            state.tasks.attach(&scope_b, 9, Origin::Created).unwrap();
+            state.spaces.show(&scope_a.task);
+            (scope_a, scope_b)
+        });
+        let target = CurrentPageTarget {
+            tab: 7,
+            space: scope_a.task.clone(),
+            navigation_epoch: 4,
+            url: "https://example.test/current".into(),
+        };
+        let snapshot = || {
+            STATE.with(|state| {
+                let state = state.borrow();
+                json!({"spaces":state.spaces.views(), "active":state.spaces.active_space(),
+                "overview":state.spaces.overview(), "tasks":state.tasks.list()})
+            })
+        };
+        let reject_unchanged = |target: &CurrentPageTarget| {
+            let before = snapshot();
+            // Invalid state must fail before touching the inert CEF handle.
+            assert!(open_current_page_in_user_tab(target).is_err());
+            assert_eq!(snapshot(), before);
+        };
+        assert!(validate_current_page_target(&target).is_ok());
+        for change in [
+            (|target: &mut CurrentPageTarget| target.tab = 99) as fn(&mut CurrentPageTarget),
+            |target| target.space = USER_SPACE.into(),
+            |target| target.navigation_epoch += 1,
+            |target| target.url = "https://example.test/other".into(),
+            |target| target.url = "about:blank".into(),
+        ] {
+            let mut stale = target.clone();
+            change(&mut stale);
+            reject_unchanged(&stale);
+        }
+        let changes: [fn(&mut Tab); 8] = [
+            |tab| tab.rejected_creation = true,
+            |tab| tab.navigation.committed = false,
+            |tab| tab.navigation.document_available = false,
+            |tab| tab.navigation.provisional = true,
+            |tab| tab.navigation.intent_pending = true,
+            |tab| tab.navigation.recovering = true,
+            |tab| tab.navigation.error = Some(json!({"code": -324})),
+            |tab| tab.navigation.renderer_exit = Some(json!({"status": "crashed"})),
+        ];
+        for change in changes {
+            STATE.with(|state| change(state.borrow_mut().tabs.get_mut(&7).unwrap()));
+            reject_unchanged(&target);
+            STATE.with(|state| {
+                state.borrow_mut().tabs.insert(7, page());
+            });
+        }
+        STATE.with(|state| state.borrow_mut().spaces.set_overview(true));
+        reject_unchanged(&target);
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.spaces.set_overview(false);
+            state.spaces.show(USER_SPACE);
+        });
+        reject_unchanged(&target);
+        STATE.with(|state| state.borrow_mut().spaces.show(&scope_a.task));
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.tabs.insert(11, page());
+            state.spaces.insert(11, &scope_a.task, true);
+        });
+        reject_unchanged(&target);
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.tabs.remove(&11);
+            state.spaces.remove(11);
+            state.spaces.remove(7);
+        });
+        reject_unchanged(&target);
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.spaces.insert(7, &scope_a.task, true);
+            state.tabs.remove(&7);
+        });
+        reject_unchanged(&target);
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.tabs.insert(7, page());
+            state.spaces.show(USER_SPACE);
+            let user_target = CurrentPageTarget {
+                tab: 8,
+                space: USER_SPACE.into(),
+                ..target.clone()
+            };
+            assert!(validate_current_page_source(&state, &user_target, &None, true).is_ok());
+            state.tasks.attach(&scope_b, 8, Origin::Borrowed).unwrap();
+            assert!(validate_current_page_source(&state, &user_target, &None, true).is_err());
+            state.tasks.release(&scope_b, 8).unwrap();
+            state.spaces.show(&scope_a.task);
+        });
+        let owner = STATE.with(|state| link_owner(&state.borrow().tasks, 7));
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            // Even if selection/epoch stayed unchanged around a CEF call, a
+            // revision change must invalidate the captured owner identity.
+            let paused = state.tasks.handoff(&scope_a).unwrap();
+            assert!(validate_current_page_source(&state, &target, &owner, true).is_err());
+            let resumed = state
+                .tasks
+                .resume(&TaskScope {
+                    task: paused.id,
+                    revision: paused.revision,
+                })
+                .unwrap();
+            assert!(validate_current_page_source(&state, &target, &owner, true).is_err());
+            assert_eq!(resumed.status, Status::Active);
+        });
+        let current_owner = STATE.with(|state| link_owner(&state.borrow().tasks, 7));
+        let before_ui_change = snapshot();
+        STATE.with(|state| {
+            assert!(
+                validate_current_page_source(&state.borrow(), &target, &current_owner, false)
+                    .is_err()
+            );
+        });
+        assert_eq!(snapshot(), before_ui_change);
+        let before = snapshot();
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.tabs.insert(10, page());
+            state.spaces.insert(10, USER_SPACE, false);
+            assert!(validate_current_page_source(&state, &target, &current_owner, true).is_ok());
+            assert_eq!(state.spaces.active_tab(), Some(7));
+            assert!(can_discard_user_staging(&state, 10, Some(7)));
+            assert!(!can_discard_user_staging(&state, 7, Some(7)));
+            assert!(!can_discard_user_staging(&state, 99, Some(7)));
+            // Pending cleanup must leave an adopted destination to its owner,
+            // even before the space mapping catches up with task ownership.
+            state.tasks.attach(&scope_b, 10, Origin::Borrowed).unwrap();
+            assert!(!can_discard_user_staging(&state, 10, Some(7)));
+            state.tasks.release(&scope_b, 10).unwrap();
+            state.spaces.adopt(10, &scope_b.task);
+            assert!(!can_discard_user_staging(&state, 10, Some(7)));
+            state.spaces.release(10);
+            state.tabs.get_mut(&10).unwrap().rejected_creation = true;
+            assert!(can_discard_user_staging(&state, 10, Some(7)));
+            remember_closed_page(&mut state, 10, &target.url);
+            assert!(!state.closed_pages.can_reopen());
+            state.tabs.get_mut(&10).unwrap().rejected_creation = false;
+        });
+        // Successful selection uses the actual user selector, without handoff.
+        let tasks_before = STATE.with(|state| state.borrow().tasks.list());
+        select_user_tab(10).unwrap();
+        STATE.with(|state| {
+            let state = state.borrow();
+            assert_eq!(state.tasks.list(), tasks_before);
+            assert_eq!(state.spaces.active_space(), USER_SPACE);
+            assert_eq!(state.spaces.active_tab(), Some(10));
+            assert_eq!(
+                state
+                    .spaces
+                    .views()
+                    .iter()
+                    .find(|space| space.id == scope_a.task)
+                    .unwrap()
+                    .selected_tab,
+                Some(7)
+            );
+            assert_eq!(
+                state.tasks.info(&scope_b.task).unwrap().revision,
+                scope_b.revision
+            );
+            assert_eq!(
+                before["tasks"][0]["revision"],
+                state.tasks.info(&scope_a.task).unwrap().revision
+            );
+        });
+        clear();
+    }
+
+    #[test]
+    fn sidebar_close_revalidates_moves_and_visibility_before_handoff() {
+        clear();
+        let scope = STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let task = state.tasks.create("sidebar close owner").unwrap();
+            let scope = TaskScope {
+                task: task.id,
+                revision: task.revision,
+            };
+            let tasks = state.tasks.list();
+            state.spaces.update_tasks(&tasks);
+            // Inert refcounted CEF values test the real state guard without
+            // loading Chromium or reaching a native close operation.
+            for id in [7, 8] {
+                let raw =
+                    cef::rc::RcImpl::new(unsafe { std::mem::zeroed::<sys::_cef_browser_t>() }, ());
+                let browser =
+                    cef::rc::ConvertReturnValue::wrap_result(raw.cast::<sys::_cef_browser_t>());
+                state.tabs.insert(
+                    id,
+                    Tab {
+                        browser,
+                        title: String::new(),
+                        rejected_creation: false,
+                        native_start_page: false,
+                        audio_muted: None,
+                        _devtools: None,
+                        navigation: Navigation::default(),
+                    },
+                );
+                state.spaces.insert(id, USER_SPACE, id == 7);
+            }
+            // Selected and non-selected rows are both closeable without first
+            // selecting the latter. The guard itself must not alter selection.
+            assert!(validate_sidebar_close(&state, 7, USER_SPACE).is_ok());
+            assert!(validate_sidebar_close(&state, 8, USER_SPACE).is_ok());
+            assert_eq!(state.spaces.active_tab(), Some(7));
+            state.tasks.attach(&scope, 8, Origin::Borrowed).unwrap();
+            state.spaces.adopt(8, &scope.task);
+            scope
+        });
+        // A row still rendered in user space must not hand off the new owner.
+        assert!(close_tab_from_sidebar(8, USER_SPACE).is_err());
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let task = state.tasks.info(&scope.task).unwrap();
+            assert_eq!(task.status, Status::Active);
+            assert_eq!(task.revision, scope.revision);
+            assert_eq!(state.spaces.active_space(), USER_SPACE);
+            assert_eq!(state.spaces.active_tab(), Some(7));
+            assert!(validate_sidebar_close(&state, 8, &scope.task).is_err());
+            state.spaces.show(&scope.task);
+            assert!(validate_sidebar_close(&state, 8, &scope.task).is_ok());
+            state.spaces.set_overview(true);
+        });
+        assert!(close_tab_from_sidebar(8, &scope.task).is_err());
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.spaces.set_overview(false);
+            state.tasks.release(&scope, 8).unwrap();
+            state.spaces.release(8);
+        });
+        // A stale task-space row must not close the now-released user tab.
+        assert!(close_tab_from_sidebar(8, &scope.task).is_err());
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            assert_eq!(state.spaces.active_space(), scope.task);
+            assert_eq!(
+                state.tasks.info(&scope.task).unwrap().revision,
+                scope.revision
+            );
+            state.spaces.show(USER_SPACE);
+            assert!(validate_sidebar_close(&state, 8, USER_SPACE).is_ok());
+            state.tabs.get_mut(&8).unwrap().rejected_creation = true;
+        });
+        assert!(close_tab_from_sidebar(8, USER_SPACE).is_err());
+        STATE.with(|state| {
+            state.borrow_mut().tabs.remove(&8);
+        });
+        assert!(close_tab_from_sidebar(8, USER_SPACE).is_err());
+        clear();
+    }
+
+    #[test]
+    fn sidebar_selection_revalidates_live_membership_without_handoff() {
+        clear();
+        let scope = STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let task = state.tasks.create("sidebar selection owner").unwrap();
+            let scope = TaskScope {
+                task: task.id,
+                revision: task.revision,
+            };
+            let tasks = state.tasks.list();
+            state.spaces.update_tasks(&tasks);
+            for id in [7, 8, 9] {
+                state.tabs.insert(id, native_blank_tab());
+                state.spaces.insert(id, USER_SPACE, id == 7);
+            }
+            state.tasks.attach(&scope, 9, Origin::Borrowed).unwrap();
+            state.spaces.adopt(9, &scope.task);
+            scope
+        });
+        let snapshot = || {
+            STATE.with(|state| {
+                let state = state.borrow();
+                json!({
+                    "spaces": state.spaces.views(),
+                    "overview": state.spaces.overview(),
+                    "tasks": state.tasks.list(),
+                })
+            })
+        };
+        let reject_unchanged = |tab, expected_space: &str| {
+            let before = snapshot();
+            assert!(select_tab_from_sidebar(tab, expected_space).is_err());
+            assert_eq!(snapshot(), before);
+        };
+        reject_unchanged(99, USER_SPACE);
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.tasks.attach(&scope, 8, Origin::Borrowed).unwrap();
+            state.spaces.adopt(8, &scope.task);
+        });
+        // An adopted user row cannot select its new owner or change AI control.
+        reject_unchanged(8, USER_SPACE);
+        // Correct membership alone is insufficient when the viewed space changed.
+        reject_unchanged(8, &scope.task);
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.spaces.show(&scope.task);
+            state.spaces.set_overview(true);
+            assert_eq!(state.spaces.active_tab(), Some(9));
+        });
+        // Valid selection reuses the real SelectTab path, exits overview, and
+        // preserves the active owner even when selecting another AI tab.
+        select_tab_from_sidebar(8, &scope.task).unwrap();
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            assert_eq!(state.spaces.active_space(), scope.task);
+            assert_eq!(state.spaces.active_tab(), Some(8));
+            assert!(!state.spaces.overview());
+            let task = state.tasks.info(&scope.task).unwrap();
+            assert_eq!(task.status, Status::Active);
+            assert_eq!(task.revision, scope.revision);
+            assert_eq!(state.tasks.owner(8).unwrap().0, scope.task);
+            state.tasks.release(&scope, 8).unwrap();
+            state.spaces.release(8);
+        });
+        // A released task row must not select the returned user tab.
+        reject_unchanged(8, &scope.task);
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.spaces.show(USER_SPACE);
+            state.tabs.get_mut(&8).unwrap().rejected_creation = true;
+        });
+        reject_unchanged(9, &scope.task);
+        reject_unchanged(8, USER_SPACE);
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.tabs.get_mut(&8).unwrap().rejected_creation = false;
+            state.spaces.remove(8);
+        });
+        // A live CEF handle without current presentation membership is stale.
+        reject_unchanged(8, USER_SPACE);
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.spaces.insert(8, USER_SPACE, false);
+            state.tabs.remove(&8);
+        });
+        // Conversely, a retained space mapping does not make a closed tab live.
+        reject_unchanged(8, USER_SPACE);
         clear();
     }
 
@@ -4214,6 +6920,65 @@ mod tests {
         worker.join().unwrap();
         assert_eq!(receiver.try_iter().count(), 1);
         assert!(!reply.active.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn completed_dom_probe_is_released_when_wait_cannot_finish() {
+        for expired in [false, true] {
+            clear();
+            let (reply, receiver) = test_reply(17);
+            let active = reply.active.clone();
+            let mut tab = native_blank_tab();
+            if !expired {
+                tab.navigation.load_failed(
+                    -324,
+                    "ERR_EMPTY_RESPONSE",
+                    "https://example.test/partial",
+                );
+            }
+            let browser = tab.browser.clone();
+            STATE.with(|state| {
+                let mut state = state.borrow_mut();
+                state.pending.insert(
+                    42,
+                    Pending {
+                        tab: 7,
+                        epoch: tab.navigation.epoch,
+                        evaluation: Evaluation::ReadyState { token: 17 },
+                        reply: reply.clone(),
+                        step: Step::Evaluate,
+                    },
+                );
+                state.tabs.insert(7, tab);
+                state.waits.insert(
+                    17,
+                    Waiter {
+                        tab: 7,
+                        until: WaitUntil::Dom,
+                        timeout_ms: 1_000,
+                        started: Instant::now() - Duration::from_secs(if expired { 2 } else { 0 }),
+                        probe_in_flight: true,
+                        reply,
+                    },
+                );
+            });
+            // A completed response cannot remain an in-flight probe, even
+            // when the timer must still return navigation failure or timeout.
+            for _ in 0..2 {
+                devtools_result(&browser, 42, true, br#"{"result":{"value":"complete"}}"#);
+                STATE.with(|state| {
+                    let state = state.borrow();
+                    assert!(state.pending.is_empty());
+                    assert!(!state.waits[&17].probe_in_flight, "expired={expired}");
+                });
+                assert!(active.load(Ordering::Acquire));
+                assert!(matches!(
+                    receiver.try_recv(),
+                    Err(mpsc::TryRecvError::Empty)
+                ));
+            }
+            clear();
+        }
     }
 
     #[test]

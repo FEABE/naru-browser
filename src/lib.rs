@@ -5,10 +5,13 @@ pub mod closed_pages;
 pub mod config;
 pub mod download_permissions;
 pub mod downloads;
+pub mod history;
 pub mod page_find;
+pub mod page_recovery;
 pub mod protocol;
 pub mod resources;
 pub mod spaces;
+pub mod start_page;
 pub mod tab_search;
 pub mod tasks;
 
@@ -24,6 +27,8 @@ pub mod control_panel;
 pub mod download_permission_runtime;
 #[cfg(feature = "browser")]
 pub mod download_runtime;
+#[cfg(feature = "browser")]
+pub mod history_runtime;
 #[cfg(all(feature = "browser", target_os = "macos"))]
 pub mod mac;
 

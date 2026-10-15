@@ -1,5 +1,399 @@
 # Naru 작업 기록
 
+## 2026-10-15, 사용자 요청에 따른 로컬 커밋 준비
+
+사용자가 커밋만 요청했다. 현재 `codex/navigation-readiness` 브랜치의 Naru 소스, 문서와 테스트 변경 39개를 한 커밋으로 남기는 범위이며 푸시와 배포는 포함하지 않는다. 별도 기능 수정은 하지 않고 이 작업 기록을 추가했다. 주요 변경은 네이티브 시작 화면과 탐색 복구, 주소와 탭 입력 보호, 방문 기록, 다운로드 관련 탭과 사이트 설정, 현재 탭 음소거, 접근 가능한 iframe의 CLI 관찰과 입력이다. 탭 복원은 사용자 보류 상태의 검토 문서만 포함한다.
+
+커밋 전 git 상태와 변경 목록, 파일 형식과 크기, 일반적인 자격 증명 패턴을 검사했다. 후보는 UTF-8 일반 파일이며 생성물, 프로필과 환경 파일은 포함하지 않는다. 패턴 검사에서 발견된 자격 증명은 없으나 모든 비밀값의 부재를 증명하는 검사는 아니다. 기존 stage는 비어 있었다. `git diff --check`가 통과했고 `artifacts/iframe-v1-source-sha256.json`의 전체 src와 변경 DOM, CEF fixture 테스트 해시가 현재 파일과 일치한다. 직전 근거는 모의 DOM 55개, Rust 단위 251개와 두 구성 전체 타깃 검사 통과다. 이번 커밋 요청에서는 테스트를 다시 실행하지 않았다.
+
+최신 소스의 실제 CEF, 네이티브 UI, 외부 사이트와 RAM 검증은 여전히 미완료다. 기존 앱을 새 소스로 교체하지 않았다. 새 빌드나 앱, 서버, 프로필 접근과 키체인 요청이 없어 정리할 새 실행 자원도 없다. 이전 격리 빌드 정리 결과는 바로 아래 작업 기록을 따른다. 커밋 식별자와 최종 워크트리 상태는 커밋 후 Git 조회 결과로 보고한다.
+
+## 2026-10-15, 탭 복원 보류와 접근 가능한 iframe 제어 소스
+
+제품 계획의 재시작 탭 복원부터 현재 호출 흐름을 조사했다. 별도 JSON, 내 공간의 최대 16개 URL과 제목, 순서와 선택, 256KiB, 선택한 탭만 먼저 로드하는 검토안을 문서로 만들었지만 사용자가 탭 복원 보류를 선택했다. `docs/session-restore-design.md`에 보류 상태를 명시했으며 세션 저장소, 복원 코드, 지연 탭은 추가하지 않았다.
+
+마지막 탭 닫기와 앱 종료도 조사했다. 현재 do_close가 마지막 탭이면 shell을 해제하고 OnBeforeClose가 메시지 루프를 종료한다. 빈 창 UI는 이미 있지만 기본 beforeunload의 취소 결과를 CEF 공개 콜백에서 구분할 수 없었다. 고정 CEF에서 기본 dialog를 사용하면 handler 연결을 지우는 경로와 TryCloseBrowser의 대기, 취소 모호성을 확인했다. 종료 플래그 하나로 처리하면 취소 뒤 앱을 잠그거나 이후의 다른 닫힘을 종료로 오인할 수 있어 적용하지 않았다. 현재 수명주기는 유지하며 이 조사도 복원 검토안에 기록했다.
+
+이후 독립 브라우저의 AI 관찰 공백인 iframe을 보완했다. `src/dom_bridge.js`에서 메인 문서가 접근할 수 있는 같은 출처 iframe의 본문과 조작 요소, 내부 열린 Shadow DOM을 기존 read와 ref 동작에 연결했다. `interactive` 평면 배열과 Rust의 native epoch 접두어, CLI 형식과 작업 제어권 검사를 유지하고 프레임 내부 항목에만 frame ID를 추가한다. `page.frames`는 read 한 번의 ID와 부모, label, accessible 또는 unavailable 또는 limit 상태를 반환한다. 접근한 문서만 실제 URL과 제목을 제한해서 반환하며 선언 src를 실제 문서 URL로 추정하지 않는다.
+
+프레임당 문서, 부모 iframe과 부모 문서의 연결을 고정한다. action 전 원래 ownerDocument와 contentDocument identity를 확인하고 제거, 교체나 접근 불가 전환을 거절한다. iframe의 크기와 상위 hidden, inert, aria-hidden, 비활성 상태를 검사한다. focus 뒤 바뀐 대상은 쓰기 전에 거절하고 input이나 keydown이 이미 전달된 뒤 바뀐 경우에는 부분 동작을 명시하고 남은 change, 폼 제출과 keyup을 중단한다. child 문서의 Range, style과 isolated realm의 native setter, Event 생성자를 사용한다. 고정 Chromium의 WindowProxy, 문서 바인딩과 보안 검사 원문을 확인했고 근거 링크는 `docs/iframe-control.md`에 남겼다.
+
+기존 본문 12,000자, 요소 120개, 방문 노드 10,000개, 열린 shadow root 64개, 순회 깊이 64와 옵션 240개 예산은 모든 문서가 공유한다. 프레임 metadata 슬롯 16개, 중첩 8단계 제한을 contentDocument getter 전에 적용한다. 접근 불가 항목도 슬롯을 사용한다. child isolated context는 지연 생성될 수 있고 반복 read가 다른 프레임을 방문하면 더 생성될 수 있어 전체 context나 RAM이 16개로 제한된다는 뜻은 아니다. 새 worker, 타이머, renderer와 파일 저장은 없다.
+
+검증과 준비 결과는 다음과 같다.
+
+- 모의 DOM 55개 전부 통과. 이전 46개에 독립 document와 Window double을 이용한 9개를 추가했다. 중첩 iframe과 shadow label, 문서별 중복 ID, child setter와 이벤트 생성자, 비밀번호 제외, 프레임 제거와 교체, 접근 예외, 부모 숨김과 0 크기, focus와 keydown 중 변경, input 뒤 부분 동작, 원문서에서 다른 문서로 이동한 요소 거절, read 세대와 전역 한도를 검사했다. `artifacts/iframe-v1-dom-tests.log`가 근거다. 실제 브라우저 SOP나 realm 동작의 실행 증거는 아니다.
+- 첫 모의 DOM 실행은 54개 통과, 1개 실패했다. 테스트 예외 문자열 inaccessible이 정상 limitations 문구와 겹친 오탐이었다. 고유 sentinel로 바꾸고 상한 이후 getter 호출 검사도 잡힐 수 있는 예외 대신 카운터로 확인하도록 강화했다. 제품 소스 변경 없이 전체 55개가 통과했다. 초기 로그는 `iframe-v1-dom-tests-initial.log`에 보존했다.
+- Rust 단위 251개 전부 통과했고 신규 Rust 테스트는 없다. 기본 기능 전체 타깃과 browser 기능을 끈 CLI 전체 타깃 Cargo 검사, cargo fmt와 git diff 검사도 통과했다. 캐시된 CEF와 Ninja를 사용해 오프라인으로 검사했으며 단위 실행 파일만 기존 Unix 소켓 검사 권한으로 실행했다. 기존 단위 구성 dead_code 3개, CLI 라이브러리 9개와 CLI 단위 구성 get 경고 1개가 남는다. 검사 전후 전체 src와 변경 테스트 해시가 동일하다.
+- `tests/shadow_smoke.py`에 실제 CEF에서 child 입력, select, Enter와 중첩 shadow 클릭, 비밀번호 제외, frame 제거 후 stale ref를 확인할 fixture를 추가했다. 기존 제외용 iframe은 opaque sandbox로 명시해 새 접근 정책에 맞췄다. Python AST, 내장 fixture JavaScript와 변경 JS 문법 검사는 통과했지만 이 통합 검사를 실행하지 않았다.
+- 독립 읽기 리뷰에서 추가 확정 P1, P2는 발견하지 못했다. 실제 CEF 엔진과 HTTP, AppKit 입력과 IME, 프레임 탐색 및 renderer 경쟁, 외부 사이트, 장시간 사용과 RAM 비교는 실행하지 않았다. 앱 번들 생성과 서명, 앱 실행, 프로필 접근과 키체인 요청을 하지 않았다.
+
+README, 아키텍처, 제품 계획과 메모리 문서를 현재 소스 범위로 갱신했다. 실제 final 앱의 다중 realm과 이벤트 동작은 미검증이다. 교차 출처 frame 내용, 프레임 내부 스크롤, native 좌표 입력과 screenshot 정합, 전체 독립 브라우저 완성과 Preseller 내장은 남아 있다. 탭 복원은 사용자 보류 상태를 유지한다.
+
+이번 컴파일과 검사 세션은 모두 종료됐다. 새 앱이나 서버는 시작하지 않았으며 기존 프로세스 상태는 다시 조회하지 않았다. 격리 `target/.iframe-test-0oeownlz`의 파일 1,392개, 파일 크기 합계 836,733,616바이트, 약 798MiB를 제거하고 경로 부재를 확인했다. 물리 디스크 블록 회수량 측정은 아니다. 기존 앱과 CLI 해시는 전후 동일하고 사용자 프로필과 탭은 건드리지 않았다. 종합 근거는 `artifacts/iframe-v1-validation.json`이다. 커밋, 푸시와 배포는 하지 않았다.
+
+## 2026-10-15, 현재 탭 음소거 소스
+
+독립 Naru의 일상 탐색을 보완하며 `src/browser.rs`와 `src/control_panel.rs`에 현재 탭 음소거를 추가했다. 보기 메뉴에서 현재 표시한 사용자 또는 AI 탭의 출력 설정을 바꾸며 작업 인계, 선택, 탐색과 주소 초안 변경을 호출하지 않는다. 체크와 기존 탭 아이콘은 CEF에서 확인된 음소거 설정만 표시한다. 현재 소리 재생 여부 감지, 배경 행의 직접 버튼, 영속 설정은 구현하지 않았다.
+
+설치된 CEF 156.0.1 커밋과 Chromium 156.0.8078.17 고정 소스를 읽어 탭별 WebContents 출력 설정, UI 스레드 getter, 기본값과 수명, IO 전달을 확인했다. AudioHandler는 mute_source loopback으로 기본 출력에 영향을 주므로 상태 표시용으로 추가하지 않았다. setter 뒤 getter는 native 설정 반영 확인이며 실제 스피커 무음 완료 증거가 아니다. 근거 링크는 `docs/tab-audio.md`에 남겼다.
+
+메뉴를 열 때 탭, 공간, 탐색 세대와 소유 작업 ID, revision, 상태 및 예상 설정을 캡처한다. 열린 메뉴 validation이 대상을 바꾸지 않으며 action은 한 번 꺼내 실행한다. native getter 전후와 setter 직전에 대상과 UI 상태를 다시 확인하고 예상 설정이 달라지면 쓰지 않는다. setter 중 탭이 닫힌 경우 OnBeforeClose 이후 보관된 host를 재조회하지 않는다. setter 이후 확인 실패는 변경 시도 자체와 구분해 알린다. CEF 호출에 STATE와 SHELL borrow를 유지하지 않는다. 네이티브 창, IME, 오버레이와 renderer 오류 가드도 연결했다.
+
+탭마다 마지막 확인값 Option 하나, 메뉴 대상과 예상값 하나 및 재진입 guard 하나를 추가했다. 메뉴 항목 한 개와 기존 탭 아이콘을 사용한다. 새 PCM 버퍼, worker, 반복 타이머, 웹 UI와 파일 저장은 없다. README, 제품 계획, 메모리 문서와 음소거 설계에 계약과 미검증 범위를 반영했다.
+
+검증 결과는 다음과 같다.
+
+- Rust 단위 251개 전부 통과. 이전 245개에 fake CEF host 검사 4개, 순수 UI 대상과 아이콘 검사 2개를 추가했다. 실제 STATE에서 다른 탭 무변경과 AI 제어권 보존, 문서와 선택, 소유권, renderer 오류와 닫힘에 따른 만료, getter 재진입과 UI veto, 예상 설정 불일치, readback 미반영과 setter 중 닫힘을 검사했다. 엔진 초기화나 AppKit 실행 검사는 아니다. 기존 Unix 소켓 검사를 위해 컴파일된 단위 실행 파일만 승인된 권한으로 실행했다. `artifacts/tab-audio-v1-rust-tests.log`가 근거다.
+- 기본 구성 전체 타깃과 browser 기능을 끈 CLI 전체 타깃 Cargo 검사, cargo fmt와 git diff 검사가 통과했다. 캐시된 CEF와 Ninja로 오프라인 컴파일했고 dev와 test 디버그 정보를 끈 격리 target을 사용했다. 기존 단위 구성 dead_code 경고 3개, CLI 라이브러리 경고 9개와 CLI 단위 구성 get 경고 1개가 남는다. 검사 전후 전체 src 해시는 동일하다.
+- 독립 읽기 검토에서 추가 P1, P2는 발견하지 못했다. menuWillOpen이 캡처 후 setEnabled를 명시하므로 이전 validation의 disabled가 고착되는 명백한 순서 결함은 보이지 않는다. 실제 AppKit tracking과 validation 순서를 실행한 증거는 아니다.
+- DOM 변경이 없어 모의 DOM 검사는 새로 실행하지 않았다. 로컬 HTTP와 CEF 통합, 네이티브 메뉴와 입력, IME와 최소 창, 실제 오디오 출력과 capture, 외부 사이트, 장시간 사용과 RAM 비교는 실행하지 않았다. 앱 번들 생성, 서명, 앱과 CEF 엔진 초기화, 사용자 프로필 접근, 키체인 요청을 하지 않았다. 기존 앱의 검증을 이 소스의 실행 결과로 합산하지 않는다.
+
+실제 메뉴 체크와 음소거, 탐색 중 설정 유지와 새 탭 기본값, 같은 origin의 다른 탭 출력, 주소 초안과 입력 포커스, 숨긴 AI 탭 선택 후 제어권 보존을 최종 앱에서 확인해야 한다. 독립 Naru 전체 완성과 Preseller 내장은 미완료다.
+
+검사 실행 세션은 모두 종료됐다. 새 앱이나 서버를 시작하지 않았으며 기존 앱의 프로세스 상태는 다시 조회하지 않았다. 격리 `target/.tab-audio-test-k5i8poom`의 파일 1,392개와 파일 크기 합계 836,708,523바이트, 약 798MiB를 제거하고 경로 부재를 확인했다. 물리 디스크 블록 회수량은 측정하지 않았다. 기존 앱과 CLI 해시는 작업 전후 같고 사용자 프로필과 탭은 건드리지 않았다. 종합 결과는 `artifacts/tab-audio-v1-validation.json`이다. 커밋, 푸시, 배포는 하지 않았다.
+
+## 2026-10-15, 다운로드와 권한 카드의 관련 탭 이동 소스
+
+독립 Naru의 일상 탐색과 AI 공간 연결을 이어서 보완했다. 실제로 전달된 다운로드 권한 요청은 기존 사이드바에 개수와 강조색으로 표시되지만, 카드에서 해당 공간과 탭을 직접 열 수 없었다. `src/downloads.rs`, `src/download_runtime.rs`, `src/download_permissions.rs`, `src/download_permission_runtime.rs`, `src/browser.rs`, `src/control_panel.rs`를 변경했다. 별도 저장소, 창이나 웹 UI를 추가하지 않았다.
+
+파일 카드에는 접수 탭 보기, 권한 카드에는 요청 탭 보기를 추가했다. 사용자의 명시적 버튼 동작에서만 기존 검색 탭 선택 경로로 공간과 탭을 바꾼다. 권한 요청의 token과 콜백을 조회할 뿐 소비하거나 Continue하지 않는다. 파일 저장, 재시도, 취소나 AI 인계도 호출하지 않는다. 네이티브 저장창이 열렸거나 종료 중이면 이동을 거절하며, 창과 IME, sender 포인터를 확인한다. 실패 전에는 패널과 초안을 지우지 않는다. 성공 뒤 fresh 탭과 공간을 재확인한 경우만 패널을 닫고 포커스를 준다.
+
+파일은 OnBeforeDownload 접수 시 문서와 제어권을 캡처한다. 읽기 검토에서 지연 응답 전 탐색이 있을 수 있어 이를 최초 링크 클릭 문서로 설명할 근거가 없음을 확인했다. 파일 버튼을 접수 탭으로 명시하고 권한의 실제 요청 대상과 구분했다. 접수 이전 원본 문서 추적은 구현하지 않았다. 이후 새 문서와 renderer 종료, 명시적 탐색, 중지, 주소나 제어권 변경은 이전 대상을 거절한다. 탭마다 출처 세대 u64 하나로 소유권 왕복도 무효화한다. attachment OnBeforeBrowse는 현재 문서를 교체하지 않을 수 있어 이 세대를 바꾸지 않는다. 같은 문서의 추가 파일 뒤에도 접수 탭을 볼 수 있는 경계다. 파일 수명과 source target 수명은 분리하며 paused 사용자 파일의 기존 저장 범위는 유지한다.
+
+중지된 AI 공간의 출처는 실제 작업 이름, 사용자 제어와 탭 번호로 표시했다. 작업 이름 48자 제한으로 기존 80자 출처 상한에서 탭 번호가 남게 했다. 파일 최대 24개와 권한 최대 4개 행에 버튼 하나씩을 추가하고 기존 컨트롤 재사용, 닫을 때 해제를 유지한다. 목록이 열려 갱신할 때 최대 24개 대상을 임시 복사하고 RUNTIME borrow 밖에서 순수 browser 상태로 검증한다. 새 알림 큐나 worker, 타이머, URL과 Browser 보관은 없다. 파일 행은 세 버튼을 하단에 배치하며 높이 120pt, 간격 128pt다. 실제 RAM과 화면 변화는 측정하지 않았다.
+
+검증 범위와 결과는 다음과 같다.
+
+- Rust 단위 245개 전부 통과. 이전 239개에 파일 메타데이터와 독립 수명 1개, 파일 런타임 조회와 저장창, 종료 가드 1개, 권한 조회의 무소비와 무승인 1개, 실제 browser STATE의 이동과 만료 1개, UI 선택과 공간 모델 1개, 좁은 폭 버튼 기하 1개를 추가했다. browser 검사는 attachment intent 후 유효한 대상, 사용자 공간에서 AI 탭 선택, revision 보존, 문서와 renderer, 닫힘, 소유권 왕복과 stale 대상의 무변경을 확인했다. 네이티브 UI와 CEF 엔진 실행 검사는 아니다. 기존 Unix 소켓 검사 때문에 단위 실행 파일만 승인된 권한으로 실행했다. `artifacts/download-source-v1-rust-tests.log`가 근거다.
+- 기본 기능 전체 타깃과 browser 기능을 끈 CLI 전체 타깃 Cargo 검사, cargo fmt와 git diff 검사를 통과했다. 캐시된 CEF와 Ninja로 오프라인 컴파일했고 테스트와 dev 디버그 정보를 끈 격리 target을 사용했다. 단위 구성의 기존 dead_code 경고 3개, CLI 라이브러리의 미사용 권한 코드 경고 9개와 CLI 단위 구성의 get 경고 1개가 남는다. 검사 전후 전체 src 해시가 같으며 앱 바이너리는 만들지 않았다.
+- 독립 읽기 검토에서 대상 캡처 시점, 콜백 무소비, 파일 수명, borrow와 재진입, 선택 후 닫기와 포커스 경계를 확인했다. 추가 P1, P2는 발견하지 못했다. 실제 AppKit 콜백 순서, 저장창이나 IME 재진입의 실행 증거로 세지 않는다.
+- DOM 변경이 없어 모의 DOM 검사는 새로 실행하지 않았다. 로컬 HTTP와 CEF, 네이티브 화면과 저장창, IME와 최소 창, 외부 사이트, 장시간 사용과 RAM 비교는 실행하지 않았다. 앱 번들 생성과 서명, 앱과 엔진 초기화, 사용자 프로필 접근, 키체인 승인 요청을 하지 않았다.
+
+README, 다운로드 설계, 제품 계획과 메모리 문서에 계약과 한계를 반영했다. Chromium이 아직 전달하지 않은 숨긴 권한 대기를 감지하는 기능은 아니다. 접수된 파일조차 없거나 대상이 만료되면 이번 경로로 해당 페이지를 찾을 수 없다. 실제 앱에서 숨긴 탭을 표시한 뒤 권한이 전달되는 흐름, 지연 응답 전 탐색, 동일 탭 주소 초안과 입력 포커스, 저장창과 동시 종료 검증은 남는다. 독립 브라우저 전체 완성과 Preseller 내장도 미완료다.
+
+컴파일과 검사 실행 세션은 모두 종료됐다. 새 앱이나 서버를 시작하지 않았으며 기존 앱 프로세스 상태를 다시 조회하지 않았다. 격리 `target/.download-source-test-797q_w2f`의 파일 1,392개, 파일 크기 합계 836,510,875바이트, 약 798MiB를 확인한 뒤 제거하고 경로 부재를 확인했다. 물리 디스크 블록 회수량은 측정하지 않았다. 기존 앱과 CLI 해시는 작업 전후 동일하고 사용자 프로필과 탭은 건드리지 않았다. `artifacts/download-source-v1-validation.json`에 검사, 경고, 미실행과 정리 결과를 남겼다. 커밋, 푸시, 배포는 하지 않았다.
+
+## 2026-10-15, 현재 사이트 다운로드 허용 설정 초기화 소스
+
+Naru의 일반 탐색 후속으로 제품 계획에 남아 있던 다운로드 사이트 설정 UI를 보완했다. 기존 ACCEPT는 사이트 허용을 저장하지만 승인 뒤 대기 token을 제거해 되돌릴 UI가 없었다. `src/download_permissions.rs`, `src/download_permission_runtime.rs`, `src/browser.rs`, `src/control_panel.rs`를 변경했다. 별도 저장소나 승인 목록 캐시는 추가하지 않았고 사용자 프로필에는 접근하지 않았다.
+
+다운로드 패널에 고정 카드 하나를 추가했다. 현재 main frame의 실제 HTTP(S) origin과 적용 설정을 읽고 ALLOW일 때만 `허용 설정 초기화`를 활성화한다. 버튼은 해당 origin의 저장 예외를 DEFAULT로 되돌린다. 모든 공간의 같은 사이트에 적용하며 대기 요청 취소 가능, 열린 페이지 다시 열기, 진행 중 파일 보존을 안내한다. 전체 승인 사이트 목록이나 새 허용, 차단 기능을 구현한 것은 아니다.
+
+설치 CEF hash와 Chromium tag가 일치하는 원문을 확인했다. AUTOMATIC_DOWNLOADS의 origin scope, ASK 기본값, DEFAULT 예외 삭제와 즉시 context 호출, DEFAULT가 조회 실패로도 반환되는 경계를 확인했다. limiter의 observer는 최근 origin만 갱신하므로 저장 예외 초기화를 모든 기존 문서의 즉시 허용 철회로 표시하면 안 된다. IGNORE는 같은 페이지에서 기다리는 다른 origin 콜백도 취소할 수 있다. 웹 도구의 cache miss와 제한 환경의 DNS 실패 뒤 공개 고정 소스만 읽는 네트워크 권한으로 원문을 확보했다. URL과 SHA-256은 `artifacts/download-site-v1-source-evidence.json`, 해석과 범위는 `docs/download-site-settings.md`에 기록했다.
+
+`browser`는 기존 CurrentPageTarget에 document epoch와 owner, revision, 상태를 묶고 실제 주소 조회 전후 검증한다. `reset_site`는 표시 당시 대상, live origin과 ALLOW, 네이티브 창과 IME를 확인한다. 같은 origin pending을 먼저 꺼내 borrow 밖에서 IGNORE한 뒤 실제 주소와 제어권, 종료 상태를 다시 확인한다. 빈 주소나 전역 기본값 변경, stale 버튼은 거절한다. setter는 AUTOMATIC_DOWNLOADS, DEFAULT만 쓰며 ASK 또는 BLOCK 재조회만 성공으로 처리한다. 여전히 ALLOW거나 조회가 불명확하면 초기화 시도와 확인 실패를 구분한다. 취소한 대기가 있으면 뒤의 실패 안내에도 부분효과를 남긴다.
+
+UI는 카드 하나, 라벨 7개와 버튼 하나를 재사용하고 패널이 열린 경우만 조회한다. CEF 조회 뒤 fresh browser snapshot으로 표시 대상을 확인한다. 읽기 검토에서 nested 조회 생략이 빈 조회 결과로 취급돼 정상 카드와 버튼 포커스를 지울 수 있는 경로를 찾았다. `DownloadSiteQuery::Skipped`를 구분해 같은 대상은 유지하고 바뀐 대상이나 실제 조회 실패만 무효화했다. 기존 AI 작업의 선택과 제어권을 바꾸지 않으며 별도 renderer, worker나 타이머는 없다. 실제 자원 증감은 측정하지 않았다.
+
+검증과 실패 이력은 다음과 같다.
+
+- 최종 Rust 단위 239개 전부 통과. 이전 231개에 origin 1개, RequestContext와 pending 4개, browser STATE 1개, UI 대상과 재진입 모델 2개를 추가했다. 정확한 origin과 빈 secondary, 자동 다운로드 타입과 DEFAULT만 쓰기, stale 대상의 무쓰기, readback 실패, scheme과 port별 대기 취소, 재진입, 문서와 소유권 변경을 검사했다. `artifacts/download-site-v1-rust-tests.log`가 근거다.
+- 최초 전체 단위 프로세스와 분리한 새 fake CEF 검사 하나는 exit 139였다. 테스트가 엔진을 로드하지 않은 상태에서 `CefString::from(&str)`의 native UTF-16 변환 함수를 호출했다. core가 검증한 `&CefString`을 getter와 setter에 재사용하도록 하고, 테스트는 호출 범위 동안 유지하는 Rust UTF-16 버퍼를 borrowed CEF 문자열로 전달했다. 엔진 초기화 없이 권한 검사 7개가 통과한 뒤 최종 전체 검사도 통과했다. production은 정상 runtime에서 native 문자열을 한 번 생성한다. 최초 실패와 분리 검사 로그를 보존했으며 제품 앱의 크래시를 재현한 결과로 세지 않는다.
+- 기본 기능 전체 타깃과 browser 기능을 끈 CLI 구성 전체 타깃 Cargo 검사, cargo fmt, git diff 공백 검사가 통과했다. 최종 검사 전후 src 해시가 같다. 검사 구성의 observe_history, page_find_result, bookmark_completed dead_code 경고 3개, CLI 전용 구성의 미사용 다운로드 권한 코드 경고 9개가 남는다.
+- 독립 읽기 리뷰에서 origin, 실제 주소와 상태 검증, pending 취소와 부분효과, 문자열 수명과 UI 재진입 경계를 확인했다. 추가 P1, P2 수정 사항은 남지 않았다. 실제 CEF 엔진, 설정 파일 반영이나 네이티브 포커스의 실행 증거는 아니다.
+- DOM 변경이 없어 모의 DOM 검사는 새로 실행하지 않았다. 로컬 HTTP와 실제 CEF, 네이티브 AppKit과 IME, 최소 창 배치, 외부 사이트, 재실행과 RAM 비교는 실행하지 않았다. 반복 승인을 중단하라는 요청에 따라 앱 번들 생성, 서명, 앱과 CEF 엔진 실행, 키체인 접근을 하지 않았다. 기존 앱의 과거 검증을 새 소스 결과로 합산하지 않는다.
+
+설계, README, 제품 계획, 다운로드와 메모리 문서를 갱신했다. 실제 앱의 설정 반영, 재탐색과 재시작, 여러 공간과 iframe, 대기와 진행 파일, 동시 탐색과 종료, 키보드와 IME는 후속 검증이다. 전체 사이트 권한 관리, 모든 기존 문서의 즉시 철회, 독립 Naru 완성과 Preseller 내장은 계속 미완료다.
+
+이번 실행 세션은 모두 종료됐다. 새 앱이나 서버를 시작하지 않았으며 기존 앱 프로세스 상태는 다시 조회하지 않았다. 초기 테스트 중단 시각과 테스트 전용 이름을 대조해 남은 임시 디렉터리 두 개, 파일 네 개와 325바이트를 확인한 뒤 제거했다. 최종 `target/.download-site-test-ppzvn45j`의 파일 3,943개, 파일 크기 합계 2,301,526,970바이트, 약 2.14GiB도 제거했다. 물리 디스크 블록 회수량 측정은 아니다. 기존 앱과 CLI SHA-256은 작업 전후 같고 사용자 프로필과 기존 탭은 건드리지 않았다. 종합 근거는 `artifacts/download-site-v1-validation.json`, 임시 폴더 정리는 `download-site-v1-crash-temp-audit.json`이다. 커밋, 푸시, 배포는 하지 않았다.
+
+## 2026-10-15, 내 공간 방문 기록과 검색 소스 구현
+
+사용자가 별도 JSON, 내 공간만 기록, 최근 30일과 최대 1,000개, 2MiB, 과거 목록 백업 없음이라는 기본안을 승인했다. 이에 맞춰 `src/history.rs`, `src/history_runtime.rs`를 추가하고 `src/browser.rs`, `src/control_panel.rs`, `src/tab_search.rs`, `src/lib.rs`, `src/main.rs`에 연결했다. 실제 사용자 프로필을 읽거나 기록을 수집하지 않았으며 앱 번들에는 아직 반영하지 않았다.
+
+`history::Store`는 안정적인 ID, 정규화된 전체 HTTP(S) URL, 최대 256자 제목과 마지막 방문 시각만 저장한다. 같은 URL은 갱신하며 오래된 항목과 직렬화 크기 상한을 적용한다. 제한된 읽기, 파일 소유권과 권한, symlink와 hardlink, 디렉터리 교체와 외부 변경을 검사한다. pending 파일에 쓰고 파일 동기화, rename, 폴더 동기화로 반영하며 과거 목록 백업이나 남은 pending 자동 승격은 없다. rename 후 폴더 동기화 실패는 반영된 변경의 내구성 경고로 구분한다. 시스템 시각 역행 때 보존 기간이 늘 수 있는 한계를 문서에 명시했다.
+
+파일 작업은 동시에 하나이며 대기는 최대 64개와 URL, 제목 UTF-8 합계 256KiB로 제한한다. 같은 주소의 방문과 제목은 합치고 넘치면 오래된 대기를 제외해 안내한다. 제목만으로 없는 방문 항목을 만들지 않는다. 전체 삭제는 세대를 먼저 바꾸고 진행 중 쓰기, 삭제, 새 세대 쓰기 순서로 처리한다. 삭제 중에는 이전 결과를 숨기며 완료된 파일 교체 뒤에만 처리 중 표시를 해제한다. 실패는 읽기 전용 상태와 오류로 알린다. 시작 시 만료 파일 정리, 완료 알림이 없을 때 접근 시 결과 회수, 정상 종료의 제한된 대기 처리를 연결했다.
+
+CEF 콜백은 실제 main frame의 문서, 최종 주소, 탐색과 문서 세대, HTTP 완료, 로딩 상태, 사용자 공간과 소유권을 다시 확인해 방문을 전달한다. AI 탐색이 release 후 늦게 끝나거나 단독 commit 콜백만 와도 사용자 기록으로 승격하지 않는다. 실패, 중지와 렌더러 종료도 이전 자격을 취소한다. 임시 생성한 북마크, 기록과 현재 주소 복사의 사용자 탭은 최종 검증과 선택 성공 전까지 기록을 보류한다. 생성 중 콜백이 완료된 뒤 실패해도 기록하지 않는 경계를 추가했다. 삭제 당시 열린 문서는 다음 전체 탐색 전까지 SPA와 fragment 이동, 늦은 제목도 기록하지 않는 제한을 둔다.
+
+통합 검색은 Tab, Bookmark, History의 ID 종류를 구분해 전체 40행을 유지하고 앞선 결과와 같은 URL의 기록을 제외한다. 전용 방문 기록 보기, 검색어를 유지하는 모드 전환, 같은 화면의 전체 삭제 확인과 취소를 추가했다. 삭제 요청 수락을 완료로 표시하지 않는다. 숨긴 버튼이나 제거된 행 때문에 포커스가 창으로 돌아오면 검색 입력을 복구하며 유효 편집기는 유지한다. 추가 컨트롤 4개는 고정 생성하고 별도 웹 UI, 창, 타이머나 상주 파일 worker를 만들지 않았다. 실제 RAM 절감량은 측정하지 않았다.
+
+검증 결과는 다음과 같다.
+
+- Rust 단위 검사 231개 전부 통과. 이전 206개에 저장소 15개, 런타임 5개, 수집과 열기 경계 3개, 검색 2개를 추가했다. 실제 임시 파일의 재로드, 삭제, 만료, 개수와 2MiB, 쓰기와 동기화 실패, 외부 변경, pending, 권한과 링크, 대기와 삭제 순서, 오래된 세대, 종료, AI 소유권과 staging 상태를 검사했다. CEF 엔진과 AppKit을 초기화한 검사는 아니다. 기존 Unix 소켓 bind 검사를 위해 컴파일된 단위 검사 실행 파일만 승인된 권한으로 실행했다. `artifacts/history-v1-rust-tests.log`가 근거다.
+- 기본 기능 전체 타깃 Cargo 검사와 browser 기능을 끈 CLI 구성 전체 타깃 검사, cargo fmt, git diff 공백 검사를 통과했다. 검사 전후 src 해시가 같다. 단위 구성은 observe_history, page_find_result, bookmark_completed의 dead_code 경고 3개, browser 기능을 끈 구성은 다운로드 권한 코드의 미사용 경고 8개가 남는다. 최초 컴파일의 반환 오류 타입 추론과 중첩 가변 borrow 두 지점을 수정한 뒤 다시 통과했다. 초기 실패는 `history-v1-tests-compile-initial.log`, 최종 결과는 `history-v1-tests-compile.log`, `history-v1-check.log`, `history-v1-cli-check.log`에 보존했다.
+- 독립 읽기 리뷰에서 저장, 삭제 세대, staging과 소유권, UI 연결을 검토했다. 추가 필수 수정 사항은 남지 않았으나 실제 CEF callback 순서나 AppKit 동작의 증거는 아니다.
+- 이번 변경에서 DOM 소스를 수정하지 않아 모의 DOM 검사를 새로 실행하지 않았다. 로컬 HTTP와 CEF 통합, 네이티브 화면과 IME, 외부 사이트, 장시간 기록과 RAM 비교는 실행하지 않았다. 반복 승인을 중단하라는 요청에 따라 앱 생성, 서명, 실행과 키체인 접근을 하지 않았다. 기존 바이너리의 과거 검증 결과를 이번 소스의 성공으로 합산하지 않았다.
+
+`docs/history-design.md`에 정책, 호출 흐름과 후속 검증을 기록하고 README, 제품 계획, 아키텍처와 메모리 문서를 갱신했다. 같은 최종 앱에서 기록 수집, 검색과 전체 삭제, 재실행, AI 상태 유지와 화면 검증이 남는다. 전체 Naru 완성과 Preseller 내장은 계속 미완료다.
+
+이번 검사 실행 세션은 모두 종료됐으며 새 앱, 보조 앱이나 서버는 시작하지 않았다. 기존 앱의 현재 프로세스 상태는 sandbox가 ps 실행을 거절해 재확인하지 않았다. 생성한 `target/.history-test-kx7wha93`의 파일 3,171개, 파일 크기 합계 2,025,839,863바이트, 약 1.89GiB를 제거했다. 물리 디스크 블록 회수량 측정은 아니다. 기존 앱과 CLI SHA-256은 작업 전후 같으며 사용자 프로필과 기존 탭 데이터를 건드리지 않았다. 종합 근거는 `artifacts/history-v1-validation.json`이다. 커밋, 푸시, 배포는 하지 않았다.
+
+## 2026-10-15, 기존 탭 순환의 초안 보호와 메뉴 보완
+
+독립 브라우저의 세로 탭과 키보드 사용성을 이어서 보완했다. 호출 흐름을 확인해 기존 Ctrl+Tab과 Cmd+Shift+괄호의 순환 기능이 이미 있음을 확인했다. 기존 경로는 목록 화면을 먼저 닫고 `cycle_tab → select → run_action`에서 실제 선택 검증 전에 주소 초안을 지웠다. 이번 변경은 순환 기능의 신규 구현이 아니라 이 선택 경로의 보호 보완이다. 실행 중 앱에서 초안 소실을 재현한 결과로 기록하지 않는다.
+
+`src/control_panel.rs`는 번호 선택과 순환을 공통 `select_tab_command`로 연결한다. 활성 창과 입력기 조합을 확인한 뒤 최신 화면에서 대상을 계산하고 실제 공간 소속, 탭 수명 검사를 통과해야 선택한다. 실패 전에는 검색, 북마크, 다운로드 화면이나 초안을 지우지 않는다. 성공한 탭과 공간을 재확인한 뒤 목록을 닫고 최종 선택이 같은 경우만 포커스를 준다. 순환 키는 목록 처리와 본문 입력 관찰보다 먼저 소비하며 반복 키나 입력기 조합 중에는 선택하지 않는다. 번호 선택에도 같은 조합 보호를 적용했다. 본문의 일반 입력과 Cmd+대괄호의 뒤로, 앞으로 동작은 유지한다.
+
+현재 공간의 사이드바 순서대로 양방향 순환하며 처음과 끝이 이어진다. 한 탭뿐이거나 현재 선택이 없으면 목록 화면에서도 아무 변화 없이 종료한다. 기존 번호 선택으로 같은 탭을 명시해 목록을 닫는 동작은 유지한다. 보기 메뉴에 이전 탭과 다음 탭을 추가하고 같은 경로로 실행한다. 순환마다 만들던 임시 Vec를 iterator로 교체했으며 새 캐시, 타이머, 저장소, 웹 UI는 추가하지 않았다. 메뉴 항목 두 개의 네이티브 자원은 추가되고 전체 RAM 절감량은 측정하지 않았다.
+
+검증 범위는 다음과 같다.
+
+- Rust 단위: 새 검사 3개를 포함한 206개 전부 통과. 다른 공간이 섞인 12개 탭의 순서와 양방향 끝 순환, 한 탭과 없는 선택의 무동작, 기존 단축키 별칭과 추가 수정키 거절을 검사했다. 메뉴 action의 편집 인계 대상 제외도 확인했다. 기존 실제 상태 기반 sidebar 선택 검사는 닫힘, adopt, release, rejected 탭 거절과 AI 소유권, revision 보존을 검사한다. 네이티브 창이나 CEF 엔진을 초기화한 검사는 아니다. 기존 Unix 소켓 bind 검사에 필요한 권한으로 컴파일된 단위 검사 실행 파일만 실행했다. `artifacts/tab-cycle-v1-rust-tests.log`가 근거다.
+- 컴파일과 정적 검사: 단위 검사 컴파일, 전체 타깃 Cargo 검사, cargo fmt, git diff 공백 검사 통과. 전체 src 해시가 검사 전후 일치했다. 기존 검사 전용 dead_code 경고인 page_find_result, bookmark_completed 두 개는 남는다. `tab-cycle-v1-tests-compile.log`, `tab-cycle-v1-check.log`에 결과가 있다.
+- 독립 읽기 리뷰: 단축키 우선 처리, 표시 공간 순서, 입력기 조회 뒤 대상 재계산, 검증 후 목록 닫기 경로를 확인했으며 추가 P1, P2 수정 사항은 없었다. 실제 키 이벤트, 반복 입력, IME, 오버레이 포커스와 실시간 경합의 재현 증거는 아니다.
+- 모의 DOM, 로컬 CEF 통합, 네이티브 UI, 외부 사이트, RAM 비교는 실행하지 않았다. 반복 승인을 중단하라는 요청을 유지해 앱 번들 생성, 서명, 앱 실행과 키체인 접근을 하지 않았다. 최종 앱에 반영한 동작 검증은 남는다.
+
+README와 제품 계획에 기존 순환 기능의 변경과 실행 한계를 기록했다. 아키텍처 문서에는 공통 선택 흐름을 추가하고, 본문 입력 감지가 아직 없다는 오래된 설명 두 곳을 실제 `send_event → observe_page_input → handoff_page_input` 흐름으로 바로잡았다. 본문 입력과 탭 선택의 제어권 차이를 문서에 명시했다.
+
+검사 프로세스는 모두 종료됐으며 새 앱, 보조 프로세스나 서버를 시작하지 않았다. 이번에 만든 `target/.tab-cycle-test-g8cdc0qu`의 파일 3,070개, 파일 크기 합계 1,966,476,762바이트를 제거했다. 약 1.8GiB이며 물리 디스크 블록 회수량 측정은 아니다. 기존 앱과 CLI SHA-256은 작업 전후 같고 사용자 프로필과 기존 탭 데이터는 건드리지 않았다. 종합 근거는 `artifacts/tab-cycle-v1-validation.json`이며 변경 전 파일과 이번 국소 diff도 같은 접두사로 남겼다. 커밋, 푸시, 배포는 하지 않았다. 전체 Naru 완성과 Preseller 내장 목표는 계속 미완료다.
+
+## 2026-10-15, 현재 주소를 새 사용자 탭에서 열기 소스 구현
+
+Naru의 일상 탐색과 사용자, AI 공간 협업을 이어서 보완했다. 제품 계획을 다시 읽어 페이지 확대는 공유 host 확대값의 영향을 해결하지 못해 보류된 상태임을 확인했다. 해당 설계를 임의로 재개하지 않고 파일 메뉴에 `현재 주소를 내 공간 새 탭에서 열기`를 추가했다. 새 기능은 항상 새 사용자 탭을 만들며 원본 AI 작업의 소유권, revision과 원래 공간의 선택을 유지한다. 주소를 새로 탐색하는 기능이며 폼, 스크롤, 이력이나 문서 상태를 복제하지 않는다. 모든 공간의 기존 프로필 공유도 유지한다.
+
+`src/control_panel.rs`는 실제 표시 탭의 대상 정보를 사용하고 주소창 초안은 읽지 않는다. 메뉴 validation과 실행에서 공간 목록, 각 목록 화면, 없는 뷰, 숨은 창과 페이지, 지원하지 않는 주소, 입력기 조합을 검사한다. 별도 단축키나 UI renderer를 추가하지 않았다. `src/browser.rs`는 실제 공간, 선택, 탐색 세대, 문서 준비와 소유권을 검사하고 CEF main frame의 HTTP(S) 주소를 읽는다. 생성 전후 실제 주소와 상태가 같은지 확인하고, 내 공간의 탭을 배경에 만든 뒤 연결과 검증이 성공한 경우에만 선택한다. 기존 `select_bookmark_tab`은 `select_user_tab`으로 이름을 일반화했으며 북마크와 최근 닫은 탭의 생성 정책은 바꾸지 않았다.
+
+읽기 검토에서 CEF 호출 중 검색 화면이나 입력기 조합만 바뀌면 STATE 검사로는 잡지 못하는 경계를 확인했다. 실제 앱 재현으로 기록하지 않는다. 최종 경로는 CEF 조회 뒤 UI 상태를 다시 확인하고, 이어 원본과 소유권을 검사한 뒤 선택한다. 성공 후 주소 초안을 다시 지우던 중복 코드는 제거했다. 실제 선택 변경은 기존 Shell::render가 처리하며, 그 이후 새로 생긴 초안을 뒤늦게 삭제하지 않는다. 실패 뒤 정리는 이번에 만든 탭이 여전히 소유되지 않은 사용자 탭일 때만 수행한다. host 조회 뒤에도 자격을 재검사하고 rejected_creation으로 표시해 최근 닫은 탭 기록에 넣지 않는다. 다른 작업에 채택된 탭은 닫지 않는다.
+
+검증 범위는 다음과 같다.
+
+- Rust 단위: 새 검사 4개를 포함한 203개가 전부 통과했다. UI 대상과 화면 가드, 실제 주소 일치, 오래된 탭과 공간, epoch, 문서 상태, owner와 revision 변경, UI 변경 거절을 확인했다. 배경 삽입의 선택 보존, 정리 대상 자격과 실제 사용자 선택 함수의 A/B 작업 보존도 검사했다. inert CEF handle과 상태 검사이며 엔진 초기화나 화면 실행은 없다. 기존 Unix 소켓 검사에 필요한 bind를 위해 컴파일된 단위 검사 실행 파일만 샌드박스 제한 밖에서 실행했다. `artifacts/current-page-v1-tests-compile.log`, `current-page-v1-rust-tests.log`가 근거다.
+- 컴파일과 정적 검사: cargo check 전체 타깃, cargo fmt 전체 검사, git diff 공백 검사 통과. `current-page-v1-check.log`에 결과가 있다. 검사 전후 전체 src 파일 해시가 같음을 확인했다. 기존 test 전용 dead_code 경고 2개는 남는다. 독립 최종 읽기 리뷰에서 추가 필수 결함은 없었다.
+- 미실행: 모의 DOM 검사는 해당 소스를 변경하지 않아 반복하지 않았다. 앱 번들 생성, 서명, 실행, 로컬 CEF와 HTTP, 네이티브 메뉴와 포커스, 실제 입력기 조합, 생성 중 변경 경합과 생성물의 실제 종료, 외부 사이트, RAM 비교는 수행하지 않았다. 이전 46개 모의 DOM과 다른 앱 바이너리의 성공을 이번 네이티브 결과로 합산하지 않는다.
+
+검사에는 별도 `target/.current-page-test-tjklle06`을 사용했다. 완료 후 일반 파일 3,070개, 파일 크기 합계 1,965,029,553바이트 약 1.8GiB와 해당 디렉터리를 제거했다. 이번에 실행한 단위 검사와 컴파일 프로세스는 종료됐고 앱, helper, 서버는 새로 띄우지 않았다. 보존 중인 앱 SHA-256은 `5eb253df67350236541fc613b4fcd9e6438492fcbf4f22ad4650c433c75b117b`, CLI는 `b0b57a113b48e321861675cef30d7cbb9e8a0aa12edd911c6aad108759625cbe`로 전후 일치한다. 프로필과 키체인은 접근하거나 변경하지 않았다. `artifacts/current-page-v1-validation.json`에 검사 결과, 미실행 범위와 정리를 기록했다.
+
+`docs/open-current-page.md`, README, 아키텍처와 제품 계획을 갱신했다. 새 기능은 소스와 단위 검사 단계이며 보존 중인 numbered-tabs-v3 앱에는 아직 없다. 실제 앱 검증, 안정적인 서명과 최종 HTTP 검증, 방문 기록, 장시간 자원 회수, Preseller 내장은 남아 있다. Naru 전체 목표는 계속 진행 중이며 커밋, 푸시, 배포는 하지 않았다.
+
+## 2026-10-15, AI 입력 종류 재검사와 완료된 DOM probe 해제
+
+Naru 완성 후속으로 AI 제어의 입력·대기·취소 경로를 점검했다. 반복 키체인 입력을 요구하지 말라는 지시를 유지해 앱이나 CLI를 실행하지 않았다. `src/dom_bridge.js`의 fill은 지원 입력 종류를 검사한 뒤 focus를 주고 native value setter를 호출했지만, focus 처리 중 바뀐 종류는 재검사하지 않았다. text가 checkbox 등으로 바뀌어도 값을 쓰고 input/change 이벤트와 성공을 반환하는 경로를 모의 DOM에서 재현했다. 기존 정책을 `supportsFill`로 공유하고 focus 전과 쓰기 직전에 적용했다. 기존 거절 대상 file·checkbox·radio·button·submit·reset·image·hidden으로 바뀌면 fill의 setter와 이벤트를 실행하지 않는다. 지원하는 text↔password 전환은 유지한다. 페이지의 focus 처리 자체가 만든 변경을 취소하거나 실제 파일 입력 동작을 재현한 검사는 아니다.
+
+`src/browser.rs::devtools_result`의 ReadyState 최종 응답도 수정했다. pending을 제거한 뒤 탐색 오류나 기한 만료로 즉시 반환하면 waiter의 `probe_in_flight`가 true로 남았다. 다음 타이머 전에 새 탐색이 오류를 지우는 상태 순서에서는 새 문서 확인을 막을 수 있다. 해당 최종 분기에서 기존 `pending_error`의 ReadyState 경로를 호출해 표시만 해제한다. waiter와 응답은 살아 있고 기존 타이머가 오류·시간 초과 및 탭 상태를 반환한다. Frame/World 준비 단계, 변경 작업과 캡처 처리에는 손대지 않았으며 자동 행동 재시도를 추가하지 않았다. 기존 inert CEF handle과 실제 STATE·devtools_result를 쓰는 회귀에서 오류·기한 만료, pending 제거, probe 해제, 즉시 성공 없음, 중복 콜백 무효화를 검사한다.
+
+검증은 다음과 같이 구분한다.
+
+- 모의 DOM: 기존 37개 통과를 확인한 뒤 새 회귀를 넣었고 수정 전 46개 중 38개 통과·8개 실패, 수정 후 46개 전부 통과했다. 부모도 최종 소스로 46개를 다시 실행해 통과했다. `artifacts/dom-fill-focus-red.log`, `dom-fill-focus-green.log`, `ai-guards-v1-dom-tests.log`가 근거다.
+- Rust 단위: 새 회귀만 먼저 실행해 수정 전 probe 표시 assertion 실패(exit 101)를 확인했다. 수정 후 전체 검사 최초 실행은 196개 통과·3개 실패였다. 실패 3개 모두 자체 Unix 소켓 bind의 샌드박스 제한이었다. 컴파일된 동일 단위 검사 실행 파일만 제한 밖에서 다시 실행해 199개 전부 통과했다. `ai-guards-v1-rust-before.log`, `ai-guards-v1-rust-tests.log`, `ai-guards-v1-rust-tests-unrestricted.log`에 실패와 성공을 구분했다. 기존 test 전용 dead_code 경고 2개는 남는다.
+- 정적 확인: cargo fmt 전체 검사와 git diff 공백 검사 통과. 독립 읽기 리뷰에서 필수 수정 사항은 없었다.
+- 미실행: 앱 번들 생성·서명·실행, 로컬 HTTP/CEF 통합, 네이티브 UI, 외부 사이트, 실제 Chromium focus 처리 및 타이머와 탐색의 경합, RAM 비교는 하지 않았다. 단위 검사 실행을 실제 CEF 브라우저 실행으로 세지 않는다. 전체 타깃 검사와 배포 빌드도 이번 범위에 없다.
+
+검사 컴파일은 별도 `target/.ai-guards-test-ih0t4yo3`에서 수행하고 완료 후 해당 디렉터리를 제거했다. 제거한 일반 파일 2,791개의 파일 크기 합계는 1,511,134,272바이트(약 1.4GiB)다. 새 앱·helper·서버 프로세스를 띄우지 않았고 검사 실행 파일은 모두 종료됐다. 기존 앱 SHA-256 `5eb253df67350236541fc613b4fcd9e6438492fcbf4f22ad4650c433c75b117b`와 CLI `b0b57a113b48e321861675cef30d7cbb9e8a0aa12edd911c6aad108759625cbe`가 전후 일치하며 프로필·키체인을 변경하지 않았다. `artifacts/ai-guards-v1-validation.json`에 소스 해시, 실제 검사 결과와 정리를 남겼다. 다른 앱의 현재 실행 여부를 조사한 결과는 아니다.
+
+`docs/architecture.md`와 `docs/product-plan.md`에 동작과 증거 범위를 반영했다. 수정 소스는 아직 보존 중인 numbered-tabs-v3 앱에 번들링하지 않았다. 변경 빌드 간 서명 정체성과 키체인 권한 유지, 최종 HTTP/CEF 검증, 장시간 자원 회수와 실제 메모리 비교, Preseller 내장은 남아 있다. 이번 단위·모의 검사를 이 범위나 Naru 전체의 완료로 표시하지 않는다. 커밋·푸시·배포는 하지 않았다.
+
+## 2026-10-15, 개발 빌드와 앱 실행 분리
+
+Naru 완성 작업을 이어가되 반복 키체인 입력을 요구하지 말라는 사용자 지시를 유지했다. 지난 턴의 숫자 탭 선택과 초안 보호는 구현 및 네이티브 검사에서 진전이 있었지만, 최종 HTTP 검사는 미완료다. 이번에는 앱이나 키체인을 조작하지 않고 `scripts/dev.sh`의 기본 자동 실행 경로를 수정했다. 기존 run_app=1은 빌드와 번들 교체가 끝나면 프로필을 사용하는 앱을 즉시 실행했다. 현재 번들의 공개 서명 메타데이터도 Signature=adhoc, TeamIdentifier=not set, cdhash 기반 designated requirement였다. [Apple TN3127](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements)은 ad hoc의 designated requirement가 해당 코드 버전에 묶인다고 설명한다. 이 자료를 인증서나 키체인 항목을 조회한 증거로 쓰지 않는다.
+
+기본값은 빌드만 수행하도록 바꿨다. 앱 실행은 명시적 `--run`에만 남겼고, 서명자가 미지정, 빈 값, ad hoc 값 `-`이면 다운로드나 컴파일 전에 거절한다. `--run`과 `--build-only`의 충돌도 거절한다. 빌드 전용 모드에서는 `--` 뒤의 브라우저 인수를 무시하지 않고 오류로 처리한다. identity와 브라우저 인수는 기존 배열 및 개별 인수 전달을 유지한다. 번들 생성, 실패 시 중단, strict 검증 후 이전 앱 교체, 중간물 정리는 바꾸지 않았다. 빌드 전용 모드도 실제로 실행하면 기존 앱 교체 과정에서 이전 앱을 종료할 수 있음을 README에 유지했다. README, `docs/architecture.md`, `docs/product-plan.md`에 변경과 미완료 범위를 반영했다.
+
+`tests/dev_script_test.py`는 실제 개발 스크립트를 공백이 있는 임시 checkout에 복사하고 PATH를 가짜 도구만 있는 디렉터리로 제한한다. fetch, Cargo, Python 단계, 앱은 호출 인수만 기록하며 실제 명령으로 전달하지 않는다. 기본 debug와 release의 앱 비실행, 명시적 빌드 전용과 identity 전달, 실행 옵션의 인수 보존, 잘못된 identity와 옵션의 조기 거절, 각 단계 및 Ninja 다운로드 실패 뒤 중단을 검사했다. `python3 -B -m unittest discover -s tests -p dev_script_test.py -v`의 9개 검사가 통과했고 Bash 문법 검사와 git diff 공백 검사도 통과했다. 부모가 별도로 재실행한 결과는 `artifacts/dev-launch-policy-v1-tests.log`에 있다. 독립 읽기 리뷰에서 필수 수정 사항은 없었다.
+
+실제 checkout의 `scripts/dev.sh --release --run`도 NARU_CODESIGN_IDENTITY를 제거한 환경에서 실행해 예상한 exit 2와 빈 stdout을 확인했다. 거절은 fetch나 Cargo 이전이며 앱을 실행하지 않았다. `artifacts/dev-launch-policy-v1-preflight.json`에 결과와 기존 앱, CLI 해시 일치를 남겼다. 앱 SHA-256은 `5eb253df67350236541fc613b4fcd9e6438492fcbf4f22ad4650c433c75b117b`, CLI는 `b0b57a113b48e321861675cef30d7cbb9e8a0aa12edd911c6aad108759625cbe`로 이전 최종 바이너리와 같다. 이번 작업은 실제 서명, Rust 재빌드, 앱 실행, 모의 DOM, 로컬 CEF, 네이티브 UI, 외부 사이트, RAM 비교를 수행하지 않았다. 이전 Rust 198개 결과를 이번 검사 수에 합산하지 않는다.
+
+임시 checkout과 가짜 앱은 검사 종료 시 제거됐다. 새 앱 번들이나 CEF 프로세스는 만들지 않았으며 프로필, 키체인, 기존 바이너리는 그대로다. 지속적인 서명 정체성과 변경 빌드 사이의 권한 유지 검증, 최종 HTTP 및 CEF 검증은 아직 남아 있다. 이번 변경을 반복 승인 문제나 독립 브라우저 전체의 해결로 표시하지 않는다. 전체 목표는 계속 진행 중이며 커밋, 푸시, 배포는 하지 않았다.
+
+## 2026-10-13, 공간별 숫자 탭 단축키와 주소 초안 보완 — HTTP 검증 미완료
+
+일상 탐색 후속으로 `src/control_panel.rs`에 ⌘1–8은 현재 표시 공간의 사이드바 순서, ⌘9는 마지막 탭을 고르는 동작을 추가했다. 없는 번호와 반복 키는 페이지에 넘기지 않으며, 오버레이·공간 보기 밖에서 같은 탭을 다시 선택하면 입력을 건드리지 않는다. `src/browser.rs::select_tab_from_sidebar`가 실제 공간·소속·살아 있는 탭을 먼저 검사하고 기존 AI 제어권을 유지하는 선택 경로를 재사용한다. 성공 후에만 목록을 닫고 최종 포커스 대상도 재확인한다. 새 저장소·renderer·타이머·탭 목록 캐시는 없다.
+
+중간 v1은 Rust 197개·전체 타깃·format·release를 통과했지만 실행하지 않았다. 읽기 리뷰에서 낡은 UI 탭 정보로 선택에 실패하기 전에 오버레이를 닫을 수 있는 순서를 발견해 v2에서 수정했다. v2는 Rust 198개·전체 타깃·format·release가 통과했다. 실제 Cmd1/2/9 선택, 없는 Cmd8에서 주소·검색·북마크 검색 입력과 포커스 유지, 검색에서 유효한 숫자 선택, 사용자·AI 공간별 순서와 A/B active revision 1 보존을 확인했다. 로컬 HTTP는 초기 로딩 대기 후 같은 바이너리에서 완료됐으며 commit·문서 준비·메인 로드와 실제 화면·소유 작업 범위의 read가 일치했다. 추가 키체인 요청은 하지 않았고 해소 원인을 단정하지 않는다. 작업 소유 탭의 비범위 read는 TASK_REQUIRED로 거절됐으며 소유 범위로 재검사했다. 근거는 `artifacts/numbered-tabs-v2-native.json`, `-ai-http.json`이다.
+
+v2 네이티브 검사에서는 상단 주소 초안→북마크→현재 탭 번호 선택에서 초안 소실을 발견했다. 숫자 선택 없이 북마크→Esc만으로도 같은 현상이 재현됐다. 기존 중앙 시작 입력 보호와 별개로, 상단 주소 보호가 다운로드 진입에만 있었다. v3는 기존 metadata-only AddressDraft 보관을 세 오버레이 진입에서 공통 사용하고, 이미 열린 오버레이·공간 보기에서는 숨은 입력을 새 초안으로 채택하지 않도록 했다. 실제 탭·공간·URL·탐색 세대 변경 시 만료 규칙은 유지했다. 최종 v3는 Rust 198개·전체 타깃·format·release가 통과했고 소스 해시가 빌드 전후 일치했다. 앱 SHA-256은 `5eb253df67350236541fc613b4fcd9e6438492fcbf4f22ad4650c433c75b117b`이며 CLI는 `b0b57a113b48e321861675cef30d7cbb9e8a0aa12edd911c6aad108759625cbe`다. 기존 test 전용 dead_code 경고 2개는 유지된다. 최종 앱에서 상단 주소→북마크→Esc, 검색·북마크·다운로드→현재 번호로 복귀할 때 초안을 보존했다. 복귀 시 주소 전체 선택을 확인했고 Right 뒤 붙여넣기로 이어쓰기를 확인했다. 없는 Cmd8의 검색·북마크 검색·다운로드 포커스 보존, 같은 탭 Cmd9의 입력 보존, 다른 Cmd1 선택의 이전 초안 초기화, 중앙 시작 입력의 기존 보호, 공간 보기에서 Cmd2 복귀, 배경 작업 시작의 사용자 선택 보존과 사용자 Cmd9의 공간 내 마지막 선택도 확인했다. AI 공간의 Cmd1/2/9·없는 Cmd8·검색→Cmd1은 A/B 모두 active revision 1을 유지했다. 숫자 3–8의 실제 각 위치·키 반복·IME·숫자 패드·실시간 stale UI 경합은 네이티브 검사 범위가 아니다. 근거는 `artifacts/numbered-tabs-v3-native.json`과 `-before-approval.json`이다.
+
+최종 v3의 첫 HTTP load는 5,021ms에 WAIT_TIMEOUT이었고, Naru 자체 스택에서 SecKeychainItemCopyContent→CSSM_DecryptDataFinal 응답 대기를 확인했다. `numbered-tabs-v3-first-http.json`과 `-http-stack.txt`에 기록했다. Computer Use의 SecurityAgent 접근 차단 때문에 사용자에게 직접 승인을 요청했다. 사용자는 반복 입력·승인 요청을 중단하라고 했으며 이를 새 승인으로 해석하지 않았다. 추가 승인 요청과 재빌드를 멈췄고 HTTP·CEF 16개는 미검증으로 남겼다. 이전 v2 HTTP 성공이나 다른 빌드의 회귀를 v3에 합산하지 않는다.
+
+v2 검증용 A/B 작업·사용자 탭 2/3을 정리하고 원래 사용자 빈 탭 1을 보존했다. 네이티브 CmdQ는 exit 0이었다. 최종 v3도 빌드 중간물 4,332개·2.5GiB를 제거했으며 최신 dist 번들 하나 약 335MiB, target 약 2.9MiB, 검증 자료 약 20.2MiB, 재사용 CEF 캐시 약 339MiB를 유지한다. 최종 v3의 A/B 작업은 모두 finished·빈 tabs/closingTabs로 정리했고 검사 탭 2–6을 닫아 원래 사용자 빈 탭 1과 빈 입력만 남겼다. pendingWaits·capture·탭 생성·다운로드 대기는 0이었다. 네이티브 CmdQ로 v3 PID 86179를 정상 종료해 exit 0을 확인했고 재시작하지 않았다. 자체 HTTP fixture PID 69901(session 60273, port 61209)은 SIGTERM 뒤 exit 0으로 종료했다. v1은 미실행이며 이전 앱과 최종 검증 앱도 남아 있지 않다. 프로필과 기존 데이터는 보존했다. 반복 승인을 요구하는 개발 서명 문제는 해결되지 않았으며 사용자가 거절한 보안 승인을 우회하거나 제공된 암호를 사용하지 않았다. README와 제품 계획에 완료된 검사와 승인 대기를 구분했으며 새 모의 DOM·외부 사이트·RAM 비교·전체 제품 완성은 주장하지 않는다. 커밋·푸시·배포는 하지 않았다.
+
+## 2026-10-13, 사이드바 재현 조건 분리와 제한된 진단 추가
+
+UI 안정화 후속으로 사이드바 잘림의 재현 조건을 확인했다. 기존 `native-focus-v3` 실행에서 접기·펼치기 두 차례, 같은 바이너리 재시작 후 한 차례 모두 정상 모서리였다. 독립 CUA 관찰도 왼쪽 24px 여백과 둥근 모서리를 확인했다. 이전 초기 검사에서의 잘림은 취소하지 않으며, 재시작만으로 재현되는 현상이라고 단정하지 않는다. 기존 Naru 표본 두 개에서 키체인 복호화 대기는 별도 Chromium worker였고 main은 AppKit 이벤트 대기였다. 메인 스레드의 중첩 루프가 잘림의 원인이라는 근거는 없었다. `artifacts/surface-probe-v1-baseline.json`과 기존 `ui-focus-v{2,3}-first-http-stack.txt`에 범위를 구분했다.
+
+`src/control_panel.rs`에 `NARU_SURFACE_PROBE` 선택형 진단을 추가했다. 미설정·오타는 즉시 비활성화하며 `noop`, `frame`, `bounds`, `visible`, `convert`, `layer`, `presentation`만 받는다. 기존 포커스 또는 전체 표면 진단과 동시에 켜면 실행하지 않는다. 사이드바 전환의 layout 뒤 최대 16회 시도하며, 상태 borrow 밖에서 기존 두 배경의 선택한 getter만 조회한다. `presentation`은 `layer` 조회가 선행된다. noop은 같은 retain·카운터·고정 로그를 거치되 추가 getter는 호출하지 않는다. 입력값·주소·페이지·포인터를 출력하지 않고 새 타이머·이미지 캐시·레이어·웹 renderer는 만들지 않는다. 기본 표시 동작의 수정이나 잘림 해결로 설명하지 않는다.
+
+처음 format 검사는 import 정렬 차이로 실패했고 해당 로그를 보존했다. 프로젝트 `cargo fmt` 적용 뒤 format·release 빌드는 성공했으며 빌드 전후 28개 소스 해시 일치를 확인했다. 앱 SHA-256은 `0a83c27b979736846c67070c98a877c95ad6817439eab182e8dc5e446d76362e`, CLI는 `1de0078a544b28c5d0e2acf9dca685bea48ccec934accaa2693304a74dc4a5c3`다. 진단 추가에 대한 빌드·네이티브 확인으로 범위를 잡았으므로 Rust 단위·전체 타깃·모의 DOM·CEF 32개 전체 회귀는 다시 실행하지 않았다. 이전 v3의 194개·32개 결과를 이 바이너리에 합산하지 않는다.
+
+새 바이너리의 진단 OFF 첫 실행에서 접기·펼치기 후 화면은 정상이었고 진단 로그는 0줄이었다. 종료는 teardown watchdog에 의해 exit 2였으며 정상 종료로 세지 않는다. 종료를 기다리는 중 다음 실행 명령을 제출했지만 이전 세션의 exit 2와 후속 단일 메인 PID 67567을 확인했다. 이후 재시작은 이전 세션 종료 확인 뒤 진행했다. noop 실행에서는 실제 UI를 18회 전환해 AX의 접힘·펼침 상태를 확인했고 로그가 정확히 sequence 1–16에서 멈췄다. 마지막 화면은 정상 모서리였다. 매 전환의 이미지를 판독한 것은 아니다. 재현 대조군이 없으므로 getter별 모드는 실행하지 않았고 어느 조회가 현상을 고친다는 판정도 하지 않았다. noop 실행의 자체 Naru 스택 표본에는 키체인 복호화 호출이 없었으며 종료는 exit 0이었다. 최초 종료 실패의 원인은 미확정이다.
+
+같은 바이너리를 다시 기본 설정으로 실행해 원래 사용자 탭 1을 보존한 검증 탭 2에서 native CmdT, 주소창 Tab→중앙 입력, 사이드바 북마크 왕복 후 초안 보존을 확인했다. 중앙 입력 Enter로 자체 HTTP fixture를 열었고 실제 화면·CLI read·commit·문서 준비·메인 로드 완료가 일치했다. 추가 키체인 질문 없이 완료했으나 변경 빌드 사이 권한 유지의 해결로 확대하지 않는다. 검증 탭은 CmdW로 닫았고 이 기본 실행도 exit 0이었다. 결과는 `surface-probe-v1-native.json`, `-http.json`, `-noop-app.log`, `-final-app.log`에 기록했다. 실제 IME·FKA 활성·최소 창·다크 모드·외부 사이트·비교 RAM은 미실행이다.
+
+기존 앱과 모든 중간 실행은 종료했고 최신 기본 실행 메인 PID 68075 하나와 CEF helper만 남겼다. 자체 fixture PID 67440은 SIGTERM 후 exit 0으로 종료했다. 원래 user 빈 탭 1과 빈 입력을 보존했으며 작업 목록·wait·capture·탭 생성·다운로드·권한·저장 대기는 모두 0이다. 빌드 중간물 1,263개·672.1MiB를 제거했고 최신 dist 번들 하나 약 335MiB, target 약 2.9MiB, 검증 자료 약 19.6MiB, CEF 캐시 약 339MiB를 유지한다. 최종 재시작 뒤 HTTP는 반복하지 않았다. 정리 및 소스·로그 검사는 `surface-probe-v1-final-state.json`, `-validation.json`에 남겼다.
+
+README·제품 계획·시작 화면 설계에 초기 실패와 후속 비재현을 구분해 반영했다. 이번 완료 범위는 제한된 진단 도구와 기본 입력·탐색 확인이다. 사이드바 원인, 최초 종료 지연, 나머지 독립 브라우저 기능과 Preseller 내장은 남아 있으며 전체 목표는 활성 상태다. 커밋·푸시·배포는 하지 않았다.
+
+## 2026-10-13, 숨긴 Chromium 키보드 포커스 보정과 사이드바 갱신 진단
+
+이전 키체인 승인 뒤 이어진 UI 보완으로 주소창과 새 탭 중앙 입력의 Tab 이동을 수정했다. `src/mac.rs`의 기존 `super.sendEvent`가 끝난 뒤, 같은 Naru key window의 일반 Tab·ShiftTab에서 실제 first responder가 숨긴 CEF 하위 뷰인 경우에만 보정한다. `src/control_panel.rs`는 AppKit의 다음·이전 유효 후보 순서와 `canBecomeKeyView` 조건을 유지하면서 숨긴 후보를 건너뛴다. 포커스를 바꾸기 직전 창·원래 responder·후보를 다시 검사하며 모든 AppKit 호출은 상태 borrow 밖에서 실행한다. 순환과 512개 후보 상한을 두었고 정상 웹 입력·마우스·직접 포커스·task/space 상태 API는 바꾸지 않는다. 방문 목록은 예외 경로에서만 생기며 arm64에서 최대 512개 참조다. 새 UI renderer·타이머·저장소는 없다.
+
+`native-focus-v1` 실제 진단에서 주소창의 nextValidKeyView와 중앙 입력의 previousValidKeyView가 hidden·hiddenAncestor=true인데도 key=true인 `RenderWidgetHostViewCocoa`였다. 일반 Tab에서 OnSetFocus 없이 OnGotFocus가 호출됐고, 이벤트 종료 뒤에도 해당 숨긴 뷰가 responder였다. 이후 기존 시작 화면 fallback이 주소창으로 돌렸다. 이를 단순 키 목록 갱신으로 해결됐다고 설명하지 않는다. v2는 진단 ON에서 주소 Tab→중앙·중앙 ShiftTab→주소 2방향, OFF에서는 네 방향을 확인했다. `src/browser.rs`의 포커스 콜백과 `src/mac.rs`, `src/control_panel.rs`의 선택적 진단은 입력값·URL·제목·포인터 주소를 기록하지 않는다. `NARU_FOCUS_DIAGNOSTICS=1`은 최대 128줄, `NARU_SURFACE_DIAGNOSTICS=1`은 첫 토글 이후 최대 32샘플이며 기본은 꺼져 있다. 후보 조회가 AppKit의 지연 계산 시점을 바꿀 수 있다는 한계도 남긴다.
+
+사이드바 문제는 아직 미해결이다. v1의 검색·새 탭 배경 frame 변경 시 setNeedsDisplay 후보는 펼친 뒤 무입력 후속 캡처에서도 왼쪽 잘림이 남았으며 실제 좌표 클릭으로도 재현됐다. CmdL 뒤에는 정상으로 돌아왔다. v2 수치 진단은 view/model의 x=12pt·정상 bounds를 보였고, 토글 직후 presentation만 이전 폭이었다. 같은 바이너리에서 전체 진단 ON은 정상, OFF는 잘림이 재현돼 진단 읽기가 현상을 가릴 가능성을 확인했다. 특정 getter나 음수 좌표가 원인이라고 확정하지 않는다. v3는 모든 배치와 상태 borrow 종료 후 frame이 바뀐 두 배경에만 공개 `displayIfNeeded()`를 호출했지만 진단 OFF 펼침 직후 잘림이 다시 나타났다. 이 후보를 해결로 표시하지 않으며 개별 getter와 무동작 I/O 대조는 후속 계획일 뿐 실행하지 않았다.
+
+v1은 format·release 빌드만 실행했다. v2와 최종 v3는 각각 Rust 단위 검사 194개, 전체 타깃 Cargo 검사, format·release 빌드를 통과했다. 새 모의 DOM 검사는 실행하지 않았다. 기존 test-only dead_code 경고 2개는 남는다. 최종 앱 SHA-256은 `03e369b4c43b551e473071658d27d0902a1e6d0f67202ac4514327ad6511d226`, CLI는 `b93656475cc0b2a17ffec2c29950a5f8f36ebfb9188ccec03a7965b55c687d7e`다. 빌드 전후 소스 해시가 같음을 확인했다. `artifacts/native-focus-v3-{source,binaries}.json`과 `-rust-tests.log`, `-check.log`, `-fmt.log`, `-build.log`에 근거를 남겼다.
+
+최종 v3는 두 진단을 끈 상태에서 검증했다. 회귀 검사가 끝난 뒤에도 주소 Tab→중앙·중앙 Tab→주소·주소 ShiftTab→중앙·중앙 ShiftTab→주소 네 방향을 실제 AX 포커스로 확인했다. Tab으로 중앙에 진입해 입력하고 사이드바 북마크·검색·다운로드를 왕복해 현재 초안을 보존했다. 선택된 입력에 End를 보낸 뒤 붙여넣으면 교체됐으므로 이어쓰기 성공으로 세지 않았고, Right로 선택을 해제한 대조에서는 정상으로 이어 썼다. AI 탭 채택 후에도 사용자 공간이 유지되는 것을 늦게 확인해 처음 의도한 AI 검사는 사용자 탭에서 실행됐다. 원래 탭에 넣은 검증 문자열을 지우고 실제 A 공간으로 전환해 다시 검증했으며, 마지막 원래 탭의 중앙 입력이 빈 placeholder인 것을 확인했다.
+
+실제 A 공간에서 Tab 이동·입력은 A/B 모두 active revision 1을 유지했다. B의 배경 HTTP 탭 생성·완료 후에도 A의 선택과 편집기가 유지돼 재포커스 없이 입력했고, 유효한 중앙 HTTP Enter만 A를 paused revision 2로 바꾸고 B는 active revision 1로 유지했다. 이번 최종 바이너리의 HTTP는 추가 키체인 질문 없이 완료됐다. 향후 다른 바이너리에서도 승인 대기가 해결됐다는 뜻은 아니다. 실제 웹 입력에서 Tab으로 팝업 버튼에 이동해 Return으로 내용이 있는 about:blank 팝업을 만들었으며, 팝업의 Tab·붙여넣기 값은 CLI read와 일치했다. 근거는 `native-focus-v3-native.json`, `-ai-keyboard.json`, `-handoff.json`, `-http-wait.json`, `-popup-read-after.json`이다. 한글은 붙여넣기 검사이며 IME 조합·FKA 활성 설정·최소 창·다크 모드·외부 사이트·장시간·비교 RAM은 실행하지 않았다.
+
+동일 최종 바이너리의 로컬 CEF select 10개·tasks 6개·spaces 10개·single_window 6개, 총 32개가 exit 0·빈 stderr·cleanupVerified true로 통과했다. 첫 실행기는 리다이렉션 로그 이름이 자체 중복 방지 규칙에 걸려 앱 접근 전에 종료됐다. 해당 로그를 보존해 다른 이름으로 옮긴 뒤 처음으로 검사들을 실행했으며 제품 실패를 재시도한 것으로 합산하지 않는다. 마지막 자료 검사의 첫 assertion은 stderr 파일 경로를 내용으로 잘못 해석해 실패했다. 실제 스키마의 stderrBytes와 해당 파일 크기를 검사해 모두 0임을 확인했으며 앱 검사는 반복하지 않았다. `native-focus-v3-harness-preflight-error.log`, `-suite.json`, `-suite-state.json`, `-regression-run.log`로 구분한다.
+
+이전 앱은 각 재빌드 전에 CmdQ로 종료했으며 중간 진단 앱과 진단 OFF 대조 실행도 종료했다. 최종 메인 PID 61776과 그 CEF helper만 유지한다. 자체 서버 PID 60445는 SIGTERM 후 exit 0으로 종료했다. v1 빌드는 중간물 1,263개·671.9MiB, v2·v3는 각각 4,332개·2.5GiB를 정리했다. target 2.9MiB·최신 dist 번들 하나 335MiB·검증 자료 약 19.3MiB·CEF 캐시 339MiB를 유지한다. 사용자 프로필과 원래 탭 1을 보존했고, 네이티브 2개와 회귀 9개 작업 모두 finished·소속/종료 대기 탭 없음으로 정리했다. 원래 user 탭 1만 선택됐고 다운로드·저장·권한·wait·capture·탭 생성 대기는 0이다. `native-focus-v3-native-cleanup.json`, `-final-state.json`, `-validation.json`에 결과를 기록했다.
+
+README·제품 계획·시작 화면 설계를 갱신했다. 이번 완료 범위는 키보드 이동 보정과 그 회귀 검증이며, 사이드바 잘림·나머지 제품 범위·Preseller 내장은 완료가 아니다. 전체 목표는 활성 상태다. 커밋·푸시·배포는 하지 않았다.
+
+
+## 2026-10-13, 입력 초안 보존 보완과 키보드·사이드바 검증
+
+새 탭 화면의 후속 네이티브 검증을 진행했다. `src/control_panel.rs`에서 검색·새 탭의 장식 배경 두 개에 `clipsToBounds`를 명시하고, 최초 배치와 실제 표시 전환 뒤 AppKit 키 뷰 목록을 갱신했다. 일반 타이핑·주기 갱신에는 목록을 다시 계산하지 않는다. 중앙 입력에서 주소창으로 Tab 이동은 확인했지만 반대 방향의 Tab·ShiftTab은 여전히 주소창에 머물렀다. 키보드 순환 해결로 표시하지 않으며 숨긴 Chromium 자식의 키 뷰 참여 여부는 후속 런타임 진단 항목이다.
+
+중간 `ui-focus-v2`에서 중앙 필드를 편집한 채 **사이드바** 북마크를 열고 Esc로 돌아오면 같은 탭 3·epoch 2의 초안이 없어졌다(2회). Tab으로 편집을 먼저 종료한 대조군은 값을 보존했다. 이전 시작 화면 검증의 중앙 북마크 버튼 경로와 구분한다. `ui-focus-v3`는 `sync`의 사전 편집 종료 조건을 대상 변경뿐 아니라 시작 화면이 곧 숨겨지는 경우로 확장했다. 기존 field editor 종료를 상태 borrow 밖, `setEnabled(false)`보다 먼저 수행한다. 입력 문자열을 별도 저장하거나 다시 쓰지 않으며 새 대상 초기화·AI 제어권 검증은 유지한다.
+
+v1·v2·v3는 각각 Rust 단위 검사 194개, 전체 타깃 Cargo 검사, format 검사와 release 빌드를 통과했다. 기존 테스트 전용 dead_code 경고 2개는 남는다. 새 모의 DOM 검사는 실행하지 않았다. 최종 앱 SHA-256은 `eacac76ec88bf8744db9f73d3191bc00fbe0dd15a3a18719ee8f755aa5d59da5`, CLI는 `47070c0aca674370d4e4af0d98e957396b5816ff4eeb31cabfff4b9cdc991450`이다. 바이너리·소스 해시 및 검사 로그는 `artifacts/ui-focus-v3-binaries.json`, `-source.json`, `-rust-tests.log`, `-check.log`, `-fmt.log`, `-build.log`에 있다.
+
+v3 실제 화면에서 편집 중 사이드바 북마크·통합 검색 단축키·다운로드 왕복의 초안 보존을 확인했다. 접기·펼치기와 배경 AI 탭 생성 뒤에도 사용자 초안에 재포커스 없이 이어 썼다. AI 작업 A의 중앙 입력·북마크 왕복은 A/B 모두 active revision 1을 유지했고, 유효 주소 Enter 제출은 A만 paused revision 2·B active revision 1로 바꿨다. 창 크기 변경 시도는 2360×1664픽셀을 바꾸지 못해 최종 최소 창 검사는 미검증이다. 접힌 검색·새 탭 배경은 정상적으로 보였고 펼친 직후 캡처에는 왼쪽 배경이 잘렸으나 후속 Tab 화면은 정상 모서리였다. 표시 전환 직후의 시각 안정성까지 해결했다고 기록하지 않는다. 한글은 붙여넣기이며 IME 조합·다크 모드·전체 버튼 키보드 이동·외부 사이트·메모리 비교는 미검증이다.
+
+v2 첫 HTTP는 잘못된 wait 옵션을 준 하네스의 INVALID_ARGUMENTS 뒤, 올바른 호출에서도 5,042ms WAIT_TIMEOUT이었다. 제품 대기와 하네스 오류를 구분한다. 앱 표본 831개가 `SecItemCopyMatching → SecKeychainItemCopyContent → decrypt`에서 대기했고, 사용자 “항상허용했다” 응답 후 같은 바이너리에서 HTTP 완료를 확인했다. 실제 about:blank 팝업 본문과 입력을 CLI read로 대조했다. v2 전체 CEF 32개는 실행하지 않았다. v3도 첫 HTTP가 문서 전 대기하며 같은 키체인 호출 스택 807개를 확인해 사용자에게 직접 승인을 요청했다. SecurityAgent 도구 접근 차단을 우회하거나 인증정보를 사용하지 않았다. 변경 빌드 간 권한 유지 문제를 해결했다고 설명하지 않는다.
+
+사용자 “했다” 응답 후 추가 재빌드 없이 v3의 AI A/B HTTP 완료를 확인했다. 사용자 탭 3의 선택과 중앙 초안은 배경 생성·완료 후 유지됐고 이어 썼다. 사용자 중앙 Enter로 자체 HTTP를 열고 내용이 있는 about:blank 팝업을 실제 클릭으로 생성했다. 팝업 본문이 보였으며 붙여넣은 값은 CLI read와 일치했다. B 작업의 CLI read 후에도 A paused revision 2·B active revision 1이었다. 최종 같은 바이너리의 select 10개·tasks 6개·spaces 10개·single_window 6개, 총 32개 로컬 CEF 회귀가 모두 exit 0·빈 stderr로 통과하고 cleanupVerified도 true였다. 근거는 `artifacts/ui-focus-v3-popup-read.json`, `-user-http.json`, `-ai-read.json`, `-suite.json`, `-suite-state.json`이며 이전 빌드 결과를 합산하지 않았다.
+
+이전 앱 PID 19977·31866·37602는 CmdQ로 정상 종료(exit 0)했고 v3 메인 PID 44339 하나가 실행 중이다. 각 빌드는 Cargo 중간물 4,332개·2.5GiB를 정리했다. 자체 서버 PID 31756도 SIGTERM 후 exit 0으로 종료했다. 최신 번들 하나, target 2.9MiB·dist 335MiB·검증 자료 18.8MiB·CEF 캐시 339MiB를 유지한다. 사용자 프로필과 원래 탭 1은 보존했으며 검증용 탭을 닫고 자체 작업 11개 모두 finished·소속/종료 대기 탭 없음으로 정리했다. 원래 사용자 탭 1만 선택됐고 다운로드·권한·저장·wait·capture·탭 생성 대기는 모두 0이다. `artifacts/ui-focus-v3-native-cleanup.json`, `-final-state.json`, `-validation.json`에 최종 상태를 남겼다. 중간 실패와 최종 결과는 `ui-focus-v1-native.json`, `ui-focus-v2-native.json`, `ui-focus-v3-native.json`에 구분했다.
+
+README·제품 계획·시작 화면 설계를 갱신했다. 전체 목표는 활성 상태이며 Tab 역방향 경로, 사이드바 전환 표시, 변경 빌드 사이 키체인 권한 유지와 나머지 제품 범위를 완료로 표시하지 않는다. 커밋·푸시·배포는 하지 않았다.
+
+## 2026-10-13, 네이티브 새 탭 시작 화면과 제출 포커스 수정
+
+Aside 형식에 토스의 시각 표현을 참고하는 후속으로, 빈 새 탭에 중앙 주소·Google 검색 입력과 열기·북마크 진입을 구현했다. `src/control_panel.rs`, `src/browser.rs`, `src/start_page.rs`, `src/lib.rs`를 연결했다. 창당 고정 AppKit 화면을 재사용하며 별도 창·웹 UI renderer·저장소를 추가하지 않았다. 앱 시작과 명시적인 새 탭에만 표시 자격을 부여하고 CLI·팝업·DevTools 등의 빈 문서를 덮지 않는다. 실제 선택·공간·탐색 세대·CEF 메인 프레임을 제출 직전에 확인하며, 기존 주소 해석과 해당 AI 소유 작업의 인계 경로를 사용한다. 같은 대상의 배경 갱신·오버레이 왕복은 초안을 보존하고 대상 변경은 초기화한다.
+
+`tests/fixtures/start-page.html`과 `tests/preview_fixture.py`에 자체 HTTP 목적지와 내용이 있는 about:blank 팝업을 추가했다. Python·JavaScript 구문 검사는 통과했으며 모의 DOM 검사는 새로 실행하지 않았다. v1과 최종 v2는 각각 Rust 단위 검사 194개·전체 타깃 검사·format·release 빌드가 통과했다. 기존 테스트 전용 dead_code 경고 2개는 남는다. 최종 소스 해시는 `artifacts/start-page-v2-source.json`, 검사 근거는 `-rust-tests.log`, `-check.log`, `-fmt.log`, `-build.log`에 있다. 최종 앱 SHA-256은 `9ef0593acf202908e7bdd94f4da34a57f4d12a7be9aac7c637bf0fe6bdcaf021`, CLI는 `47070c0aca674370d4e4af0d98e957396b5816ff4eeb31cabfff4b9cdc991450`다.
+
+v1 실제 화면에서는 사용자 중앙 입력 Enter의 HTTP 이동, 내용이 있는 about:blank 팝업 본문 표시와 네이티브 입력 전달, 배경 AI HTTP·CLI 읽기 중 초안 이어쓰기, 북마크 왕복 보존을 확인했다. 팝업 입력은 CLI read에서도 확인했다. AI가 맡은 네이티브 빈 탭의 잘못된 입력은 A/B 모두 active revision 1을 유지했고, 유효한 버튼 제출은 A만 paused revision 2로 바꿨다. 그러나 빈 Enter 뒤 포커스가 주소줄로 옮겨지고, AI 인계의 중간 화면 갱신이 주소줄을 편집 상태로 만들어 HTTP 완료 뒤에도 URL이 비어 있는 오류를 발견했다. `artifacts/start-page-v1-native.json`, `-popup-read.json`, `-ai-invalid-state.json`, `-ai-submit-state.json`에 구분했다. 이 v1에 CEF 회귀 32개를 실행하지 않았다.
+
+최종 v2는 빈 제출의 실제 대상을 검증한 뒤 중앙 편집기로 복귀한다. 실제 nonempty 제출 동안만 임시 대상 하나를 보관해 같은 탭·공간의 중간 주소 포커스 이동을 막고 성공·실패 모두 반환 직후 해제한다. 성공 뒤 실제 선택이 같고 시작 화면·오버레이가 숨겨졌을 때 본문에 포커스를 준다. 주소 값이나 다른 편집 초안을 직접 덮지 않는다. AppKit의 공유 field editor는 해당 입력의 currentEditor와 실제 firstResponder 포인터가 같을 때만 상태 borrow 밖에서 정리한다.
+
+최종 v2 실제 화면에서 빈 Enter 뒤 중앙 입력에 한글을 이어 붙일 수 있었고, 배경 빈 탭을 닫은 뒤에도 초안과 편집기가 유지됐다. 배경 AI HTTP 생성·완료 및 CLI read, 북마크·다운로드·통합 검색 왕복 후에도 같은 초안을 확인했다. 새 탭 단축키는 기존 상단 주소 포커스를 유지하고 선택 변경은 이전 중앙 초안을 지웠다. AI 빈 탭의 빈/잘못된 입력은 A/B active revision 1을 유지했으며, 유효한 버튼 제출 뒤 A만 paused revision 2·B active revision 1이고 실제 URL이 주소줄에 표시됐다. 같은 탭의 commit·문서·load 완료를 CLI 메타데이터와 대조했다. 두 빌드 모두 자체 HTTP가 완료됐으며 새 키체인 승인 질문을 하지 않았다. 변경 빌드 사이 권한 유지의 일반적인 해결로 확대하지 않는다. 근거는 `artifacts/start-page-v2-native.json`, `-first-http.json`, `-ai-invalid-state.json`, `-ai-submit-state.json`이다.
+
+Computer Use가 사용자 직접 입력에 따른 변경을 감지해 앱 조작을 멈췄다가, 사용자의 “계속 검증해줘” 응답 후 같은 바이너리로 검사를 재개했다. 사용자 입력값은 검증 자료나 문서에 저장하지 않았다. 새 사용자 탭의 중앙 Enter로 자체 HTTP를 열어 실제 URL·본문을 확인했다. 내용이 있는 about:blank 팝업은 시작 화면에 가려지지 않았고 실제 클릭·붙여넣기를 CLI read로 대조했다. CLI reload는 epoch 2→5로 바꾸면서 이전 초안을 지우고 주소줄로 포커스를 돌렸다. 별도 빈 탭의 CLI scroll 뒤에는 시작 화면이 사라져 CEF 문서를 드러냈다. 사이드바 접기·펼치기에서도 중앙 초안·편집기·폼 배치를 확인했다. 한글 검사는 붙여넣기이며 IME 조합, 실제 최소 창 크기, 다크 모드, 외부 Google 검색·사이트, 메모리 비교·장시간 사용은 미검증이다.
+
+같은 최종 start-page-v2에서 select 10개·tasks 6개·spaces 10개·single_window 6개, 총 32개 로컬 CEF 회귀가 모두 exit 0·빈 stderr로 통과했고 cleanupVerified도 true다. v1이나 이전 aside-toss-v2의 검사 수를 합산하지 않았다. 근거는 `artifacts/start-page-v2-native.json`, `-reload.json`, `-suite.json`, `-suite-state.json`이다. 임시 스크립트의 잘못된 import는 앱 접근 전에, 첫 정리 시도의 task info 응답 구조 오인은 변경 전에 실패했다. 확인한 result.task 구조로 고쳐 정상 정리했다. 이는 제품 검사 실패와 구분한다.
+
+이전 앱 PID 4240과 v1 PID 13976은 CmdQ로 정상 종료(exit 0)했고 최종 PID 19977 하나가 실행 중이다. 두 빌드 모두 Cargo 중간 파일 4,332개·2.5GiB를 정리했다. 자체 서버 PID 11973과 후속 PID 23412도 SIGTERM 후 exit 0으로 종료했다. 재개 후 새 빌드는 하지 않았다. target 약 2.9MiB·dist 335MiB·검증 자료 17.6MiB·CEF 캐시 339MiB이며 최신 앱 번들 하나를 유지한다. 사용자 프로필과 원래 탭 1은 닫거나 삭제하지 않았다. 검증 탭을 모두 닫고 자체 작업 11개가 finished·잔여 탭/종료 대기 없음임을 확인했다. 원래 사용자 탭 1만 선택됐고 다운로드·권한·저장·wait·capture·탭 생성 대기는 모두 0이다. `artifacts/start-page-v2-native-cleanup.json`, `-final-state.json`, `-validation.json`에 최종 상태를 기록했다.
+
+접힌 사이드바의 검색·새 탭 배경은 실제 화면에서 왼쪽 모서리가 잘린 듯 보였다. 소스의 배경 프레임은 x12~64pt로 음수가 아니며, 원인을 캡처나 AppKit 배치로 확정하지 못했다. 중앙 폼·입력 보존 검증과 구분하여 원본 화면과 실제 뷰·레이어 좌표를 대조할 후속 시각 점검으로 남긴다.
+
+README·제품 계획·메모리 비용 문서와 `docs/start-page-design.md`를 갱신했다. 전체 목표는 계속 활성 상태이며 Naru 완성이나 Preseller 내장을 완료로 표시하지 않는다. 커밋·푸시·배포는 하지 않았다.
+
+## 2026-10-13, Aside 구성·토스 표현의 1차 네이티브 UI 적용
+
+요청한 디자인 방향을 `src/control_panel.rs`의 공통 스타일·사이드바·주소줄에 적용했다. 상단 검색 40pt → 공간 전환 → 현재 공간·38pt 세로 탭 순서로 정리하고, 하단 북마크·다운로드는 보조 행, 새 탭은 파란 40pt 주 버튼으로 구분했다. 툴바는 56pt, 주소 영역은 36pt, 주소·탭 제목은 13pt 시스템 폰트다. 중립 배경·파란 선택 표면·중간 굵기를 사용한다. 기존 216pt 사이드바·76pt 접힘, 행 재사용·주소 초안·AI 제어권·액션 검증은 유지한다. 고정 배경 뷰 세 개만 추가했으며 UI용 웹 renderer·worker·타이머·저장소는 추가하지 않았다. README·제품 계획·메모리 문서를 갱신했다.
+
+첫 v1 실행에서 새 탭의 아이콘이 왼쪽 끝, 글자가 가운데에 떨어져 보였다. AppKit의 `imageHugsTitle` 계약을 확인한 뒤 새 탭 버튼에만 `setImageHugsTitle(true)`를 적용해 v2에서 아이콘·글자가 함께 가운데에 배치됨을 실제 화면으로 확인했다. 버튼과 둥근 배경은 형제 뷰로 유지해 부모 배경이 포커스 표시를 자르지 않게 했다. v1의 자체 HTTP·약 800pt 너비(1602×1104 스크린샷)의 펼침/접힘·검색·북마크와 탭 종료 뒤 북마크 입력 유지는 별도 결과다. 최종 v2의 창 경계 드래그는 크기를 바꾸지 못했으므로 최종 네이티브 최소 창 검증으로 합산하지 않는다.
+
+최종 v2 소스에서 Rust 단위 검사 190개, 전체 타깃 Cargo 검사, format·diff 검사와 release 빌드가 통과했다. 최소 창에서 주소·상태·중지·닫기 영역이 분리되는 순수 기하 회귀를 추가했고 기존 찾기·복구 영역 검사도 새 높이로 확인했다. 기존 test-only dead_code 경고 두 개는 남는다. 근거는 `artifacts/aside-toss-v2-final-rust-tests.log`, `-final-check.log`, `-final-fmt.log`, `-build.log`다. 새 모의 DOM 검사는 하지 않았다.
+
+같은 v2 앱의 로컬 CEF 선택 10개·작업 6개·공간 10개·단일 창 6개, 총 32개가 exit 0·빈 stderr·cleanup true로 통과했다. 실제 네이티브에서는 새 탭 생성과 주소 포커스, 배경 빈 탭을 닫은 뒤 주소 초안과 이어 쓰기, 한글 붙여넣기 검색과 Enter 복귀, 긴 한글 제목 말줄임·접근성 도움말, 접힌 탭 닫기, 공간 카드, 빈 다운로드 패널을 확인했다. 빈 AI 작업 A의 중지 버튼은 A만 paused revision 2로 바꾸고 B는 active revision 1을 유지했다. 이는 활성 웹페이지 조작 중 인계 검사와 구분한다. IME 조합 입력, 다크 모드, 키보드만으로 모든 버튼 순회, 외부 사이트, 다운로드 저장·권한 창, 비교 RAM·장시간 검사는 하지 않았다. 근거는 `artifacts/aside-toss-v2-native.json`, `-native-after-stop.json`, `-suite.json`, `-suite-state.json`이다.
+
+최종 빌드 첫 HTTP는 5,041ms, 짧은 주소 재검사는 5,045ms에 WAIT_TIMEOUT이었다. 자체 서버에는 해당 요청이 도착하지 않았고 앱 스레드 825개 표본이 `SecItemCopyMatching → SecKeychainItemCopyContent → SecurityServer::ClientSession::decrypt`에서 대기했다. 보안 창을 도구로 확인하거나 승인하지 않았고 사용자에게 직접 확인을 요청했다. 이후 네이티브 검사 중 같은 앱·같은 바이너리에서 실제 HTTP commit·문서·load 완료를 확인해 나머지 검증을 이어갔다. OS 대기가 풀린 정확한 이유나 변경 빌드 간 키체인 권한 유지의 해결로 단정하지 않는다. 최초 실패와 후속 성공은 `-cli.jsonl`, `-startup-stack.txt`, `-http-recovered.json`, `-http-recovered-state.json`에 보존했다.
+
+이전 메인 앱 88613·98551은 CmdQ로 정상 종료(exit 0)했고 최신 v2 메인 PID 4240 하나만 실행 중이다. 최종 앱 SHA-256은 `c00666472cca6ad069f511050cad84d9a0f11dcc08f673edea46950d52da64ff`다. 자체 서버 93300도 SIGTERM 후 exit 0으로 종료했다. 검사용 탭·작업을 정리해 원래 user 빈 탭 1과 선택만 남겼고 다운로드·권한·저장·wait·캡처·탭 생성 대기는 모두 0개다. 사용자 프로필을 보존했다. v1은 Cargo 중간물 4,848개·2.6GiB, v2는 4,332개·2.5GiB를 정리했다. 최종 target 약 2.9MiB·dist 335MiB·검증 자료 16.6MiB·CEF 캐시 339MiB다. `artifacts/aside-toss-v2-final-state.json`, `-validation.json`에 결과와 한계를 기록했다.
+
+이 작업은 독립 Naru의 탐색 UI 1차 개선이다. 새 탭 시작 화면, 검색·북마크 내부 배치의 추가 정리, hover·키보드 접근성·최종 좁은 창/다크 검증, 빌드 간 키체인 대기와 실제 메모리 비교는 남아 있다. Naru 전체 완성과 Preseller 내장은 완료로 표시하지 않는다. 커밋·푸시·배포는 하지 않았다.
+
+## 2026-10-13, 탐색 실패 복구 검증 완료와 Aside·토스 UI 방향 반영
+
+독립 브라우저의 실패 복구를 개선했다. `src/page_recovery.rs`의 대상 값과 `src/browser.rs`의 실제 탭·공간·탐색 세대 검증을 연결하고, `src/control_panel.rs`에 96포인트 AppKit 복구 막대·주소 수정·새로 고침을 추가했다. 주소 수정은 포커스만 옮기며 명시적인 새로 고침은 기존 reload와 AI 제어권 인계 경로를 사용한다. 공간 목록·overlay에서는 숨기고 로딩 중 재시도와 오래된 대상을 거절한다. 별도 UI renderer·창·저장소를 추가하지 않았다. 렌더러 종료 분류도 구현했지만 실제 프로세스 종료 검증은 아직 하지 않았다.
+
+변경 전 앱에서 Chromium의 ERR_EMPTY_RESPONSE와 CLI의 ERR_ABORTED가 다른 현상을 관찰하고, 자체 서버를 복구한 뒤 네이티브 ⌘R의 같은 주소 복구를 확인했다. recovery-v1 앱 SHA `cd4d478aed0e864830ebc187c0c613275b93f52d4d9279f630ff58960bd128bc`는 Rust 185개·전체 타깃·format 검사와 release 빌드를 통과했다. 첫 HTTP는 문서 생성 전 5,049ms WAIT_TIMEOUT과 새 SecurityAgent를 보였고, Computer Use의 `com.apple.SecurityAgent` 접근은 도구가 명시적으로 거절했다. 사용자에게 직접 확인을 요청했으며 허용 응답 후 같은 앱의 HTTP가 완료됐다. 사용자 인증정보를 명령·로그·파일에 넣거나 보안 접근 제한을 우회하지 않았다.
+
+v1의 짧은 관찰을 사용한 로컬 CEF 복구 6개 검사는 통과했지만 실제 화면을 확인하자 복구 막대가 사라졌다. `artifacts/navigation-recovery-v1-app.log`는 -324 뒤 같은 URL의 browse-begin이 오류를 지우고 후속 -3을 기록하는 경로를 보였다. `-native.json`, `-native-failure-state.json`에 실패를 남겼다. `tests/navigation_recovery_smoke.py`의 관찰을 최소 12초로 늘리고 진행 중인 재시도와 완료 상태를 구분하자 같은 v1에서 오류 소실을 잡았다(exit 1). `-delayed-smoke.json`의 cleanup은 true이며 원래 user 탭 1을 보존했다. 짧은 검사 통과를 기능 완료로 확대하지 않는다.
+
+v2는 같은 URL의 비사용자 후속 탐색에서 이전 실제 오류 하나를 내부 후보로 이동하고, 같은 URL의 ABORTED에서만 복원한다. 진행 중인 public error는 비워 `wait`가 이전 오류로 즉시 실패하지 않게 했다. 명시적인 native/CLI 탐색, 사용자 gesture, redirect/history, 다른 URL, 새 오류, 정상 commit, 오류 없는 종료, 중지와 렌더러 종료에서 후보를 지운다. CEF가 내부 오류 페이지 식별자를 제공하지 않아 같은 URL의 비사용자 스크립트 탐색과 엔진 재시도를 완전히 구별하는 구현은 아니다. opt-in 진단은 코드·세대·일치 여부·전이값만 기록하고 원문 URL·오류 문자열은 기록하지 않는다.
+
+`tests/navigation_recovery_fixture.py`는 자체 loopback 실패/복구 fixture이며, 스모크는 정리 전 task의 tabs·closingTabs가 자체 생성 ID에만 속하는지 검사한다. 최종 소스 Rust 189개·전체 타깃 Cargo·format·diff·Python 문법 검사가 통과했다. 기존 test 전용 dead_code 경고 2개는 남는다. `artifacts/navigation-recovery-v2-final-rust-tests.log`, `-check.log`, `-fmt.log`가 근거다. v2 release도 성공했다. 앱 SHA는 `f7697af15e84619a758dc12ca5d4ec0bdc649d237f56f6702f67539f47fb4232`, CLI는 `63f9774beae38a982ed5dd52df81ea65fd301b52b9ab31c78827e940f9439f76`다. 같은 프로필의 첫 HTTP가 완료됐으며 v2 실행에는 별도의 사용자 승인 질문을 하지 않았다. 변경 빌드 간 키체인 권한 유지 전체를 보장하는 결과는 아니다.
+
+v2의 확장 로컬 CEF 복구 6개가 통과했다. 사용자·AI 실패를 각각 12초 이상 관찰했으며 같은 URL 후속 browse의 transition 33554433, gesture/redirect false, -324 후보 뒤 -3 콜백에서도 원래 오류가 유지됐다. CLI reload는 같은 페이지를 복구했고 AI active·revision 및 사용자 선택도 유지했다. 진단 로그에는 CEF의 browser-info 응답 timeout도 남는다. 이번 수정은 Naru의 오류 보존과 명시적인 복구이며 그 엔진 내부 timeout의 근본 원인을 해결한 것으로 표시하지 않는다. `artifacts/navigation-recovery-v2-smoke.json`, `-app.log`에 근거가 있다.
+
+네이티브 UI에서는 실패 막대가 계속 표시되고 주소 수정이 해당 URL을 선택함을 확인했다. 검색 overlay에서는 버튼이 숨겨지고 Esc 뒤 복원됐다. 서버를 정상화하고 막대의 새로 고침을 누르면 같은 사용자 탭에서 `Naru Recovery Restored`가 표시되고 막대가 사라졌다. AI A의 주소 수정 뒤 A/B 모두 active·revision 1을 유지했고, 복구 버튼은 A만 paused·revision 2로 바꾸고 B는 active·revision 1을 유지했다. 같은 AI 탭의 정상 제목·load 완료·오류 해제도 확인했다. 초기 검사 코드가 AI 탭에 전역 wait를 보내 TASK_REQUIRED로 거절된 기록은 그대로 남기고, 작업을 재개하지 않은 채 실제 화면과 전역 탭 메타데이터로 검증했다. `-native.json`, `-cli.jsonl`에 근거가 있다. 실패 페이지의 ⌘F는 준비되지 않았다는 안내를 반환했으므로 찾기와 복구 막대의 동시 표시를 실제로 검증했다고 기록하지 않는다.
+
+기존 CEF select 10개·tasks 6개·spaces 10개·single_window 6개도 통과했다. 추가 navigation의 첫 실행은 bind만 한 소켓의 즉시 연결 거절을 가정하다 WAIT_TIMEOUT을 만났다. 앱과 무관한 자체 TCP probe는 같은 Mac에서 bind/no-listen 연결이 501ms 뒤 EAGAIN이고 listen 대조군은 0.405ms 연결 성공임을 보였다. `tests/navigation_smoke.py`, `tests/controls_smoke.py`를 요청 수신 뒤 응답 없이 연결을 닫는 자체 fixture로 바꾸고 요청 수신 여부·음수 오류 코드·문자열·주소 검증을 유지했다. 같은 앱에서 navigation 6개·controls 7개가 통과했고 204·중지·이력·동일 문서·복구를 확인했다. 최종 로컬 CEF 성공은 합계 51개이며 각 실행은 exit 0·빈 stderr·자체 탭 정리를 확인했다. 첫 실패와 OS probe는 별도 파일에 보존한다. 새 모의 DOM·외부 사이트·IME·좁은 창·다크 모드·실제 렌더러 종료·메모리 절감량 검증은 하지 않았다.
+
+이전 앱 PID 71159와 v1 PID 81208은 각각 CmdQ 뒤 exit 0으로 종료했다. v1 빌드는 중간물 4,332개·2.5GiB, v2 빌드는 4,848개·2.6GiB를 정리했다. 마지막 target 2.9MiB·dist 335MiB·artifacts 16MiB·CEF 캐시 339MiB이며 dist에는 최신 앱 하나만 있다. 자체 fixture PID 74523도 SIGTERM 뒤 exit 0으로 종료했다. 최종 메인 앱 PID 88613 하나, 원래 user 빈 탭 1과 선택만 남았고 생성한 모든 작업은 finished·빈 소속 탭이다. 다운로드·저장·권한·wait·캡처·탭 생성 대기는 모두 0이다. 사용자 프로필은 보존했다. `-final-state.json`, `-validation.json`에 최종 경계를 기록했다.
+
+작업 도중 사용자는 기능을 어느 정도 완성한 뒤 Aside 형식에 토스 디자인을 참고하자고 제안했다. 기존 실제 앱 비교와 새 공식 Aside·TDS·토스 UX Writing 자료를 확인해 `docs/product-plan.md`에 다음 UI 기준과 순서를 반영했다. 구성은 Aside의 왼쪽 탐색, 표현은 토스의 색·글자·간격·행·버튼·문구 원칙, 동작은 Naru의 사용자·AI 공간과 CLI다. 공개 Mobile/React Native 원칙은 AppKit에 맞게 적용하며 UI renderer나 TDS 실행 패키지를 추가하지 않는다. 제안 수치는 Naru용 시안이며 이번에 전체 화면 재설계를 구현한 것은 아니다. README·제품 계획·메모리 문서를 갱신했다. 커밋·푸시·배포는 하지 않았으며 Naru 전체 완성과 Preseller 내장은 미완료다.
+
+## 2026-10-13, 최종 검색 빌드 승인 후 검증·재시작·정리 완료
+
+사용자의 허용 응답 뒤 최종 tab-search-label-v1 앱 PID 68589와 SHA-256 `9a24e9181f909c07482cf26f610676be39b3b618990525b37d65faab3ac6eb88`가 유지됨을 확인했다. 재빌드나 제품 코드 변경 없이 미완료 검증을 이어갔다. 기존 자체 HTTP 탭 2는 commit·문서 생성·메인 load 완료 상태였고 실제 페이지가 표시됐다. 최초 5,039ms WAIT_TIMEOUT은 `artifacts/tab-search-label-v1-validation.json`과 첫 HTTP 로그에 보존한다. 이 빌드의 승인 대기는 해소됐다.
+
+네이티브 UI에서 자체 페이지의 이탈 확인을 켜고 원래 user 탭 1로 돌아와 주소 초안을 입력했다. 배경 탭 2의 행 닫기 버튼을 누르면 beforeunload 확인창이 열렸다. Cancel은 탭을 유지하고 OK는 해당 탭을 닫았으며, 두 경로 모두 원래 선택과 주소 초안을 보존했다. 주소창을 다시 클릭하지 않고 이어 쓰기도 성공했다. `artifacts/tab-search-label-v1-approved-native.json`에 CUA 관찰과 실제 HTTP 상태를 기록했다. 앞선 같은 바이너리의 “새”·“새 탭” 검색 확인과 함께 최종 소스의 네이티브 결과로 사용한다. 한글 IME 조합 입력 검사는 아니다.
+
+같은 최종 바이너리의 로컬 CEF 검사 select 10개·tasks 6개·spaces 10개·single_window 6개, 총 32개가 exit 0·빈 stderr·cleanup true로 통과했다. 검사 후 원래 user 빈 탭 1만 남았고 다운로드·권한·저장·wait·캡처·탭 생성 대기는 모두 0개였다. `artifacts/tab-search-label-v1-suite.json`, `-suite-state.json`, `-post-suite-state.json`에 결과를 남겼다. Rust 단위 검사 179개·독립 검색 6개·전체 타깃 검사·format은 이전에 통과한 같은 소스의 결과이며 이번에 다시 실행하지 않았다. 새 모의 DOM 검사나 외부 사이트 검증도 실행하지 않았다.
+
+CmdQ로 앱의 정상 종료(exit 0)를 확인한 뒤 같은 SHA·같은 tasks-phase1 프로필로 재실행했다. 새 메인 PID는 71159이며 추가 승인 요청 없이 자체 HTTP 페이지가 commit·문서 생성·load 완료에 도달했다. 재시작 뒤 SecurityAgent는 관찰되지 않았다. 이는 같은 바이너리 재시작의 검증이며, 코드가 바뀐 두 빌드 사이의 인증서 서명·키체인 권한 유지까지 검증한 것은 아니다.
+
+재시작 검사용 탭 2를 닫고 자체 fixture PID 65830에 SIGTERM을 보내 exit 0으로 종료했다. 원래 user 빈 탭 1의 선택, 빈 작업 목록, 모든 대기 0개를 확인했다. 이전 앱은 종료됐고 최신 앱 PID 71159 하나만 실행 중이다. 사용자 프로필은 보존했고 새 빌드 중간물은 만들지 않았다. target 2.9MiB·dist 335MiB·검증 자료 15MiB·CEF 캐시 339MiB이며, 앞선 빌드의 중간물 671.5MiB 정리 결과를 유지한다. 정리·재시작 증거는 `artifacts/tab-search-label-v1-restart-http.json`, `-final-state.json`, `-final-validation.json`이다.
+
+README·제품 계획·메모리 문서의 최종 HTTP 승인 대기와 CEF 미실행 상태를 실제 결과로 갱신했다. 이번 탭 행·검색 수정의 최종 로컬 검증은 마쳤다. 메모리 절감 측정, 좁은 창, 키보드만으로 행 닫기, 외부 사이트·장시간 사용, 실제 인증서로 변경 빌드 간 권한 유지와 Preseller 내장은 남아 있으며 Naru 전체 완성으로 표시하지 않는다. 커밋·푸시·배포는 하지 않았다.
+
+## 2026-10-13, 승인 후 탭 닫기 검증과 새 탭 검색 최종 빌드
+
+사용자의 키체인 허용 응답 뒤 같은 tab-rows-v1 앱 PID 56917에서 검증을 재개했다. 앱 SHA-256 `2a5b4ae280cf0d195e9e388279ba58174a6a7d0147cc06310e36ef7923d1c7bb`는 유지됐다. 자체 fixture를 새로 실행하고 HTTP 탭 11의 commit·문서 생성·load 완료와 제목을 확인했다. 직전 승인 대기는 이 바이너리에서 해소됐다.
+
+네이티브 UI로 자체 페이지의 이탈 확인 체크박스를 클릭한 뒤 원래 user 탭 1로 돌아와 주소 초안을 입력했다. 배경 탭 11의 행 닫기 버튼으로 beforeunload 확인창이 열렸고, Cancel 뒤 탭이 유지됐다. 다시 닫아 OK를 누르면 탭 11이 제거됐다. 두 경우 모두 user 탭 1의 선택과 초안이 유지됐으며 주소창을 다시 클릭하지 않고 이어 쓸 수 있었다. 로컬 CEF 회귀 select 10개·tasks 6개·spaces 10개·single_window 6개, 총 32개가 exit 0·빈 stderr·cleanup true로 통과했다. 마지막 status의 다운로드·권한·저장·wait·캡처·탭 생성 대기는 모두 0개였다. 근거는 `artifacts/tab-rows-v1-approved-native.json`, `-approved-native-state.json`, `-suite.json`, `-suite-state.json`이다. 외부 사이트 검증과 구분한다.
+
+이미 수정·검사한 `src/tab_search.rs`와 `src/control_panel.rs`의 표시 제목 검색을 release 앱에 반영했다. “새 탭” 별칭 검색과 기존 원래 제목·URL·공간 검색을 함께 유지한다. 같은 소스의 Rust 단위 검사 179개·전체 타깃 Cargo 검사·format 검사와 독립 검색 검사 6개는 앞선 로그의 결과이며 이번에 재실행한 것으로 세지 않는다. 새 모의 DOM 검사는 실행하지 않았다. `scripts/dev.sh`, `scripts/bundle-macos.py`의 선택 서명자 옵션도 포함하되 실제 빌드는 기본 ad hoc을 사용했다. 인증서를 선택·생성하거나 키체인 권한을 도구로 변경하지 않았다.
+
+이전 앱을 CmdQ로 정상 종료(exit 0)한 뒤 최종 빌드가 성공했다. 최종 앱 SHA-256은 `9a24e9181f909c07482cf26f610676be39b3b618990525b37d65faab3ac6eb88`, CLI는 `5500a7107d94c94638ff4dd9cbecb52b17b2b237dacd83eeccba513af6693ec6`다. 최종 앱의 네이티브 검색창에 “새”, “새 탭”을 각각 붙여 넣자 빈 탭 한 개가 표시됐고 Enter로 원래 탭을 선택했다. 이는 한글 붙여넣기 검사이며 IME 조합 입력 검사가 아니다. 근거는 `artifacts/tab-search-label-v1-build.log`, `-validation.json`과 CUA 관찰이다.
+
+최종 앱 PID 68589에서 자체 HTTP 탭 2의 첫 wait는 5,039ms 뒤 WAIT_TIMEOUT으로 끝났다. commit·문서 생성 전이며 앱 시작 직후 새 SecurityAgent PID 68597이 확인됐다. 새 서명에 대한 키체인 승인 대기로 의심해 사용자에게 직접 허용을 요청했다. 보안 창을 대신 확인하거나 승인하지 않았다. 최종 바이너리의 HTTP·CEF 회귀 32개는 아직 통과하지 않았으며 이전 v1의 결과로 대체하지 않는다. 같은 바이너리를 검증할 실행기는 `artifacts/tab-search-label-v1-suite-run.py`에 준비했다.
+
+빌드는 Cargo 중간물 1,263개·671.5MiB를 정리했다. target 2.9MiB, dist 335MiB, 검증 자료 15MiB, CEF 캐시 339MiB다. 이전 앱 PID 56917은 종료했고 최신 앱 하나만 실행 중이다. 승인 후 검증을 위해 자체 fixture PID 65830과 검사용 배경 탭 2를 유지하며 기존 프로필과 원래 user 탭 1을 보존하고 선택도 1로 복원했다. README·제품 계획·메모리 문서를 실제 바이너리별 결과로 갱신했다. 새 메모리 절감 측정·좁은 창·키보드만으로 행 닫기·외부 사이트·실제 인증서 서명 간 권한 유지·Preseller 내장은 미검증이다. 이번 변경의 커밋·푸시·배포는 하지 않았다.
+
+## 2026-10-13, 최신 소스 전체 검사와 키체인 대기 정리
+
+앞선 턴은 검색 소스 수정·서명자 지정 옵션·네이티브 패널 검사·키체인 스택 증거를 만든 진행으로 분류한다. 이번에는 같은 앱 PID 56917과 fixture PID 47769가 살아 있음을 먼저 확인했다. 자체 HTTP 탭 2는 여전히 committed false·documentAvailable false였으며 원래 user 탭 1의 선택을 보존했다. `artifacts/tab-rows-v1-third-turn-state.json`에 시작 상태를 남겼다.
+
+새 검색 수정까지 포함한 최신 소스로 Rust 단위 검사 179개, 전체 타깃 Cargo 검사, format·diff 검사가 통과했다. 기존 test 전용 dead_code 경고 2개는 남는다. 근거는 `artifacts/tab-search-label-v1-rust-tests.log`, `-check.log`, `-fmt.log`다. 앞선 독립 검색 6개·서명 모의 검사와 구분한다. 새 모의 DOM·CEF HTTP·네이티브 검색·beforeunload·외부 사이트 검증이나 실제 인증서 서명은 실행하지 않았다. release 앱도 다시 만들지 않았으므로 새 검색 수정은 현재 실행 앱에 아직 없다.
+
+더 이상 사용하지 않는 자체 HTTP 탭 2를 닫고 fixture PID 47769에 SIGTERM을 보내 exit 0으로 정상 종료했다. `scripts/cleanup-build.py --profile release`는 검사 중간물 3,073개·1.8GiB를 삭제하고 기존 release 실행 파일 세 개를 보존했다. 원래 user 빈 탭 1과 선택만 남았으며 다운로드·권한·저장·wait·캡처·탭 생성 대기는 0개다. `artifacts/tab-rows-v1-blocked-cleanup-state.json`과 `artifacts/tab-search-label-v1-build-cleanup.log`에 결과를 남겼다. target 2.9MiB, dist 335MiB, 검증 자료 14MiB다. 사용자 프로필은 보존했다.
+
+마지막에 살아 있는 같은 앱을 1초 sample해 `SecItemCopyMatching → SecKeychainItemCopyContent → SecurityServer::ClientSession::decrypt → mach_msg`에서 813개 표본이 계속 대기하는 것을 확인했다. 원본은 `artifacts/tab-rows-v1-blocked-stack.txt`다. 사용자 보안 창을 읽거나 권한을 대신 바꾸지 않았다. 앞선 두 턴과 이번 턴에 같은 OS 키체인 조회 대기가 이어졌다. 별도로 가능한 소스 수정·전체 검사·모의 서명 검사·빈 탭 UI 검사는 마쳤으며, 남은 HTTP·beforeunload·새 앱 적용 검증은 사용자 확인 또는 OS 응답 변화가 필요하다. 목표 전체는 미완료이며 동일 조건의 세 번째 확인 뒤 blocked로 전환하는 조건을 충족했다.
+
+최신 메인 앱 PID 56917 하나는 그대로 유지한다. 앱 SHA-256 `2a5b4ae280cf0d195e9e388279ba58174a6a7d0147cc06310e36ef7923d1c7bb`, CLI `5500a7107d94c94638ff4dd9cbecb52b17b2b237dacd83eeccba513af6693ec6`가 정리 전후 일치한다. 이후 진행할 때 같은 앱에서 자체 fixture를 새로 시작해 HTTP부터 확인한다. 같은 브랜치의 변경은 여전히 미커밋이며 커밋·푸시·배포는 하지 않았다. README·제품 계획에 최신 소스 검사 범위와 현재 실행 앱의 차이를 반영했다. 문서 리뷰에서 서명의 기본값 설명과 CLI 종료 뒤 패널 포커스 검사를 행별 닫기 버튼 검사와 구분하도록 보정했다.
+
+## 2026-10-13, 새 탭 검색 수정·패널 포커스 확인·서명자 선택 준비
+
+앞선 탭 행 변경은 실제 코드·빌드·빈 탭 검증을 진행한 작업으로 분류한다. 이번 시작에 동일 앱 PID 56917과 자체 fixture PID 47769의 생존을 확인했으며 HTTP 탭 2는 여전히 commit 전이었다. 같은 바이너리의 미완료 HTTP 검사를 새 앱으로 대체하지 않고 현재 가능한 네이티브 검사를 진행했다.
+
+실행 중인 tab-rows-v1에서 통합 검색의 현재 자체 탭 9를 CLI로 닫은 뒤 about:blank 입력을 이어 썼고, 검색 결과 2개와 입력 포커스가 유지됐다. 북마크 검색 중 자체 배경 탭 8을 닫은 뒤 입력을 이어 쓰고, 다운로드 패널의 닫기 버튼에 포커스를 둔 채 자체 배경 탭 10을 닫은 뒤 Space로 패널을 닫았다. 북마크를 추가하거나 파일을 저장하지 않았다. `artifacts/tab-rows-v1-followup.json`에 관찰을, `-followup-state.json`과 `-cli.jsonl`에 상태를 기록했다. Shift+Tab은 현재 환경에서 주소창 포커스를 벗어나지 않았고 한 번의 창 경계 drag도 크기를 바꾸지 못했으므로 키보드 전용 행 닫기·좁은 창을 성공으로 기록하지 않는다. 시스템 설정은 바꾸지 않았다.
+
+같은 앱에서 “새 탭” 표시를 “새”로 검색하면 결과가 0개이고 about로는 결과가 나타나는 차이를 발견했다. `src/tab_search.rs::display_title`을 추가해 sidebar·검색 결과 표시와 검색 별칭을 일치시켰다. `src/control_panel.rs`의 두 표시 경로도 이 함수를 사용한다. 원래 제목·URL·공간의 검색을 보존하고 표시가 다른 경우 고정된 짧은 별칭만 참조한다. 기존 query 200자·결과 40개·필드 4,096자 상한을 유지한다. 일반 제목의 중복 복사·새 캐시·프로세스는 추가하지 않았다. 독립 검색 모듈의 회귀 6개와 format·diff 검사가 통과했다. `artifacts/tab-search-label-v1-tests.validation.json`에 rustc 단독 검사임을 기록했다. 새 소스는 이전 Rust 178개 검사와 release 이후 변경이며 이번에는 전체 Cargo 검사·release 빌드·네이티브 검색 재검증을 하지 않았다.
+
+HTTP 대기를 추정만으로 설명하지 않기 위해 자체 네트워크 보조 PID 56925와 메인 PID 56917을 각각 1초 sample했다. 메인 앱의 ThreadPoolForegroundWorker 6991989는 821개 표본 모두 `SecItemCopyMatching → SecKeychainItemCopyContent → SecurityServer::ClientSession::decrypt → mach_msg`에서 대기했다. 실제 키체인 조회 응답 대기는 확인했지만 항목 값·정확한 대상 item·보안 창은 읽지 않았으며 모든 HTTP 대기와의 인과를 확정한 것은 아니다. 원본은 `artifacts/tab-rows-v1-browser-stack.txt`와 `-network-stack.txt`에 있다. CEF 내부의 제거된 심볼 대신 OS Security 함수 경로를 근거로 삼는다.
+
+`scripts/bundle-macos.py`가 항상 ad hoc 서명을 쓰던 경로에 `--signing-identity`를 추가하고 `scripts/dev.sh`에 명시된 `NARU_CODESIGN_IDENTITY` 전달을 연결했다. 기본 '-'는 유지하고 빈/공백 값은 거절한다. 모든 중첩 Mach-O·framework·helper·CLI·앱에 같은 값을 전달하며 서명 실패를 숨기거나 ad hoc으로 대체하지 않는다. 기존 strict 검증, 이전 앱 종료, 검증된 번들 교체·복구 순서는 유지했다. 인증서를 조회·생성·선택하거나 키체인 권한을 수정하지 않았다. 실제 안정 서명이나 두 번의 변경 빌드 사이 권한 유지 성공으로 기록하지 않는다. 모의 subprocess 6개 검사 그룹과 환경변수 전달 5가지 경우, Bash 문법 검사를 통과했으며 두 스크립트의 독립 읽기 리뷰에서도 추가 수정 필수 결함을 찾지 못했다. `artifacts/signing-identity-v1-validation.json`은 실제 도구 실행 기록에서 결과를 정리한 자료이며 원본 임시 검사 스크립트나 별도 출력 파일은 보존하지 않았다.
+
+모의 DOM·새 HTTP CEF 회귀·beforeunload·외부 사이트 검사는 미실행이다. 새 앱을 빌드하지 않아 메인 PID 56917, 앱 SHA `2a5b4ae280cf0d195e9e388279ba58174a6a7d0147cc06310e36ef7923d1c7bb`, CLI SHA `5500a7107d94c94638ff4dd9cbecb52b17b2b237dacd83eeccba513af6693ec6`는 유지된다. 새 자체 빈 탭 8~10은 모두 정리했고 원래 user 탭 1과 선택, HTTP 대기 탭 2만 남았다. 다운로드·권한·저장·wait·캡처·탭 생성 대기는 0개다. 검색 검사 실행 파일 1.2MiB는 성공 결과와 해시를 남긴 뒤 삭제했으며 모의 서명 fixture도 정리했다. target 2.9MiB, dist 335MiB, 검증 자료 14MiB다. 사용자 프로필·데이터는 보존했다. 같은 HTTP 검사와 사용자 확인을 위해 기존 앱과 fixture 한 개만 유지하며 README·제품 계획을 갱신했다. 커밋·푸시·배포는 하지 않았고 전체 목표는 진행 중이다.
+
+## 2026-10-13, 세로 탭 행 닫기와 AppKit 재사용 — HTTP 검증 대기
+
+독립 Naru의 일상 사용성을 개선하는 범위에서 `src/control_panel.rs`의 각 탭 행에 닫기 버튼을 추가했다. 펼친 행의 제목·아이콘과 접힌 76포인트 사이드바의 선택/닫기 영역을 구분했다. 탭 ID와 공간이 같으면 AppKit 컨트롤을 재사용하고 제거된 행의 참조는 해제한다. 별도 UI renderer, 프로세스, 반복 타이머나 영속 저장소를 추가하지 않았다. 실제 메모리 절감량은 측정하지 않았다.
+
+행의 현재 버튼 포인터와 공간을 확인하고, `src/browser.rs`에서 실제 탭 소속을 닫기 직전에 다시 검사한다. adopt/release 뒤 화면에 잠시 남은 행으로 다른 공간의 탭을 닫거나 AI를 중지하지 않게 했다. 배경 행 닫기는 주소 초안을 보존하며 같은 AI 작업 인계의 정확히 한 세대 증가만 임시로 반영한다. 실제 탐색·같은 URL reload·선택 변경은 이 예외로 무시하지 않는다. 작업 인계와 CEF CloseBrowser(false)의 기존 이탈 확인 경로를 유지한다.
+
+Rust 단위 검사 178개, 전체 타깃 Cargo 검사, format·diff 검사와 release 빌드가 통과했다. 추가 순수 회귀 4개는 행 배치, 무효 행, 실시간 공간 검증, 제한된 주소 인계 예외를 확인한다. 기존 test 전용 dead_code 경고 2개는 남는다. `artifacts/tab-rows-v1-rust-tests.log`, `-check.log`, `-fmt.log`, `-build.log`에 근거를 남겼다. 앱 SHA-256은 `2a5b4ae280cf0d195e9e388279ba58174a6a7d0147cc06310e36ef7923d1c7bb`, CLI는 `5500a7107d94c94638ff4dd9cbecb52b17b2b237dacd83eeccba513af6693ec6`다.
+
+같은 앱의 네이티브 빈 탭 검사에서 펼친/접힌 배경 행 닫기 뒤 현재 선택, 입력한 주소와 입력 포커스를 유지했다. 닫은 뒤 다시 포커스하지 않고 문자를 이어 써서 확인했다. 선택한 자체 탭 닫기와 접힌 행의 아이콘/닫기 영역도 확인했다. 자체 AI A 공간에서 선택한 탭 5의 주소를 편집하며 형제 탭 6을 닫자 A만 paused revision 2가 됐고 B는 active revision 1을 유지했다. 선택 5와 주소 편집도 유지됐다. `artifacts/tab-rows-v1-native.json`, `-after-ai-close.json`, `-cli.jsonl`에 범위와 CLI 결과를 남겼다. 처음 CLI로 about:blank를 열려던 진단은 HTTP(S) 전용 계약으로 거절됐으며 이후 native Cmd+T로 만들었다. 이를 제품 결함으로 세지 않는다.
+
+새 바이너리의 첫 로컬 HTTP 탭 2는 5초 wait에서 WAIT_TIMEOUT이고 commit·documentAvailable은 false였다. 앱 PID 56917 시작 직후 SecurityAgent PID 56927을 확인했다. 기존 빌드에서 사용자가 보안 창이 없다고 답한 이후 만든 새 바이너리임을 설명하고 직접 확인을 요청했다. 보안 창을 도구로 읽거나 승인하지 않았다. HTTP 페이지의 beforeunload·제목 갱신·기존 CEF 회귀 32개는 아직 실행하지 않았다. 새 모의 DOM·외부 사이트 검사, 최대 탭 부하와 비교 메모리 측정도 하지 않았다. 실행기는 새 SHA에 고정해 준비했으나 준비를 통과로 기록하지 않는다.
+
+이전 앱 PID 44130은 정상 종료(exit 0)했고 최신 메인 PID 56917 하나만 남았다. 빌드에서 중간물 4,332개·2.5GiB를 정리했으며 dist는 최신 앱 하나, target/release는 실행 파일 세 개다. 현재 target 2.9MiB, dist 335MiB, 검증 자료 14MiB, CEF 캐시 339MiB다. 자체 빈 탭 3~7과 두 AI 작업은 정리했다. 원래 user 탭 1과 선택, 프로필을 보존하고 입력했던 검증 초안도 지웠다. 다운로드·권한·저장·wait·캡처·탭 생성 대기는 0개다. 같은 바이너리에서 확인을 이어가기 위해 자체 HTTP 탭 2와 fixture PID 47769/포트 56766, 최신 앱만 유지한다. README·제품 계획·메모리 문서를 갱신했고 이번 후속 변경은 커밋·푸시·배포하지 않았다. 앞선 비공개 업로드 완료 상태와 구분하며 전체 Naru 완성을 선언하지 않는다.
+
+## 2026-10-13, 권한 v2의 실제 허용과 사용자 요청 재개 검사
+
+직전 개발 턴은 소스 변경과 실제 CEF 검사, 비공개 업로드까지 진행한 상태다. 새 목표 턴에서 Git 작업 폴더가 깨끗한 상태와 기존 앱 PID 44130, 원래 user 공간의 빈 탭 1, 다운로드 대기 0개를 다시 확인했다. 추가 빌드 없이 같은 권한 v2 바이너리로 남은 네이티브 검사를 이어갔다.
+
+직접 만든 로컬 사이트의 권한 카드에서 허용을 누르자 두 번째 파일도 저장 위치 대기로 들어갔다. 네이티브 저장창에서 각 경로를 선택해 131,072바이트와 8,388,608바이트 파일을 저장했다. 두 파일 모두 고정 fixture 원본 바이트와 일치했다. 작은 파일 SHA-256은 `59f410ae5e17962412e2aed4f815918f634932f2abf084f00bb638c4db017850`, 큰 파일은 `7d212b9c884f5c77896de960ae17cc341cda43b14d6a971f34ca29ebd4badf7f`다. 사용자 공간과 AI active revision 1을 보존했다. 완료 기록 지우기 후에도 파일과 해시가 유지됐고 확인한 자체 검증 파일 두 개만 삭제했다.
+
+다른 로컬 origin의 자체 작업을 paused revision 2로 인계한 뒤 본문의 두 파일 연속 요청 버튼을 native 클릭했다. 링크 이벤트는 합성이지만 사용자 activation은 true였다. AI를 revision 3으로 재개하면 권한 대기 1개는 사라지고 먼저 접수한 사용자 파일의 저장 대기 1개는 유지됐다. 기존 paused 다운로드의 scope None 계약과 일치한다. 저장 대기를 포함한 active 개수는 실제 전송 중 개수와 같지 않다. 작업 종료 뒤 모든 다운로드 대기와 임시 탭을 정리하고 원래 user 탭 1로 돌아왔다.
+
+근거는 `artifacts/download-permission-v2-native-followup.json`이다. 외부 사이트, 재개 뒤 첫 사용자 파일의 실제 저장, 모든 늦은 콜백 경합이나 사이트 권한 해제 UI는 검증하지 않았다. 이번 로컬 origin 허용은 CEF 프로필 설정에 남으며 별도 프로필 편집으로 제거하지 않았다. README, 제품 계획, 다운로드 설계와 메모리 문서를 실제 결과로 갱신했다. 후속 탭 UI 작업을 위해 최신 앱과 자체 fixture 한 개를 유지하며 추가 커밋과 푸시는 하지 않았다. 같은 앱에서 자체 탭을 정리한 뒤 RSS 세 표본은 모두 합계 722.094MiB였다. 공유 매핑이 중복되는 값이며 새로운 앱이나 최적화 전후 비교가 아니다. 원본은 `artifacts/download-permission-v2-after-native-memory.json`에 있다.
+
+추가 실제 CEF 용량 검사에서는 파일과 저장 대기 4개가 찬 뒤 다섯 번째 요청이 추가되지 않았다. 최초 하네스는 파일 4개와 권한 4개가 동시에 생길 것으로 잘못 가정해 실패했다. 실제로 `CanDownload`의 파일 상한 검사가 후속 권한 요청 전에 거절하므로 관찰값은 파일 4개와 권한 3개였다. 이 호출 흐름을 확인한 별도 실행은 성공했고 자체 작업 5개를 종료해 원래 사용자 탭과 대기 0개를 보존했다. `artifacts/download-permission-v2-file-capacity.json`에 결과를 남겼으며 권한 큐 자체의 4개 경계에 대한 네이티브 검증으로 확대하지 않는다.
+
 ## 2026-10-13, 연속 다운로드 권한 처리와 비공개 업로드 준비
 
 독립 브라우저 개발을 이어가며 이전에 남긴 연속 합성 다운로드 미접수를 조사했다. 기존 v4 바이너리의 자체 로컬 페이지에서 첫 파일만 서버에 도착하고 두 번째 파일은 클릭 성공 응답 뒤에도 요청되지 않는 현상을 재현했다. 이후 실제 CEF MULTIPLE_DOWNLOADS 콜백의 진입을 확인했다. 최초 재현 근거는 `artifacts/download-permission-baseline.json`이다.

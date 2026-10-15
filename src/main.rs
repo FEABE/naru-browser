@@ -70,7 +70,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         return Err("CEF initialization failed".into());
     }
-    light_browser::bookmark_runtime::initialize(data_dir);
+    light_browser::bookmark_runtime::initialize(data_dir.clone());
+    light_browser::history_runtime::initialize(data_dir);
     let stopped = Arc::new(AtomicBool::new(false));
     let server = browser::start_server(listener, stopped.clone());
     eprintln!("Light Browser ready: {}", socket_path.display());
@@ -80,6 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = std::os::unix::net::UnixStream::connect(&socket_path);
     let _ = server.join();
     light_browser::bookmark_runtime::shutdown();
+    light_browser::history_runtime::shutdown();
     light_browser::control_panel::shutdown();
     browser::clear();
     shutdown();

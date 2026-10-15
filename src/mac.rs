@@ -7,7 +7,7 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSApp, NSApplication, NSApplicationActivationPolicy, NSApplicationDidUnhideNotification,
-    NSEvent,
+    NSEvent, NSEventType,
 };
 use objc2_foundation::{NSNotification, NSNotificationCenter};
 use std::cell::Cell;
@@ -29,7 +29,18 @@ define_class!(
             let previous = self.ivars().handling_event.replace(Bool::YES);
             if !crate::control_panel::handle_shortcut(event) {
                 crate::control_panel::observe_page_input(event);
+                let focus_trace = crate::control_panel::begin_focus_tab_trace(event);
+                if event.r#type() == NSEventType::KeyDown {
+                    crate::control_panel::trace_sidebar_geometry("key-before");
+                }
                 let _: () = unsafe { msg_send![super(self), sendEvent:event] };
+                crate::control_panel::correct_hidden_cef_tab_focus(event);
+                if event.r#type() == NSEventType::KeyDown {
+                    crate::control_panel::trace_sidebar_geometry("key-after");
+                }
+                if let Some(previous) = focus_trace {
+                    crate::control_panel::end_focus_tab_trace(previous);
+                }
             }
             self.ivars().handling_event.set(previous);
         }

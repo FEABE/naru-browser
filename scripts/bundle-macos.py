@@ -3,7 +3,8 @@
 
 Layout follows cef-rs/cef/src/build_util/mac.rs. LibraryLoader loads the
 framework relative to the executable, so no rpath changes are necessary.
-Ad hoc signing is for local use; this does not create a notarized release.
+Signing defaults to ad hoc for local use; this does not create a notarized release.
+Pass --signing-identity to use an explicitly selected code-signing identity.
 """
 
 import argparse
@@ -127,8 +128,15 @@ def create_app(path, source_binary, executable_name, identifier, display_name, h
     (contents / "PkgInfo").write_bytes(b"APPL????")
 
 
-def sign(path):
-    subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", str(path)], check=True)
+def signing_identity(value):
+    if not value.strip():
+        raise argparse.ArgumentTypeError("Signing identity must not be empty or whitespace-only.")
+    return value
+
+
+def sign(path, identity):
+    # A selected identity must fail explicitly; never fall back to ad hoc.
+    subprocess.run(["/usr/bin/codesign", "--force", "--sign", identity, str(path)], check=True)
 
 
 def is_macho(path):
@@ -181,7 +189,7 @@ function run(argv) {
         print("Stopped previous app before replacing its bundle.", file=sys.stderr)
 
 
-def bundle(target_dir, cef_path, output_dir):
+def bundle(target_dir, cef_path, output_dir, identity="-"):
     for name in (MAIN_BINARY, HELPER_BINARY, CLI_BINARY):
         if not (target_dir / name).is_file():
             raise ValueError("Missing executable: %s. Run cargo build --bins first." % (target_dir / name))
@@ -205,8 +213,8 @@ def bundle(target_dir, cef_path, output_dir):
         framework_binary = (framework / "Chromium Embedded Framework").resolve()
         for candidate in sorted(framework.rglob("*")):
             if candidate.resolve() != framework_binary and is_macho(candidate):
-                sign(candidate)
-        sign(framework)
+                sign(candidate, identity)
+        sign(framework, identity)
 
         for suffix, id_suffix in HELPERS:
             # CEF derives helper paths from the main executable's basename.
@@ -214,11 +222,11 @@ def bundle(target_dir, cef_path, output_dir):
             helper = frameworks / (name + ".app")
             create_app(helper, target_dir / HELPER_BINARY, name,
                        APP_ID + ".helper" + id_suffix, APP_NAME + " Helper" + suffix, True)
-            sign(helper)
+            sign(helper, identity)
 
         cli = app / "Contents/MacOS" / CLI_BINARY
         shutil.copy2(target_dir / CLI_BINARY, cli)
-        sign(cli)
+        sign(cli, identity)
         shutil.copy2(ROOT / "THIRD_PARTY_NOTICES.md", app / "Contents/Resources/THIRD_PARTY_NOTICES.md")
         credits = framework_source.parent / "CREDITS.html"
         if credits.is_file():
@@ -226,7 +234,7 @@ def bundle(target_dir, cef_path, output_dir):
         license_file = framework_source.parent / "LICENSE.txt"
         if license_file.is_file():
             shutil.copy2(license_file, app / "Contents/Resources/CEF-LICENSE.txt")
-        sign(app)
+        sign(app, identity)
         subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)], check=True)
         stop_previous_app(destination)
         # Retain the previous generated bundle until the replacement has verified.
@@ -247,11 +255,14 @@ def main():
     parser.add_argument("--target-dir", type=Path, default=ROOT / "target/debug")
     parser.add_argument("--cef-path", type=Path, default=Path(os.environ.get("CEF_PATH", ROOT / ".cache/cef")))
     parser.add_argument("--output-dir", type=Path, default=ROOT / "dist")
+    parser.add_argument("--signing-identity", type=signing_identity, default="-",
+                        help="Code-signing identity to use for all nested code and the app (default: ad hoc).")
     args = parser.parse_args()
     if sys.platform != "darwin":
         parser.error("macOS is required to bundle and sign this app")
     try:
-        result = bundle(args.target_dir.resolve(), args.cef_path.resolve(), args.output_dir.resolve())
+        result = bundle(args.target_dir.resolve(), args.cef_path.resolve(),
+                        args.output_dir.resolve(), args.signing_identity)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         parser.exit(1, "Bundling failed: %s\n" % error)
     print(result)

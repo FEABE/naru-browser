@@ -1,6 +1,8 @@
 //! CEF download callbacks stay on the UI thread; rows contain copied metadata only.
 
-use crate::downloads::{MAX_ACTIVE, MAX_PATH_BYTES, Model, Progress, Snapshot, Status};
+use crate::downloads::{
+    MAX_ACTIVE, MAX_PATH_BYTES, Model, Progress, Snapshot, SourceTarget, Status,
+};
 use cef::*;
 use std::{cell::RefCell, collections::BTreeMap, path::Path};
 
@@ -46,6 +48,19 @@ struct Runtime {
 }
 
 impl Runtime {
+    fn source_target(&self, id: u32) -> Result<SourceTarget, String> {
+        if self.shutting_down {
+            return Err("브라우저를 종료하고 있습니다.".into());
+        }
+        if self.dialog.is_some() {
+            return Err("저장 위치 선택 창을 먼저 닫아 주세요.".into());
+        }
+        self.model
+            .entry(id)
+            .and_then(|entry| entry.source_target.clone())
+            .ok_or_else(|| "다운로드를 요청한 탭을 확인할 수 없습니다.".into())
+    }
+
     fn retry(&self, id: u32, tab: i32) -> Result<Option<Retry>, &'static str> {
         if self.shutting_down {
             return Err("브라우저를 종료하고 있습니다.");
@@ -92,7 +107,7 @@ impl Runtime {
 thread_local! { static RUNTIME: RefCell<Runtime> = RefCell::new(Runtime::default()); }
 
 pub fn snapshot() -> Snapshot {
-    RUNTIME.with(|slot| {
+    let (mut snapshot, targets) = RUNTIME.with(|slot| {
         let state = slot.borrow();
         let mut snapshot = state.model.snapshot();
         snapshot.notice = state.notice.clone();
@@ -104,8 +119,35 @@ pub fn snapshot() -> Snapshot {
                 snapshot.notice = Some("저장 위치 선택 창을 먼저 닫아 주세요.".into());
             }
         }
-        snapshot
+        let targets = snapshot
+            .rows
+            .iter()
+            .map(|row| state.source_target(row.id).ok())
+            .collect::<Vec<_>>();
+        (snapshot, targets)
+    });
+    // Browser state validation is metadata-only and runs outside RUNTIME.
+    // At most MAX_RECORDS targets are copied, only for a requested snapshot.
+    for (row, target) in snapshot.rows.iter_mut().zip(targets) {
+        row.can_reveal = target
+            .as_ref()
+            .is_some_and(|target| crate::browser::validate_download_source(target).is_ok());
+    }
+    snapshot
+}
+
+pub(crate) fn source_reveal_allowed() -> bool {
+    RUNTIME.with(|slot| {
+        let state = slot.borrow();
+        !state.shutting_down && state.dialog.is_none()
     })
+}
+
+pub(crate) fn reveal_source(id: u32) -> Result<i32, String> {
+    let target = RUNTIME.with(|slot| slot.borrow().source_target(id))?;
+    // Selection is explicit, does not restart a file, and may reenter either
+    // runtime when revealing a previously hidden Chromium permission prompt.
+    crate::browser::reveal_download_source(&target)
 }
 
 pub fn activity() -> (usize, usize) {
@@ -215,9 +257,14 @@ pub(crate) fn before_download(
         if state.callbacks.len() >= MAX_ACTIVE {
             return Err("다운로드는 대기와 진행을 합쳐 최대 4개까지 받을 수 있습니다.".to_owned());
         }
-        state
-            .model
-            .insert(id, tab, context.scope, &name, &context.source)?;
+        state.model.insert(
+            id,
+            tab,
+            context.scope,
+            &name,
+            &context.source,
+            Some(context.source_target),
+        )?;
         state.callbacks.insert(
             id,
             Callbacks {
@@ -575,10 +622,46 @@ pub(crate) fn clear() {
 mod tests {
     use super::*;
 
+    #[test]
+    fn source_lookup_preserves_download_and_rejects_sheet_shutdown_and_removed_record() {
+        let mut runtime = Runtime::default();
+        let target = SourceTarget {
+            tab: 7,
+            generation: 2,
+            document_epoch: 3,
+            owner: None,
+        };
+        runtime
+            .model
+            .insert(
+                1,
+                7,
+                None,
+                "test.txt",
+                "내 공간, 탭 7",
+                Some(target.clone()),
+            )
+            .unwrap();
+        let before = runtime.model.snapshot();
+        assert_eq!(runtime.source_target(1), Ok(target.clone()));
+        assert_eq!(runtime.model.snapshot(), before);
+        runtime.dialog = Some(Dialog { id: 1, sequence: 4 });
+        assert!(runtime.source_target(1).is_err());
+        runtime.dialog = None;
+        runtime.shutting_down = true;
+        assert!(runtime.source_target(1).is_err());
+        runtime.shutting_down = false;
+        assert!(runtime.source_target(999).is_err());
+        runtime.model.cancel(1);
+        assert_eq!(runtime.source_target(1), Ok(target));
+        runtime.model.clear_finished();
+        assert!(runtime.source_target(1).is_err());
+    }
+
     fn approved(runtime: &mut Runtime, id: u32, scope: Option<crate::protocol::TaskScope>) {
         runtime
             .model
-            .insert(id, 7, scope, "test.txt", "사용자")
+            .insert(id, 7, scope, "test.txt", "사용자", None)
             .unwrap();
         assert!(runtime.model.choose(id));
         runtime.model.start(id, "/tmp/approved.txt").unwrap();
@@ -645,7 +728,7 @@ mod tests {
 
         runtime
             .model
-            .insert(2, 7, None, "pending.txt", "사용자")
+            .insert(2, 7, None, "pending.txt", "사용자", None)
             .unwrap();
         runtime.callbacks.insert(2, Callbacks::default());
         assert!(runtime.retry(2, 7).is_err());
@@ -663,7 +746,7 @@ mod tests {
         let mut runtime = Runtime::default();
         runtime
             .model
-            .insert(1, 7, None, "test.txt", "사용자")
+            .insert(1, 7, None, "test.txt", "사용자", None)
             .unwrap();
         assert!(runtime.model.choose(1));
         let dialog = Dialog { id: 1, sequence: 3 };
@@ -688,7 +771,7 @@ mod tests {
         let mut runtime = Runtime::default();
         runtime
             .model
-            .insert(1, 7, None, "test.txt", "사용자")
+            .insert(1, 7, None, "test.txt", "사용자", None)
             .unwrap();
         assert!(runtime.model.choose(1));
         let current = Dialog { id: 1, sequence: 4 };
@@ -711,7 +794,7 @@ mod tests {
         let mut runtime = Runtime::default();
         runtime
             .model
-            .insert(1, 7, None, "test.txt", "사용자")
+            .insert(1, 7, None, "test.txt", "사용자", None)
             .unwrap();
         runtime.callbacks.insert(1, Callbacks::default());
         assert!(runtime.model.choose(1));

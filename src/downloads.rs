@@ -11,6 +11,16 @@ const MAX_NAME_CHARS: usize = 256;
 const MAX_SOURCE_CHARS: usize = 80;
 const MAX_REASON_CHARS: usize = 160;
 
+/// Identity of the document when a file was accepted by Naru. Metadata only;
+/// revealing it neither replays the URL nor takes control of its task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceTarget {
+    pub(crate) tab: i32,
+    pub(crate) generation: u64,
+    pub(crate) document_epoch: u64,
+    pub(crate) owner: Option<(TaskScope, crate::tasks::Status)>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     Pending,
@@ -36,6 +46,7 @@ pub struct Entry {
     pub status: Status,
     pub name: String,
     source: String,
+    pub(crate) source_target: Option<SourceTarget>,
     path: Option<String>,
     received: i64,
     total: i64,
@@ -74,6 +85,7 @@ pub struct DownloadRow {
     pub detail: String,
     pub can_choose: bool,
     pub can_cancel: bool,
+    pub can_reveal: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -117,6 +129,7 @@ impl Model {
         scope: Option<TaskScope>,
         name: &str,
         source: &str,
+        source_target: Option<SourceTarget>,
     ) -> Result<(), String> {
         if self.entry(id).is_some() {
             return Err("이미 등록된 다운로드입니다.".into());
@@ -139,6 +152,7 @@ impl Model {
             status: Status::Pending,
             name: display_name(name),
             source: bounded_text(source, MAX_SOURCE_CHARS),
+            source_target: source_target.filter(|target| target.tab == tab),
             path: None,
             received: 0,
             total: 0,
@@ -250,6 +264,7 @@ impl Model {
                     detail: entry.detail(),
                     can_choose: entry.status == Status::Pending,
                     can_cancel: !entry.status.is_terminal() && entry.status != Status::Canceling,
+                    can_reveal: entry.source_target.is_some(),
                 })
                 .collect(),
             active_count: self.active_count(),
@@ -364,9 +379,51 @@ fn bounded_text(value: &str, limit: usize) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn source_identity_is_bounded_to_its_record_and_never_controls_file_lifetime() {
+        let mut model = Model::new();
+        let source = SourceTarget {
+            tab: 7,
+            generation: 3,
+            document_epoch: 11,
+            owner: Some((
+                TaskScope {
+                    task: "paused-task".into(),
+                    revision: 5,
+                },
+                crate::tasks::Status::Paused,
+            )),
+        };
+        model
+            .insert(1, 7, None, "a.txt", "작업 A, 탭 7", Some(source.clone()))
+            .unwrap();
+        assert!(model.snapshot().rows[0].can_reveal);
+        assert_eq!(model.entry(1).unwrap().scope, None);
+        // A paused user's file remains a user file when that task is canceled.
+        assert!(model.cancel_task("paused-task", None).is_empty());
+        assert!(model.choose(1));
+        model.start(1, "/tmp/source-test.txt").unwrap();
+        model.update(
+            1,
+            Progress {
+                status: Status::Complete,
+                ..Default::default()
+            },
+        );
+        assert_eq!(model.entry(1).unwrap().source_target, Some(source.clone()));
+        assert!(model.snapshot().rows[0].can_reveal);
+        // Never point a different file tab at the captured source.
+        model
+            .insert(2, 8, None, "b.txt", "작업 B", Some(source))
+            .unwrap();
+        assert!(!model.snapshot().rows[0].can_reveal);
+        assert_eq!(model.clear_finished(), 1);
+        assert!(model.entry(1).is_none());
+    }
+
     fn insert(model: &mut Model, id: u32) {
         model
-            .insert(id, id as i32, None, "file.txt", "사용자 공간")
+            .insert(id, id as i32, None, "file.txt", "사용자 공간", None)
             .unwrap();
     }
 
@@ -380,7 +437,7 @@ mod tests {
         assert!(model.choose(3));
         model.start(3, "/tmp/file.txt").unwrap();
         assert!(!model.can_accept());
-        assert!(model.insert(5, 5, None, "f", "사용자").is_err());
+        assert!(model.insert(5, 5, None, "f", "사용자", None).is_err());
         assert_eq!(model.snapshot().active_count, 4);
         assert_eq!(model.activity(), (4, 2));
         assert!(model.cancel(2));
@@ -426,7 +483,7 @@ mod tests {
             }
         ));
         assert_eq!(model.entry(1).unwrap().status, Status::Canceled);
-        assert!(model.insert(1, 1, None, "new.txt", "사용자").is_err());
+        assert!(model.insert(1, 1, None, "new.txt", "사용자", None).is_err());
         assert_eq!(model.clear_finished(), 1);
         assert!(!model.update(1, Progress::default()));
         assert!(model.snapshot().rows.is_empty());
@@ -460,7 +517,7 @@ mod tests {
         assert_eq!(model.clear_finished(), 0);
         assert!(model.update(1, Progress::default()));
         assert_eq!(model.entry(1).unwrap().status, Status::Canceling);
-        assert!(model.insert(5, 5, None, "f", "공간").is_err());
+        assert!(model.insert(5, 5, None, "f", "공간", None).is_err());
         assert!(model.update(
             1,
             Progress {
@@ -549,6 +606,7 @@ mod tests {
                     }),
                     "f",
                     "공간",
+                    None,
                 )
                 .unwrap();
         }
@@ -613,6 +671,7 @@ mod tests {
                 None,
                 &format!("/tmp/{}", "가".repeat(300)),
                 &"나".repeat(200),
+                None,
             )
             .unwrap();
         assert_eq!(model.entry(1).unwrap().name.chars().count(), MAX_NAME_CHARS);
