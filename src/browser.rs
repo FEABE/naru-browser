@@ -470,6 +470,8 @@ struct Tab {
     native_start_page: bool,
     // Last confirmed native mute setting, not evidence of audible playback.
     audio_muted: Option<bool>,
+    context_menu: Option<ContextMenuTarget>,
+    context_menu_generation: u64,
     _devtools: Option<Registration>,
     navigation: Navigation,
 }
@@ -700,6 +702,9 @@ struct LinkCreation {
     opener: i32,
     owner: Option<(TaskScope, Status)>,
     foreground: bool,
+    // Explicit context-menu intents stay in their accepted source space.
+    // Existing renderer navigation/popup paths retain their original policy.
+    expected_space: Option<String>,
 }
 
 impl LinkCreation {
@@ -747,7 +752,10 @@ fn link_is_current(state: &State, link: &LinkCreation) -> bool {
             .get(&link.opener)
             .is_some_and(|tab| !tab.rejected_creation),
         &state.tasks,
-    )
+    ) && link
+        .expected_space
+        .as_ref()
+        .is_none_or(|space| state.spaces.tab_space(link.opener) == Some(space.as_str()))
 }
 
 #[derive(Default)]
@@ -1099,14 +1107,15 @@ pub(crate) fn download_host(tab: i32, scope: Option<&TaskScope>) -> Result<Brows
 pub fn shell_snapshot() -> ShellSnapshot {
     STATE.with(|state| {
         let state = state.borrow();
+        let spaces = state.spaces.views();
         ShellSnapshot {
-            spaces: state.spaces.views(),
             active_space: state.spaces.active_space().to_owned(),
             active_tab: state.spaces.active_tab(),
             overview: state.spaces.overview(),
-            tabs: state
-                .tabs
+            tabs: spaces
                 .iter()
+                .flat_map(|space| space.tabs.iter())
+                .filter_map(|id| state.tabs.get(id).map(|tab| (id, tab)))
                 .filter(|(_, tab)| !tab.rejected_creation)
                 .map(|(id, tab)| {
                     let task = state
@@ -1153,6 +1162,7 @@ pub fn shell_snapshot() -> ShellSnapshot {
                     }
                 })
                 .collect(),
+            spaces,
         }
     })
 }
@@ -1252,6 +1262,319 @@ pub fn handoff_page_input(tab: i32) -> Result<bool, String> {
     let Some(scope) = scope else { return Ok(false) };
     shell_action(ShellAction::Stop(tab, scope))?;
     Ok(true)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ContextMenuTarget {
+    tab: i32,
+    space: String,
+    frame_id: String,
+    navigation_epoch: u64,
+    document_epoch: u64,
+    owner: Option<(TaskScope, Status)>,
+    link_url: Option<String>,
+}
+
+fn context_menu_target(state: &State, tab: i32) -> Option<ContextMenuTarget> {
+    let page = state.tabs.get(&tab)?;
+    let target = ContextMenuTarget {
+        tab,
+        space: state.spaces.tab_space(tab)?.to_owned(),
+        frame_id: String::new(),
+        navigation_epoch: page.navigation.epoch,
+        document_epoch: page.navigation.document_epoch,
+        owner: link_owner(&state.tasks, tab),
+        link_url: None,
+    };
+    context_menu_target_matches(state, &target).then_some(target)
+}
+
+fn context_menu_target_matches(state: &State, target: &ContextMenuTarget) -> bool {
+    !state.spaces.overview()
+        && state.spaces.active_tab() == Some(target.tab)
+        && state.spaces.active_space() == target.space
+        && state.spaces.tab_space(target.tab) == Some(target.space.as_str())
+        && link_owner(&state.tasks, target.tab) == target.owner
+        && target
+            .owner
+            .as_ref()
+            .is_none_or(|(_, status)| matches!(status, Status::Active | Status::Paused))
+        && state.tabs.get(&target.tab).is_some_and(|page| {
+            !page.rejected_creation
+                && page.navigation.renderer_exit.is_none()
+                && page.navigation.epoch == target.navigation_epoch
+                && page.navigation.document_epoch == target.document_epoch
+        })
+}
+
+fn dismiss_context_menu(tab: i32) {
+    STATE.with(|slot| {
+        if let Some(page) = slot.borrow_mut().tabs.get_mut(&tab) {
+            page.context_menu = None;
+            page.context_menu_generation = page.context_menu_generation.saturating_add(1);
+        }
+    });
+}
+
+fn capture_context_menu(
+    tab: i32,
+    callback_frame: impl FnOnce() -> Option<String>,
+    mut current_frame: impl FnMut(i32) -> Option<String>,
+) -> bool {
+    let candidate = STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        let page = state.tabs.get_mut(&tab)?;
+        page.context_menu = None;
+        let generation = page.context_menu_generation.saturating_add(1);
+        page.context_menu_generation = generation;
+        if generation == u64::MAX {
+            return None;
+        }
+        context_menu_target(&state, tab).map(|target| (target, generation))
+    });
+    let Some((mut target, generation)) = candidate else {
+        return false;
+    };
+    // Capture only the callback frame's ID, after invalidating the older menu.
+    // Frame getters and native visibility checks may both reenter.
+    let Some(frame_id) = callback_frame().filter(|id| !id.is_empty()) else {
+        return false;
+    };
+    target.frame_id = frame_id;
+    if !context_menu_command_current(&target, generation)
+        || current_frame(tab).as_deref() != Some(target.frame_id.as_str())
+        || !context_menu_command_current(&target, generation)
+    {
+        return false;
+    }
+    STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        if context_menu_target_matches(&state, &target)
+            && state.tabs[&tab].context_menu_generation == generation
+        {
+            state.tabs.get_mut(&tab).unwrap().context_menu = Some(target);
+            true
+        } else {
+            false
+        }
+    })
+}
+
+fn context_menu_command_current(target: &ContextMenuTarget, generation: u64) -> bool {
+    STATE.with(|slot| {
+        let state = slot.borrow();
+        context_menu_target_matches(&state, target)
+            && state.tabs[&target.tab].context_menu_generation == generation
+            && state.tabs[&target.tab].context_menu.is_none()
+    })
+}
+
+fn take_context_menu_command(
+    tab: i32,
+    callback_frame: impl FnOnce() -> Option<String>,
+    mut current_frame: impl FnMut(i32) -> Option<String>,
+    require_link: bool,
+) -> Option<ContextMenuTarget> {
+    let captured = STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        let page = state.tabs.get_mut(&tab)?;
+        page.context_menu
+            .take()
+            .map(|target| (target, page.context_menu_generation))
+    });
+    let (mut target, generation) = captured?;
+    if (require_link && target.link_url.is_none())
+        || !context_menu_command_current(&target, generation)
+        || callback_frame().as_deref() != Some(target.frame_id.as_str())
+        || !context_menu_command_current(&target, generation)
+        || current_frame(tab).as_deref() != Some(target.frame_id.as_str())
+        || !context_menu_command_current(&target, generation)
+    {
+        return None;
+    }
+    if let Some((scope, Status::Active)) = target.owner.as_mut() {
+        let (Some(epoch), Some(revision)) = (
+            target.navigation_epoch.checked_add(1),
+            scope.revision.checked_add(1),
+        ) else {
+            return None;
+        };
+        scope.revision = revision;
+        target.navigation_epoch = epoch;
+        target.owner.as_mut().unwrap().1 = Status::Paused;
+        if !matches!(handoff_page_input(tab), Ok(true)) {
+            return None;
+        }
+        // Our handoff expires refs once. It must not permit a different commit,
+        // owner, resumed task, space, selection or nested menu to execute.
+        if !context_menu_command_current(&target, generation)
+            || current_frame(tab).as_deref() != Some(target.frame_id.as_str())
+            || !context_menu_command_current(&target, generation)
+        {
+            return None;
+        }
+    }
+    Some(target)
+}
+
+// CEF's return value is 1 to consume/reject, 0 to execute the default command.
+fn execute_context_menu(
+    tab: i32,
+    callback_frame: impl FnOnce() -> Option<String>,
+    current_frame: impl FnMut(i32) -> Option<String>,
+) -> i32 {
+    i32::from(take_context_menu_command(tab, callback_frame, current_frame, false).is_none())
+}
+
+// CEF reserves 26500..=28500 for application menu commands.
+const CONTEXT_OPEN_LINK: i32 = 26500;
+
+fn stored_context_menu_current(target: &ContextMenuTarget, generation: u64) -> bool {
+    STATE.with(|slot| {
+        let state = slot.borrow();
+        context_menu_target_matches(&state, target)
+            && state.tabs[&target.tab].context_menu_generation == generation
+            && state.tabs[&target.tab].context_menu.as_ref() == Some(target)
+    })
+}
+
+fn add_context_link(
+    tab: i32,
+    link_url: impl FnOnce() -> Option<String>,
+    mut current_frame: impl FnMut(i32) -> Option<String>,
+    add_item: impl FnOnce() -> bool,
+) {
+    let captured = STATE.with(|slot| {
+        let state = slot.borrow();
+        let page = state.tabs.get(&tab)?;
+        Some((page.context_menu.clone()?, page.context_menu_generation))
+    });
+    let Some((target, generation)) = captured else {
+        return;
+    };
+    if target.link_url.is_some() {
+        return;
+    }
+    let mut current = || {
+        stored_context_menu_current(&target, generation)
+            && current_frame(tab).as_deref() == Some(target.frame_id.as_str())
+            && stored_context_menu_current(&target, generation)
+    };
+    if !current() {
+        return;
+    }
+    let Some(url) = link_url().and_then(|url| crate::address::normalize_url(&url).ok()) else {
+        return;
+    };
+    if !current() || !add_item() || !current() {
+        return;
+    }
+    STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        // No native call intervenes between the final check and this update.
+        state
+            .tabs
+            .get_mut(&tab)
+            .unwrap()
+            .context_menu
+            .as_mut()
+            .unwrap()
+            .link_url = Some(url);
+    });
+}
+
+fn context_link_url(params: Option<&ContextMenuParams>) -> Option<String> {
+    let value = params?.link_url();
+    let raw: Option<&sys::_cef_string_utf16_t> = (&value).into();
+    let raw = raw?;
+    if raw.str_.is_null() || raw.length == 0 || raw.length > 8192 {
+        return None;
+    }
+    // CEF owns this valid UTF-16 buffer for the lifetime of `value`. Bound the
+    // copy before conversion; normalize_url also bounds the resulting UTF-8 URL.
+    String::from_utf16(unsafe { std::slice::from_raw_parts(raw.str_, raw.length) }).ok()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ContextLinkResult {
+    Rejected,
+    Queued,
+    Failed,
+}
+
+fn execute_context_link(
+    tab: i32,
+    callback_frame: impl FnOnce() -> Option<String>,
+    current_frame: impl FnMut(i32) -> Option<String>,
+    post: impl FnOnce(String, LinkCreation, Option<u64>) -> bool,
+) -> ContextLinkResult {
+    let Some(target) = take_context_menu_command(tab, callback_frame, current_frame, true) else {
+        return ContextLinkResult::Rejected;
+    };
+    let link = LinkCreation {
+        opener: tab,
+        owner: target.owner,
+        foreground: false,
+        expected_space: Some(target.space),
+    };
+    // The accepted URL is an intent, independent of later menu dismissal or
+    // page selection. The opener's lifetime, ownership and space remain bound.
+    if !STATE.with(|slot| link_is_current(&slot.borrow(), &link)) {
+        return ContextLinkResult::Failed;
+    }
+    let Ok(reservation) = reserve_link_creation(&link) else {
+        return ContextLinkResult::Failed;
+    };
+    if post(target.link_url.unwrap(), link, reservation) {
+        ContextLinkResult::Queued
+    } else {
+        if let Some(ticket) = reservation {
+            STATE.with(|slot| {
+                slot.borrow_mut().creations.release(ticket);
+            });
+        }
+        ContextLinkResult::Failed
+    }
+}
+
+fn context_link_creation_failed(link: &LinkCreation) {
+    #[cfg(not(test))]
+    if link.expected_space.is_some() {
+        crate::control_panel::context_link_failed(link.opener);
+    }
+    #[cfg(test)]
+    let _ = link;
+}
+
+fn context_menu_frame_id(frame: Option<&Frame>) -> Option<String> {
+    let frame = frame.filter(|frame| frame.is_valid() != 0)?;
+    let id = CefString::from(&frame.identifier()).to_string();
+    (!id.is_empty()).then_some(id)
+}
+
+fn context_menu_current_frame(tab: i32) -> Option<String> {
+    #[cfg(not(test))]
+    {
+        if !crate::control_panel::context_menu_target_is_visible(tab) {
+            return None;
+        }
+        // Visibility getters may have closed the tab. Obtain its live browser
+        // afterwards, and make every CEF call outside the STATE borrow.
+        let browser = STATE.with(|slot| {
+            slot.borrow()
+                .tabs
+                .get(&tab)
+                .filter(|page| !page.rejected_creation && page.navigation.renderer_exit.is_none())
+                .map(|page| page.browser.clone())
+        })?;
+        let frame = browser.focused_frame()?;
+        context_menu_frame_id(Some(&frame))
+    }
+    #[cfg(test)]
+    {
+        let _ = tab;
+        None
+    }
 }
 
 fn sync_shell() {
@@ -2033,6 +2356,63 @@ pub(crate) fn select_tab_from_sidebar(tab: i32, expected_space: &str) -> Result<
     shell_action(ShellAction::SelectTab(tab))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TabOrderTarget {
+    pub tab: i32,
+    pub space: String,
+    pub neighbor: i32,
+    pub forward: bool,
+}
+
+fn validate_tab_order_state(state: &State, target: &TabOrderTarget) -> Result<(), String> {
+    let order = state.spaces.ordered_tabs(&target.space);
+    let index = order.iter().position(|id| *id == target.tab);
+    let adjacent = index.and_then(|index| {
+        if target.forward {
+            index.checked_add(1)
+        } else {
+            index.checked_sub(1)
+        }
+    });
+    if state.spaces.overview()
+        || state.spaces.active_space() != target.space
+        || state.spaces.active_tab() != Some(target.tab)
+        || adjacent.and_then(|index| order.get(index)) != Some(&target.neighbor)
+        || [target.tab, target.neighbor].into_iter().any(|id| {
+            state.spaces.tab_space(id) != Some(target.space.as_str())
+                || !state
+                    .tabs
+                    .get(&id)
+                    .is_some_and(|tab| !tab.rejected_creation)
+        })
+    {
+        return Err("탭 순서나 선택이 바뀌었습니다. 메뉴를 다시 열어 주세요.".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_tab_order_target(target: &TabOrderTarget) -> Result<(), String> {
+    STATE.with(|state| validate_tab_order_state(&state.borrow(), target))
+}
+
+pub(crate) fn reorder_tab_from_sidebar(target: &TabOrderTarget) -> Result<(), String> {
+    // Presentation metadata only: no CEF/AppKit call, selection, navigation or
+    // AI handoff occurs between validation and the adjacent swap.
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        validate_tab_order_state(&state, target)?;
+        if !state.spaces.reorder_adjacent(
+            target.tab,
+            &target.space,
+            target.neighbor,
+            target.forward,
+        ) {
+            return Err("현재 탭을 이동할 수 없습니다.".into());
+        }
+        Ok(())
+    })
+}
+
 fn validate_recovery_state(
     state: &State,
     target: &PageRecoveryTarget,
@@ -2459,6 +2839,7 @@ wrap_task! {
                 if let Some(ticket) = self.reservation {
                     STATE.with(|state| { state.borrow_mut().creations.release(ticket); });
                 }
+                context_link_creation_failed(&self.link);
             }
             notify_panel();
         }
@@ -3470,7 +3851,8 @@ fn create_browser_with_link(
     link: Option<LinkCreation>,
 ) -> Option<Browser> {
     let foreground = scope.is_none() && link.as_ref().is_none_or(|link| link.foreground);
-    create_browser_with_context(url, scope, reservation, link, None, foreground, false)
+    let space = link.as_ref().and_then(|link| link.expected_space.clone());
+    create_browser_with_context(url, scope, reservation, link, space, foreground, false)
 }
 
 fn create_browser_with_context(
@@ -3853,6 +4235,50 @@ wrap_client! {
         fn find_handler(&self) -> Option<FindHandler> { Some(PageFindHandler::new()) }
         fn download_handler(&self) -> Option<DownloadHandler> { Some(FileDownloadHandler::new()) }
         fn permission_handler(&self) -> Option<PermissionHandler> { Some(FilePermissionHandler::new()) }
+        fn context_menu_handler(&self) -> Option<ContextMenuHandler> { Some(PageContextMenuHandler::new()) }
+    }
+}
+wrap_context_menu_handler! {
+    struct PageContextMenuHandler;
+    impl ContextMenuHandler {
+        fn on_before_context_menu(&self, browser:Option<&mut Browser>, frame:Option<&mut Frame>,
+            params:Option<&mut ContextMenuParams>, model:Option<&mut MenuModel>) {
+            if let Some(browser) = browser {
+                let tab = browser.identifier();
+                if capture_context_menu(tab, ||context_menu_frame_id(frame.as_deref()), context_menu_current_frame) {
+                    add_context_link(tab, ||context_link_url(params.as_deref()), context_menu_current_frame,
+                        || model.is_some_and(|model| model.insert_item_at(0, CONTEXT_OPEN_LINK, Some(&CefString::from("링크 주소를 새 탭에서 열기"))) != 0));
+                }
+            }
+        }
+        fn on_context_menu_command(&self, browser:Option<&mut Browser>, frame:Option<&mut Frame>,
+            _params:Option<&mut ContextMenuParams>, command_id:i32, _event_flags:EventFlags) -> i32 {
+            let Some(browser) = browser else { return 1; };
+            let tab = browser.identifier();
+            if command_id == CONTEXT_OPEN_LINK {
+                let result = execute_context_link(tab, ||context_menu_frame_id(frame.as_deref()), context_menu_current_frame,
+                    |url, link, reservation| {
+                        let mut task = OpenLinkTask::new(url, link, reservation);
+                        post_task(ThreadId::UI, Some(&mut task)) != 0
+                    });
+                #[cfg(not(test))]
+                match result {
+                    ContextLinkResult::Rejected => crate::control_panel::context_menu_rejected(tab),
+                    ContextLinkResult::Failed => crate::control_panel::context_link_failed(tab),
+                    ContextLinkResult::Queued => {},
+                }
+                #[cfg(test)]
+                let _ = result;
+                return 1;
+            }
+            let handled = execute_context_menu(tab, ||context_menu_frame_id(frame.as_deref()), context_menu_current_frame);
+            #[cfg(not(test))]
+            if handled != 0 { crate::control_panel::context_menu_rejected(tab); }
+            handled
+        }
+        fn on_context_menu_dismissed(&self, browser:Option<&mut Browser>, _frame:Option<&mut Frame>) {
+            if let Some(browser) = browser { dismiss_context_menu(browser.identifier()); }
+        }
     }
 }
 wrap_life_span_handler! {
@@ -3891,7 +4317,7 @@ wrap_life_span_handler! {
             let foreground = popup_foreground(target_disposition, scope.is_some());
             let link = opener.map(|opener| STATE.with(|state| {
                 let state = state.borrow();
-                LinkCreation { opener, owner:link_owner(&state.tasks,opener), foreground }
+                LinkCreation { opener, owner:link_owner(&state.tasks,opener), foreground, expected_space:None }
             }));
             let space = opener.and_then(|opener|STATE.with(|state|state.borrow().spaces.tab_space(opener).map(str::to_owned))).unwrap_or_else(||USER_SPACE.into());
             window_info.hidden = i32::from(!foreground || STATE.with(|state| {
@@ -3925,7 +4351,7 @@ wrap_life_span_handler! {
                     let reserved = self.reservation.is_none_or(|ticket|state.creations.release(ticket));
                     let attached = current && reserved && self.scope.as_ref().is_none_or(|scope|state.tasks.attach(scope,browser.identifier(),Origin::Created).is_ok());
                     if attached { state.spaces.insert(browser.identifier(), &self.space, self.foreground); }
-                    state.tabs.insert(browser.identifier(),Tab {browser:browser.clone(),title:String::new(),rejected_creation:!attached,native_start_page:self.native_start_page,audio_muted:None,_devtools:None,
+                    state.tabs.insert(browser.identifier(),Tab {browser:browser.clone(),title:String::new(),rejected_creation:!attached,native_start_page:self.native_start_page,audio_muted:None,context_menu:None,context_menu_generation:0,_devtools:None,
                         navigation:Navigation { requested_url:self.requested_url.clone(), history: HistoryObservation {
                             attempt: Some(self.history.generation.filter(|_| self.space == USER_SPACE && self.scope.is_none())), staged: self.history.staged, ..Default::default()
                         }, ..Default::default() } });
@@ -3935,6 +4361,7 @@ wrap_life_span_handler! {
                         // Creation may finish after a handoff or finish. This is
                         // a newly created task window, never an adopted user tab.
                         if let Some(host) = browser.host() { host.close_browser(0); }
+                        if let Some(link) = &self.link { context_link_creation_failed(link); }
                         return;
                 }
                 if let Some(host) = browser.host() {
@@ -3943,6 +4370,7 @@ wrap_life_span_handler! {
                         eprintln!("Cannot attach browser tab: {error}");
                         STATE.with(|state| { if let Some(tab) = state.borrow_mut().tabs.get_mut(&browser.identifier()) { tab.rejected_creation = true; } });
                         host.close_browser(1);
+                        if let Some(link) = &self.link { context_link_creation_failed(link); }
                         return;
                     }
                 }
@@ -4120,7 +4548,7 @@ wrap_request_handler! {
                 let state = state.borrow();
                 let opener = browser.identifier();
                 state.tabs.get(&opener).filter(|tab| !tab.rejected_creation)
-                    .map(|_| LinkCreation { opener, owner:link_owner(&state.tasks, opener), foreground })
+                    .map(|_| LinkCreation { opener, owner:link_owner(&state.tasks, opener), foreground, expected_space:None })
             });
             let Some(link) = link else { return 1; };
             let reservation = match reserve_link_creation(&link) {
@@ -4153,6 +4581,9 @@ wrap_request_handler! {
             }
         }
         fn on_before_browse(&self,browser:Option<&mut Browser>,frame:Option<&mut Frame>,request:Option<&mut cef::Request>,user_gesture:i32,is_redirect:i32) -> i32 {
+            // A subframe can replace its document without changing the main
+            // navigation epoch. Cancel the whole tab's menu conservatively.
+            if let Some(browser) = browser.as_ref() { dismiss_context_menu(browser.identifier()); }
             if frame.is_some_and(|frame| frame.is_main()!=0) {
                 if let Some(browser) = browser {
                     invalidate_page_find(browser.identifier());
@@ -4202,6 +4633,8 @@ wrap_load_handler! {
             });queue_history_observation(browser.identifier());notify_panel();}
         }
         fn on_load_start(&self,browser:Option<&mut Browser>,frame:Option<&mut Frame>,_transition_type:TransitionType) {
+            // Restored documents may commit without OnBeforeBrowse.
+            if let Some(browser) = browser.as_ref() { dismiss_context_menu(browser.identifier()); }
             let Some(frame) = frame.filter(|frame| frame.is_main()!=0) else { return; };
             let url = CefString::from(&frame.url()).to_string();
             let generation = crate::history_runtime::generation();
@@ -4271,6 +4704,8 @@ mod tests {
             rejected_creation: false,
             native_start_page: true,
             audio_muted: None,
+            context_menu: None,
+            context_menu_generation: 0,
             _devtools: None,
             navigation: Navigation {
                 epoch: 4,
@@ -4281,6 +4716,724 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    fn context_menu_fixture(owned: bool) -> Option<TaskScope> {
+        clear();
+        STATE.with(|slot| {
+            let mut state = slot.borrow_mut();
+            for id in [7, 8] {
+                let mut tab = native_blank_tab();
+                tab.native_start_page = false;
+                tab.navigation.requested_url = "https://example.test/menu".into();
+                tab.navigation.document_epoch = 2;
+                state.tabs.insert(id, tab);
+                state.spaces.insert(id, USER_SPACE, id == 7);
+            }
+            if !owned {
+                return None;
+            }
+            let task = state.tasks.create("menu owner").unwrap();
+            let scope = TaskScope {
+                task: task.id,
+                revision: task.revision,
+            };
+            state.tasks.attach(&scope, 7, Origin::Borrowed).unwrap();
+            let tasks = state.tasks.list();
+            state.spaces.update_tasks(&tasks);
+            state.spaces.adopt(7, &scope.task);
+            state.spaces.show(&scope.task);
+            Some(scope)
+        })
+    }
+
+    fn menu_frame_id() -> Option<String> {
+        Some("frame-1".into())
+    }
+
+    #[test]
+    fn context_menu_user_and_paused_commands_run_once_without_handoff() {
+        for owned in [false, true] {
+            let paused = context_menu_fixture(owned).map(|scope| {
+                handoff_native(scope.clone()).unwrap();
+                TaskScope {
+                    revision: scope.revision + 1,
+                    ..scope
+                }
+            });
+            capture_context_menu(7, menu_frame_id, |_| menu_frame_id());
+            assert_eq!(
+                execute_context_menu(7, menu_frame_id, |_| menu_frame_id()),
+                0
+            );
+            assert_eq!(
+                execute_context_menu(7, menu_frame_id, |_| menu_frame_id()),
+                1
+            );
+            if let Some(scope) = paused {
+                STATE.with(|slot| {
+                    let task = slot.borrow().tasks.info(&scope.task).unwrap();
+                    assert_eq!(
+                        (task.status, task.revision),
+                        (Status::Paused, scope.revision)
+                    );
+                });
+            }
+            capture_context_menu(7, menu_frame_id, |_| menu_frame_id());
+            dismiss_context_menu(7);
+            assert_eq!(
+                execute_context_menu(7, menu_frame_id, |_| menu_frame_id()),
+                1
+            );
+        }
+        clear();
+    }
+
+    #[test]
+    fn context_menu_active_owner_handoffs_only_itself_before_default_command() {
+        let scope = context_menu_fixture(true).unwrap();
+        let other = STATE.with(|slot| slot.borrow_mut().tasks.create("other menu owner").unwrap());
+        capture_context_menu(7, menu_frame_id, |_| menu_frame_id());
+        let mut native_checks = 0;
+        assert_eq!(
+            execute_context_menu(7, menu_frame_id, |_| {
+                native_checks += 1;
+                menu_frame_id()
+            }),
+            0
+        );
+        assert_eq!(native_checks, 2);
+        STATE.with(|slot| {
+            let state = slot.borrow();
+            let task = state.tasks.info(&scope.task).unwrap();
+            assert_eq!(
+                (task.status, task.revision),
+                (Status::Paused, scope.revision + 1)
+            );
+            let other_now = state.tasks.info(&other.id).unwrap();
+            assert_eq!(
+                (other_now.status, other_now.revision),
+                (Status::Active, other.revision)
+            );
+            assert_eq!(state.tabs[&7].navigation.epoch, 5);
+            assert_eq!(state.tabs[&7].navigation.document_epoch, 2);
+            assert_eq!(state.spaces.active_tab(), Some(7));
+            assert_eq!(state.spaces.active_space(), scope.task);
+        });
+        clear();
+    }
+
+    #[test]
+    fn context_menu_resume_or_owner_change_rejects_without_stopping_new_owner() {
+        let scope = context_menu_fixture(true).unwrap();
+        handoff_native(scope.clone()).unwrap();
+        capture_context_menu(7, menu_frame_id, |_| menu_frame_id());
+        let (reply, result) = test_reply(1);
+        handle(
+            &Command::TaskResume {
+                task: scope.task.clone(),
+                revision: scope.revision + 1,
+            },
+            reply,
+        );
+        assert!(result.try_recv().unwrap().ok);
+        assert_eq!(
+            execute_context_menu(7, menu_frame_id, |_| menu_frame_id()),
+            1
+        );
+        STATE.with(|slot| {
+            let task = slot.borrow().tasks.info(&scope.task).unwrap();
+            assert_eq!(
+                (task.status, task.revision),
+                (Status::Active, scope.revision + 2)
+            );
+        });
+
+        context_menu_fixture(false);
+        capture_context_menu(7, menu_frame_id, |_| menu_frame_id());
+        let new_owner = STATE.with(|slot| {
+            let mut state = slot.borrow_mut();
+            let task = state.tasks.create("adopt while menu open").unwrap();
+            let scope = TaskScope {
+                task: task.id,
+                revision: task.revision,
+            };
+            state.tasks.attach(&scope, 7, Origin::Borrowed).unwrap();
+            scope
+        });
+        // Even before the presentation moves, authorization changed.
+        assert_eq!(
+            execute_context_menu(7, menu_frame_id, |_| menu_frame_id()),
+            1
+        );
+        STATE.with(|slot| {
+            let task = slot.borrow().tasks.info(&new_owner.task).unwrap();
+            assert_eq!(
+                (task.status, task.revision),
+                (Status::Active, new_owner.revision)
+            );
+        });
+        clear();
+    }
+
+    #[test]
+    fn context_menu_rejects_stale_navigation_selection_space_and_closed_tabs() {
+        let changes: [fn(&mut State); 8] = [
+            |state| state.tabs.get_mut(&7).unwrap().navigation.epoch += 1,
+            |state| state.tabs.get_mut(&7).unwrap().navigation.document_epoch += 1,
+            |state| {
+                state.spaces.select_tab(8);
+            },
+            |state| {
+                let task = state.tasks.create("other visible space").unwrap();
+                let tasks = state.tasks.list();
+                state.spaces.update_tasks(&tasks);
+                state.spaces.show(&task.id);
+            },
+            |state| state.spaces.set_overview(true),
+            |state| {
+                state.tabs.remove(&7);
+            },
+            |state| state.tabs.get_mut(&7).unwrap().rejected_creation = true,
+            |state| state.tabs.get_mut(&7).unwrap().navigation.renderer_exit = Some(json!({})),
+        ];
+        for change in changes {
+            context_menu_fixture(false);
+            capture_context_menu(7, menu_frame_id, |_| menu_frame_id());
+            STATE.with(|slot| change(&mut slot.borrow_mut()));
+            assert_eq!(
+                execute_context_menu(7, menu_frame_id, |_| menu_frame_id()),
+                1
+            );
+        }
+        context_menu_fixture(false);
+        capture_context_menu(7, menu_frame_id, |_| None);
+        assert_eq!(
+            execute_context_menu(7, menu_frame_id, |_| menu_frame_id()),
+            1
+        );
+        capture_context_menu(7, menu_frame_id, |_| menu_frame_id());
+        assert_eq!(execute_context_menu(7, menu_frame_id, |_| None), 1);
+        clear();
+    }
+
+    #[test]
+    fn context_menu_native_reentry_preserves_newer_menu_and_rechecks_document() {
+        context_menu_fixture(false);
+        capture_context_menu(7, menu_frame_id, |_| {
+            capture_context_menu(7, menu_frame_id, |_| menu_frame_id());
+            menu_frame_id()
+        });
+        assert_eq!(
+            execute_context_menu(7, menu_frame_id, |_| {
+                capture_context_menu(7, menu_frame_id, |_| menu_frame_id());
+                menu_frame_id()
+            }),
+            1
+        );
+        assert_eq!(
+            execute_context_menu(7, menu_frame_id, |_| menu_frame_id()),
+            0
+        );
+        capture_context_menu(7, menu_frame_id, |_| menu_frame_id());
+        assert_eq!(
+            execute_context_menu(7, menu_frame_id, |_| {
+                capture_context_menu(7, menu_frame_id, |_| menu_frame_id());
+                dismiss_context_menu(7);
+                menu_frame_id()
+            }),
+            1
+        );
+
+        let scope = context_menu_fixture(true).unwrap();
+        capture_context_menu(7, menu_frame_id, |_| menu_frame_id());
+        let mut checks = 0;
+        assert_eq!(
+            execute_context_menu(7, menu_frame_id, |_| {
+                checks += 1;
+                if checks == 2 {
+                    STATE.with(|slot| {
+                        slot.borrow_mut()
+                            .tabs
+                            .get_mut(&7)
+                            .unwrap()
+                            .navigation
+                            .document_epoch += 1
+                    });
+                }
+                menu_frame_id()
+            }),
+            1
+        );
+        STATE.with(|slot| {
+            let task = slot.borrow().tasks.info(&scope.task).unwrap();
+            assert_eq!(
+                (task.status, task.revision),
+                (Status::Paused, scope.revision + 1)
+            );
+        });
+        clear();
+    }
+
+    #[test]
+    fn context_menu_rejects_missing_or_changed_callback_and_focused_frames() {
+        for invalid in [None, Some(String::new()), Some("frame-2".into())] {
+            context_menu_fixture(false);
+            capture_context_menu(7, || invalid.clone(), |_| menu_frame_id());
+            assert_eq!(
+                execute_context_menu(7, menu_frame_id, |_| menu_frame_id()),
+                1
+            );
+
+            let scope = context_menu_fixture(true).unwrap();
+            capture_context_menu(7, menu_frame_id, |_| menu_frame_id());
+            assert_eq!(
+                execute_context_menu(7, || invalid.clone(), |_| menu_frame_id()),
+                1
+            );
+            capture_context_menu(7, menu_frame_id, |_| menu_frame_id());
+            assert_eq!(
+                execute_context_menu(7, menu_frame_id, |_| invalid.clone()),
+                1
+            );
+            STATE.with(|slot| {
+                let task = slot.borrow().tasks.info(&scope.task).unwrap();
+                assert_eq!(
+                    (task.status, task.revision),
+                    (Status::Active, scope.revision)
+                );
+            });
+        }
+        clear();
+    }
+
+    #[test]
+    fn context_menu_rechecks_frame_after_handoff_and_callback_getter_reentry() {
+        for changed in [None, Some("frame-2".into())] {
+            let scope = context_menu_fixture(true).unwrap();
+            capture_context_menu(7, menu_frame_id, |_| menu_frame_id());
+            let mut checks = 0;
+            assert_eq!(
+                execute_context_menu(7, menu_frame_id, |_| {
+                    checks += 1;
+                    if checks == 1 {
+                        menu_frame_id()
+                    } else {
+                        changed.clone()
+                    }
+                }),
+                1
+            );
+            STATE.with(|slot| {
+                let task = slot.borrow().tasks.info(&scope.task).unwrap();
+                assert_eq!(
+                    (task.status, task.revision),
+                    (Status::Paused, scope.revision + 1)
+                );
+            });
+        }
+        context_menu_fixture(false);
+        capture_context_menu(
+            7,
+            || {
+                capture_context_menu(7, menu_frame_id, |_| menu_frame_id());
+                menu_frame_id()
+            },
+            |_| panic!("stale outer capture must not query native UI"),
+        );
+        assert_eq!(
+            execute_context_menu(
+                7,
+                || {
+                    dismiss_context_menu(7);
+                    menu_frame_id()
+                },
+                |_| panic!("dismissed command must not query native UI")
+            ),
+            1
+        );
+        clear();
+    }
+
+    #[test]
+    fn subframe_browse_and_commit_invalidate_menu_without_main_epoch_change() {
+        // Invoke the actual callbacks with inert CEF handles. No native string
+        // conversion or Chromium/AppKit initialization is involved.
+        unsafe extern "C" fn identifier(_: *mut sys::_cef_browser_t) -> i32 {
+            7
+        }
+        let mut raw_browser = unsafe { std::mem::zeroed::<sys::_cef_browser_t>() };
+        raw_browser.get_identifier = Some(identifier);
+        let raw_browser = cef::rc::RcImpl::new(raw_browser, ());
+        let mut browser =
+            cef::rc::ConvertReturnValue::wrap_result(raw_browser.cast::<sys::_cef_browser_t>());
+        let raw_frame =
+            cef::rc::RcImpl::new(unsafe { std::mem::zeroed::<sys::_cef_frame_t>() }, ());
+        let mut subframe =
+            cef::rc::ConvertReturnValue::wrap_result(raw_frame.cast::<sys::_cef_frame_t>());
+        for commit in [false, true] {
+            context_menu_fixture(false);
+            capture_context_menu(7, menu_frame_id, |_| menu_frame_id());
+            if commit {
+                PageLoadHandler::new().on_load_start(
+                    Some(&mut browser),
+                    Some(&mut subframe),
+                    TransitionType::default(),
+                );
+            } else {
+                assert_eq!(
+                    NavigationHandler::new().on_before_browse(
+                        Some(&mut browser),
+                        Some(&mut subframe),
+                        None,
+                        0,
+                        0
+                    ),
+                    0
+                );
+            }
+            STATE.with(|slot| {
+                let state = slot.borrow();
+                assert_eq!(state.tabs[&7].navigation.epoch, 4);
+                assert_eq!(state.tabs[&7].navigation.document_epoch, 2);
+            });
+            assert_eq!(
+                execute_context_menu(7, menu_frame_id, |_| menu_frame_id()),
+                1
+            );
+        }
+        clear();
+    }
+
+    fn prepare_context_link(url: &str) {
+        assert!(capture_context_menu(7, menu_frame_id, |_| menu_frame_id()));
+        add_context_link(7, || Some(url.into()), |_| menu_frame_id(), || true);
+    }
+
+    #[test]
+    fn context_link_item_requires_a_bounded_normalized_http_url() {
+        let rejected = [
+            String::new(),
+            "javascript:alert(1)".into(),
+            "about:blank".into(),
+            "https://user:password@example.test/".into(),
+            "https://example.test/\nnext".into(),
+            format!("https://example.test/{}", "x".repeat(8192)),
+            // Under the input byte cap, over the normalized output byte cap.
+            format!("https://example.test/{}", "가".repeat(1000)),
+        ];
+        for url in rejected {
+            context_menu_fixture(false);
+            capture_context_menu(7, menu_frame_id, |_| menu_frame_id());
+            add_context_link(
+                7,
+                || Some(url),
+                |_| menu_frame_id(),
+                || panic!("invalid URL must not add a menu item"),
+            );
+            STATE.with(|slot| {
+                assert!(
+                    slot.borrow().tabs[&7]
+                        .context_menu
+                        .as_ref()
+                        .unwrap()
+                        .link_url
+                        .is_none()
+                )
+            });
+        }
+        context_menu_fixture(false);
+        prepare_context_link("HTTPS://example.test/a b?q=한글");
+        let mut queued = None;
+        assert_eq!(
+            execute_context_link(
+                7,
+                menu_frame_id,
+                |_| menu_frame_id(),
+                |url, link, ticket| {
+                    queued = Some((url, link, ticket));
+                    true
+                }
+            ),
+            ContextLinkResult::Queued
+        );
+        let (url, link, ticket) = queued.unwrap();
+        assert_eq!(url, "https://example.test/a%20b?q=%ED%95%9C%EA%B8%80");
+        assert_eq!(link.expected_space.as_deref(), Some(USER_SPACE));
+        assert!(!link.foreground);
+        assert!(link.owner.is_none());
+        assert!(ticket.is_none());
+        clear();
+    }
+
+    #[test]
+    fn context_link_preparation_rechecks_getters_and_model_calls() {
+        context_menu_fixture(false);
+        capture_context_menu(7, menu_frame_id, |_| menu_frame_id());
+        add_context_link(
+            7,
+            || {
+                capture_context_menu(7, menu_frame_id, |_| menu_frame_id());
+                Some("https://example.test/old-menu".into())
+            },
+            |_| menu_frame_id(),
+            || panic!("stale URL getter must not mutate a new menu"),
+        );
+        STATE.with(|slot| {
+            assert!(
+                slot.borrow().tabs[&7]
+                    .context_menu
+                    .as_ref()
+                    .unwrap()
+                    .link_url
+                    .is_none()
+            )
+        });
+
+        add_context_link(
+            7,
+            || Some("https://example.test/old-menu".into()),
+            |_| menu_frame_id(),
+            || {
+                prepare_context_link("https://example.test/new-menu");
+                true
+            },
+        );
+        STATE.with(|slot| {
+            assert_eq!(
+                slot.borrow().tabs[&7]
+                    .context_menu
+                    .as_ref()
+                    .unwrap()
+                    .link_url
+                    .as_deref(),
+                Some("https://example.test/new-menu")
+            )
+        });
+
+        capture_context_menu(7, menu_frame_id, |_| menu_frame_id());
+        add_context_link(
+            7,
+            || Some("https://example.test/failed-item".into()),
+            |_| menu_frame_id(),
+            || false,
+        );
+        assert_eq!(
+            execute_context_link(
+                7,
+                menu_frame_id,
+                |_| menu_frame_id(),
+                |_, _, _| panic!("failed item cannot queue")
+            ),
+            ContextLinkResult::Rejected
+        );
+
+        capture_context_menu(7, menu_frame_id, |_| menu_frame_id());
+        let mut checks = 0;
+        add_context_link(
+            7,
+            || Some("https://example.test/changed-frame".into()),
+            |_| {
+                checks += 1;
+                if checks == 3 {
+                    Some("other-frame".into())
+                } else {
+                    menu_frame_id()
+                }
+            },
+            || true,
+        );
+        assert_eq!(checks, 3);
+        STATE.with(|slot| {
+            assert!(
+                slot.borrow().tabs[&7]
+                    .context_menu
+                    .as_ref()
+                    .unwrap()
+                    .link_url
+                    .is_none()
+            )
+        });
+        clear();
+    }
+
+    #[test]
+    fn context_link_captures_post_handoff_owner_and_survives_normal_dismissal() {
+        let scope = context_menu_fixture(true).unwrap();
+        prepare_context_link("https://example.test/chosen");
+        let mut queued = None;
+        assert_eq!(
+            execute_context_link(
+                7,
+                menu_frame_id,
+                |_| menu_frame_id(),
+                |url, link, ticket| {
+                    queued = Some((url, link, ticket));
+                    true
+                }
+            ),
+            ContextLinkResult::Queued
+        );
+        let (url, link, ticket) = queued.unwrap();
+        assert_eq!(url, "https://example.test/chosen");
+        assert_eq!(
+            link.owner,
+            Some((
+                TaskScope {
+                    task: scope.task.clone(),
+                    revision: scope.revision + 1
+                },
+                Status::Paused
+            ))
+        );
+        assert_eq!(link.expected_space.as_deref(), Some(scope.task.as_str()));
+        assert!(!link.foreground);
+        assert!(link.scope().is_none());
+        assert!(ticket.is_none());
+        STATE.with(|slot| {
+            let state = slot.borrow();
+            assert_eq!(state.spaces.active_space(), scope.task);
+            assert_eq!(state.spaces.active_tab(), Some(7));
+            assert!(link_is_current(&state, &link));
+        });
+        dismiss_context_menu(7);
+        STATE.with(|slot| {
+            let mut state = slot.borrow_mut();
+            assert!(state.spaces.show(USER_SPACE));
+            assert!(state.spaces.select_tab(8));
+            let navigation = &mut state.tabs.get_mut(&7).unwrap().navigation;
+            navigation.epoch += 1;
+            navigation.document_epoch += 1;
+            navigation.requested_url = "https://example.test/later-document".into();
+            assert!(link_is_current(&state, &link));
+            assert_eq!(state.spaces.active_tab(), Some(8));
+            state
+                .tasks
+                .resume(&TaskScope {
+                    task: scope.task,
+                    revision: scope.revision + 1,
+                })
+                .unwrap();
+            assert!(!link_is_current(&state, &link));
+        });
+        clear();
+    }
+
+    #[test]
+    fn context_link_queue_rejects_moved_closed_or_newly_owned_openers() {
+        for change in 0..3 {
+            context_menu_fixture(false);
+            prepare_context_link("https://example.test/chosen");
+            let mut queued = None;
+            assert_eq!(
+                execute_context_link(
+                    7,
+                    menu_frame_id,
+                    |_| menu_frame_id(),
+                    |_, link, _| {
+                        queued = Some(link);
+                        true
+                    }
+                ),
+                ContextLinkResult::Queued
+            );
+            let link = queued.unwrap();
+            STATE.with(|slot| {
+                let mut state = slot.borrow_mut();
+                match change {
+                    0 => {
+                        let task = state.tasks.create("different space").unwrap();
+                        let tasks = state.tasks.list();
+                        state.spaces.update_tasks(&tasks);
+                        state.spaces.insert(7, &task.id, false);
+                        // Old renderer links keep their existing space policy.
+                        let legacy = LinkCreation {
+                            expected_space: None,
+                            ..link.clone()
+                        };
+                        assert!(link_is_current(&state, &legacy));
+                    }
+                    1 => {
+                        state.tabs.remove(&7);
+                    }
+                    _ => {
+                        let task = state.tasks.create("new owner").unwrap();
+                        state
+                            .tasks
+                            .attach(
+                                &TaskScope {
+                                    task: task.id,
+                                    revision: task.revision,
+                                },
+                                7,
+                                Origin::Borrowed,
+                            )
+                            .unwrap();
+                    }
+                }
+                assert!(!link_is_current(&state, &link));
+            });
+        }
+        clear();
+    }
+
+    #[test]
+    fn context_link_queue_failure_consumes_intent_once_and_missing_link_does_not_handoff() {
+        let scope = context_menu_fixture(true).unwrap();
+        capture_context_menu(7, menu_frame_id, |_| menu_frame_id());
+        assert_eq!(
+            execute_context_link(
+                7,
+                menu_frame_id,
+                |_| menu_frame_id(),
+                |_, _, _| panic!("no menu link")
+            ),
+            ContextLinkResult::Rejected
+        );
+        STATE.with(|slot| {
+            assert_eq!(
+                slot.borrow().tasks.info(&scope.task).unwrap().revision,
+                scope.revision
+            )
+        });
+
+        prepare_context_link("https://example.test/chosen");
+        let mut queued = 0;
+        assert_eq!(
+            execute_context_link(
+                7,
+                menu_frame_id,
+                |_| menu_frame_id(),
+                |_, _, _| {
+                    queued += 1;
+                    false
+                }
+            ),
+            ContextLinkResult::Failed
+        );
+        assert_eq!(
+            execute_context_link(
+                7,
+                menu_frame_id,
+                |_| menu_frame_id(),
+                |_, _, _| {
+                    queued += 1;
+                    true
+                }
+            ),
+            ContextLinkResult::Rejected
+        );
+        assert_eq!(queued, 1);
+        STATE.with(|slot| {
+            let state = slot.borrow();
+            let task = state.tasks.info(&scope.task).unwrap();
+            assert_eq!(
+                (task.status, task.revision),
+                (Status::Paused, scope.revision + 1)
+            );
+            assert_eq!(state.creations.len(), 0);
+        });
+        clear();
     }
 
     #[derive(Default)]
@@ -4895,6 +6048,8 @@ mod tests {
                     rejected_creation: false,
                     native_start_page: false,
                     audio_muted: None,
+                    context_menu: None,
+                    context_menu_generation: 0,
                     _devtools: None,
                     navigation: Navigation {
                         epoch: 4,
@@ -4984,6 +6139,8 @@ mod tests {
                     rejected_creation: false,
                     native_start_page: false,
                     audio_muted: None,
+                    context_menu: None,
+                    context_menu_generation: 0,
                     _devtools: None,
                     navigation: Navigation {
                         epoch: 1,
@@ -5310,6 +6467,7 @@ mod tests {
             opener: 7,
             owner: None,
             foreground: false,
+            expected_space: None,
         };
         assert!(user_link.matches(true, &tasks));
         assert!(!user_link.matches(false, &tasks));
@@ -5363,6 +6521,7 @@ mod tests {
             opener: 7,
             owner: Some((owner.clone(), Status::Active)),
             foreground: true,
+            expected_space: None,
         };
         let ticket = reserve_link_creation(&owned).unwrap().unwrap();
         STATE.with(|state| {
@@ -6319,6 +7478,8 @@ mod tests {
                         rejected_creation: false,
                         native_start_page: false,
                         audio_muted: None,
+                        context_menu: None,
+                        context_menu_generation: 0,
                         _devtools: None,
                         navigation: Navigation::default(),
                     },
@@ -6373,6 +7534,155 @@ mod tests {
             state.borrow_mut().tabs.remove(&8);
         });
         assert!(close_tab_from_sidebar(8, USER_SPACE).is_err());
+        clear();
+    }
+
+    #[test]
+    fn sidebar_reordering_preserves_selection_navigation_and_ai_ownership() {
+        clear();
+        let scope = STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let task = state.tasks.create("ordered task").unwrap();
+            let scope = TaskScope {
+                task: task.id,
+                revision: task.revision,
+            };
+            let tasks = state.tasks.list();
+            state.spaces.update_tasks(&tasks);
+            for id in [7, 3, 9, 12, 11] {
+                state.tabs.insert(id, native_blank_tab());
+                state.spaces.insert(id, USER_SPACE, id == 3);
+            }
+            for id in [12, 11] {
+                state.tasks.attach(&scope, id, Origin::Borrowed).unwrap();
+                state.spaces.adopt(id, &scope.task);
+            }
+            scope
+        });
+        let before_tasks =
+            STATE.with(|state| serde_json::to_value(state.borrow().tasks.list()).unwrap());
+        reorder_tab_from_sidebar(&TabOrderTarget {
+            tab: 3,
+            space: USER_SPACE.into(),
+            neighbor: 7,
+            forward: false,
+        })
+        .unwrap();
+        let snapshot = shell_snapshot();
+        assert_eq!(snapshot.active_tab, Some(3));
+        assert_eq!(
+            snapshot
+                .tabs
+                .iter()
+                .filter(|tab| tab.space == USER_SPACE)
+                .map(|tab| tab.id)
+                .collect::<Vec<_>>(),
+            [3, 7, 9]
+        );
+        assert_eq!(
+            snapshot
+                .spaces
+                .iter()
+                .find(|space| space.id == USER_SPACE)
+                .unwrap()
+                .tabs,
+            [3, 7, 9]
+        );
+        STATE.with(|state| {
+            state.borrow_mut().spaces.show(&scope.task);
+        });
+        reorder_tab_from_sidebar(&TabOrderTarget {
+            tab: 12,
+            space: scope.task.clone(),
+            neighbor: 11,
+            forward: true,
+        })
+        .unwrap();
+        STATE.with(|state| {
+            let state = state.borrow();
+            assert_eq!(state.spaces.ordered_tabs(&scope.task), [11, 12]);
+            assert_eq!(state.spaces.active_tab(), Some(12));
+            assert_eq!(state.spaces.ordered_tabs(USER_SPACE), [3, 7, 9]);
+            assert_eq!(
+                serde_json::to_value(state.tasks.list()).unwrap(),
+                before_tasks
+            );
+            assert_eq!(state.tasks.owner(12).unwrap().0, scope.task);
+            for tab in state.tabs.values() {
+                assert_eq!(tab.navigation.epoch, 4);
+                assert_eq!(tab.navigation.requested_url, "about:blank");
+            }
+        });
+        clear();
+    }
+
+    #[test]
+    fn sidebar_reordering_rejects_stale_selection_neighbors_direction_and_lifetime() {
+        clear();
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            for id in [7, 3, 9] {
+                state.tabs.insert(id, native_blank_tab());
+                state.spaces.insert(id, USER_SPACE, id == 3);
+            }
+        });
+        let target = TabOrderTarget {
+            tab: 3,
+            space: USER_SPACE.into(),
+            neighbor: 9,
+            forward: true,
+        };
+        let reject = |target: &TabOrderTarget| {
+            let before =
+                STATE.with(|state| serde_json::to_value(state.borrow().spaces.views()).unwrap());
+            assert!(reorder_tab_from_sidebar(target).is_err());
+            assert_eq!(
+                STATE.with(|state| serde_json::to_value(state.borrow().spaces.views()).unwrap()),
+                before
+            );
+        };
+        reject(&TabOrderTarget {
+            neighbor: 7,
+            ..target.clone()
+        });
+        reject(&TabOrderTarget {
+            space: "other".into(),
+            ..target.clone()
+        });
+        STATE.with(|state| {
+            state.borrow_mut().spaces.select_tab(7);
+        });
+        reject(&target);
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.spaces.select_tab(3);
+            state.spaces.set_overview(true);
+        });
+        reject(&target);
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.spaces.set_overview(false);
+            state.tabs.get_mut(&9).unwrap().rejected_creation = true;
+        });
+        reject(&target);
+        STATE.with(|state| {
+            state
+                .borrow_mut()
+                .tabs
+                .get_mut(&9)
+                .unwrap()
+                .rejected_creation = false;
+        });
+        reorder_tab_from_sidebar(&target).unwrap();
+        reject(&target); // the same pair now has the opposite direction
+        let reverse = TabOrderTarget {
+            forward: false,
+            ..target
+        };
+        STATE.with(|state| {
+            state.borrow_mut().tabs.remove(&9);
+        });
+        reject(&reverse); // stale presentation membership is insufficient
         clear();
     }
 

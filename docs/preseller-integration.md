@@ -15,7 +15,7 @@
 - Naru의 `src/main.rs`는 AppKit 준비, CEF 초기화, 메시지 루프와 종료를 직접 소유한다. `src/control_panel.rs`의 `Shell::new`가 자체 NSWindow를 만들며 `src/browser.rs`의 `create_browser_with_context`는 그 창의 부모 뷰와 크기를 사용한다. 외부 앱의 뷰와 수명주기를 받는 연결 API는 없다.
 - `src/protocol.rs`는 동일 사용자 로컬 소켓에서 요청당 JSON 응답 하나를 반환한다. CLI 명령과 작업 범위는 재사용할 수 있지만 호스트에 상태 변화를 전달하는 구독 계약은 없다.
 - 사용자 공간과 AI 공간은 탭 선택·소유권을 구분한다. 모든 탭이 공유하는 프로필을 계정별로 격리하는 기능은 아니다.
-- DOM 읽기와 입력은 메인 프레임과 열린 Shadow DOM을 대상으로 한다. iframe 관찰과 trusted 입력은 현재 범위 밖이며 파일 입력은 `fill`에서 거부한다. 일반적인 CEF 파일 선택창이나 HTTP(S) 로그인 redirect까지 작동하지 않는다는 판단은 하지 않았다.
+- DOM 읽기와 입력은 메인 프레임과 열린 Shadow DOM을 대상으로 한다. 후속 소스에 접근 가능한 iframe과 내부 열린 Shadow DOM의 관찰과 합성 입력을 추가했고 모의 DOM 검사를 통과했다. 실제 CEF 다중 프레임 검증은 남아 있으며 교차 출처 iframe과 trusted 입력은 구현 전이다. 파일 입력은 `fill`에서 거부한다. 일반적인 CEF 파일 선택창이나 HTTP(S) 로그인 redirect까지 작동하지 않는다는 판단은 하지 않았다. [iframe 계약과 검증 경계](iframe-control.md)를 따른다.
 - 다운로드 진행, 파일 지정, 권한 요청, 인증 완료 등을 Preseller에 전달하는 명시적 계약은 없다.
 - 참조 대화 [preseller-app 완성 설계 및 구현](thread://01a00e45-5985-7803-9b45-1ac2449137fa?hostId=local)의 최근 기록에는 Electron 내부 저장·IPC와 Kotlin 서버가 등장한다. 상품 작업본, 재수집 충돌, 이미지 처리와 저장 복구가 이미 별도의 개발 대상이다. 이번에는 해당 프로젝트 소스를 직접 읽거나 실행하지 않았으므로 현재 구현 계약은 연결 전에 다시 확인해야 한다.
 

@@ -25,6 +25,7 @@ struct Space {
     status: String,
     revision: u64,
     selected: Option<i32>,
+    tabs: Vec<i32>,
 }
 
 pub struct Spaces {
@@ -46,6 +47,7 @@ impl Default for Spaces {
                 status: "user".into(),
                 revision: 0,
                 selected: None,
+                tabs: Vec::new(),
             },
         );
         Self {
@@ -79,6 +81,49 @@ impl Spaces {
     pub fn tab_space(&self, tab: i32) -> Option<&str> {
         self.tabs.get(&tab).map(String::as_str)
     }
+    pub fn ordered_tabs(&self, space: &str) -> &[i32] {
+        self.records
+            .get(space)
+            .map_or(&[], |record| record.tabs.as_slice())
+    }
+
+    /// Move the currently selected tab one place in its visible space. The
+    /// expected neighbor and direction reject a menu target that became stale.
+    pub fn reorder_adjacent(
+        &mut self,
+        tab: i32,
+        expected_space: &str,
+        neighbor: i32,
+        forward: bool,
+    ) -> bool {
+        if self.overview
+            || self.active != expected_space
+            || self.tab_space(tab) != Some(expected_space)
+            || self.tab_space(neighbor) != Some(expected_space)
+        {
+            return false;
+        }
+        let Some(space) = self.records.get_mut(expected_space) else {
+            return false;
+        };
+        if space.selected != Some(tab) {
+            return false;
+        }
+        let Some(index) = space.tabs.iter().position(|&candidate| candidate == tab) else {
+            return false;
+        };
+        let adjacent = if forward {
+            index.checked_add(1)
+        } else {
+            index.checked_sub(1)
+        };
+        let Some(adjacent) = adjacent.filter(|&index| space.tabs.get(index) == Some(&neighbor))
+        else {
+            return false;
+        };
+        space.tabs.swap(index, adjacent);
+        true
+    }
 
     pub fn update_tasks(&mut self, tasks: &[TaskView]) {
         for task in tasks {
@@ -104,6 +149,7 @@ impl Spaces {
                     status: status.into(),
                     revision: task.revision,
                     selected: None,
+                    tabs: Vec::new(),
                 });
             space.name.clone_from(&task.name);
             space.status = status.into();
@@ -131,8 +177,15 @@ impl Spaces {
         } else {
             USER_SPACE
         };
-        self.tabs.insert(tab, space.into());
+        if let Some(previous) = self.tabs.insert(tab, space.into()) {
+            if previous != space {
+                self.repair_selection(&previous, tab);
+            }
+        }
         let entry = self.records.get_mut(space).expect("space exists");
+        if !entry.tabs.contains(&tab) {
+            entry.tabs.push(tab);
+        }
         if entry.selected.is_none() || (foreground && self.active == space && !self.overview) {
             entry.selected = Some(tab);
         }
@@ -222,13 +275,16 @@ impl Spaces {
     }
 
     fn repair_selection(&mut self, space: &str, removed: i32) {
-        let replacement = self
-            .tabs
-            .iter()
-            .find_map(|(&tab, id)| (id == space).then_some(tab));
         if let Some(record) = self.records.get_mut(space) {
+            record.tabs.retain(|&tab| tab != removed);
+            if record.tabs.is_empty() {
+                record.tabs = Vec::new();
+            } else if record.tabs.capacity() > 32 && record.tabs.len() <= record.tabs.capacity() / 4
+            {
+                record.tabs.shrink_to(record.tabs.len() * 2);
+            }
             if record.selected == Some(removed) {
-                record.selected = replacement;
+                record.selected = record.tabs.first().copied();
             }
         }
     }
@@ -245,11 +301,7 @@ impl Spaces {
                 revision: space.revision,
                 selected_tab: space.selected,
                 active: self.active == *id,
-                tabs: self
-                    .tabs
-                    .iter()
-                    .filter_map(|(&tab, space)| (space == id).then_some(tab))
-                    .collect(),
+                tabs: space.tabs.clone(),
             })
             .collect();
         views.sort_by_key(|view| (view.id != USER_SPACE, view.id.clone()));
@@ -370,5 +422,166 @@ mod tests {
         assert_eq!(spaces.tab_space(1), Some(first.id.as_str()));
         spaces.show(&first.id);
         assert_eq!(spaces.active_tab(), Some(1));
+    }
+
+    #[test]
+    fn insertion_order_is_shared_by_views_and_duplicate_inserts_keep_position() {
+        let mut spaces = Spaces::default();
+        for tab in [30, 4, 20] {
+            spaces.insert(tab, USER_SPACE, false);
+        }
+        spaces.insert(4, USER_SPACE, false);
+        assert_eq!(spaces.ordered_tabs(USER_SPACE), &[30, 4, 20]);
+        assert_eq!(spaces.views()[0].tabs, vec![30, 4, 20]);
+        assert_eq!(spaces.active_tab(), Some(30));
+        assert!(spaces.ordered_tabs("missing").is_empty());
+
+        let task = Registry::default().create("Destination").unwrap();
+        spaces.update_tasks(&[task.clone()]);
+        spaces.insert(8, &task.id, false);
+        spaces.insert(30, &task.id, false);
+        assert_eq!(spaces.ordered_tabs(USER_SPACE), &[4, 20]);
+        assert_eq!(spaces.ordered_tabs(&task.id), &[8, 30]);
+        assert_eq!(spaces.active_tab(), Some(4));
+        assert_eq!(spaces.tab_space(30), Some(task.id.as_str()));
+    }
+
+    #[test]
+    fn reordering_changes_only_order_and_rejects_the_stale_direction() {
+        let mut spaces = Spaces::default();
+        let mut tasks = Registry::default();
+        let task = tasks.create("Ordered task").unwrap();
+        spaces.update_tasks(&[task.clone()]);
+        spaces.insert(70, USER_SPACE, true);
+        for tab in [9, 2, 7] {
+            spaces.insert(tab, &task.id, false);
+        }
+        spaces.show(&task.id);
+        spaces.select_tab(2);
+        assert!(spaces.reorder_adjacent(2, &task.id, 9, false));
+        assert_eq!(spaces.ordered_tabs(&task.id), &[2, 9, 7]);
+        // The same pair is still adjacent, but the old upward action is stale.
+        assert!(!spaces.reorder_adjacent(2, &task.id, 9, false));
+        assert!(!spaces.reorder_adjacent(2, &task.id, 7, false));
+        assert!(spaces.reorder_adjacent(2, &task.id, 9, true));
+        assert!(spaces.reorder_adjacent(2, &task.id, 7, true));
+        assert_eq!(spaces.ordered_tabs(&task.id), &[9, 7, 2]);
+        assert!(!spaces.reorder_adjacent(2, &task.id, 9, true));
+        assert_eq!(spaces.active_space(), task.id);
+        assert_eq!(spaces.active_tab(), Some(2));
+        assert!(!spaces.overview());
+        spaces.update_tasks(&tasks.list());
+        let view = spaces
+            .views()
+            .into_iter()
+            .find(|view| view.id == task.id)
+            .unwrap();
+        assert_eq!(view.revision, task.revision);
+        assert_eq!(view.status, "active");
+        assert_eq!(view.tabs, vec![9, 7, 2]);
+        assert_eq!(spaces.ordered_tabs(USER_SPACE), &[70]);
+    }
+
+    #[test]
+    fn reorder_rejects_hidden_overview_unselected_removed_and_nonadjacent_targets() {
+        let mut spaces = Spaces::default();
+        let task = Registry::default().create("Background").unwrap();
+        spaces.update_tasks(&[task.clone()]);
+        for tab in [10, 20, 30] {
+            spaces.insert(tab, USER_SPACE, false);
+        }
+        spaces.insert(40, &task.id, false);
+        spaces.insert(50, &task.id, false);
+        assert!(!spaces.reorder_adjacent(40, &task.id, 50, true));
+        assert!(!spaces.reorder_adjacent(20, USER_SPACE, 30, true));
+        assert!(!spaces.reorder_adjacent(10, &task.id, 20, true));
+        assert!(!spaces.reorder_adjacent(10, USER_SPACE, 40, true));
+        assert!(!spaces.reorder_adjacent(10, USER_SPACE, 30, true));
+        assert!(!spaces.reorder_adjacent(10, USER_SPACE, 10, true));
+        spaces.set_overview(true);
+        assert!(!spaces.reorder_adjacent(10, USER_SPACE, 20, true));
+        assert!(spaces.overview());
+        spaces.set_overview(false);
+        spaces.remove(20);
+        assert!(!spaces.reorder_adjacent(10, USER_SPACE, 20, true));
+        assert_eq!(spaces.ordered_tabs(USER_SPACE), &[10, 30]);
+        assert_eq!(spaces.ordered_tabs(&task.id), &[40, 50]);
+        assert_eq!(spaces.active_tab(), Some(10));
+        spaces.remove(30);
+        assert!(!spaces.reorder_adjacent(10, USER_SPACE, 10, false));
+        assert_eq!(spaces.ordered_tabs(USER_SPACE), &[10]);
+    }
+
+    #[test]
+    fn adoption_release_and_finished_cleanup_preserve_each_spaces_order() {
+        let mut spaces = Spaces::default();
+        let mut tasks = Registry::default();
+        let mut task = tasks.create("Borrower").unwrap();
+        spaces.update_tasks(&[task.clone()]);
+        for tab in [30, 10, 20] {
+            spaces.insert(tab, USER_SPACE, false);
+        }
+        spaces.insert(8, &task.id, false);
+        spaces.insert(9, &task.id, false);
+        spaces.select_tab(20);
+        assert!(spaces.reorder_adjacent(20, USER_SPACE, 10, false));
+        spaces.adopt(20, &task.id);
+        assert_eq!(spaces.ordered_tabs(USER_SPACE), &[30, 10]);
+        assert_eq!(spaces.ordered_tabs(&task.id), &[8, 9, 20]);
+        assert_eq!(spaces.active_tab(), Some(30));
+        spaces.finish(
+            &[
+                (20, Origin::Borrowed),
+                (8, Origin::Created),
+                (9, Origin::Created),
+            ],
+            &[8, 9],
+        );
+        assert_eq!(spaces.ordered_tabs(USER_SPACE), &[30, 10, 20]);
+        assert_eq!(spaces.ordered_tabs(&task.id), &[8, 9]);
+        assert_eq!(spaces.active_tab(), Some(30));
+        task.status = Status::Finished;
+        spaces.update_tasks(&[task.clone()]);
+        spaces.show(&task.id);
+        spaces.remove(8);
+        assert_eq!(spaces.ordered_tabs(&task.id), &[9]);
+        assert_eq!(spaces.active_tab(), Some(9));
+        spaces.remove(9);
+        assert!(!spaces.contains(&task.id));
+        assert!(spaces.ordered_tabs(&task.id).is_empty());
+        assert_eq!(spaces.active_space(), USER_SPACE);
+        assert_eq!(spaces.ordered_tabs(USER_SPACE), &[30, 10, 20]);
+    }
+
+    #[test]
+    fn closing_many_tabs_reclaims_order_capacity_without_changing_the_remaining_order() {
+        let mut spaces = Spaces::default();
+        let task = Registry::default().create("Preserved space").unwrap();
+        spaces.update_tasks(&[task.clone()]);
+        spaces.insert(1000, &task.id, false);
+        for tab in 1..=128 {
+            spaces.insert(tab, USER_SPACE, false);
+        }
+        assert!(spaces.records[USER_SPACE].tabs.capacity() >= 128);
+        for tab in 1..=112 {
+            spaces.remove(tab);
+        }
+        assert_eq!(
+            spaces.ordered_tabs(USER_SPACE),
+            &(113..=128).collect::<Vec<_>>()
+        );
+        assert!(spaces.records[USER_SPACE].tabs.capacity() <= 32);
+        assert_eq!(spaces.active_tab(), Some(113));
+        assert_eq!(spaces.active_space(), USER_SPACE);
+        assert_eq!(spaces.ordered_tabs(&task.id), &[1000]);
+        for tab in 113..=128 {
+            spaces.remove(tab);
+        }
+        assert_eq!(spaces.records[USER_SPACE].tabs.capacity(), 0);
+        assert_eq!(spaces.active_tab(), None);
+        assert_eq!(spaces.ordered_tabs(&task.id), &[1000]);
+        spaces.insert(200, USER_SPACE, false);
+        assert_eq!(spaces.ordered_tabs(USER_SPACE), &[200]);
+        assert_eq!(spaces.active_tab(), Some(200));
     }
 }

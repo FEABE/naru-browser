@@ -490,6 +490,12 @@ struct TabAudioMenu {
     expected: bool,
 }
 
+#[derive(Clone)]
+struct TabOrderMenu {
+    item: Retained<NSMenuItem>,
+    target: crate::browser::TabOrderTarget,
+}
+
 fn tab_status_symbol(muted: Option<bool>, ai_active: bool, loading: bool) -> &'static str {
     if muted == Some(true) {
         "speaker.slash"
@@ -873,6 +879,8 @@ thread_local! {
     static DOWNLOAD_SITE_QUERYING: Cell<bool> = const { Cell::new(false) };
     static TAB_AUDIO_QUERYING: Cell<bool> = const { Cell::new(false) };
     static TAB_AUDIO_MENU: RefCell<Option<TabAudioMenu>> = const { RefCell::new(None) };
+    static TAB_ORDER_MENU: RefCell<[Option<TabOrderMenu>; 2]> = const { RefCell::new([None, None]) };
+    static TAB_ORDER_QUERYING: Cell<bool> = const { Cell::new(false) };
 }
 
 fn focus_trace_enabled() -> bool {
@@ -1427,7 +1435,9 @@ define_class!(
                     if item.action() == Some(sel!(toggleTabAudio:)) {
                         prepare_tab_audio_menu(item.clone());
                         item.setEnabled(validate_tab_audio_menu(&item));
-                        break;
+                    } else if let Some(forward) = tab_order_menu_direction(&item) {
+                        prepare_tab_order_menu(item.clone(), forward);
+                        item.setEnabled(validate_tab_order_menu(&item, forward));
                     }
                 }
             }
@@ -1462,6 +1472,8 @@ define_class!(
         fn validate_menu_item(&self, item: &NSMenuItem) -> bool {
             if item.action() == Some(sel!(toggleTabAudio:)) {
                 validate_tab_audio_menu(item)
+            } else if let Some(forward) = tab_order_menu_direction(item) {
+                validate_tab_order_menu(item, forward)
             } else if item.action() == Some(sel!(reopenClosedTab:)) {
                 can_reopen_closed_tab_ui()
             } else if item.action() == Some(sel!(openCurrentPageInUserTab:)) {
@@ -1477,6 +1489,12 @@ define_class!(
 
         #[unsafe(method(toggleTabAudio:))]
         fn toggle_tab_audio(&self, sender: &NSMenuItem) { toggle_tab_audio(sender); }
+
+        #[unsafe(method(moveTabUp:))]
+        fn move_tab_up(&self, sender: &NSMenuItem) { reorder_tab(sender, false); }
+
+        #[unsafe(method(moveTabDown:))]
+        fn move_tab_down(&self, sender: &NSMenuItem) { reorder_tab(sender, true); }
 
         #[unsafe(method(nextTab:))]
         fn next_tab(&self, _sender: Option<&AnyObject>) { cycle_tab(true); }
@@ -6688,6 +6706,141 @@ fn run_action(action: Option<ShellAction>) {
     refresh();
 }
 
+fn tab_order_menu_direction(item: &NSMenuItem) -> Option<bool> {
+    if item.action() == Some(sel!(moveTabUp:)) {
+        Some(false)
+    } else if item.action() == Some(sel!(moveTabDown:)) {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+fn tab_order_target(
+    tabs: &[ShellTab],
+    space: &str,
+    active: Option<i32>,
+    overview: bool,
+    overlay: bool,
+    forward: bool,
+) -> Option<crate::browser::TabOrderTarget> {
+    if overview || overlay {
+        return None;
+    }
+    let tab = active?;
+    let visible = tabs.iter().filter(|item| item.space == space);
+    let index = visible.clone().position(|item| item.id == tab)?;
+    let neighbor_index = if forward {
+        index.checked_add(1)?
+    } else {
+        index.checked_sub(1)?
+    };
+    Some(crate::browser::TabOrderTarget {
+        tab,
+        space: space.to_owned(),
+        neighbor: visible.clone().nth(neighbor_index)?.id,
+        forward,
+    })
+}
+
+fn tab_order_target_ui(forward: bool) -> Option<crate::browser::TabOrderTarget> {
+    let window = SHELL.with(|slot| {
+        slot.try_borrow()
+            .ok()?
+            .as_ref()
+            .map(|shell| shell.window.clone())
+    })?;
+    if !window.isKeyWindow()
+        || !window.isVisible()
+        || window.isMiniaturized()
+        || page_find_has_marked_text()
+    {
+        return None;
+    }
+    // Resolve only after native getters, which may dispatch nested callbacks.
+    let target = SHELL.with(|slot| {
+        let slot = slot.try_borrow().ok()?;
+        let shell = slot.as_ref()?;
+        if !std::ptr::eq(&*shell.window, &*window) {
+            return None;
+        }
+        tab_order_target(
+            &shell.tabs,
+            &shell.active_space,
+            shell.active,
+            shell.overview,
+            shell.overlay_is_open(),
+            forward,
+        )
+    })?;
+    crate::browser::validate_tab_order_target(&target).ok()?;
+    Some(target)
+}
+
+fn prepare_tab_order_menu(item: Retained<NSMenuItem>, forward: bool) {
+    if TAB_ORDER_QUERYING.with(|busy| busy.replace(true)) {
+        return;
+    }
+    let previous = TAB_ORDER_MENU.with(|slot| slot.borrow_mut()[usize::from(forward)].take());
+    drop(previous);
+    item.setToolTip(Some(&NSString::from_str(
+        "같은 공간에서 순서만 바꿉니다. 선택한 페이지와 AI 제어권은 유지하며, 재시작 후 순서는 복원하지 않습니다.",
+    )));
+    let value = tab_order_target_ui(forward).map(|target| TabOrderMenu { item, target });
+    TAB_ORDER_MENU.with(|slot| slot.borrow_mut()[usize::from(forward)] = value);
+    TAB_ORDER_QUERYING.with(|busy| busy.set(false));
+}
+
+fn validate_tab_order_menu(item: &NSMenuItem, forward: bool) -> bool {
+    if TAB_ORDER_QUERYING.with(|busy| busy.replace(true)) {
+        return false;
+    }
+    let value = TAB_ORDER_MENU.with(|slot| {
+        slot.try_borrow().ok()?[usize::from(forward)]
+            .as_ref()
+            .filter(|value| std::ptr::eq(item, &*value.item))
+            .cloned()
+    });
+    let valid =
+        value.is_some_and(|value| tab_order_target_ui(forward).as_ref() == Some(&value.target));
+    TAB_ORDER_QUERYING.with(|busy| busy.set(false));
+    valid
+}
+
+fn reorder_tab(sender: &NSMenuItem, forward: bool) {
+    if TAB_ORDER_QUERYING.with(|busy| busy.replace(true)) {
+        return;
+    }
+    let value = TAB_ORDER_MENU.with(|slot| {
+        let mut slot = slot.try_borrow_mut().ok()?;
+        let value = &mut slot[usize::from(forward)];
+        if !value
+            .as_ref()
+            .is_some_and(|value| std::ptr::eq(sender, &*value.item))
+        {
+            return None;
+        }
+        value.take()
+    });
+    if let Some(value) =
+        value.filter(|value| tab_order_target_ui(forward).as_ref() == Some(&value.target))
+    {
+        let result = crate::browser::reorder_tab_from_sidebar(&value.target);
+        SHELL.with(|slot| {
+            if let Some(shell) = slot.borrow_mut().as_mut() {
+                if result.is_ok() {
+                    shell.reveal_active_tab = true;
+                }
+                shell.notice = result.err();
+            }
+        });
+        // Keep responder and drafts intact; the existing coalesced refresh
+        // reuses row controls and updates their position/accessibility labels.
+        crate::browser::notify_panel();
+    }
+    TAB_ORDER_QUERYING.with(|busy| busy.set(false));
+}
+
 fn tab_audio_page(
     tabs: &[ShellTab],
     space: &str,
@@ -7140,6 +7293,9 @@ fn shortcut_key(event: &NSEvent) -> Option<String> {
 pub fn shutdown() {
     let audio_menu = TAB_AUDIO_MENU.with(|slot| slot.borrow_mut().take());
     drop(audio_menu);
+    let order_menu =
+        TAB_ORDER_MENU.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), [None, None]));
+    drop(order_menu);
     close_page_find(false, false);
     let shell = SHELL.with(|slot| slot.borrow_mut().take());
     if let Some(shell) = shell {
@@ -7197,7 +7353,7 @@ fn is_page_edit_action(action: Sel) -> bool {
 fn visible_page_input_target() -> Option<(i32, Retained<NSWindow>, Retained<NSView>)> {
     // AppKit calls and handoff must not cross a shell RefCell borrow.
     let (tab, window, view) = SHELL.with(|slot| {
-        let slot = slot.borrow();
+        let slot = slot.try_borrow().ok()?;
         let shell = slot.as_ref()?;
         if shell.overview || shell.overlay_is_open() {
             return None;
@@ -7213,6 +7369,101 @@ fn visible_page_input_target() -> Option<(i32, Retained<NSWindow>, Retained<NSVi
         return None;
     }
     Some((tab, window, view))
+}
+
+fn context_menu_page(
+    tabs: &[ShellTab],
+    space: &str,
+    active: Option<i32>,
+    overview: bool,
+    overlay: bool,
+    start_page_visible: bool,
+    tab: i32,
+) -> bool {
+    !overview
+        && !overlay
+        && !start_page_visible
+        && active == Some(tab)
+        && tabs
+            .iter()
+            .any(|item| item.id == tab && item.space == space && !item.crashed)
+}
+
+/// A CEF context menu may outlive selection or an overlay change. Validate its
+/// native visibility again at command time without changing focus or drafts.
+#[cfg(not(test))]
+pub(crate) fn context_menu_target_is_visible(tab: i32) -> bool {
+    let Some((selected, window, view)) = visible_page_input_target() else {
+        return false;
+    };
+    if selected != tab || !window.isKeyWindow() {
+        return false;
+    }
+    // All native getters ran without a SHELL borrow. They may have dispatched
+    // callbacks, so the retained window/view must still be the current pair.
+    SHELL.with(|slot| {
+        let Ok(slot) = slot.try_borrow() else {
+            return false;
+        };
+        let Some(shell) = slot.as_ref() else {
+            return false;
+        };
+        std::ptr::eq(&*shell.window, &*window)
+            && shell
+                .views
+                .get(&tab)
+                .is_some_and(|current| std::ptr::eq(&**current, &*view))
+            && context_menu_page(
+                &shell.tabs,
+                &shell.active_space,
+                shell.active,
+                shell.overview,
+                shell.overlay_is_open(),
+                shell.start_page.visible,
+                tab,
+            )
+    })
+}
+
+#[cfg(not(test))]
+pub(crate) fn context_menu_rejected(tab: i32) {
+    context_menu_notice(
+        tab,
+        "페이지나 제어권이 바뀌어 메뉴를 실행하지 않았습니다. 메뉴를 다시 열어 주세요.",
+    );
+}
+
+#[cfg(not(test))]
+pub(crate) fn context_link_failed(tab: i32) {
+    context_menu_notice(tab, "링크를 새 탭에서 열지 못했습니다. 다시 시도해 주세요.");
+}
+
+#[cfg(not(test))]
+fn context_menu_notice(tab: i32, message: &str) {
+    let changed = SHELL.with(|slot| {
+        let Ok(mut slot) = slot.try_borrow_mut() else {
+            return false;
+        };
+        let Some(shell) = slot.as_mut() else {
+            return false;
+        };
+        if !context_menu_page(
+            &shell.tabs,
+            &shell.active_space,
+            shell.active,
+            shell.overview,
+            shell.overlay_is_open(),
+            shell.start_page.visible,
+            tab,
+        ) {
+            return false;
+        }
+        shell.notice = Some(message.into());
+        true
+    });
+    if changed {
+        crate::browser::notify_panel();
+    }
 }
 
 fn page_has_keyboard_focus(window: &NSWindow, view: &NSView) -> bool {
@@ -7712,6 +7963,12 @@ fn install_menu(target: &ShellTarget, marker: MainThreadMarker) {
 
     let view = submenu(&main, "보기", marker);
     view.setDelegate(Some(ProtocolObject::from_ref(target)));
+    for (title, action) in [
+        ("현재 탭 위로 이동", sel!(moveTabUp:)),
+        ("현재 탭 아래로 이동", sel!(moveTabDown:)),
+    ] {
+        menu_item(&view, title, Some(action), "", Some(target), false, marker);
+    }
     menu_item(
         &view,
         "현재 탭 음소거",
@@ -8737,6 +8994,40 @@ mod tests {
     }
 
     #[test]
+    fn reorder_menu_uses_visible_order_without_wrap_or_hidden_space_targets() {
+        let mut tabs = vec![
+            numbered_tab_fixture(7, "user"),
+            numbered_tab_fixture(20, "task-a"),
+            numbered_tab_fixture(3, "user"),
+            numbered_tab_fixture(9, "user"),
+        ];
+        let target = |tabs: &[ShellTab], active, forward| {
+            tab_order_target(tabs, "user", active, false, false, forward)
+        };
+        assert_eq!(target(&tabs, Some(3), false).unwrap().neighbor, 7);
+        assert_eq!(target(&tabs, Some(3), true).unwrap().neighbor, 9);
+        assert!(target(&tabs, Some(7), false).is_none());
+        assert!(target(&tabs, Some(9), true).is_none());
+        assert!(target(&tabs, None, true).is_none());
+        assert!(target(&tabs, Some(20), true).is_none());
+        for (overview, overlay) in [(true, false), (false, true)] {
+            assert!(tab_order_target(&tabs, "user", Some(3), overview, overlay, true).is_none());
+        }
+        let old = target(&tabs, Some(3), true).unwrap();
+        tabs.swap(2, 3);
+        assert_ne!(target(&tabs, Some(3), true).as_ref(), Some(&old));
+        assert_eq!(
+            numbered_tab_target(&tabs, "user", 2, Some(3), false, false),
+            Some(9)
+        );
+        assert_eq!(cycle_tab_target(&tabs, "user", Some(3), false), Some(9));
+        // Closing the only peer cannot turn a one-tab space into a wrap move.
+        tabs.retain(|tab| tab.id == 3 || tab.space != "user");
+        assert!(target(&tabs, Some(3), false).is_none());
+        assert!(target(&tabs, Some(3), true).is_none());
+    }
+
+    #[test]
     fn cycle_tabs_wrap_in_sidebar_order_without_crossing_spaces_or_limiting_to_nine() {
         let ids: Vec<_> = (0..12).map(|index| 100 - index * 3).collect();
         let mut tabs: Vec<_> = ids
@@ -9095,6 +9386,46 @@ mod tests {
         ] {
             assert!(!is_page_edit_action(action));
         }
+    }
+
+    #[test]
+    fn context_menu_requires_the_same_visible_page_without_native_surfaces() {
+        let mut tabs = vec![
+            numbered_tab_fixture(7, "user"),
+            numbered_tab_fixture(9, "task-a"),
+        ];
+        assert!(context_menu_page(
+            &tabs,
+            "task-a",
+            Some(9),
+            false,
+            false,
+            false,
+            9
+        ));
+        for (space, active, overview, overlay, start, tab) in [
+            ("user", Some(7), false, false, false, 9),
+            ("user", Some(9), false, false, false, 9),
+            ("task-a", None, false, false, false, 9),
+            ("task-a", Some(9), true, false, false, 9),
+            ("task-a", Some(9), false, true, false, 9),
+            ("task-a", Some(9), false, false, true, 9),
+            ("task-a", Some(9), false, false, false, 99),
+        ] {
+            assert!(!context_menu_page(
+                &tabs, space, active, overview, overlay, start, tab
+            ));
+        }
+        tabs[1].crashed = true;
+        assert!(!context_menu_page(
+            &tabs,
+            "task-a",
+            Some(9),
+            false,
+            false,
+            false,
+            9
+        ));
     }
 
     #[test]
