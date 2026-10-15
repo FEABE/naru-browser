@@ -2413,6 +2413,53 @@ pub(crate) fn reorder_tab_from_sidebar(target: &TabOrderTarget) -> Result<(), St
     })
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TabDragTarget {
+    pub tab: i32,
+    pub space: String,
+    pub selected: Option<i32>,
+    pub order: Vec<i32>,
+}
+
+fn validate_tab_drag_state(state: &State, target: &TabDragTarget) -> Result<(), String> {
+    if state.spaces.overview()
+        || state.spaces.active_space() != target.space
+        || state.spaces.active_tab() != target.selected
+        || state.spaces.ordered_tabs(&target.space) != target.order.as_slice()
+        || !target.order.contains(&target.tab)
+        || target.order.iter().any(|id| {
+            state.spaces.tab_space(*id) != Some(target.space.as_str())
+                || !state.tabs.get(id).is_some_and(|tab| !tab.rejected_creation)
+        })
+    {
+        return Err("탭 목록이나 선택이 바뀌었습니다. 다시 드래그해 주세요.".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_tab_drag_target(target: &TabDragTarget) -> Result<(), String> {
+    STATE.with(|slot| validate_tab_drag_state(&slot.borrow(), target))
+}
+
+pub(crate) fn reorder_tab_by_drag(
+    target: &TabDragTarget,
+    before: Option<i32>,
+) -> Result<bool, String> {
+    // Reordering a background row must not select/focus it or hand off its AI
+    // owner. Validate and mutate presentation metadata within one STATE borrow.
+    STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        validate_tab_drag_state(&state, target)?;
+        if before == Some(target.tab) {
+            return Ok(false);
+        }
+        state
+            .spaces
+            .reorder_before(target.tab, &target.space, before, &target.order)
+            .ok_or_else(|| "탭을 놓을 위치가 바뀌었습니다. 다시 드래그해 주세요.".into())
+    })
+}
+
 fn validate_recovery_state(
     state: &State,
     target: &PageRecoveryTarget,
@@ -7683,6 +7730,160 @@ mod tests {
             state.borrow_mut().tabs.remove(&9);
         });
         reject(&reverse); // stale presentation membership is insufficient
+        clear();
+    }
+
+    fn tab_drag_fixture() -> (TabDragTarget, TaskScope) {
+        clear();
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let task = state.tasks.create("drag owner").unwrap();
+            let scope = TaskScope {
+                task: task.id,
+                revision: task.revision,
+            };
+            let tasks = state.tasks.list();
+            state.spaces.update_tasks(&tasks);
+            for id in [7, 8, 9] {
+                let mut tab = native_blank_tab();
+                tab.navigation.document_epoch = 2;
+                state.tabs.insert(id, tab);
+                state.spaces.insert(id, USER_SPACE, id == 7);
+                state.tasks.attach(&scope, id, Origin::Borrowed).unwrap();
+                state.spaces.adopt(id, &scope.task);
+            }
+            assert!(state.spaces.show(&scope.task));
+            assert!(state.spaces.select_tab(7));
+            (
+                TabDragTarget {
+                    tab: 8,
+                    space: scope.task.clone(),
+                    selected: Some(7),
+                    order: vec![7, 8, 9],
+                },
+                scope,
+            )
+        })
+    }
+
+    #[test]
+    fn sidebar_drag_moves_background_tab_without_selection_or_ai_handoff() {
+        let (mut target, scope) = tab_drag_fixture();
+        let before_tasks =
+            STATE.with(|state| serde_json::to_value(state.borrow().tasks.list()).unwrap());
+        assert!(validate_tab_drag_target(&target).is_ok());
+        assert_eq!(reorder_tab_by_drag(&target, Some(7)), Ok(true));
+        STATE.with(|state| {
+            let state = state.borrow();
+            assert_eq!(state.spaces.ordered_tabs(&scope.task), [8, 7, 9]);
+            assert_eq!(state.spaces.active_tab(), Some(7));
+            target.order = state.spaces.ordered_tabs(&scope.task).to_vec();
+        });
+        assert_eq!(reorder_tab_by_drag(&target, None), Ok(true));
+        STATE.with(|state| {
+            let state = state.borrow();
+            assert_eq!(state.spaces.ordered_tabs(&scope.task), [7, 9, 8]);
+            assert_eq!(state.spaces.active_space(), scope.task);
+            assert_eq!(state.spaces.active_tab(), Some(7));
+            assert!(!state.spaces.overview());
+            assert_eq!(
+                serde_json::to_value(state.tasks.list()).unwrap(),
+                before_tasks
+            );
+            let task = state.tasks.info(&scope.task).unwrap();
+            assert_eq!(task.revision, scope.revision);
+            assert_eq!(task.status, Status::Active);
+            for id in [7, 8, 9] {
+                let owner = state.tasks.owner(id).unwrap();
+                assert_eq!(owner.0, scope.task);
+                assert_eq!(owner.1, Origin::Borrowed);
+                let tab = &state.tabs[&id];
+                assert_eq!(tab.navigation.epoch, 4);
+                assert_eq!(tab.navigation.document_epoch, 2);
+                assert_eq!(tab.navigation.requested_url, "about:blank");
+            }
+            target.order = state.spaces.ordered_tabs(&scope.task).to_vec();
+        });
+        assert_eq!(reorder_tab_by_drag(&target, None), Ok(false));
+        clear();
+    }
+
+    #[test]
+    fn sidebar_drag_rejects_stale_order_selection_space_and_live_membership() {
+        let cases: &[(&str, fn(&mut State))] = &[
+            ("order", |state| {
+                let space = state.spaces.active_space().to_owned();
+                assert!(state.spaces.reorder_adjacent(7, &space, 8, true));
+            }),
+            ("selection", |state| {
+                assert!(state.spaces.select_tab(8));
+            }),
+            ("overview", |state| state.spaces.set_overview(true)),
+            ("active space", |state| {
+                assert!(state.spaces.show(USER_SPACE));
+            }),
+            ("closed source", |state| {
+                state.tabs.remove(&8);
+            }),
+            ("closed listed tab", |state| {
+                state.tabs.remove(&9);
+            }),
+            ("rejected source", |state| {
+                state.tabs.get_mut(&8).unwrap().rejected_creation = true;
+            }),
+            ("rejected listed tab", |state| {
+                state.tabs.get_mut(&9).unwrap().rejected_creation = true;
+            }),
+            ("moved listed tab", |state| {
+                state.spaces.insert(9, USER_SPACE, false);
+            }),
+        ];
+        for (name, change) in cases {
+            let (target, _) = tab_drag_fixture();
+            let before = STATE.with(|state| {
+                let mut state = state.borrow_mut();
+                change(&mut state);
+                json!({"spaces": state.spaces.views(), "tasks": state.tasks.list()})
+            });
+            assert!(validate_tab_drag_target(&target).is_err(), "{name}");
+            assert!(reorder_tab_by_drag(&target, Some(7)).is_err(), "{name}");
+            // Dropping onto the source is a no-op only for a current drag.
+            assert!(reorder_tab_by_drag(&target, Some(8)).is_err(), "{name}");
+            STATE.with(|state| {
+                let state = state.borrow();
+                assert_eq!(
+                    json!({"spaces": state.spaces.views(), "tasks": state.tasks.list()}),
+                    before,
+                    "{name}"
+                );
+            });
+        }
+        clear();
+    }
+
+    #[test]
+    fn sidebar_drag_noops_and_invalid_drop_targets_preserve_metadata() {
+        let (target, _) = tab_drag_fixture();
+        let before = STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.tabs.insert(11, native_blank_tab());
+            state.spaces.insert(11, USER_SPACE, false);
+            json!({"spaces": state.spaces.views(), "tasks": state.tasks.list()})
+        });
+        assert_eq!(reorder_tab_by_drag(&target, Some(8)), Ok(false));
+        assert_eq!(reorder_tab_by_drag(&target, Some(9)), Ok(false));
+        assert!(reorder_tab_by_drag(&target, Some(11)).is_err());
+        assert!(reorder_tab_by_drag(&target, Some(999)).is_err());
+        let missing_source = TabDragTarget { tab: 999, ..target };
+        assert!(validate_tab_drag_target(&missing_source).is_err());
+        assert!(reorder_tab_by_drag(&missing_source, Some(999)).is_err());
+        STATE.with(|state| {
+            let state = state.borrow();
+            assert_eq!(
+                json!({"spaces": state.spaces.views(), "tasks": state.tasks.list()}),
+                before
+            );
+        });
         clear();
     }
 

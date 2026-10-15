@@ -13,9 +13,9 @@ use objc2::{
 use objc2_app_kit::{
     NSApp, NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua,
     NSBackingStoreType, NSButton, NSCellImagePosition, NSColor, NSEvent, NSEventModifierFlags,
-    NSEventType, NSFont, NSFontWeightMedium, NSImage, NSImageSymbolConfiguration,
-    NSImageSymbolScale, NSImageView, NSMenu, NSMenuDelegate, NSMenuItem, NSScrollView, NSTextField,
-    NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSEventType, NSFont, NSFontWeightMedium, NSGestureRecognizer, NSGestureRecognizerState,
+    NSImage, NSImageSymbolConfiguration, NSImageSymbolScale, NSImageView, NSMenu, NSMenuDelegate,
+    NSMenuItem, NSScrollView, NSTextField, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
     NSArray, NSData, NSNotification, NSObject, NSPoint, NSRect, NSSize, NSString,
@@ -24,6 +24,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
     ffi::c_void,
+    rc::Rc,
 };
 
 pub struct ShellSnapshot {
@@ -478,9 +479,111 @@ struct TabRow {
     id: i32,
     space: String,
     button: Retained<NSButton>,
+    drag: Retained<TabDragRecognizer>,
     close: Retained<NSButton>,
     icon: Retained<NSImageView>,
     title: Retained<NSTextField>,
+}
+
+struct TabDragSession {
+    target: crate::browser::TabDragTarget,
+    recognizer: Retained<TabDragRecognizer>,
+    button: Retained<NSButton>,
+    window: Retained<NSWindow>,
+    scroll: Retained<NSScrollView>,
+    document: Retained<TopDownView>,
+    indicator: Retained<SurfaceView>,
+    geometry: TabDragGeometry,
+    collapsed: bool,
+}
+
+#[derive(PartialEq)]
+struct TabDragGeometry {
+    window: NSRect,
+    scroll: NSRect,
+    document: NSRect,
+    viewport: NSRect,
+    source: NSRect,
+}
+
+#[derive(Default)]
+struct TabDragTracking {
+    origin: Cell<Option<NSPoint>>,
+    location: Cell<NSPoint>,
+    epoch: Cell<u64>,
+}
+
+fn tab_drag_threshold(origin: NSPoint, current: NSPoint) -> bool {
+    let dx = current.x - origin.x;
+    let dy = current.y - origin.y;
+    dx.is_finite() && dy.is_finite() && dx * dx + dy * dy >= 36.0
+}
+
+define_class!(
+    #[unsafe(super(NSGestureRecognizer))]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = TabDragTracking]
+    struct TabDragRecognizer;
+
+    unsafe impl NSObjectProtocol for TabDragRecognizer {}
+    impl TabDragRecognizer {
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, event: &NSEvent) {
+            self.ivars().epoch.set(TAB_DRAG_EPOCH.with(Cell::get));
+            unsafe { let _: () = msg_send![super(self), mouseDown: event]; }
+            let point = event.locationInWindow();
+            self.ivars().origin.set(Some(point));
+            self.ivars().location.set(point);
+        }
+        #[unsafe(method(mouseDragged:))]
+        fn mouse_dragged(&self, event: &NSEvent) {
+            unsafe { let _: () = msg_send![super(self), mouseDragged: event]; }
+            let point = event.locationInWindow();
+            self.ivars().location.set(point);
+            match self.state() {
+                NSGestureRecognizerState::Possible => {
+                    if self.ivars().origin.get().is_some_and(|origin| tab_drag_threshold(origin, point)) {
+                        self.setState(NSGestureRecognizerState::Began);
+                    }
+                }
+                NSGestureRecognizerState::Began | NSGestureRecognizerState::Changed => {
+                    self.setState(NSGestureRecognizerState::Changed);
+                }
+                _ => {},
+            }
+        }
+        #[unsafe(method(mouseUp:))]
+        fn mouse_up(&self, event: &NSEvent) {
+            unsafe { let _: () = msg_send![super(self), mouseUp: event]; }
+            self.ivars().location.set(event.locationInWindow());
+            match self.state() {
+                // Failure releases the original mouse sequence to NSButton.
+                // No manually synthesized click replaces AppKit tracking.
+                NSGestureRecognizerState::Possible => self.setState(NSGestureRecognizerState::Failed),
+                NSGestureRecognizerState::Began | NSGestureRecognizerState::Changed => {
+                    self.setState(NSGestureRecognizerState::Ended);
+                }
+                _ => {},
+            }
+        }
+        #[unsafe(method(locationInView:))]
+        fn location_in_view(&self, view: Option<&NSView>) -> NSPoint {
+            let point = self.ivars().location.get();
+            view.map_or(point, |view| view.convertPoint_fromView(point, None))
+        }
+        #[unsafe(method(reset))]
+        fn reset(&self) {
+            unsafe { let _: () = msg_send![super(self), reset]; }
+            self.ivars().origin.set(None);
+        }
+    }
+);
+
+impl TabDragRecognizer {
+    fn new(target: &ShellTarget, marker: MainThreadMarker) -> Retained<Self> {
+        let value = Self::alloc(marker).set_ivars(TabDragTracking::default());
+        unsafe { msg_send![super(value), initWithTarget: target, action: sel!(dragTab:)] }
+    }
 }
 
 #[derive(Clone)]
@@ -847,6 +950,7 @@ struct Shell {
     stop: Retained<NSButton>,
     tab_buttons: Vec<TabRow>,
     selected_tab_background: Retained<SurfaceView>,
+    tab_drop_indicator: Retained<SurfaceView>,
     cards: Vec<SpaceCard>,
     views: BTreeMap<i32, Retained<NSView>>,
     tabs: Vec<ShellTab>,
@@ -881,6 +985,10 @@ thread_local! {
     static TAB_AUDIO_MENU: RefCell<Option<TabAudioMenu>> = const { RefCell::new(None) };
     static TAB_ORDER_MENU: RefCell<[Option<TabOrderMenu>; 2]> = const { RefCell::new([None, None]) };
     static TAB_ORDER_QUERYING: Cell<bool> = const { Cell::new(false) };
+    // Rc clones share one order snapshot; pointer motion never clones its Vec.
+    static TAB_DRAG: RefCell<Option<Rc<TabDragSession>>> = const { RefCell::new(None) };
+    static TAB_DRAG_QUERYING: Cell<bool> = const { Cell::new(false) };
+    static TAB_DRAG_EPOCH: Cell<u64> = const { Cell::new(0) };
 }
 
 fn focus_trace_enabled() -> bool {
@@ -1452,8 +1560,13 @@ define_class!(
         }
         #[unsafe(method(windowDidResize:))]
         fn window_did_resize(&self, _notification: &NSNotification) {
+            cancel_tab_drag();
             layout();
         }
+        #[unsafe(method(windowDidResignKey:))]
+        fn window_did_resign_key(&self, _notification: &NSNotification) { cancel_tab_drag(); }
+        #[unsafe(method(windowWillMiniaturize:))]
+        fn window_will_miniaturize(&self, _notification: &NSNotification) { cancel_tab_drag(); }
         #[unsafe(method(windowDidBecomeKey:))]
         fn window_did_become_key(&self, _notification: &NSNotification) {
             crate::browser::notify_panel();
@@ -1516,6 +1629,8 @@ define_class!(
         fn select_tab(&self, sender: &NSButton) {
             tab_row_action(sender, false);
         }
+        #[unsafe(method(dragTab:))]
+        fn drag_tab(&self, sender: &TabDragRecognizer) { tab_drag_action(sender); }
         #[unsafe(method(closeTabRow:))]
         fn close_tab_row(&self, sender: &NSButton) {
             tab_row_action(sender, true);
@@ -1631,6 +1746,7 @@ define_class!(
         }
         #[unsafe(method(toggleSidebar:))]
         fn toggle_sidebar(&self, _sender: Option<&AnyObject>) {
+            cancel_tab_drag();
             SHELL.with(|slot| {
                 if let Some(shell) = slot.borrow_mut().as_mut() {
                     shell.sidebar_collapsed = !shell.sidebar_collapsed;
@@ -2893,6 +3009,9 @@ impl Shell {
         let selected_tab_background =
             surface_child(&tab_document, SurfaceKind::Selection, 10.0, false, marker);
         selected_tab_background.setHidden(true);
+        let tab_drop_indicator =
+            surface_child(&tab_document, SurfaceKind::Primary, 1.0, false, marker);
+        tab_drop_indicator.setHidden(true);
         let tab_scroll = scroll_view(&sidebar, &tab_document, marker);
         let overview_document = TopDownView::new(marker);
         let overview_scroll = scroll_view(&root, &overview_document, marker);
@@ -3235,6 +3354,7 @@ impl Shell {
             stop,
             tab_buttons: Vec::new(),
             selected_tab_background,
+            tab_drop_indicator,
             cards: Vec::new(),
             views: BTreeMap::new(),
             tabs: Vec::new(),
@@ -3623,6 +3743,11 @@ impl Shell {
                         "",
                         marker,
                     );
+                    let drag = TabDragRecognizer::new(&self.target, marker);
+                    // AppKit delays the button's tracking until pan recognition
+                    // fails. A plain click still uses selectTab: unchanged.
+                    drag.setDelaysPrimaryMouseButtonEvents(true);
+                    select_button.addGestureRecognizer(&drag);
                     let close = button(
                         &self.tab_document,
                         "",
@@ -3640,6 +3765,7 @@ impl Shell {
                         id: tab.id,
                         space: tab.space.clone(),
                         button: select_button,
+                        drag,
                         close,
                         icon,
                         title,
@@ -5835,6 +5961,7 @@ fn layout() {
             background.displayIfNeeded();
         }
     }
+    validate_active_tab_drag();
 }
 
 impl Shell {
@@ -6678,6 +6805,356 @@ fn tab_row_action(sender: &NSButton, close: bool) {
     }
 }
 
+fn tab_drag_target_matches(
+    target: &crate::browser::TabDragTarget,
+    tabs: &[ShellTab],
+    space: &str,
+    selected: Option<i32>,
+    overview: bool,
+    overlay: bool,
+) -> bool {
+    !overview
+        && !overlay
+        && target.space == space
+        && target.selected == selected
+        && target.order.len() > 1
+        && target.order.contains(&target.tab)
+        && tabs
+            .iter()
+            .filter(|tab| tab.space == space)
+            .map(|tab| tab.id)
+            .eq(target.order.iter().copied())
+}
+
+fn tab_drag_geometry(
+    window: &NSWindow,
+    scroll: &NSScrollView,
+    document: &NSView,
+    button: &NSButton,
+) -> TabDragGeometry {
+    TabDragGeometry {
+        window: window.frame(),
+        scroll: scroll.frame(),
+        document: document.frame(),
+        viewport: document.visibleRect(),
+        source: button.frame(),
+    }
+}
+
+fn tab_drag_shell_matches(session: &TabDragSession) -> bool {
+    SHELL.with(|slot| {
+        let Ok(slot) = slot.try_borrow() else {
+            return false;
+        };
+        let Some(shell) = slot.as_ref() else {
+            return false;
+        };
+        std::ptr::eq(&*shell.window, &*session.window)
+            && std::ptr::eq(&*shell.tab_scroll, &*session.scroll)
+            && std::ptr::eq(&*shell.tab_document, &*session.document)
+            && std::ptr::eq(&*shell.tab_drop_indicator, &*session.indicator)
+            && shell.sidebar_collapsed == session.collapsed
+            && shell.tab_buttons.iter().any(|row| {
+                row.id == session.target.tab
+                    && row.space == session.target.space
+                    && std::ptr::eq(&*row.drag, &*session.recognizer)
+                    && std::ptr::eq(&*row.button, &*session.button)
+            })
+            && tab_drag_target_matches(
+                &session.target,
+                &shell.tabs,
+                &shell.active_space,
+                shell.active,
+                shell.overview,
+                shell.overlay_is_open(),
+            )
+    })
+}
+
+fn tab_drag_is_stored(session: &Rc<TabDragSession>) -> bool {
+    TAB_DRAG.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|current| Rc::ptr_eq(current, session))
+    })
+}
+
+fn tab_drag_current(session: &Rc<TabDragSession>, stored: bool) -> bool {
+    if (stored && !tab_drag_is_stored(session)) || !tab_drag_shell_matches(session) {
+        return false;
+    }
+    // Native getters may reenter; neither the shell nor drag state is borrowed.
+    let native = session.window.isKeyWindow()
+        && session.window.isVisible()
+        && !session.window.isMiniaturized()
+        && session.button.isEnabled()
+        && !session.document.isHiddenOrHasHiddenAncestor()
+        && session
+            .recognizer
+            .view()
+            .is_some_and(|view| std::ptr::eq::<NSView>(&*view, &***session.button))
+        && session
+            .button
+            .window()
+            .is_some_and(|window| std::ptr::eq(&*window, &*session.window))
+        && tab_drag_geometry(
+            &session.window,
+            &session.scroll,
+            &session.document,
+            &session.button,
+        ) == session.geometry
+        && !page_find_has_marked_text();
+    native
+        && (!stored || tab_drag_is_stored(session))
+        && tab_drag_shell_matches(session)
+        && crate::browser::validate_tab_drag_target(&session.target).is_ok()
+}
+
+fn cancel_tab_drag() {
+    TAB_DRAG_EPOCH.with(|epoch| epoch.set(epoch.get().saturating_add(1)));
+    let session = TAB_DRAG.with(|slot| slot.borrow_mut().take());
+    if let Some(session) = session {
+        session.indicator.setHidden(true);
+    }
+}
+
+fn validate_active_tab_drag() {
+    let session = TAB_DRAG.with(|slot| slot.borrow().clone());
+    if TAB_DRAG_QUERYING.with(|busy| busy.replace(true)) {
+        if session.is_some_and(|session| !tab_drag_shell_matches(&session)) {
+            cancel_tab_drag();
+        }
+        return;
+    }
+    if session.is_some_and(|session| !tab_drag_current(&session, true)) {
+        cancel_tab_drag();
+    }
+    TAB_DRAG_QUERYING.with(|busy| busy.set(false));
+}
+
+fn begin_tab_drag(sender: &TabDragRecognizer) {
+    let Some(epoch) = TAB_DRAG_EPOCH.with(Cell::get).checked_add(1) else {
+        return;
+    };
+    cancel_tab_drag();
+    if epoch == u64::MAX || TAB_DRAG_EPOCH.with(Cell::get) != epoch {
+        return;
+    }
+    let candidate = SHELL.with(|slot| {
+        let slot = slot.try_borrow().ok()?;
+        let shell = slot.as_ref()?;
+        let row = shell
+            .tab_buttons
+            .iter()
+            .find(|row| std::ptr::eq(sender, &*row.drag))?;
+        let target = crate::browser::TabDragTarget {
+            tab: row.id,
+            space: row.space.clone(),
+            selected: shell.active,
+            order: shell
+                .tabs
+                .iter()
+                .filter(|tab| tab.space == row.space)
+                .map(|tab| tab.id)
+                .collect(),
+        };
+        if !tab_drag_target_matches(
+            &target,
+            &shell.tabs,
+            &shell.active_space,
+            shell.active,
+            shell.overview,
+            shell.overlay_is_open(),
+        ) {
+            return None;
+        }
+        Some((
+            target,
+            row.drag.clone(),
+            row.button.clone(),
+            shell.window.clone(),
+            shell.tab_scroll.clone(),
+            shell.tab_document.clone(),
+            shell.tab_drop_indicator.clone(),
+            shell.sidebar_collapsed,
+        ))
+    });
+    let Some((target, recognizer, button, window, scroll, document, indicator, collapsed)) =
+        candidate
+    else {
+        return;
+    };
+    let geometry = tab_drag_geometry(&window, &scroll, &document, &button);
+    let session = Rc::new(TabDragSession {
+        target,
+        recognizer,
+        button,
+        window,
+        scroll,
+        document,
+        indicator,
+        geometry,
+        collapsed,
+    });
+    if tab_drag_current(&session, false) && TAB_DRAG_EPOCH.with(Cell::get) == epoch {
+        TAB_DRAG.with(|slot| *slot.borrow_mut() = Some(session));
+    }
+}
+
+/// Return an insertion anchor and its line using actual native row frames.
+/// Binary search reads O(log n) frames without collecting or cloning tab lists.
+fn tab_drag_drop(
+    order: &[i32],
+    source: i32,
+    point: NSPoint,
+    viewport: NSRect,
+    mut frame: impl FnMut(i32) -> Option<NSRect>,
+) -> Option<(Option<i32>, f64)> {
+    let source_index = order.iter().position(|id| *id == source)?;
+    if order.len() < 2
+        || ![
+            point.x,
+            point.y,
+            viewport.origin.x,
+            viewport.origin.y,
+            viewport.size.width,
+            viewport.size.height,
+        ]
+        .into_iter()
+        .all(f64::is_finite)
+        || viewport.size.width <= 0.0
+        || viewport.size.height <= 0.0
+        || point.x < viewport.origin.x
+        || point.x >= viewport.origin.x + viewport.size.width
+        || point.y < viewport.origin.y
+        || point.y >= viewport.origin.y + viewport.size.height
+    {
+        return None;
+    }
+    let mut row_frame = |id| {
+        let value = frame(id)?;
+        (value.origin.y.is_finite() && value.size.height.is_finite() && value.size.height > 0.0)
+            .then_some(value)
+    };
+    let (mut low, mut high) = (0, order.len() - 1);
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let id = order[middle + usize::from(middle >= source_index)];
+        let bounds = row_frame(id)?;
+        if point.y < bounds.origin.y + bounds.size.height / 2.0 {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    if low < order.len() - 1 {
+        let id = order[low + usize::from(low >= source_index)];
+        Some((Some(id), row_frame(id)?.origin.y - 1.0))
+    } else {
+        let bounds = row_frame(*order.last()?)?;
+        Some((None, bounds.origin.y + bounds.size.height + 1.0))
+    }
+}
+
+fn tab_drag_action(sender: &TabDragRecognizer) {
+    if TAB_DRAG_QUERYING.with(|busy| busy.replace(true)) {
+        cancel_tab_drag();
+        return;
+    }
+    let epoch = TAB_DRAG_EPOCH.with(Cell::get);
+    let state = sender.state();
+    if TAB_DRAG_EPOCH.with(Cell::get) != epoch {
+        TAB_DRAG_QUERYING.with(|busy| busy.set(false));
+        return;
+    }
+    if state == NSGestureRecognizerState::Began {
+        if sender.ivars().epoch.get() != epoch {
+            TAB_DRAG_QUERYING.with(|busy| busy.set(false));
+            return;
+        }
+        begin_tab_drag(sender);
+    }
+    if matches!(
+        state,
+        NSGestureRecognizerState::Began
+            | NSGestureRecognizerState::Changed
+            | NSGestureRecognizerState::Ended
+    ) {
+        update_tab_drag(sender, state == NSGestureRecognizerState::Ended);
+    } else if state == NSGestureRecognizerState::Cancelled {
+        cancel_tab_drag();
+    }
+    // Failed sends no action. No drag state is retained until Began.
+    TAB_DRAG_QUERYING.with(|busy| busy.set(false));
+}
+
+fn update_tab_drag(sender: &TabDragRecognizer, ended: bool) {
+    let session = TAB_DRAG.with(|slot| slot.borrow().clone());
+    let Some(session) = session.filter(|session| std::ptr::eq(sender, &*session.recognizer)) else {
+        return;
+    };
+    if !tab_drag_current(&session, true) {
+        cancel_tab_drag();
+        return;
+    }
+    let point = sender.locationInView(Some(&session.document));
+    let drop = tab_drag_drop(
+        &session.target.order,
+        session.target.tab,
+        point,
+        session.geometry.viewport,
+        |id| {
+            let button = SHELL.with(|slot| {
+                let slot = slot.try_borrow().ok()?;
+                let shell = slot.as_ref()?;
+                shell
+                    .tab_buttons
+                    .iter()
+                    .find(|row| row.id == id && row.space == session.target.space)
+                    .map(|row| row.button.clone())
+            })?;
+            Some(button.frame())
+        },
+    );
+    let Some((before, y)) = drop.filter(|_| tab_drag_current(&session, true)) else {
+        cancel_tab_drag();
+        return;
+    };
+    if ended {
+        // Consume before the pure backend change; no native call intervenes.
+        TAB_DRAG.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        let result = crate::browser::reorder_tab_by_drag(&session.target, before);
+        session.indicator.setHidden(true);
+        SHELL.with(|slot| {
+            if let Some(shell) = slot.borrow_mut().as_mut() {
+                shell.notice = result.as_ref().err().cloned();
+            }
+        });
+        // Keep the existing selection and scroll position, including when the
+        // dragged row is a background tab. No editor or handoff action is used.
+        if result != Ok(false) {
+            crate::browser::notify_panel();
+        }
+    } else {
+        session.indicator.setFrame(rect(
+            2.0,
+            y,
+            (session.geometry.document.size.width - 4.0).max(0.0),
+            2.0,
+        ));
+        if !tab_drag_is_stored(&session) {
+            session.indicator.setHidden(true);
+            return;
+        }
+        session.indicator.setHidden(false);
+        if !tab_drag_current(&session, true) {
+            cancel_tab_drag();
+        }
+    }
+}
+
 fn run_action(action: Option<ShellAction>) {
     let Some(action) = action else {
         return;
@@ -7291,6 +7768,7 @@ fn shortcut_key(event: &NSEvent) -> Option<String> {
 }
 
 pub fn shutdown() {
+    cancel_tab_drag();
     let audio_menu = TAB_AUDIO_MENU.with(|slot| slot.borrow_mut().take());
     drop(audio_menu);
     let order_menu =
@@ -7511,6 +7989,11 @@ pub fn observe_page_input(event: &NSEvent) {
         return;
     };
     let kind = event.r#type();
+    // This first version keeps the drag viewport fixed. Wheel scrolling
+    // cancels rather than assigning an anchor from an obsolete row location.
+    if kind == NSEventType::ScrollWheel {
+        cancel_tab_drag();
+    }
     let (delta_x, delta_y) = if kind == NSEventType::ScrollWheel {
         (event.scrollingDeltaX(), event.scrollingDeltaY())
     } else {
@@ -7560,6 +8043,11 @@ pub fn observe_page_input(event: &NSEvent) {
 pub fn handle_shortcut(event: &NSEvent) -> bool {
     if event.r#type() != NSEventType::KeyDown {
         return false;
+    }
+    let dragging = TAB_DRAG.with(|slot| slot.borrow().is_some());
+    cancel_tab_drag();
+    if dragging && event.keyCode() == 53 {
+        return true;
     }
     let window = SHELL.with(|slot| slot.borrow().as_ref().map(|shell| shell.window.clone()));
     if !window.is_some_and(|window| window.isKeyWindow()) {
@@ -8866,6 +9354,172 @@ mod tests {
         assert!(!handoff.rebase(&mut stale, &snapshot));
         snapshot.tabs.clear();
         assert!(!handoff.rebase(&mut original_draft(), &snapshot));
+    }
+
+    #[test]
+    fn tab_drag_threshold_preserves_small_click_motion() {
+        let origin = NSPoint::new(12.0, 20.0);
+        for point in [origin, NSPoint::new(13.0, 20.0), NSPoint::new(15.0, 24.0)] {
+            assert!(!tab_drag_threshold(origin, point));
+        }
+        assert!(tab_drag_threshold(origin, NSPoint::new(12.0, 26.0)));
+        assert!(tab_drag_threshold(origin, NSPoint::new(6.0, 20.0)));
+        assert!(!tab_drag_threshold(origin, NSPoint::new(f64::NAN, 20.0)));
+        assert!(!tab_drag_threshold(
+            origin,
+            NSPoint::new(12.0, f64::INFINITY)
+        ));
+    }
+
+    #[test]
+    fn tab_drag_drop_uses_row_midpoints_and_never_anchors_to_source() {
+        let order = [7, 8, 9];
+        let frame = |id| {
+            let index = order.iter().position(|candidate| *candidate == id)?;
+            Some(tab_row_frames(200.0, false, 4.0 + index as f64 * TAB_ROW_HEIGHT).selection)
+        };
+        let viewport = rect(0.0, 0.0, 200.0, 180.0);
+        for (source, y, expected) in [
+            (8, 4.0, (Some(7), 3.0)),
+            (8, 49.0, (Some(9), 79.0)),
+            (8, 110.0, (None, 117.0)),
+            (7, 49.0, (Some(8), 41.0)),
+            (9, 4.0, (Some(7), 3.0)),
+        ] {
+            let drop = tab_drag_drop(&order, source, NSPoint::new(10.0, y), viewport, frame);
+            assert_eq!(drop, Some(expected));
+            assert_ne!(drop.unwrap().0, Some(source));
+        }
+        assert!(tab_drag_drop(&order, 99, NSPoint::new(10.0, 4.0), viewport, frame).is_none());
+        assert!(tab_drag_drop(&[7], 7, NSPoint::new(10.0, 4.0), viewport, frame).is_none());
+        assert!(tab_drag_drop(&order, 8, NSPoint::new(10.0, 4.0), viewport, |_| None).is_none());
+    }
+
+    #[test]
+    fn tab_drag_drop_rejects_outside_or_invalid_viewport_coordinates() {
+        let order = [7, 8, 9];
+        let frame = |id| {
+            let index = order.iter().position(|candidate| *candidate == id)?;
+            Some(tab_row_frames(60.0, true, 4.0 + index as f64 * TAB_ROW_HEIGHT).selection)
+        };
+        let viewport = rect(0.0, 38.0, 60.0, 76.0);
+        assert_eq!(
+            tab_drag_drop(&order, 7, NSPoint::new(12.0, 50.0), viewport, frame),
+            Some((Some(8), 41.0))
+        );
+        for point in [
+            NSPoint::new(-1.0, 50.0),
+            NSPoint::new(60.0, 50.0),
+            NSPoint::new(12.0, 37.0),
+            NSPoint::new(12.0, 114.0),
+            NSPoint::new(f64::NAN, 50.0),
+        ] {
+            assert!(tab_drag_drop(&order, 7, point, viewport, frame).is_none());
+        }
+        assert!(
+            tab_drag_drop(
+                &order,
+                7,
+                NSPoint::new(12.0, 50.0),
+                rect(0.0, 0.0, 0.0, 100.0),
+                frame
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn tab_drag_target_keeps_background_selection_and_rejects_changed_order() {
+        let mut tabs = vec![
+            numbered_tab_fixture(7, "user"),
+            numbered_tab_fixture(8, "user"),
+            numbered_tab_fixture(9, "other"),
+        ];
+        let target = crate::browser::TabDragTarget {
+            tab: 8,
+            space: "user".into(),
+            selected: Some(7),
+            order: vec![7, 8],
+        };
+        assert!(tab_drag_target_matches(
+            &target,
+            &tabs,
+            "user",
+            Some(7),
+            false,
+            false
+        ));
+        tabs[0].loading = true;
+        tabs[1].title = "Updated while dragging".into();
+        assert!(tab_drag_target_matches(
+            &target,
+            &tabs,
+            "user",
+            Some(7),
+            false,
+            false
+        ));
+        assert!(!tab_drag_target_matches(
+            &target,
+            &tabs,
+            "user",
+            Some(8),
+            false,
+            false
+        ));
+        assert!(!tab_drag_target_matches(
+            &target,
+            &tabs,
+            "other",
+            Some(7),
+            false,
+            false
+        ));
+        assert!(!tab_drag_target_matches(
+            &target,
+            &tabs,
+            "user",
+            Some(7),
+            true,
+            false
+        ));
+        assert!(!tab_drag_target_matches(
+            &target,
+            &tabs,
+            "user",
+            Some(7),
+            false,
+            true
+        ));
+        tabs.swap(0, 1);
+        assert!(!tab_drag_target_matches(
+            &target,
+            &tabs,
+            "user",
+            Some(7),
+            false,
+            false
+        ));
+        tabs.swap(0, 1);
+        tabs[1].space = "other".into();
+        assert!(!tab_drag_target_matches(
+            &target,
+            &tabs,
+            "user",
+            Some(7),
+            false,
+            false
+        ));
+        tabs.pop();
+        tabs.pop();
+        assert!(!tab_drag_target_matches(
+            &target,
+            &tabs,
+            "user",
+            Some(7),
+            false,
+            false
+        ));
     }
 
     #[test]

@@ -48,7 +48,7 @@ flowchart LR
 
 `src/mac.rs`는 macOS 앱 이벤트와 브라우저 단축키를 연결하고, `src/control_panel.rs`는 단일 AppKit 브라우저 창을 구성한다. 창 안의 중지 버튼은 `src/browser.rs`의 기존 TaskHandoff 처리 경로를 호출한다. `src/bin/helper.rs`는 CEF 보조 프로세스와 sandbox 초기화를 담당한다. 런타임은 고정된 CEF 156.0.1 beta이며 로컬 파생 바인딩과 API 15600을 함께 사용한다. 버전 교차 검증과 앱 시작 시 API 해시 확인은 서로 다른 CEF 조합의 실행을 막는다.
 
-`src/tasks.rs`는 CLI 작업 소유권과 revision을 관리한다. `src/spaces.rs`는 표시 공간, 공간별 탭 선택과 실행 중 표시 순서, 빌린 탭의 원래 공간을 관리한다. 표시 순서는 `SpaceView.tabs`와 shell snapshot에 공통으로 전달하며 같은 공간의 인접 이동은 선택·탐색·AI 인계 없이 메타데이터만 바꾼다. [탭 순서 계약](tab-order.md)에 메뉴 대상 수명과 자원 제한을 기록했다. `src/browser.rs`가 작업 생성과 소유권 변경 뒤 두 상태를 맞추고 `src/control_panel.rs`에 스냅샷을 전달한다. 표시 공간과 작업 소유권은 별개다. 완료 공간에 남긴 결과 탭은 작업 소유권 없이도 그 공간에 표시할 수 있다.
+`src/tasks.rs`는 CLI 작업 소유권과 revision을 관리한다. `src/spaces.rs`는 표시 공간, 공간별 탭 선택과 실행 중 표시 순서, 빌린 탭의 원래 공간을 관리한다. 표시 순서는 `SpaceView.tabs`와 shell snapshot에 공통으로 전달하며 같은 공간의 메뉴 이동과 드래그 정렬은 선택, 탐색, AI 인계 없이 메타데이터만 바꾼다. 드래그는 시작 당시 전체 순서를 재검사하고 지정한 탭 앞이나 목록 끝으로 이동한다. [탭 순서 계약](tab-order.md)에 메뉴 대상 수명과 자원 제한을 기록했다. `src/browser.rs`가 작업 생성과 소유권 변경 뒤 두 상태를 맞추고 `src/control_panel.rs`에 스냅샷을 전달한다. 표시 공간과 작업 소유권은 별개다. 완료 공간에 남긴 결과 탭은 작업 소유권 없이도 그 공간에 표시할 수 있다.
 
 ## 작업 공간과 제어권
 

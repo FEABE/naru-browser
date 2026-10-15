@@ -125,6 +125,48 @@ impl Spaces {
         true
     }
 
+    /// Place a tab before another tab, or at the end, without selecting it.
+    /// A drag uses its original visible order so background changes cancel it.
+    pub fn reorder_before(
+        &mut self,
+        tab: i32,
+        expected_space: &str,
+        before: Option<i32>,
+        expected_order: &[i32],
+    ) -> Option<bool> {
+        if self.overview
+            || self.active != expected_space
+            || self.tab_space(tab) != Some(expected_space)
+            || before == Some(tab)
+            || before.is_some_and(|id| self.tab_space(id) != Some(expected_space))
+        {
+            return None;
+        }
+        let space = self.records.get_mut(expected_space)?;
+        if space.tabs != expected_order {
+            return None;
+        }
+        let from = space.tabs.iter().position(|&id| id == tab)?;
+        let boundary = match before {
+            Some(id) => space.tabs.iter().position(|&candidate| candidate == id)?,
+            None => space.tabs.len(),
+        };
+        let to = if from < boundary {
+            boundary - 1
+        } else {
+            boundary
+        };
+        if from == to {
+            return Some(false);
+        }
+        if from < to {
+            space.tabs[from..=to].rotate_left(1);
+        } else {
+            space.tabs[to..=from].rotate_right(1);
+        }
+        Some(true)
+    }
+
     pub fn update_tasks(&mut self, tasks: &[TaskView]) {
         for task in tasks {
             let status = match task.status {
@@ -551,6 +593,80 @@ mod tests {
         assert!(spaces.ordered_tabs(&task.id).is_empty());
         assert_eq!(spaces.active_space(), USER_SPACE);
         assert_eq!(spaces.ordered_tabs(USER_SPACE), &[30, 10, 20]);
+    }
+
+    #[test]
+    fn drag_order_moves_background_tabs_to_any_boundary_without_selecting() {
+        let mut spaces = Spaces::default();
+        for id in [10, 20, 30, 40] {
+            spaces.insert(id, USER_SPACE, false);
+        }
+        let capacity = spaces.records[USER_SPACE].tabs.capacity();
+        assert_eq!(
+            spaces.reorder_before(40, USER_SPACE, Some(20), &[10, 20, 30, 40]),
+            Some(true)
+        );
+        assert_eq!(spaces.ordered_tabs(USER_SPACE), &[10, 40, 20, 30]);
+        assert_eq!(spaces.active_tab(), Some(10));
+        assert_eq!(
+            spaces.reorder_before(40, USER_SPACE, None, &[10, 40, 20, 30]),
+            Some(true)
+        );
+        assert_eq!(
+            spaces.reorder_before(40, USER_SPACE, None, &[10, 20, 30, 40]),
+            Some(false)
+        );
+        assert_eq!(
+            spaces.reorder_before(20, USER_SPACE, Some(30), &[10, 20, 30, 40]),
+            Some(false)
+        );
+        assert_eq!(
+            spaces.reorder_before(30, USER_SPACE, Some(10), &[10, 20, 30, 40]),
+            Some(true)
+        );
+        assert_eq!(spaces.ordered_tabs(USER_SPACE), &[30, 10, 20, 40]);
+        assert_eq!(spaces.active_tab(), Some(10));
+        assert_eq!(spaces.records[USER_SPACE].tabs.capacity(), capacity);
+    }
+
+    #[test]
+    fn drag_order_rejects_stale_or_foreign_targets_without_partial_reordering() {
+        let mut spaces = Spaces::default();
+        let task = Registry::default().create("Background work").unwrap();
+        spaces.update_tasks(&[task.clone()]);
+        for id in [1, 2, 3] {
+            spaces.insert(id, USER_SPACE, false);
+        }
+        spaces.insert(4, &task.id, false);
+        for (tab, before, order) in [
+            (2, Some(4), vec![1, 2, 3]),
+            (4, Some(1), vec![1, 2, 3]),
+            (2, Some(2), vec![1, 2, 3]),
+            (2, Some(1), vec![3, 2, 1]),
+            (2, Some(1), vec![1, 2]),
+        ] {
+            assert_eq!(spaces.reorder_before(tab, USER_SPACE, before, &order), None);
+            assert_eq!(spaces.ordered_tabs(USER_SPACE), &[1, 2, 3]);
+        }
+        spaces.set_overview(true);
+        assert_eq!(
+            spaces.reorder_before(3, USER_SPACE, Some(1), &[1, 2, 3]),
+            None
+        );
+        spaces.show(&task.id);
+        assert_eq!(
+            spaces.reorder_before(3, USER_SPACE, Some(1), &[1, 2, 3]),
+            None
+        );
+        spaces.show(USER_SPACE);
+        spaces.remove(2);
+        assert_eq!(
+            spaces.reorder_before(3, USER_SPACE, Some(1), &[1, 2, 3]),
+            None
+        );
+        assert_eq!(spaces.ordered_tabs(USER_SPACE), &[1, 3]);
+        assert_eq!(spaces.active_tab(), Some(1));
+        assert_eq!(spaces.ordered_tabs(&task.id), &[4]);
     }
 
     #[test]
