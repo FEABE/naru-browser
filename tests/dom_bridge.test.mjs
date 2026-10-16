@@ -157,7 +157,23 @@ function fixture() {
         ? { width: 20, height: 10 } : { width: 0, height: 0 };
     }
     click() { this.clicked = (this.clicked || 0) + 1; }
-    focus() { this.focused = (this.focused || 0) + 1; this.onFocus?.(); }
+    focus() {
+      this.focused = (this.focused || 0) + 1;
+      const focusable = ["INPUT", "TEXTAREA", "SELECT", "BUTTON"].includes(this.tagName) ||
+        (this.tagName === "A" && this.getAttribute("href") !== null) ||
+        this.getAttribute("tabindex") !== null ||
+        (this.isContentEditable && !this.parentElement?.isContentEditable);
+      if (this.ignoreFocus || !focusable || !this.isConnected || this.matches(":disabled")) return;
+      // Model only logical focus retargeting across roots/documents. Real blur,
+      // focus events, native key routing and window activation need Chromium.
+      let current = this;
+      for (let depth = 0; current && depth < 100; depth += 1) {
+        const root = current.getRootNode();
+        root.activeElement = current;
+        current = root.host || root.defaultView?.frameElement;
+      }
+      this.onFocus?.();
+    }
     dispatchEvent(event) {
       this.events.push(event.type);
       this.onEvent?.(event);
@@ -283,6 +299,7 @@ function fixture() {
   document.readyState = "interactive";
   document.body = new Element("BODY");
   document.append(document.body);
+  document.activeElement = document.body;
   document.body.innerText = "Fixture page";
   document.createTextNode = (value) => new Text(value);
   document.createRange = () => ({
@@ -445,18 +462,164 @@ test("fill preserves supported text, textarea and text/password focus conversion
   }
 });
 
-test("Enter respects cancelled keydown and reports a form submission request separately", () => {
+test("Enter prepares logical focus without dispatching keys or requesting form submission", () => {
   const f = fixture();
   const input = f.add("INPUT", { type: "search" });
   let submissions = 0;
   input.form = { requestSubmit() { submissions += 1; } };
   const ref = f.bridge.read().interactive[0].ref;
-  assert.equal(f.bridge.act({ action: "press", ref, key: "Enter" }).formSubmissionRequested, true);
-  assert.equal(submissions, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(f.bridge.act({ action: "press", ref, key: "Enter" }))),
+    { ok: true, action: "press", key: "Enter", prepared: true, attempted: false });
+  assert.equal(f.document.activeElement, input);
+  assert.equal(submissions, 0);
+  assert.deepEqual(input.events, []);
   input.onEvent = (event) => { if (event.type === "keydown") event.preventDefault(); };
-  assert.equal(f.bridge.act({ action: "press", ref, key: "Enter" }).formSubmissionRequested, false);
-  assert.equal(submissions, 1);
-  assert.equal(f.bridge.act({ action: "press", ref, key: "Tab" }).error, "UNSUPPORTED_KEY");
+  assert.equal(f.bridge.act({ action: "press", ref, key: "Enter" }).prepared, true);
+  assert.equal(submissions, 0);
+  assert.deepEqual(input.events, []);
+  const unsupported = f.bridge.act({ action: "press", ref, key: "Tab" });
+  assert.equal(unsupported.error, "UNSUPPORTED_KEY");
+  assert.equal(unsupported.attempted, false);
+});
+
+test("Enter preparation rejects ignored focus, non-focusable refs and immediate focus theft", () => {
+  for (const kind of ["ignored", "not-focusable", "redirected"]) {
+    const f = fixture();
+    const target = f.add(kind === "not-focusable" ? "DIV" : "INPUT", { role: "textbox", "aria-label": "Target" });
+    const other = f.add("TEXTAREA");
+    if (kind === "ignored") target.ignoreFocus = true;
+    if (kind === "redirected") target.onFocus = () => other.focus();
+    const ref = f.bridge.read().interactive.find((item) => item.label === "Target").ref;
+    const result = f.bridge.act({ action: "press", ref, key: "Enter" });
+    assert.equal(result.error, "FOCUS_NOT_REACHED", kind);
+    assert.equal(result.attempted, false, kind);
+    assert.deepEqual(target.events, [], kind);
+    assert.deepEqual(other.events, [], kind);
+    assert.equal(target.isConnected, true, kind);
+  }
+});
+
+test("Enter preparation supports focusable controls without changing values or activating a window", () => {
+  const f = fixture();
+  f.document.hasFocus = () => assert.fail("Background documents do not need window focus");
+  f.window.focus = () => assert.fail("Preparation must not activate a window");
+  for (const [tag, attributes] of [
+    ["INPUT", { type: "password" }], ["TEXTAREA", {}], ["BUTTON", {}],
+    ["A", { href: "https://example.test/" }], ["DIV", { contenteditable: "true" }],
+    ["DIV", { role: "combobox", tabindex: "0" }],
+  ]) {
+    const target = f.add(tag, { ...attributes, "aria-label": "Target" });
+    target.value = "private-value";
+    if (tag === "DIV" && attributes.contenteditable) target.textContent = "editor text";
+    const ref = f.bridge.read().interactive.find((item) => item.label === "Target").ref;
+    const result = f.bridge.act({ action: "press", ref, key: "Enter" });
+    assert.equal(result.prepared, true, tag);
+    assert.equal(result.attempted, false, tag);
+    assert.equal(f.document.activeElement, target, tag);
+    assert.equal(target.value, "private-value", tag);
+    if (attributes.contenteditable) assert.equal(target.textContent, "editor text");
+    assert.deepEqual(target.events, [], tag);
+    assert.equal(target.clicked, undefined, tag);
+    assert.ok(!JSON.stringify(result).includes("private-value"));
+    target.remove();
+  }
+});
+
+test("Enter preparation verifies every nested shadow and iframe focus boundary", () => {
+  const f = fixture();
+  const outer = f.add("DIV");
+  const outerRoot = outer.attachShadow({ mode: "open" });
+  const first = embed(f, {}, outerRoot);
+  const inner = first.child.add("DIV");
+  const innerRoot = inner.attachShadow({ mode: "open" });
+  const second = embed(first.child, {}, innerRoot);
+  const host = second.child.add("DIV");
+  const root = host.attachShadow({ mode: "open" });
+  const target = second.child.add("INPUT", { "aria-label": "Deep target" }, root);
+  const ref = f.bridge.read().interactive.find((item) => item.label === "Deep target").ref;
+  assert.equal(f.bridge.act({ action: "press", ref, key: "Enter" }).prepared, true);
+  for (const [boundary, active] of [
+    [root, target], [second.child.document, host], [innerRoot, second.frame],
+    [first.child.document, inner], [outerRoot, first.frame], [f.document, outer],
+  ]) {
+    assert.equal(boundary.activeElement, active);
+    target.onFocus = () => { boundary.activeElement = null; };
+    const result = f.bridge.act({ action: "press", ref, key: "Enter" });
+    assert.equal(result.error, "FOCUS_NOT_REACHED");
+    assert.equal(result.attempted, false);
+    assert.deepEqual(target.events, []);
+    target.onFocus = null;
+    target.focus();
+  }
+});
+
+test("Enter preparation rechecks ref, document and control state after focus", () => {
+  for (const mutate of [
+    (f, target) => target.remove(),
+    (f, target) => { target.hidden = true; },
+    (f, target) => { target.disabled = true; },
+    (f, target) => { target.parentElement.inert = true; },
+    (f, target) => target.parentElement.setAttribute("aria-disabled", "true"),
+    (f, target) => { target.ownerDocument = fixture().document; },
+    (f) => f.bridge.read(),
+  ]) {
+    const f = fixture();
+    const target = f.add("INPUT");
+    const ref = f.bridge.read().interactive[0].ref;
+    target.onFocus = () => mutate(f, target);
+    const result = f.bridge.act({ action: "press", ref, key: "Enter" });
+    assert.equal(result.error, "ELEMENT_UNAVAILABLE");
+    assert.equal(result.attempted, false);
+    assert.deepEqual(target.events, []);
+  }
+});
+
+test("Enter preparation revalidates after focus getters and keeps exception contents private", () => {
+  for (const failure of ["new-read", "detached", "exception"]) {
+    const f = fixture();
+    const target = f.add("INPUT");
+    const ref = f.bridge.read().interactive[0].ref;
+    target.onFocus = () => {
+      Object.defineProperty(f.document, "activeElement", {
+        configurable: true,
+        get() {
+          if (failure === "exception") throw new Error("private-keyboard-error");
+          if (failure === "new-read") f.bridge.read();
+          else target.remove();
+          return target;
+        },
+      });
+    };
+    const result = f.bridge.act({ action: "press", ref, key: "Enter" });
+    assert.equal(result.error, failure === "exception" ? "ACTION_FAILED" : "ELEMENT_UNAVAILABLE");
+    assert.equal(result.attempted, false);
+    assert.ok(!JSON.stringify(result).includes("private-keyboard-error"));
+    assert.deepEqual(target.events, []);
+  }
+});
+
+test("Enter preparation bounds focus-chain inspection and rejects stale refs before focusing", () => {
+  const f = fixture();
+  const target = f.add("INPUT");
+  const oldRef = f.bridge.read().interactive[0].ref;
+  const ref = f.bridge.read().interactive[0].ref;
+  for (const stale of [oldRef, "unknown-ref"]) {
+    const result = f.bridge.act({ action: "press", ref: stale, key: "Enter" });
+    assert.equal(result.error, "STALE_REF");
+    assert.equal(result.attempted, false);
+    assert.equal(target.focused, undefined);
+  }
+  let reads = 0;
+  const cyclicRoot = target.attachShadow({ mode: "open" });
+  target.onFocus = () => {
+    target.getRootNode = () => cyclicRoot;
+    Object.defineProperty(cyclicRoot, "activeElement", { get() { reads += 1; return target; } });
+  };
+  const result = f.bridge.act({ action: "press", ref, key: "Enter" });
+  assert.equal(result.error, "FOCUS_NOT_REACHED");
+  assert.equal(result.attempted, false);
+  assert.ok(reads > 0 && reads <= 64, `Focus chain used ${reads} reads`);
+  assert.deepEqual(target.events, []);
 });
 
 test("snapshot bounds text and interactive elements and excludes hidden content", () => {
@@ -531,8 +694,11 @@ test("open and nested shadow roots use root-local labels and preserve ref action
   assert.equal(f.bridge.act({ action: "fill", ref: named.ref, text: "hello shadow" }).ok, true);
   assert.equal(input.value, "hello shadow");
   assert.deepEqual(input.events, ["input", "change"]);
-  assert.equal(f.bridge.act({ action: "press", ref: named.ref, key: "Enter" }).formSubmissionRequested, true);
-  assert.equal(submissions, 1);
+  assert.equal(f.bridge.act({ action: "press", ref: named.ref, key: "Enter" }).prepared, true);
+  assert.equal(submissions, 0);
+  assert.equal(root.activeElement, input);
+  assert.equal(f.document.activeElement, host);
+  assert.deepEqual(input.events, ["input", "change"]);
   const nestedRef = page.interactive.find((item) => item.label === "Nested action").ref;
   assert.equal(f.bridge.act({ action: "click", ref: nestedRef }).ok, true);
   assert.equal(button.clicked, 1);
@@ -1407,8 +1573,11 @@ test("same-origin frames expose bounded context and flat refs with nested shadow
   assert.equal(button.clicked, 1);
   let submitted = 0;
   input.form = { requestSubmit() { submitted += 1; } };
-  assert.equal(f.bridge.act({ action: "press", ref: item("Child input").ref, key: "Enter" }).formSubmissionRequested, true);
-  assert.equal(submitted, 1);
+  assert.equal(f.bridge.act({ action: "press", ref: item("Child input").ref, key: "Enter" }).prepared, true);
+  assert.equal(submitted, 0);
+  assert.equal(child.document.activeElement, input);
+  assert.equal(f.document.activeElement, child.window.frameElement);
+  assert.deepEqual(input.events, ["input", "change"]);
   assert.equal(page.viewport.width, f.window.innerWidth);
   f.bridge.act({ action: "scroll", y: 100 });
   assert.equal(f.window.scrollY, 100);
@@ -1475,7 +1644,7 @@ test("frame availability includes embedding ancestors, zero size and disabled st
   }
 });
 
-test("focus and key handlers cannot redirect frame refs to another document", () => {
+test("focus handlers cannot redirect frame refs to another document", () => {
   for (const action of ["fill", "select", "press"]) {
     const f = fixture();
     const { frame, child } = embed(f);
@@ -1488,20 +1657,10 @@ test("focus and key handlers cannot redirect frame refs to another document", ()
     element.onFocus = () => { frame.contentDocument = fixture().document; };
     const result = f.bridge.act({ action, ref, text: "must-not-write", value: "b", key: "Enter" });
     assert.equal(result.error, "ELEMENT_UNAVAILABLE");
+    if (action === "press") assert.equal(result.attempted, false);
     assert.deepEqual(element.events, []);
     assert.equal(element.value, action === "select" ? "a" : "");
   }
-  const f = fixture();
-  const { frame, child } = embed(f);
-  const input = child.add("INPUT");
-  let submitted = 0;
-  input.form = { requestSubmit() { submitted += 1; } };
-  input.onEvent = (event) => { if (event.type === "keydown") frame.contentDocument = null; };
-  const ref = f.bridge.read().interactive[0].ref;
-  const result = f.bridge.act({ action: "press", ref, key: "Enter" });
-  assert.equal(result.formSubmissionRequested, false);
-  assert.equal(submitted, 0);
-  assert.deepEqual(input.events, ["keydown"]);
 });
 
 test("unavailable frames are explicit and metadata access stops at sixteen slots", () => {

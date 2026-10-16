@@ -16,7 +16,7 @@ import threading
 import time
 from urllib.parse import urlsplit
 
-from smoke import BrowserCli, CheckFailed, ROOT, element, require
+from smoke import BrowserCli, CheckFailed, ROOT, element, require, require_native_press_ack
 
 
 PASSWORD = "SHADOW_FAKE_PASSWORD_MUST_NOT_BE_EXPOSED"
@@ -120,7 +120,7 @@ readableFrame.addEventListener('load', () => {
   doc.body.innerHTML = '<p>Readable child paragraph</p><form><label>Frame query<input name="query"></label>' +
     '<label>Frame password<input type="password" value="SHADOW_FAKE_PASSWORD_MUST_NOT_BE_EXPOSED"></label>' +
     '<label>Frame choice<select><option value="a">Alpha</option><option value="b">Beta</option></select></label>' +
-    '</form><p id="receipt">No child action</p>';
+    '<button type="submit">Submit child form</button></form><p id="receipt">No child action</p>';
   const query = doc.querySelector('[name=query]');
   const choice = doc.querySelector('select');
   query.addEventListener('input', () => { doc.getElementById('receipt').textContent = 'Frame input: ' + query.value; });
@@ -286,7 +286,7 @@ def run(args):
         require(element(page, "Shadow query").get("value") == QUERY and f"Input event: {QUERY}" in page["text"],
                 "Shadow fill did not reach the input value and page input handler")
         pressed = command("press", tab, element(page, "Shadow query")["ref"], "Enter")
-        require(pressed["page"].get("formSubmissionRequested") is True, "Enter did not request the shadow form submission")
+        require_native_press_ack(pressed["page"])
         page = read()
         require(f"Submitted shadow query: {QUERY}" in page["text"], "Shadow form submit handler did not run")
         click(page, "Root scoped action")
@@ -339,7 +339,8 @@ def run(args):
         command("select", tab, element(page, "Frame choice")["ref"], "b")
         page = read()
         require("Frame choice: b" in page["text"], "Child-realm select change did not reach its page handler")
-        command("press", tab, element(page, "Frame query")["ref"], "Enter")
+        pressed = command("press", tab, element(page, "Frame query")["ref"], "Enter")
+        require_native_press_ack(pressed["page"])
         page = read()
         require(f"Frame submitted: {QUERY}" in page["text"], "Child form submit handler did not run")
         click(page, "Frame shadow action")

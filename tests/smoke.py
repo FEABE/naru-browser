@@ -128,6 +128,17 @@ def element(page, label):
     return matches[0]
 
 
+def require_native_press_ack(page):
+    """Validate engine dispatch acknowledgement, not the resulting page effect."""
+    require(isinstance(page, dict) and page.get("ok") is True and
+            page.get("action") == "press" and page.get("key") == "Enter" and
+            page.get("input") == "chromium" and page.get("attempted") is True and
+            page.get("dispatchAcknowledged") is True and isinstance(page.get("detail"), str),
+            "press: expected Chromium Enter dispatch acknowledgement")
+    require("trusted" not in page and "formSubmissionRequested" not in page,
+            "press: engine acknowledgement must not claim event trust or form submission")
+
+
 def run(args):
     cli = BrowserCli(args.cli.resolve(), args.data_dir.resolve())
     checks = []
@@ -182,7 +193,7 @@ def run(args):
         old_document = page["documentId"]
         old_ref = element(page, "Search query")["ref"]
         pressed = cli.success("press", tab, old_ref, "Enter")["page"]
-        require(pressed.get("formSubmissionRequested") is True, "press: form submission was not requested")
+        require_native_press_ack(pressed)
         page = cli.wait_for_page(
             tab,
             lambda value: value.get("title") == "Fixture search results" and f"Search result: {TEST_QUERY}" in value.get("text", ""),

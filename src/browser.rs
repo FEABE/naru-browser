@@ -15,6 +15,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     os::unix::net::{UnixListener, UnixStream},
     path::Path,
+    rc::Rc as Shared,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -525,6 +526,7 @@ impl Tab {
 enum ActionEvidence {
     Check,
     Fill,
+    Press,
 }
 
 impl ActionEvidence {
@@ -532,6 +534,7 @@ impl ActionEvidence {
         match command {
             Command::Check { .. } => Some(Self::Check),
             Command::Fill { .. } => Some(Self::Fill),
+            Command::Press { .. } => Some(Self::Press),
             _ => None,
         }
     }
@@ -542,6 +545,7 @@ impl ActionEvidence {
                 &["attempted", "trusted", "checked", "indeterminate"]
             }
             Self::Fill if value["action"] == "fill" => &["attempted", "trusted"],
+            Self::Press if value["action"] == "press" => &["attempted"],
             _ => &[],
         }
     }
@@ -557,18 +561,77 @@ enum Evaluation {
         token: u64,
     },
 }
+#[derive(Clone)]
 enum Step {
     Frame(String),
     World(String),
     Evaluate,
     Screenshot(String),
+    Press {
+        batch: Shared<PressBatch>,
+        part: usize,
+    },
 }
+#[derive(Clone)]
 struct Pending {
     tab: i32,
     epoch: u64,
     evaluation: Evaluation,
     reply: Reply,
     step: Step,
+}
+impl Pending {
+    fn mutation_dispatched(&self) -> bool {
+        matches!(self.step, Step::Evaluate | Step::Press { .. })
+            && matches!(self.evaluation, Evaluation::Page { mutation: true, .. })
+    }
+
+    fn press_preparation(&self) -> bool {
+        matches!(self.step, Step::Evaluate)
+            && matches!(
+                self.evaluation,
+                Evaluation::Page {
+                    evidence: Some(ActionEvidence::Press),
+                    ..
+                }
+            )
+    }
+
+    fn outcome_details(&self) -> Json {
+        let mut details = json!({"outcomeUnknown":self.mutation_dispatched()});
+        if let Step::Press { batch, .. } = &self.step {
+            details["attempted"] =
+                json!(batch.progress.borrow().attempted.iter().any(|value| *value));
+        } else if self.press_preparation() {
+            details["attempted"] = json!(false);
+        }
+        details
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PressFailure {
+    code: &'static str,
+    message: &'static str,
+}
+
+struct PressProgress {
+    enqueuing: bool,
+    attempted: [bool; 2],
+    accepted: [Option<bool>; 2],
+    acknowledged: [bool; 2],
+    failure: Option<PressFailure>,
+}
+
+struct PressBatch {
+    ids: [i32; 2],
+    tab: i32,
+    epoch: u64,
+    // Retain the original browser until both parts finish; raw identity cannot
+    // be recycled while a late callback is being checked.
+    browser: Browser,
+    reply: Reply,
+    progress: RefCell<PressProgress>,
 }
 struct Waiter {
     tab: i32,
@@ -3091,7 +3154,13 @@ fn pending_error(pending: &Pending, code: &str, message: &str) {
             }
         });
     } else {
-        pending.reply.error(code, message);
+        if pending.mutation_dispatched() {
+            pending
+                .reply
+                .error_details(code, message, pending.outcome_details());
+        } else {
+            pending.reply.error(code, message);
+        }
     }
 }
 
@@ -3110,13 +3179,13 @@ fn control_detached(tab: i32) {
             .collect::<Vec<_>>()
     });
     for request in pending {
-        if matches!(request.step, Step::Evaluate)
-            && matches!(request.evaluation, Evaluation::Page { mutation: true, .. })
-        {
+        if request.mutation_dispatched() {
+            let mut details = request.outcome_details();
+            details["tab"] = json!(tab);
             request.reply.error_details(
                 "CONTROL_DISCONNECTED",
                 "The page disconnected during an action. Inspect before repeating it.",
-                json!({"tab":tab,"outcomeUnknown":true}),
+                details,
             );
         } else {
             // Readiness probes can resume; page actions are never repeated.
@@ -3161,12 +3230,13 @@ fn renderer_terminated(tab: i32, reason: Json) {
         (pending, waits)
     });
     for request in pending {
-        let unknown = matches!(request.step, Step::Evaluate)
-            && matches!(request.evaluation, Evaluation::Page { mutation: true, .. });
+        let mut details = request.outcome_details();
+        details["tab"] = json!(tab);
+        details["renderer"] = reason.clone();
         request.reply.error_details(
             "RENDERER_TERMINATED",
             "The renderer stopped. Inspect the tab before retrying an action.",
-            json!({"tab":tab,"renderer":reason,"outcomeUnknown":unknown}),
+            details,
         );
     }
     for waiter in waits {
@@ -3218,12 +3288,13 @@ fn revoke_task_requests(task: &str, only_tab: Option<i32>) {
         (pending, waits)
     });
     for request in pending {
-        let unknown = matches!(request.step, Step::Evaluate)
-            && matches!(request.evaluation, Evaluation::Page { mutation: true, .. });
+        let mut details = request.outcome_details();
+        details["task"] = json!(task);
+        details["tab"] = json!(request.tab);
         request.reply.error_details(
             "TASK_CONTROL_LOST",
             "Task control changed. Inspect the page before continuing.",
-            json!({"task":task,"tab":request.tab,"outcomeUnknown":unknown}),
+            details,
         );
     }
     for waiter in waits {
@@ -4120,6 +4191,437 @@ fn create_browser_with_history(
     )
 }
 
+fn press_target_failure(
+    state: &State,
+    browser: &Browser,
+    tab: i32,
+    epoch: u64,
+    reply: &Reply,
+    allow_navigation: bool,
+) -> Option<PressFailure> {
+    if !reply.active.load(Ordering::Acquire) {
+        return Some(PressFailure {
+            code: "COMMAND_CANCELED",
+            message: "The Enter request is no longer active.",
+        });
+    }
+    if let Err(error) = state.tasks.check_tab(reply.scope.as_ref(), tab) {
+        return Some(PressFailure {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    let Some(tab) = state.tabs.get(&tab) else {
+        return Some(PressFailure {
+            code: "TAB_CLOSED",
+            message: "The tab closed during Enter preparation.",
+        });
+    };
+    if tab.rejected_creation || tab.browser.get_raw() != browser.get_raw() {
+        return Some(PressFailure {
+            code: "TAB_CLOSED",
+            message: "The original browser is no longer available.",
+        });
+    }
+    if tab.navigation.renderer_exit.is_some() {
+        return Some(PressFailure {
+            code: "RENDERER_TERMINATED",
+            message: "The renderer stopped during Enter. Inspect before retrying.",
+        });
+    }
+    if !allow_navigation
+        && (tab.navigation.epoch != epoch
+            || tab.navigation.provisional
+            || !tab.navigation.committed
+            || !tab.navigation.document_available)
+    {
+        return Some(PressFailure {
+            code: "PAGE_CHANGED",
+            message: "The document changed before Enter finished dispatching. Read again; do not automatically repeat Enter.",
+        });
+    }
+    None
+}
+
+fn press_registered(state: &State, batch: &Shared<PressBatch>) -> bool {
+    batch.ids.iter().all(|id| state.pending.get(id).is_some_and(|pending| {
+        matches!(&pending.step, Step::Press { batch: current, .. } if Shared::ptr_eq(current, batch))
+    }))
+}
+
+fn remove_press_batch(batch: &Shared<PressBatch>) {
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        for id in batch.ids {
+            if state.pending.get(&id).is_some_and(|pending| {
+                matches!(&pending.step, Step::Press { batch: current, .. } if Shared::ptr_eq(current, batch))
+            }) {
+                state.pending.remove(&id);
+            }
+        }
+    });
+}
+
+fn finish_press_batch(batch: &Shared<PressBatch>) {
+    let (enqueuing, failure, acknowledged, attempted) = {
+        let progress = batch.progress.borrow();
+        (
+            progress.enqueuing,
+            progress.failure,
+            progress.accepted == [Some(true); 2] && progress.acknowledged == [true; 2],
+            progress.attempted.iter().any(|value| *value),
+        )
+    };
+    if enqueuing {
+        return;
+    }
+    let current = STATE.with(|state| {
+        let state = state.borrow();
+        press_registered(&state, batch).then(|| {
+            press_target_failure(
+                &state,
+                &batch.browser,
+                batch.tab,
+                batch.epoch,
+                &batch.reply,
+                true,
+            )
+        })
+    });
+    let Some(current_failure) = current else {
+        return;
+    };
+    let failure = failure.or(current_failure);
+    if failure.is_none() && !acknowledged {
+        return;
+    }
+    remove_press_batch(batch);
+    if let Some(failure) = failure {
+        batch.reply.error_details(
+            failure.code,
+            failure.message,
+            json!({"tab":batch.tab,"outcomeUnknown":true,"attempted":attempted}),
+        );
+    } else {
+        batch.reply.ok(json!({"tab":batch.tab,"page":{
+            "ok":true,"action":"press","key":"Enter","input":"chromium",
+            "attempted":true,"dispatchAcknowledged":true,
+            "detail":"Chromium acknowledged Enter keyDown and keyUp; read again to verify effects."
+        }}));
+    }
+}
+
+// CEF documents asynchronous results. Keep both entries even if a transport
+// re-enters its observer before returning; a callback alone cannot acknowledge
+// dispatch. These adjacent UI submissions are not an atomic renderer operation.
+fn enqueue_press_batch(
+    batch: &Shared<PressBatch>,
+    mut native_available: impl FnMut() -> bool,
+    mut submit: impl FnMut(usize, i32) -> i32,
+) {
+    for part in 0..2 {
+        if !STATE.with(|state| press_registered(&state.borrow(), batch)) {
+            return;
+        }
+        if batch.progress.borrow().failure.is_some() {
+            break;
+        }
+        let available = native_available();
+        // Native getters can re-enter cancellation, handoff, navigation or close.
+        let checked = STATE.with(|state| {
+            let state = state.borrow();
+            press_registered(&state, batch).then(|| {
+                press_target_failure(
+                    &state,
+                    &batch.browser,
+                    batch.tab,
+                    batch.epoch,
+                    &batch.reply,
+                    false,
+                )
+            })
+        });
+        let Some(failure) = checked else {
+            return;
+        };
+        if batch.progress.borrow().failure.is_some() {
+            break;
+        }
+        let failure = failure.or_else(|| {
+            (!available).then_some(PressFailure {
+                code: "TAB_CLOSED",
+                message: "The browser is unavailable during Enter dispatch.",
+            })
+        });
+        if let Some(failure) = failure {
+            batch.progress.borrow_mut().failure = Some(failure);
+            break;
+        }
+        batch.progress.borrow_mut().attempted[part] = true;
+        let receipt = submit(part, batch.ids[part]);
+        if !STATE.with(|state| press_registered(&state.borrow(), batch)) {
+            return;
+        }
+        let mut progress = batch.progress.borrow_mut();
+        progress.accepted[part] = Some(receipt == batch.ids[part]);
+        if receipt != batch.ids[part] {
+            progress.failure = Some(PressFailure {
+                code: "CONTROL_UNAVAILABLE",
+                message: "Chromium rejected an Enter event. Inspect before retrying.",
+            });
+            break;
+        }
+    }
+    batch.progress.borrow_mut().enqueuing = false;
+    finish_press_batch(batch);
+}
+
+fn press_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) -> bool {
+    let part = STATE.with(|state| {
+        let state = state.borrow();
+        match &state.pending.get(&id)?.step {
+            Step::Press { batch, part } => Some((batch.clone(), *part)),
+            _ => None,
+        }
+    });
+    let Some((batch, part)) = part else {
+        return false;
+    };
+    // Input results are empty objects in this protocol. Bound error payloads,
+    // and never retain page or Chromium text in the shared completion state.
+    let valid_json = (success && bytes.is_empty())
+        || (bytes.len() <= 64 * 1024
+            && serde_json::from_slice::<Json>(bytes).is_ok_and(|value| value.is_object()));
+    let current = STATE.with(|state| {
+        let state = state.borrow();
+        press_target_failure(&state, browser, batch.tab, batch.epoch, &batch.reply, true)
+    });
+    {
+        let mut progress = batch.progress.borrow_mut();
+        if progress.acknowledged[part] {
+            return true;
+        }
+        if !progress.attempted[part] || !valid_json {
+            progress.failure = Some(PressFailure {
+                code: "INVALID_RESULT",
+                message: "Chromium returned an invalid Enter acknowledgement. Inspect before retrying.",
+            });
+        } else if !success {
+            progress.failure = Some(PressFailure {
+                code: "CONTROL_ERROR",
+                message: "Chromium could not dispatch Enter. Inspect before retrying.",
+            });
+        } else if let Some(failure) = current {
+            progress.failure = Some(failure);
+        }
+        progress.acknowledged[part] = true;
+    }
+    finish_press_batch(&batch);
+    true
+}
+
+fn reserve_press_batch(
+    id: i32,
+    pending: &Pending,
+    browser: &Browser,
+) -> Result<Shared<PressBatch>, PressFailure> {
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        if let Some(failure) = press_target_failure(
+            &state,
+            browser,
+            pending.tab,
+            pending.epoch,
+            &pending.reply,
+            false,
+        ) {
+            return Err(failure);
+        }
+        if !state.pending.get(&id).is_some_and(|current| {
+            current.reply.token == pending.reply.token && current.press_preparation()
+        }) {
+            return Err(PressFailure {
+                code: "COMMAND_CANCELED",
+                message: "The Enter preparation is no longer current.",
+            });
+        }
+        let Some(last) = state.next_message.checked_add(2) else {
+            return Err(PressFailure {
+                code: "CONTROL_UNAVAILABLE",
+                message: "The control message identifiers are exhausted.",
+            });
+        };
+        let batch = Shared::new(PressBatch {
+            ids: [last - 1, last],
+            tab: pending.tab,
+            epoch: pending.epoch,
+            browser: browser.clone(),
+            reply: pending.reply.clone(),
+            progress: RefCell::new(PressProgress {
+                enqueuing: true,
+                attempted: [false; 2],
+                accepted: [None; 2],
+                acknowledged: [false; 2],
+                failure: None,
+            }),
+        });
+        state.next_message = last;
+        state.pending.remove(&id);
+        for (part, id) in batch.ids.iter().enumerate() {
+            state.pending.insert(
+                *id,
+                Pending {
+                    step: Step::Press {
+                        batch: batch.clone(),
+                        part,
+                    },
+                    ..pending.clone()
+                },
+            );
+        }
+        Ok(batch)
+    })
+}
+
+fn dispatch_press(browser: &Browser, id: i32, pending: &Pending) {
+    let host = browser.host();
+    let mut dictionaries = ["keyDown", "keyUp"].map(|kind| {
+        let mut params = json!({"type":kind,"key":"Enter","code":"Enter","windowsVirtualKeyCode":13,
+            "nativeVirtualKeyCode":0});
+        if kind == "keyDown" {
+            params["text"] = json!("\r");
+            params["unmodifiedText"] = json!("\r");
+        }
+        parse_json(
+            Some(&CefString::from(params.to_string().as_str())),
+            JsonParserOptions::default(),
+        )
+        .and_then(|value| value.dictionary())
+    });
+    // Native code zero prevents Chromium's fallback into native browser key
+    // handling. No set_focus, frontmost-window or current-space mutation.
+    let available = browser.is_valid() != 0 && browser.has_document() != 0;
+    if host.is_none() || dictionaries.iter().any(Option::is_none) || !available {
+        finish_press_preparation(
+            id,
+            pending,
+            "CONTROL_UNAVAILABLE",
+            "Chromium is unavailable for Enter.",
+        );
+        return;
+    }
+    let batch = match reserve_press_batch(id, pending, browser) {
+        Ok(batch) => batch,
+        Err(failure) => {
+            finish_press_preparation(id, pending, failure.code, failure.message);
+            return;
+        }
+    };
+    let host = host.unwrap();
+    let method = CefString::from("Input.dispatchKeyEvent");
+    enqueue_press_batch(
+        &batch,
+        || browser.is_valid() != 0 && browser.has_document() != 0,
+        |part, message| {
+            host.execute_dev_tools_method(message, Some(&method), dictionaries[part].as_mut())
+        },
+    );
+}
+
+fn finish_press_preparation(id: i32, pending: &Pending, code: &str, message: &str) {
+    let removed = STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        if state.pending.get(&id).is_some_and(|current| {
+            current.reply.token == pending.reply.token && current.press_preparation()
+        }) {
+            state.pending.remove(&id);
+            true
+        } else {
+            false
+        }
+    });
+    if !removed {
+        return;
+    }
+    // Preparation can focus a page element, but has dispatched no native keys.
+    pending
+        .reply
+        .error_details(code, message, pending.outcome_details());
+}
+
+fn press_preparation_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) -> bool {
+    let pending = STATE.with(|state| {
+        state
+            .borrow()
+            .pending
+            .get(&id)
+            .filter(|pending| pending.press_preparation())
+            .cloned()
+    });
+    let Some(pending) = pending else {
+        return false;
+    };
+    let failure = STATE.with(|state| {
+        press_target_failure(
+            &state.borrow(),
+            browser,
+            pending.tab,
+            pending.epoch,
+            &pending.reply,
+            false,
+        )
+    });
+    if let Some(failure) = failure {
+        finish_press_preparation(id, &pending, failure.code, failure.message);
+        return true;
+    }
+    let result = (bytes.len() <= 64 * 1024)
+        .then(|| serde_json::from_slice::<Json>(bytes).ok())
+        .flatten();
+    let Some(result) = result else {
+        finish_press_preparation(
+            id,
+            &pending,
+            "INVALID_RESULT",
+            "Chromium returned an invalid Enter preparation.",
+        );
+        return true;
+    };
+    let value = &result["result"]["value"];
+    if !success || result.get("exceptionDetails").is_some() {
+        finish_press_preparation(
+            id,
+            &pending,
+            "PAGE_SCRIPT_ERROR",
+            "Enter preparation failed. Read again before repeating it.",
+        );
+    } else if value["ok"] == false && value["action"] == "press" {
+        finish_press_preparation(
+            id,
+            &pending,
+            value["error"].as_str().unwrap_or("ACTION_FAILED"),
+            value["detail"]
+                .as_str()
+                .unwrap_or("Enter preparation did not complete."),
+        );
+    } else if value["ok"] == true
+        && value["action"] == "press"
+        && value["key"] == "Enter"
+        && value["prepared"] == true
+        && value["attempted"] == false
+    {
+        dispatch_press(browser, id, &pending);
+    } else {
+        finish_press_preparation(
+            id,
+            &pending,
+            "INVALID_PAGE_RESULT",
+            "The page did not confirm Enter preparation. Read again.",
+        );
+    }
+    true
+}
+
 fn dispatch(browser: &Browser, method: &str, params: Json, pending: Pending) {
     if !pending.reply.active.load(Ordering::Acquire) {
         return;
@@ -4151,6 +4653,38 @@ fn dispatch(browser: &Browser, method: &str, params: Json, pending: Pending) {
         JsonParserOptions::default(),
     )
     .and_then(|value| value.dictionary());
+    if matches!(
+        pending.evaluation,
+        Evaluation::Page {
+            evidence: Some(ActionEvidence::Press),
+            ..
+        }
+    ) {
+        let available =
+            browser.is_valid() != 0 && browser.has_document() != 0 && dictionary.is_some();
+        let failure = STATE.with(|state| {
+            press_target_failure(
+                &state.borrow(),
+                browser,
+                pending.tab,
+                pending.epoch,
+                &pending.reply,
+                false,
+            )
+        });
+        if let Some(failure) = failure {
+            pending_error(&pending, failure.code, failure.message);
+            return;
+        }
+        if !available {
+            pending_error(
+                &pending,
+                "CONTROL_UNAVAILABLE",
+                "The browser is unavailable for Enter preparation.",
+            );
+            return;
+        }
+    }
     let (id, start_page_revoked) = STATE.with(|state| {
         let mut state = state.borrow_mut();
         state.next_message += 1;
@@ -4160,8 +4694,7 @@ fn dispatch(browser: &Browser, method: &str, params: Json, pending: Pending) {
         }
         // Reads, screenshots and action preparation leave native input alone.
         // An actual page mutation gives the CEF document its visible surface.
-        let start_page_revoked = matches!(pending.step, Step::Evaluate)
-            && matches!(pending.evaluation, Evaluation::Page { mutation: true, .. })
+        let start_page_revoked = pending.mutation_dispatched()
             && state
                 .tabs
                 .get_mut(&pending.tab)
@@ -4197,6 +4730,11 @@ fn devtools_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) {
     if complete_preview(id, success, bytes) {
         return;
     }
+    if press_result(browser, id, success, bytes)
+        || press_preparation_result(browser, id, success, bytes)
+    {
+        return;
+    }
     let Some(pending) = complete_control_request(id) else {
         return;
     };
@@ -4215,8 +4753,7 @@ fn devtools_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) {
     }
     // Check every preparation step. An action's own navigation is allowed
     // after evaluation has been dispatched, and is not retried.
-    let already_dispatched_action = matches!(pending.step, Step::Evaluate)
-        && matches!(pending.evaluation, Evaluation::Page { mutation: true, .. });
+    let already_dispatched_action = pending.mutation_dispatched();
     if !matches!(pending.step, Step::Screenshot(_)) && !already_dispatched_action {
         let current = STATE.with(|state| {
             state.borrow().tabs.get(&pending.tab).is_some_and(|tab| {
@@ -4401,6 +4938,9 @@ fn devtools_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) {
                     "Could not save screenshot to a new file.",
                 ),
             }
+        }
+        Step::Press { .. } => {
+            unreachable!("Enter results are aggregated before completing a pending request")
         }
     }
 }
@@ -4622,7 +5162,14 @@ wrap_life_span_handler! {
                 let tasks = state.tasks.list();
                 state.spaces.update_tasks(&tasks);
                 state.waits.retain(|_,waiter| {if waiter.tab==id {waiter.reply.error("TAB_CLOSED","The tab closed while waiting.");false}else{true}});
-                state.pending.retain(|_,pending| {if pending.tab==id {pending.reply.error("TAB_CLOSED","The tab closed during the request.");false}else{true}});
+                state.pending.retain(|_,pending| {if pending.tab==id {
+                    if pending.mutation_dispatched() {
+                        pending.reply.error_details("TAB_CLOSED","The tab closed during the request. Inspect before retrying.",pending.outcome_details());
+                    } else {
+                        pending.reply.error("TAB_CLOSED","The tab closed during the request.");
+                    }
+                    false
+                }else{true}});
                 state.tabs.is_empty()
             });
             crate::control_panel::remove(id);
@@ -8949,6 +9496,330 @@ mod tests {
         worker.join().unwrap();
         assert_eq!(receiver.try_iter().count(), 1);
         assert!(!reply.active.load(Ordering::Acquire));
+    }
+
+    fn test_press_preparation() -> (Pending, Browser, mpsc::Receiver<Response>) {
+        clear();
+        let tab = native_blank_tab();
+        let browser = tab.browser.clone();
+        let (mut reply, receiver) = test_reply(701);
+        let scope = STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let task = state.tasks.create("Enter test").unwrap();
+            let scope = TaskScope {
+                task: task.id,
+                revision: task.revision,
+            };
+            state.tasks.attach(&scope, 7, Origin::Created).unwrap();
+            let tasks = state.tasks.list();
+            state.spaces.update_tasks(&tasks);
+            state.spaces.insert(8, USER_SPACE, true);
+            state.spaces.insert(7, &scope.task, false);
+            state.tabs.insert(8, native_blank_tab());
+            state.tabs.insert(7, tab);
+            scope
+        });
+        reply.scope = Some(scope);
+        let pending = Pending {
+            tab: 7,
+            epoch: 4,
+            reply,
+            evaluation: Evaluation::Page {
+                mutation: true,
+                evidence: Some(ActionEvidence::Press),
+            },
+            step: Step::Evaluate,
+        };
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.next_message = 42;
+            state.pending.insert(42, pending.clone());
+        });
+        (pending, browser, receiver)
+    }
+
+    fn test_press_batch() -> (Shared<PressBatch>, mpsc::Receiver<Response>) {
+        let (pending, browser, receiver) = test_press_preparation();
+        (
+            reserve_press_batch(42, &pending, &browser).unwrap(),
+            receiver,
+        )
+    }
+
+    #[test]
+    fn enter_synchronous_acknowledgements_keep_the_lock_until_both_receipts() {
+        let (batch, receiver) = test_press_batch();
+        let mut sent = Vec::new();
+        enqueue_press_batch(
+            &batch,
+            || true,
+            |part, id| {
+                sent.push(part);
+                devtools_result(&batch.browser, id, true, b"{}");
+                assert!(receiver.try_recv().is_err());
+                STATE.with(|state| assert!(press_registered(&state.borrow(), &batch)));
+                // The normal command admission path must still see TAB_BUSY even
+                // when both callbacks arrived before ExecuteDevToolsMethod returned.
+                let (mut reply, blocked) = test_reply(702);
+                reply.scope = batch.reply.scope.clone();
+                handle(&Command::Read { tab: 7 }, reply);
+                assert_eq!(blocked.try_recv().unwrap().error.unwrap().code, "TAB_BUSY");
+                id
+            },
+        );
+        assert_eq!(sent, [0, 1]);
+        let wire = serde_json::to_value(receiver.try_recv().unwrap()).unwrap();
+        assert_eq!(wire["result"]["page"]["dispatchAcknowledged"], true);
+        assert_eq!(wire["result"]["page"]["input"], "chromium");
+        assert!(wire["result"]["page"].get("trusted").is_none());
+        STATE.with(|state| {
+            let state = state.borrow();
+            assert!(state.pending.is_empty());
+            assert_eq!(state.spaces.active_space(), USER_SPACE);
+            assert_eq!(state.spaces.active_tab(), Some(8));
+        });
+        for id in batch.ids {
+            devtools_result(&batch.browser, id, true, b"{}");
+        }
+        assert!(receiver.try_recv().is_err());
+        clear();
+    }
+
+    #[test]
+    fn enter_async_reversed_results_wait_for_both_and_allow_own_navigation() {
+        let (batch, receiver) = test_press_batch();
+        enqueue_press_batch(&batch, || true, |_, id| id);
+        assert!(receiver.try_recv().is_err());
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let nav = &mut state.tabs.get_mut(&7).unwrap().navigation;
+            nav.epoch += 1;
+            nav.provisional = true;
+        });
+        devtools_result(&batch.browser, batch.ids[1], true, b"");
+        assert!(receiver.try_recv().is_err());
+        STATE.with(|state| assert_eq!(state.borrow().pending.len(), 2));
+        devtools_result(&batch.browser, batch.ids[0], true, b"{}");
+        assert!(receiver.try_recv().unwrap().error.is_none());
+        assert!(receiver.try_recv().is_err());
+        STATE.with(|state| assert!(state.borrow().pending.is_empty()));
+        clear();
+    }
+
+    #[test]
+    fn enter_rejected_receipt_cannot_succeed_after_a_synchronous_ack() {
+        for rejected in 0..2 {
+            let (batch, receiver) = test_press_batch();
+            let mut sent = Vec::new();
+            enqueue_press_batch(
+                &batch,
+                || true,
+                |part, id| {
+                    sent.push(part);
+                    devtools_result(&batch.browser, id, true, b"{}");
+                    assert!(receiver.try_recv().is_err());
+                    if part == rejected { 0 } else { id }
+                },
+            );
+            assert_eq!(sent.len(), rejected + 1);
+            let error = receiver.try_recv().unwrap().error.unwrap();
+            assert_eq!(error.code, "CONTROL_UNAVAILABLE");
+            assert_eq!(
+                error.details.unwrap(),
+                json!({"tab":7,"outcomeUnknown":true,"attempted":true})
+            );
+            for id in batch.ids {
+                devtools_result(&batch.browser, id, true, b"{}");
+            }
+            assert!(receiver.try_recv().is_err());
+            STATE.with(|state| assert!(state.borrow().pending.is_empty()));
+        }
+        clear();
+    }
+
+    #[test]
+    fn enter_navigation_during_keydown_never_sends_keyup_to_the_new_document() {
+        let (batch, receiver) = test_press_batch();
+        let mut sent = Vec::new();
+        enqueue_press_batch(
+            &batch,
+            || true,
+            |part, id| {
+                sent.push(part);
+                devtools_result(&batch.browser, id, true, b"{}");
+                STATE.with(|state| {
+                    state
+                        .borrow_mut()
+                        .tabs
+                        .get_mut(&7)
+                        .unwrap()
+                        .navigation
+                        .epoch += 1
+                });
+                id
+            },
+        );
+        assert_eq!(sent, [0]);
+        let error = receiver.try_recv().unwrap().error.unwrap();
+        assert_eq!(error.code, "PAGE_CHANGED");
+        assert_eq!(error.details.unwrap()["attempted"], true);
+        STATE.with(|state| assert!(state.borrow().pending.is_empty()));
+        clear();
+    }
+
+    #[test]
+    fn enter_rechecks_after_native_getters_and_does_not_revive_canceled_batches() {
+        for cancel in [false, true] {
+            let (batch, receiver) = test_press_batch();
+            let mut sent = 0;
+            enqueue_press_batch(
+                &batch,
+                || {
+                    if cancel {
+                        batch.reply.active.store(false, Ordering::Release);
+                        remove_wait(batch.reply.token);
+                    } else {
+                        STATE.with(|state| state.borrow_mut().tabs.insert(7, native_blank_tab()));
+                    }
+                    true
+                },
+                |_, id| {
+                    sent += 1;
+                    id
+                },
+            );
+            assert_eq!(sent, 0);
+            if cancel {
+                assert!(receiver.try_recv().is_err());
+            } else {
+                let error = receiver.try_recv().unwrap().error.unwrap();
+                assert_eq!(error.code, "TAB_CLOSED");
+                assert_eq!(error.details.unwrap()["attempted"], false);
+            }
+            for id in batch.ids {
+                devtools_result(&batch.browser, id, true, b"{}");
+            }
+            assert!(receiver.try_recv().is_err());
+            STATE.with(|state| assert!(state.borrow().pending.is_empty()));
+        }
+        clear();
+    }
+
+    #[test]
+    fn enter_handoff_detach_and_renderer_exit_terminate_both_parts_once() {
+        for cause in 0..3 {
+            let (batch, receiver) = test_press_batch();
+            let mut sent = Vec::new();
+            enqueue_press_batch(
+                &batch,
+                || true,
+                |part, id| {
+                    sent.push(part);
+                    devtools_result(&batch.browser, id, true, b"{}");
+                    match cause {
+                        0 => {
+                            revoke_task_requests(&batch.reply.scope.as_ref().unwrap().task, Some(7))
+                        }
+                        1 => control_detached(7),
+                        _ => renderer_terminated(7, json!({"status":"crashed"})),
+                    }
+                    id
+                },
+            );
+            assert_eq!(sent, [0]);
+            let error = receiver.try_recv().unwrap().error.unwrap();
+            assert_eq!(
+                error.code,
+                [
+                    "TASK_CONTROL_LOST",
+                    "CONTROL_DISCONNECTED",
+                    "RENDERER_TERMINATED"
+                ][cause]
+            );
+            let details = error.details.unwrap();
+            assert_eq!(details["outcomeUnknown"], true);
+            assert_eq!(details["attempted"], true);
+            for id in batch.ids {
+                devtools_result(&batch.browser, id, true, b"{}");
+            }
+            assert!(receiver.try_recv().is_err());
+            STATE.with(|state| assert!(state.borrow().pending.is_empty()));
+        }
+        clear();
+    }
+
+    #[test]
+    fn enter_protocol_error_stops_dispatch_and_malformed_late_results_never_succeed() {
+        for immediate in [false, true] {
+            let (batch, receiver) = test_press_batch();
+            let mut sent = Vec::new();
+            enqueue_press_batch(
+                &batch,
+                || true,
+                |part, id| {
+                    sent.push(part);
+                    if immediate {
+                        devtools_result(&batch.browser, id, false, br#"{"message":"failed"}"#);
+                    }
+                    id
+                },
+            );
+            if !immediate {
+                assert!(receiver.try_recv().is_err());
+                devtools_result(&batch.browser, batch.ids[0], true, b"invalid");
+            }
+            assert_eq!(sent.len(), if immediate { 1 } else { 2 });
+            let error = receiver.try_recv().unwrap().error.unwrap();
+            assert_eq!(
+                error.code,
+                if immediate {
+                    "CONTROL_ERROR"
+                } else {
+                    "INVALID_RESULT"
+                }
+            );
+            assert_eq!(error.details.unwrap()["outcomeUnknown"], true);
+            devtools_result(&batch.browser, batch.ids[1], true, b"{}");
+            assert!(receiver.try_recv().is_err());
+        }
+        clear();
+    }
+
+    #[test]
+    fn enter_preparation_rejects_legacy_success_and_stale_documents_without_keys() {
+        for stale in [false, true] {
+            let (_pending, browser, receiver) = test_press_preparation();
+            if stale {
+                STATE.with(|state| {
+                    state
+                        .borrow_mut()
+                        .tabs
+                        .get_mut(&7)
+                        .unwrap()
+                        .navigation
+                        .epoch += 1
+                });
+            }
+            devtools_result(&browser, 42, true, br#"{"result":{"value":{"ok":true,"action":"press","key":"Enter","trusted":false}}}"#);
+            let error = receiver.try_recv().unwrap().error.unwrap();
+            assert_eq!(
+                error.code,
+                if stale {
+                    "PAGE_CHANGED"
+                } else {
+                    "INVALID_PAGE_RESULT"
+                }
+            );
+            assert_eq!(
+                error.details.unwrap(),
+                json!({"outcomeUnknown":true,"attempted":false})
+            );
+            STATE.with(|state| {
+                assert!(state.borrow().pending.is_empty());
+                assert_eq!(state.borrow().next_message, 42);
+            });
+        }
+        clear();
     }
 
     #[test]

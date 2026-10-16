@@ -1,5 +1,42 @@
 # Naru 작업 기록
 
+## 2026-10-16, Chromium Enter 변경의 커밋과 비공개 푸시 요청
+
+사용자의 커밋 요청과 이어진 푸시 요청에 따라 CLI Enter 구현, 테스트, 문서의 14개 파일을 기존 `codex/navigation-readiness` 브랜치에 커밋하고 같은 원격 브랜치로 올리는 범위다. 새 클릭 입력 설계 조사는 파일 변경 없이 중단했다. 제품 코드를 추가로 수정하지 않았으며 아래 구현 기록의 미커밋 표시는 당시 상태다.
+
+GitHub 조회에서 `FEABE/naru-browser`의 `isPrivate: true`와 기본 브랜치 main을 확인했다. 작업 전 로컬 HEAD와 원격 작업 브랜치는 모두 `0d7967d0fd2e4010f90da5478511ab6d660c43af`이었다. 제한 환경의 첫 네트워크 조회는 실패했으며 네트워크 접근을 허용한 조회는 성공했다. 이번 푸시 대상은 기본 브랜치가 아닌 기존 작업 브랜치다.
+
+현재 소스와 Cargo 파일 31개, 기존 앱과 CLI 2개의 해시가 최종 Enter 컴파일과 Rust 단위 검사 기록에 일치했다. DOM bridge와 모의 검사 파일의 해시도 기존 94개 통과 결과와 일치했다. Rust 단위 324개, 기본 구성과 CLI 전용 구성 검사, 독립 Chromium 20개 검사 결과를 확인했으며 이번에는 같은 소스의 빌드와 동작 검사를 반복하지 않았다. `cargo fmt --all --check`와 `git diff --check`는 다시 통과했다.
+
+최신 Naru CEF 통합, 네이티브 UI와 배경 선택 보존, 외부 사이트, 장시간 RAM 검증은 여전히 미완료다. 이번 작업에서 앱, 서버와 빌드를 실행하지 않았고 앞선 임시 target의 부재를 확인했다. 빌드 산출물, 사용자 프로필과 검증 원본은 Git 제외 상태를 유지한다. 커밋과 푸시의 실제 결과, 최종 로컬과 원격 SHA, 작업 트리는 `artifacts/commit-push-native-enter-20261016.json`에 기록한다.
+
+## 2026-10-16, CLI Enter를 Chromium 입력으로 연결
+
+직전 목표 턴은 Finder 위치 표시 변경의 `0d7967d` 커밋과 비공개 원격 SHA 확인까지 마친 진전이다. 이번에는 ego lite식 페이지 제어를 위해 Enter의 합성 이벤트와 수동 폼 제출을 Chromium 입력으로 바꿨다. 독립 브라우저 완성과 Preseller 내장 목표는 유지하며 전체 완료로 판정하지 않는다. 이번 새 변경은 커밋하거나 푸시하지 않았다.
+
+`src/dom_bridge.js`의 press는 참조, 문서와 표시 상태를 확인한 뒤 포커스를 준비한다. 실제 activeElement를 열린 shadow host와 부모 iframe까지 최대 64단계로 확인하고 마지막 참조 검사를 수행한다. 포커스를 즉시 빼앗기거나 받을 수 없으면 FOCUS_NOT_REACHED로 거절한다. 준비 결과에는 `prepared:true`, `attempted:false`를 반환하고 KeyboardEvent와 form.requestSubmit을 실행하지 않는다. 준비 중 포커스 핸들러의 부작용이 없다는 뜻은 아니다.
+
+`src/browser.rs`는 준비 결과를 확인한 뒤 같은 CEF 호스트에 Enter keyDown과 keyUp을 차례로 요청한다. keyDown에 CR 텍스트를 넣고 nativeVirtualKeyCode는 0으로 고정한다. OS 키 이벤트를 만드는 경로 대신 Chromium의 페이지 입력을 사용한다. 두 pending과 공유 배치 상태를 먼저 등록하며 두 엔진 접수 반환값, 두 응답과 enqueue 종료를 확인해야 한 번 성공한다. 준비에서 배치로 넘어갈 때도 탭의 진행 상태를 유지한다. 네이티브 getter 뒤와 각 제출 직전에 활성 요청, 작업 제어권, 문서 세대, renderer와 원래 Browser를 재검사한다. 첫 제출 중 문서나 제어권이 바뀌면 나머지 키를 보내지 않는다. 취소, 닫힘, renderer 종료와 연결 해제는 결과 불확실성을 남기며 늦은 응답으로 요청을 되살리지 않는다.
+
+최종 성공은 `input:"chromium"`, `attempted:true`, `dispatchAcknowledged:true`로 두 엔진 응답만 표현한다. 예전 trusted와 formSubmissionRequested는 제거한다. 입력 결과는 다시 읽어 확인하며 자동 반복이나 합성 입력 fallback은 없다. 기존 Runtime.evaluate 준비 단계는 CEF의 비동기 결과 계약을 따르고, 새 두 입력 배치는 응답이 호출 중 도착하는 경우도 보수적으로 처리한다. 두 엔진 요청의 원자적 처리나 IPC 사이의 대상 고정은 보장하지 않는다.
+
+`src/cli.rs`의 도움말을 Enter 지원 범위에 맞췄다. `docs/keyboard-input.md`에 동작, 응답 변경, 포커스와 문서 변경 경계, 한계를 기록하고 README, 아키텍처, 제품 계획과 메모리 문서를 갱신했다. 새로운 저장소, 상주 프로세스, 웹 UI renderer와 타이머는 없다. 고정 크기의 배치 상태와 원래 Browser 참조 하나를 요청 수명 동안 유지하며 기존 만료와 취소 경로로 해제한다. 실제 RAM 절감량을 측정한 결과는 아니다.
+
+검증은 다음과 같이 구분한다.
+
+- 모의 DOM은 최종 94개가 전부 통과했다. 준비 전용 계약과 즉시 포커스 이동, 무시된 focus, Shadow DOM과 iframe의 연결, 문서와 참조 변경, 예외 정제, 키와 제출 미발행을 다룬다. 변경 전 새 기대 조건으로 실행한 94개는 84개 통과와 10개 실패였다. 최종 bridge SHA-256은 `3d392703fb285e03d4a70c9d952158dbcce9957ddf23d68c8198cfec9fdbf17d`이며 원본과 해시는 `artifacts/keyboard-native-v2-dom-before.*`, `keyboard-native-v2-dom-after.*`에 있다.
+- 최종 Rust 단위 324개가 전부 통과했다. 새 회귀 8개는 실제 reserve, enqueue, devtools_result와 TAB_BUSY, revoke, detach, renderer 경로를 stub 전송과 함께 실행한다. 동기 응답 뒤 반환값 0, 일부 응답과 중복 응답, 늦은 응답, getter 중 문서 변경, 첫 키 뒤 변경과 취소, 준비 성공 계약 불일치를 포함한다. CEF 엔진을 실행한 검사는 아니다. 오프라인 잠금 의존성 단위 실행 파일 컴파일, 기본 구성과 CLI 전용 구성의 전체 타깃 검사, format도 통과했다. 원본은 `artifacts/keyboard-native-v2-check.json`, `keyboard-native-v2-rust-tests.json`이다. 기존 test 전용 observe_history, page_find_result, bookmark_completed의 dead_code 경고 3개만 확인했다.
+- 독립 ego lite Chromium 152의 자체 공간 8에서 nativeVirtualKeyCode 0의 기본 동작을 관찰했다. rawDown, char, up 방식과 keyDown 텍스트, keyUp 방식의 19개 관찰 및 SDK press 비교 1개를 기록했다. 버튼, textarea, 편집 영역, 기본 submitter, keydown 취소와 포커스 경합을 확인했다. 최초 스크립트 실행은 브라우저 명령 전에 await 구문 오류로 끝났으며 로그를 보존하고 실행 래퍼만 수정했다. 근거는 `artifacts/keyboard-native-v2-native0-probe.json`과 실행 로그다.
+- 같은 공간에서 최종 bridge를 isolated world에 넣고 main world fixture와 연결한 20개 검사가 모두 통과했다. main, 중첩 Shadow DOM과 iframe, 서로 중첩된 shadow와 iframe, 버튼과 줄바꿈, 기본 submitter와 취소, 포커스 이동 거절, focus 중 대상 삭제와 미지원 키를 포함한다. keydown이 포커스를 옮기면 후속 입력이 새 대상으로 가는 한계도 관찰했다. `artifacts/keyboard-native-v2-bridge-probe.json`에 실제 값, 판단과 소스 해시를 기록했다. ego의 공개 CDP는 대상 탭을 자동 활성화하므로 Naru의 배경 선택 보존, 같은 UI 턴의 CEF 접수, 물리 키 입력 검증으로 확대하지 않는다.
+- 설치된 CEF 헤더의 Chromium 버전 156.0.8078.17과 같은 태그의 공식 InputHandler, RenderWidgetHostImpl 소스를 확인했다. native code 0에서 브라우저 UI로의 미처리 키 전달을 막는 분기와 페이지 포커스 전달을 확인했다. URL, 해시와 관련 원문은 `artifacts/keyboard-native-chromium156-source.json`에 있다. 플랫폼 소스 확인을 실제 Naru 동작 증거로 대신하지 않는다.
+- `tests/fixtures/native_press.html`, `tests/native_press_smoke.py`를 추가했다. 기존 `tests/smoke.py`, `tests/shadow_smoke.py`는 새 응답 계약과 실제 제출 결과를 확인하도록 바꿨다. iframe의 두 입력 폼에는 native implicit submit 대상 버튼을 추가했다. Python AST 3개와 inline JavaScript 구문 7개는 통과했으며 근거는 `artifacts/keyboard-native-v2-smoke-static.json`이다. 실제 Naru CLI와 CEF smoke는 실행하지 않았다.
+
+최신 Naru의 실제 배경 Enter, 네이티브 선택과 입력기, 사용자 입력과의 경합, 외부 서비스와 장시간 RAM 검증은 남아 있다. 포커스 준비 직후나 keydown 처리 중의 대상 변경, 서브프레임 교체는 원자적으로 막지 못한다. 중간 변경 때문에 keyUp을 생략하면 이전 페이지의 키 상태가 남을 수 있으며 자동 재전송으로 복구하지 않는다. 지원 키는 Enter 한 개이고 Tab, 화살표, 조합키와 IME는 후속 범위다. 앱 번들, release 실행 파일과 서명을 만들거나 Naru, HTTP 서버를 실행하지 않았고 키체인 승인 질문도 하지 않았다.
+
+검증 공간 8은 finish를 정확히 한 번 호출했다. 실제 응답의 closedSpace true, closedManagedLabels p1, preservedUnmanagedCount 0을 `artifacts/keyboard-native-v2-cleanup-space.json`에 보존했다. 기존 사용자 탭과 프로필에 정리 명령을 보내지 않았다. 컴파일 세션 42905와 단위 세션 80673은 모두 exit 0으로 종료됐다. 정확한 `target/.keyboard-native-test-lu8b_b5o`의 identity와 symlink 0개를 확인한 뒤 파일 2,060개, 크기 합계 1,486,752,774바이트를 제거했다. 소스와 기존 앱, CLI의 해시는 컴파일, 단위 검사와 정리 전후 같았다. `artifacts/keyboard-native-v2-cleanup.json`이 근거이며 파일 크기 합계를 물리 디스크 회수량으로 해석하지 않는다.
+
+최종 공백 검사와 변경 문서의 로컬 링크 99개 존재 검사가 통과했다. 소스, 검사 파일과 기존 앱, CLI의 해시 38개가 검증 기록과 일치했고 임시 target의 부재를 확인했다. `artifacts/keyboard-native-v2-final-static.json`에 기록했다. HEAD는 `0d7967d`를 유지한다.
+
 ## 2026-10-16, Finder 위치 표시 변경의 커밋과 비공개 푸시 요청
 
 사용자의 커밋 요청과 이어진 푸시 요청에 따라 기존 Finder 위치 표시 변경 11개 파일을 `codex/navigation-readiness`에 커밋하고 기존 `origin`의 같은 브랜치로 올리는 범위다. 제품 코드를 추가로 변경하지 않았다. 아래 구현 기록의 미커밋 표시는 해당 작업 종료 당시의 상태다.

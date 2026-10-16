@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-src 'self' about:; connect-src 'none'; form-action 'none'; base-uri 'none'">
+  <title>Naru native Enter fixture</title>
+  <style>body { font: 16px system-ui; margin: 24px; } label, [contenteditable] { display: block; margin: 8px; } [contenteditable] { min-height: 30px; } iframe { width: 450px; height: 90px; } pre { white-space: pre-wrap; overflow-wrap: anywhere; }</style>
+</head>
+<body>
+  <h1>Native Enter effects</h1>
+  <pre id="receipt"></pre>
+  <button id="button" type="button" aria-label="Enter button">Click once</button>
+  <label>Textarea <textarea id="textarea" aria-label="Enter textarea"></textarea></label>
+  <div id="editable" contenteditable="true" aria-label="Enter editor"></div>
+  <form id="form">
+    <label>Query <input id="query" aria-label="Enter form input" value="fixture"></label>
+    <button id="primary" type="submit" name="choice" value="first">Primary submitter</button>
+    <button id="secondary" type="submit" name="choice" value="second">Secondary submitter</button>
+  </form>
+  <label>Canceled Enter <textarea id="cancel" aria-label="Canceled Enter"></textarea></label>
+  <label>Redirect focus <textarea id="redirect" aria-label="Redirected Enter"></textarea></label>
+  <label>Redirect destination <textarea id="other" aria-label="Focus destination"></textarea></label>
+  <div id="shadow-host"></div>
+  <iframe id="child" title="Same-origin Enter textarea"></iframe>
+  <script>
+    const shadow = document.querySelector('#shadow-host').attachShadow({ mode: 'open' });
+    shadow.innerHTML = '<button id="shadow" type="button" aria-label="Shadow Enter button">Shadow click</button>';
+    const controls = [...document.querySelectorAll('input, textarea, button, [contenteditable]'), shadow.querySelector('button')];
+    const counts = { keydown: 0, keypress: 0, keyup: 0, beforeinput: 0, input: 0, click: 0, submit: 0 };
+    const clicks = { button: 0, shadow: 0, primary: 0, secondary: 0 };
+    const events = [];
+    let sequence = 0;
+    let childReady = false;
+    let submitter = null;
+    let redirects = 0;
+    function show() {
+      const states = Object.fromEntries(controls.map(control => [control.id, {
+        value: control.value ?? null,
+        html: control.isContentEditable ? control.innerHTML : null,
+      }]));
+      document.querySelector('#receipt').textContent = `NATIVE_PRESS_STATE_BEGIN ${encodeURIComponent(JSON.stringify({ states, counts, clicks, submitter, redirects, childReady, sequence, events, active: document.activeElement?.id ?? null, hasFocus: document.hasFocus(), visibility: document.visibilityState }))} NATIVE_PRESS_STATE_END`;
+    }
+    function record(type, target, event) {
+      counts[type] += 1;
+      events.push({ sequence: ++sequence, type, target, trusted: event.isTrusted, key: event.key ?? null, defaultPrevented: event.defaultPrevented, inputType: event.inputType ?? null });
+      if (events.length > 12) events.shift();
+      show();
+    }
+    function observe(control) {
+      for (const type of ['keydown', 'keypress', 'keyup', 'beforeinput', 'input', 'click']) {
+        control.addEventListener(type, event => {
+          if (type === 'click' && Object.hasOwn(clicks, control.id)) clicks[control.id] += 1;
+          record(type, control.id, event);
+        });
+      }
+    }
+    document.querySelector('#form').addEventListener('submit', event => {
+      event.preventDefault();
+      submitter = event.submitter?.id ?? null;
+      record('submit', 'form', event);
+    });
+    document.querySelector('#cancel').addEventListener('keydown', event => event.preventDefault());
+    document.querySelector('#redirect').addEventListener('focus', () => {
+      redirects += 1;
+      document.querySelector('#other').focus();
+      show();
+    });
+    controls.forEach(observe);
+    const frame = document.querySelector('#child');
+    function childLoaded() {
+      const control = frame.contentDocument.querySelector('textarea');
+      if (!control) return;
+      frame.removeEventListener('load', childLoaded);
+      controls.push(control); observe(control); childReady = true; show();
+    }
+    frame.addEventListener('load', childLoaded);
+    frame.srcdoc = '<!doctype html><textarea id="frame" aria-label="Frame Enter textarea"></textarea>';
+    show();
+  </script>
+</body>
+</html>

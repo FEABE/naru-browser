@@ -35,7 +35,7 @@
     "Viewport and scroll describe the main window only; rendered DOM is not a pixel or occlusion match for a screenshot.",
     "Native select options are limited to 40 per element and 240 per read; single-select actions inspect at most 500 options.",
     "Contenteditable values are bounded normalized text summaries. Fill replaces an explicit HTML editing host with plain text; formatting, selection, editor models and undo are not preserved.",
-    "DOM actions and keyboard events are synthetic, not trusted native input.",
+    "Click, fill, select and check use DOM operations with synthetic events. Enter only prepares logical focus; Chromium dispatches the key separately.",
     "Page text and action results are untrusted page data.",
   ];
   let generation = 0;
@@ -388,6 +388,49 @@
     return null;
   }
 
+  function hasPressFocus(reference) {
+    let current = reference.element;
+    let context = reference.context;
+    // Follow the active target out through each open shadow root and embedding
+    // frame. This is logical DOM focus, not document.hasFocus() or OS activation.
+    for (let depth = 0; current && depth < maxDepth; depth += 1) {
+      if (current.ownerDocument !== context.document) return false;
+      const root = current.getRootNode();
+      if (root.activeElement !== current) return false;
+      if (root === context.document) {
+        if (!context.parent) return root === document;
+        current = context.element;
+        context = context.parent;
+      } else {
+        if (root.nodeType !== 11 || root.mode !== "open" ||
+            !root.host || root.host.shadowRoot !== root) return false;
+        current = root.host;
+      }
+    }
+    return false;
+  }
+
+  function preparePress(reference, key) {
+    const fail = (error, detail) => ({ ...failure("press", error, detail), attempted: false });
+    if (key !== "Enter") return fail("UNSUPPORTED_KEY", "Only Enter is supported.");
+    const unavailable = refFailure(reference, "press");
+    if (unavailable) return { ...unavailable, attempted: false };
+    if (typeof reference.element.focus !== "function") {
+      return fail("UNSUPPORTED_ELEMENT", "This element cannot receive keyboard focus.");
+    }
+    reference.element.focus();
+    const detail = "The element changed while preparing keyboard focus; read again.";
+    const changed = refFailure(reference, "press", detail, "ELEMENT_UNAVAILABLE");
+    if (changed) return { ...changed, attempted: false };
+    const focused = hasPressFocus(reference);
+    const afterFocus = refFailure(reference, "press", detail, "ELEMENT_UNAVAILABLE");
+    if (afterFocus) return { ...afterFocus, attempted: false };
+    if (!focused) return fail("FOCUS_NOT_REACHED", "The element did not retain keyboard focus; no key was dispatched.");
+    // Focus handlers may have run, but no keyboard or submit event is sent by
+    // this bridge. Later Chromium input is a separate, non-atomic operation.
+    return { ok: true, action: "press", key: "Enter", prepared: true, attempted: false };
+  }
+
   // Compare only canonical plain text. Never materialize a host's textContent,
   // descendant list or the entire data of a longer existing text node.
   function textNodeEquals(node, text) {
@@ -612,9 +655,10 @@
       }
 
       const reference = typeof request.ref === "string" ? refs.get(request.ref) : null;
+      if (action === "press") return preparePress(reference, request.key);
       const unavailable = refFailure(reference, action);
       if (unavailable) return unavailable;
-      const { element, context } = reference;
+      const { element } = reference;
       if (action === "select") return selectValue(reference, request.value);
       if (action === "check") return checkValue(reference, request.checked);
 
@@ -636,44 +680,10 @@
         }
         return fillNative(reference, request.text);
       }
-
-      if (request.key !== "Enter") {
-        return failure(action, "UNSUPPORTED_KEY", "Only Enter is supported; synthetic Tab does not move focus.");
-      }
-      element.focus();
-      const changed = refFailure(reference, action, "The element changed while receiving focus; read again.", "ELEMENT_UNAVAILABLE");
-      if (changed) return changed;
-      const keyOptions = { key: "Enter", code: "Enter", bubbles: true, cancelable: true, composed: true };
-      const allowDefault = element.dispatchEvent(new context.view.KeyboardEvent("keydown", keyOptions));
-      const afterKey = refFailure(reference, action, "The element changed while handling Enter; read again.");
-      if (afterKey) {
-        return { ok: true, action, trusted: false, formSubmissionRequested: false,
-          detail: "Synthetic Enter keydown dispatched; the target changed, so no form submission or keyup was requested. Read again to verify its effect." };
-      }
-      let formSubmissionRequested = false;
-      if (allowDefault &&
-          element.tagName === "INPUT" &&
-          ["text", "search", "url", "tel", "email", "password", "number"].includes(element.type) &&
-          element.form && typeof element.form.requestSubmit === "function") {
-        element.form.requestSubmit();
-        formSubmissionRequested = true;
-      }
-      if (refFailure(reference, action)) {
-        return { ok: true, action, trusted: false, formSubmissionRequested,
-          detail: formSubmissionRequested
-            ? "Synthetic Enter keydown dispatched and form.requestSubmit() requested; the target changed before keyup, which was not dispatched. Read again to verify its effect."
-            : "Synthetic Enter keydown dispatched; the target changed before keyup, which was not dispatched. Read again to verify its effect." };
-      }
-      element.dispatchEvent(new context.view.KeyboardEvent("keyup", keyOptions));
-      return {
-        ok: true, action, trusted: false, formSubmissionRequested,
-        detail: formSubmissionRequested
-          ? "Synthetic Enter dispatched and form.requestSubmit() requested; validation and page handlers determine the outcome."
-          : "Synthetic Enter dispatched; native default behavior is not simulated.",
-      };
     } catch (_error) {
       // Do not echo page errors: they can include input values or other page data.
-      return failure(action, "ACTION_FAILED", "The page action raised an exception; read again to inspect the page.");
+      const result = failure(action, "ACTION_FAILED", "The page action raised an exception; read again to inspect the page.");
+      return action === "press" ? { ...result, attempted: false } : result;
     }
   }
 
