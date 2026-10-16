@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-src 'self' about:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Naru native fill fixture</title>
+  <style>body { font: 16px system-ui; margin: 24px; } label { display: block; margin: 8px; } iframe { width: 450px; height: 80px; } pre { white-space: pre-wrap; overflow-wrap: anywhere; }</style>
+</head>
+<body>
+  <h1>Exact native value verification</h1>
+  <p>Synthetic input/change, exact literal comparison. No native beforeinput or same-value no-op.</p>
+  <pre id="receipt"></pre>
+  <label>Text <input id="text" aria-label="Text input" value="old"></label>
+  <label>Number <input id="number" type="number" aria-label="Number input" value="1"></label>
+  <label>Date <input id="date" type="date" aria-label="Date input" value="2026-10-16"></label>
+  <label>Textarea <textarea id="textarea" aria-label="Textarea input">old</textarea></label>
+  <label>Readonly <input id="readonly" readonly aria-label="Readonly input" value="old"></label>
+  <label>Input rollback <input id="reset-input" aria-label="Rollback on input" value="old"></label>
+  <label>Change rollback <input id="reset-change" aria-label="Rollback on change" value="old"></label>
+  <label>Remove <input id="remove" aria-label="Remove on input" value="old"></label>
+  <label>Readonly after input <input id="lock" aria-label="Lock on input" value="old"></label>
+  <label>Type after input <input id="type" aria-label="Retype on input" value="old"></label>
+  <label>Getter spoof <input id="spoof" aria-label="Spoofed own getter" value="old"></label>
+  <label>Password rollback <input id="password" type="password" aria-label="Password rollback"></label>
+  <div id="shadow-host"></div>
+  <iframe id="child" title="Same-origin native input" srcdoc="&lt;input id='frame' aria-label='Frame input' value='old'&gt;"></iframe>
+  <script>
+    const shadow = document.querySelector('#shadow-host').attachShadow({ mode: 'open' });
+    shadow.innerHTML = '<input id="shadow" aria-label="Shadow input" value="old">';
+    const controls = [...document.querySelectorAll('input, textarea'), shadow.querySelector('input')];
+    const counts = { beforeinput: 0, input: 0, change: 0 };
+    const events = [];
+    let childReady = false;
+    function nativeValue(element) {
+      const view = element.ownerDocument.defaultView;
+      const prototype = element.tagName === 'TEXTAREA' ? view.HTMLTextAreaElement.prototype : view.HTMLInputElement.prototype;
+      return Object.getOwnPropertyDescriptor(prototype, 'value').get.call(element);
+    }
+    function show() {
+      const states = Object.fromEntries(controls.map(element => [element.id, {
+        ...(element.id === 'password' ? { length: nativeValue(element).length } : { value: nativeValue(element) }),
+        connected: element.isConnected, type: element.type, readonly: element.readOnly,
+      }]));
+      document.querySelector('#receipt').textContent = `NATIVE_FILL_STATE_BEGIN ${encodeURIComponent(JSON.stringify({ states, counts, events, childReady }))} NATIVE_FILL_STATE_END`;
+    }
+    document.querySelector('#reset-input').addEventListener('input', event => event.target.value = 'rollback');
+    document.querySelector('#reset-change').addEventListener('change', event => event.target.value = 'rollback');
+    document.querySelector('#remove').addEventListener('input', event => event.target.remove());
+    document.querySelector('#lock').addEventListener('input', event => event.target.readOnly = true);
+    document.querySelector('#type').addEventListener('input', event => event.target.type = 'password');
+    Object.defineProperty(document.querySelector('#spoof'), 'value', { get() { return 'requested'; } });
+    document.querySelector('#spoof').addEventListener('input', event => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(event.target, 'rollback');
+    });
+    document.querySelector('#password').addEventListener('change', event => event.target.value = '');
+    function observe(element) {
+      for (const type of Object.keys(counts)) element.addEventListener(type, event => {
+        counts[type] += 1;
+        events.push({ type, target: element.id, trusted: event.isTrusted });
+        if (events.length > 4) events.shift();
+        show();
+      });
+    }
+    controls.forEach(observe);
+    document.querySelector('#child').addEventListener('load', () => {
+      const input = document.querySelector('#child').contentDocument.querySelector('input');
+      controls.push(input); observe(input); childReady = true; show();
+    }, { once: true });
+    show();
+  </script>
+</body>
+</html>

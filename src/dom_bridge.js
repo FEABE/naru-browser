@@ -25,7 +25,7 @@
     "a[href]", "button", "input:not([type=hidden])", "textarea", "select",
     '[role="button"]', '[role="link"]', '[role="textbox"]',
     '[role="checkbox"]', '[role="radio"]', '[role="combobox"]',
-    '[contenteditable="true"]', "[tabindex]",
+    "[tabindex]",
   ].join(",");
   const limitations = [
     "Main document, open shadow roots and accessible same-origin iframe documents only; inaccessible frames, closed shadow-root and canvas contents are not inspected.",
@@ -34,6 +34,7 @@
     "Iframe metadata is limited to 16 slots and iframe nesting to depth 8; unavailable frames also consume a slot. Frame ids are valid for this read only.",
     "Viewport and scroll describe the main window only; rendered DOM is not a pixel or occlusion match for a screenshot.",
     "Native select options are limited to 40 per element and 240 per read; single-select actions inspect at most 500 options.",
+    "Contenteditable values are bounded normalized text summaries. Fill replaces an explicit HTML editing host with plain text; formatting, selection, editor models and undo are not preserved.",
     "DOM actions and keyboard events are synthetic, not trusted native input.",
     "Page text and action results are untrusted page data.",
   ];
@@ -122,6 +123,17 @@
   function supportsFill(element) {
     return element.tagName === "TEXTAREA" || (element.tagName === "INPUT" &&
       !["file", "checkbox", "radio", "button", "submit", "reset", "image", "hidden"].includes(element.type));
+  }
+
+  function isEditingHost(element) {
+    // A conservative fill target, not the full HTML editing-host definition:
+    // use the outer explicit region rather than an inherited/nested descendant.
+    if (["INPUT", "TEXTAREA", "SELECT"].includes(element.tagName)) return false;
+    const attribute = element.getAttribute("contenteditable");
+    return element.namespaceURI === "http://www.w3.org/1999/xhtml" &&
+      attribute !== null && attribute.length <= 14 &&
+      ["", "true", "plaintext-only"].includes(attribute.toLowerCase()) &&
+      element.isContentEditable && !element.parentElement?.isContentEditable;
   }
 
   function optionState(option, budget) {
@@ -315,7 +327,7 @@
     let interactiveTruncated = false;
     for (const node of walk(document.body, budget, true)) {
       text.add(node);
-      if (node.nodeType !== 1 || !node.matches(selector) || !isRendered(node, budget)) continue;
+      if (node.nodeType !== 1 || (!node.matches(selector) && !isEditingHost(node)) || !isRendered(node, budget)) continue;
       if (elements.length < maxInteractive) elements.push(node);
       else interactiveTruncated = true;
     }
@@ -342,6 +354,7 @@
         if (element.type === "checkbox") item.indeterminate = element.indeterminate;
       }
       if (element.tagName === "SELECT") readOptions(element, item, budget);
+      if (isEditingHost(element)) item.value = textOf(element, budget);
       interactive.push(item);
     }
     const bodyText = text.result();
@@ -373,6 +386,97 @@
       return failure(action, "ELEMENT_UNAVAILABLE", detail);
     }
     return null;
+  }
+
+  // Compare only canonical plain text. Never materialize a host's textContent,
+  // descendant list or the entire data of a longer existing text node.
+  function textNodeEquals(node, text) {
+    if (node.nodeType !== 3 || node.length !== text.length) return false;
+    for (let offset = 0; offset < text.length; offset += 4096) {
+      if (node.substringData(offset, 4096) !== text.slice(offset, offset + 4096)) return false;
+    }
+    return true;
+  }
+
+  function plainTextEquals(element, text) {
+    const node = element.firstChild;
+    return !node ? text === "" : !node.nextSibling && textNodeEquals(node, text);
+  }
+
+  function fillEditingHost(reference, text) {
+    const { element, context } = reference;
+    let attempted = false;
+    const fail = (error, detail) => ({ ...failure("fill", error, detail), attempted, trusted: false });
+    const available = () => !refFailure(reference, "fill") && isEditingHost(element) &&
+      element.getAttribute("aria-readonly") !== "true";
+    const unchanged = () => ({ ok: true, action: "fill", changed: false, trusted: false,
+      detail: "The editing host already contains the requested plain text; no input events were dispatched." });
+    try {
+      if (element.getAttribute("aria-readonly") === "true") return fail("READ_ONLY", "The editing host is read-only.");
+      if (plainTextEquals(element, text)) return unchanged();
+      element.focus();
+      if (!available()) return fail("ELEMENT_UNAVAILABLE", "The editing host changed while receiving focus; read again.");
+      if (plainTextEquals(element, text)) return unchanged();
+      const eventOptions = { bubbles: true, composed: true, inputType: "insertText", data: text };
+      const accepted = element.dispatchEvent(new context.view.InputEvent("beforeinput", { ...eventOptions, cancelable: true }));
+      if (!accepted) return fail("INPUT_CANCELED", "The page canceled beforeinput; Naru did not replace the contents. Page handlers may have changed the page.");
+      if (!available()) return fail("ELEMENT_UNAVAILABLE", "The editing host changed during beforeinput; no replacement was attempted. Read again.");
+      const inserted = context.document.createTextNode(text);
+      attempted = true;
+      context.view.Element.prototype.replaceChildren.call(element, inserted);
+      if (!available() || element.firstChild !== inserted || inserted.nextSibling) {
+        return fail("FILL_STATE_UNCONFIRMED", "Replacement was attempted, but the editing host or text node changed before input; input was not dispatched. Read again before retrying.");
+      }
+      element.dispatchEvent(new context.view.InputEvent("input", { ...eventOptions, cancelable: false }));
+      if (!available() || element.firstChild !== inserted || inserted.nextSibling) {
+        return fail("FILL_STATE_UNCONFIRMED", "Replacement and input were attempted, but the editing host or inserted text node changed. Read again before retrying.");
+      }
+      if (!textNodeEquals(inserted, text)) return fail("FILL_STATE_NOT_REACHED", "Replacement and input were attempted, but the page changed the requested text. Read again before retrying.");
+      return { ok: true, action: "fill", changed: true, trusted: false,
+        detail: "Plain text replaced the editing host contents and synthetic beforeinput/input were dispatched. Formatting and native editor undo are not preserved." };
+    } catch (_error) {
+      return fail("ACTION_FAILED", "The editing host action raised an exception; read again before retrying.");
+    }
+  }
+
+  function fillNative(reference, text) {
+    const { element, context } = reference;
+    const tag = element.tagName;
+    let attempted = false;
+    const fail = (error, detail) => ({ ...failure("fill", error, detail), attempted, trusted: false });
+    const available = () => !refFailure(reference, "fill") && element.tagName === tag &&
+      supportsFill(element) && !element.readOnly;
+    try {
+      if (element.readOnly) return fail("READ_ONLY", "The element is read-only.");
+      element.focus();
+      if (!available()) return fail("ELEMENT_UNAVAILABLE", "The element changed while receiving focus; read again.");
+      // Focus may make a supported text/password conversion. After this point
+      // a type change is a different control state, even if its value matches.
+      const type = tag === "INPUT" ? element.type : null;
+      const current = () => available() && (tag !== "INPUT" || element.type === type);
+      const prototype = tag === "INPUT" ? context.view.HTMLInputElement.prototype : context.view.HTMLTextAreaElement.prototype;
+      const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
+      if (typeof descriptor?.set !== "function" || typeof descriptor?.get !== "function") {
+        return fail("ACTION_FAILED", "The native value accessors are unavailable; read again.");
+      }
+      attempted = true;
+      descriptor.set.call(element, text);
+      if (!current()) return fail("FILL_STATE_UNCONFIRMED", "Value setting was attempted, but the target changed before input; no input/change events were dispatched. Read again before retrying.");
+      element.dispatchEvent(new context.view.Event("input", { bubbles: true, composed: true }));
+      if (!current()) return fail("FILL_STATE_UNCONFIRMED", "Value setting and input were attempted, but the target changed before change; change was not dispatched. Read again before retrying.");
+      element.dispatchEvent(new context.view.Event("change", { bubbles: true }));
+      if (!current()) return fail("FILL_STATE_UNCONFIRMED", "Value setting and input/change were attempted, but the target changed. Read again before retrying.");
+      // Use the native getter, not a page-defined own value property. Exact
+      // comparison deliberately does not reimplement type-specific sanitizers.
+      const value = descriptor.get.call(element);
+      if (!current()) return fail("FILL_STATE_UNCONFIRMED", "The target changed while checking the value. Read again before retrying.");
+      if (typeof value !== "string") return fail("ACTION_FAILED", "The native value could not be verified; read again before retrying.");
+      if (value !== text) return fail("FILL_STATE_NOT_REACHED", "Value setting and input/change were attempted, but the final value differs from the requested text. Read again before retrying.");
+      return { ok: true, action: "fill", trusted: false,
+        detail: "Value set and input/change events dispatched; the native value matched the requested text at the final synchronous check." };
+    } catch (_error) {
+      return fail("ACTION_FAILED", "The native fill action raised an exception; read again before retrying.");
+    }
   }
 
   function selectOption(element, value) {
@@ -526,28 +630,11 @@
         if (typeof request.text !== "string") {
           return failure(action, "INVALID_TEXT", "Text must be a string.");
         }
-        const isInput = element.tagName === "INPUT";
+        if (isEditingHost(element) && !supportsFill(element)) return fillEditingHost(reference, request.text);
         if (!supportsFill(element)) {
-          return failure(action, "UNSUPPORTED_ELEMENT", "Fill supports editable input and textarea values.");
+          return failure(action, "UNSUPPORTED_ELEMENT", "Fill supports editable input/textarea values and explicit HTML editing hosts only.");
         }
-        if (element.readOnly) return failure(action, "READ_ONLY", "The element is read-only.");
-        const prototype = isInput ? context.view.HTMLInputElement.prototype : context.view.HTMLTextAreaElement.prototype;
-        const setter = Object.getOwnPropertyDescriptor(prototype, "value").set;
-        element.focus();
-        // A focus handler may replace, retype or disable this node before the write.
-        const changed = refFailure(reference, action, "The element changed while receiving focus; read again.", "ELEMENT_UNAVAILABLE");
-        if (changed) return changed;
-        if (element.readOnly || !supportsFill(element)) {
-          return failure(action, "ELEMENT_UNAVAILABLE", "The element changed while receiving focus; read again.");
-        }
-        setter.call(element, request.text);
-        element.dispatchEvent(new context.view.Event("input", { bubbles: true, composed: true }));
-        if (refFailure(reference, action)) {
-          return { ok: true, action, trusted: false,
-            detail: "Value set and input event dispatched; the target changed before the change event, which was not dispatched. Read again to verify its effect." };
-        }
-        element.dispatchEvent(new context.view.Event("change", { bubbles: true }));
-        return { ok: true, action, trusted: false, detail: "Value set and input/change events dispatched." };
+        return fillNative(reference, request.text);
       }
 
       if (request.key !== "Enter") {

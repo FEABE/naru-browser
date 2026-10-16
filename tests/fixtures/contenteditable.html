@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-src 'self' about:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Naru contenteditable fixture</title>
+  <style>
+    body { font: 16px system-ui; margin: 24px; color: #183832; background: #f2f7f5; }
+    [contenteditable], [role=textbox] { min-height: 24px; padding: 8px; margin: 8px; border: 1px solid #8ba69c; white-space: pre-wrap; }
+    iframe { width: 500px; height: 100px; } pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <h1>Plain text editing-host replacement</h1>
+  <p>Local synthetic beforeinput/input actions. Formatting, selection, native undo and application editor models are not preserved.</p>
+  <pre id="receipt"></pre>
+  <div id="normal" contenteditable aria-label="Normal editor"><b>old</b></div>
+  <div id="plain" contenteditable="plaintext-only" aria-label="Plain editor">old plain</div>
+  <div id="canonical" contenteditable="true" aria-label="Canonical editor">same</div>
+  <div id="empty" contenteditable="true" aria-label="Empty editor"></div>
+  <div id="readonly" contenteditable="true" aria-readonly="true" aria-label="Readonly editor">readonly</div>
+  <div id="cancel" contenteditable="true" aria-label="Canceled editor">old</div>
+  <div id="focus-replace" contenteditable="true" aria-label="Replace on focus">old</div>
+  <div id="focus-disable" contenteditable="true" aria-label="Disable on focus">old</div>
+  <div id="before-remove" contenteditable="true" aria-label="Remove on beforeinput">old</div>
+  <div id="before-readonly" contenteditable="true" aria-label="Readonly on beforeinput">old</div>
+  <div id="rollback" contenteditable="true" aria-label="Rollback on input">old</div>
+  <div id="rewrite" contenteditable="true" aria-label="Rewrite on input">old</div>
+  <div id="input-remove" contenteditable="true" aria-label="Remove on input">old</div>
+  <div contenteditable="true" aria-label="Outer editor">
+    <span id="inherited" role="textbox" aria-label="Inherited editor">inherited</span>
+    <span id="nested" contenteditable="true" role="textbox" aria-label="Nested editor">nested</span>
+  </div>
+  <div id="shadow-host"></div>
+  <iframe id="child" title="Same-origin editor" srcdoc="&lt;div id='frame' contenteditable='true' aria-label='Frame editor' style='min-height:30px'&gt;frame old&lt;/div&gt;"></iframe>
+  <button id="refresh" type="button">Refresh editor diagnostic</button>
+  <script>
+    const shadow = document.querySelector('#shadow-host').attachShadow({ mode: 'open' });
+    shadow.innerHTML = '<div id="shadow" contenteditable="true" aria-label="Shadow editor" style="min-height:30px">shadow old</div>';
+    const hosts = [...document.querySelectorAll('[id][contenteditable], [id][role=textbox]'), shadow.querySelector('#shadow')];
+    const counts = { beforeinput: 0, input: 0, change: 0 };
+    const focuses = {};
+    const events = [];
+    let childReady = false;
+    function show() {
+      const states = Object.fromEntries(hosts.map(host => [host.id, {
+        text: host.textContent, connected: host.isConnected, editable: host.isContentEditable,
+        readonly: host.getAttribute('aria-readonly') === 'true',
+        canonical: !host.firstChild || (host.childNodes.length === 1 && host.firstChild.nodeType === Node.TEXT_NODE),
+      }]));
+      const value = { states, counts, focuses, events, childReady,
+        hasFocus: document.hasFocus(), visibilityState: document.visibilityState };
+      document.querySelector('#receipt').textContent = `EDITOR_STATE_BEGIN ${encodeURIComponent(JSON.stringify(value))} EDITOR_STATE_END`;
+    }
+    document.querySelector('#cancel').addEventListener('beforeinput', event => event.preventDefault());
+    document.querySelector('#focus-replace').addEventListener('focus', event => event.target.replaceWith(event.target.cloneNode(true)), { once: true });
+    document.querySelector('#focus-disable').addEventListener('focus', event => event.target.contentEditable = 'false', { once: true });
+    document.querySelector('#before-remove').addEventListener('beforeinput', event => event.target.remove());
+    document.querySelector('#before-readonly').addEventListener('beforeinput', event => event.target.setAttribute('aria-readonly', 'true'));
+    document.querySelector('#rollback').addEventListener('input', event => event.target.firstChild.data = 'rollback');
+    document.querySelector('#rewrite').addEventListener('input', event => {
+      const bold = document.createElement('b');
+      bold.textContent = event.data;
+      event.target.replaceChildren(bold);
+    });
+    document.querySelector('#input-remove').addEventListener('input', event => event.target.remove());
+    function observe(host) {
+      host.addEventListener('focus', () => { focuses[host.id] = (focuses[host.id] || 0) + 1; show(); });
+      for (const type of Object.keys(counts)) host.addEventListener(type, event => {
+        counts[type] += 1;
+        events.push({ type, target: host.id, trusted: event.isTrusted, cancelable: event.cancelable,
+          composed: event.composed, data: event.data ?? null, inputType: event.inputType ?? null });
+        if (events.length > 4) events.shift();
+        show();
+      });
+    }
+    hosts.forEach(observe);
+    document.querySelector('#child').addEventListener('load', () => {
+      const host = document.querySelector('#child').contentDocument.querySelector('#frame');
+      hosts.push(host);
+      observe(host);
+      childReady = true;
+      show();
+    }, { once: true });
+    document.querySelector('#refresh').addEventListener('click', show);
+    show();
+  </script>
+</body>
+</html>

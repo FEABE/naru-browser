@@ -19,6 +19,7 @@ pub enum SearchResultId {
     Tab(i32),
     Bookmark(u64),
     History(u64),
+    Query(u64),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -69,6 +70,13 @@ pub fn combined_results<'a>(
     results
 }
 
+/// Keep internal matches first, reserving one of the existing result slots for
+/// an explicit navigation action. This does not issue a network request.
+pub fn append_query_result(results: &mut Vec<SearchResultId>, revision: u64) {
+    results.truncate(MAX_RESULTS - 1);
+    results.push(SearchResultId::Query(revision));
+}
+
 pub fn bounded_query(value: &str) -> String {
     value.chars().take(MAX_QUERY_CHARS).collect()
 }
@@ -116,14 +124,31 @@ pub struct SearchState {
     pub open: bool,
     pub mode: SearchMode,
     pub query: String,
+    pub query_overflow: bool,
+    pub revision: u64,
     pub selected: Option<SearchResultId>,
     pub confirm_clear: bool,
     pub notice: Option<String>,
 }
 
 impl SearchState {
+    pub fn open(&mut self, mode: SearchMode) {
+        if !self.open {
+            self.close();
+            self.open = true;
+        }
+        self.set_mode(mode);
+    }
+
+    pub fn close(&mut self) {
+        let revision = self.revision.saturating_add(1);
+        *self = Self::default();
+        self.revision = revision;
+    }
+
     pub fn set_mode(&mut self, mode: SearchMode) {
         if self.mode != mode {
+            self.revision = self.revision.saturating_add(1);
             self.mode = mode;
             self.selected = None;
             self.confirm_clear = false;
@@ -133,10 +158,31 @@ impl SearchState {
 
     pub fn set_query(&mut self, value: &str) {
         let query = bounded_query(value);
-        if self.query != query {
+        // A programmatic write of the bounded text must not turn a truncated
+        // address into an executable URL. Require a genuinely different edit.
+        let overflow = value.chars().nth(MAX_QUERY_CHARS).is_some()
+            || (self.query_overflow && self.query == query);
+        if self.query != query || self.query_overflow != overflow {
             self.query = query;
+            self.query_overflow = overflow;
+            self.revision = self.revision.saturating_add(1);
             self.selected = None;
+            self.notice = None;
         }
+    }
+
+    pub fn query_destination(
+        &self,
+    ) -> Result<Option<(String, crate::address::AddressKind)>, crate::address::AddressError> {
+        if !self.open
+            || self.mode != SearchMode::All
+            || self.query_overflow
+            || self.confirm_clear
+            || self.revision == u64::MAX
+        {
+            return Ok(None);
+        }
+        crate::address::resolve_with_kind(&self.query)
     }
 
     pub fn reconcile(&mut self, results: &[SearchResultId]) {
@@ -165,6 +211,132 @@ impl SearchState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_action_is_last_within_the_existing_budget_and_internal_matches_stay_first() {
+        use SearchResultId::{Query, Tab};
+        let mut results: Vec<_> = (1..=MAX_RESULTS as i32).map(Tab).collect();
+        append_query_result(&mut results, 9);
+        assert_eq!(results.len(), MAX_RESULTS);
+        assert_eq!(
+            results[..MAX_RESULTS - 1],
+            (1..MAX_RESULTS as i32).map(Tab).collect::<Vec<_>>()
+        );
+        assert_eq!(results.last(), Some(&Query(9)));
+
+        let mut state = SearchState::default();
+        state.reconcile(&results);
+        assert_eq!(state.selected, Some(Tab(1)));
+        state.selected = Some(Query(9));
+        let mut refreshed = vec![Tab(12)];
+        append_query_result(&mut refreshed, 9);
+        state.reconcile(&refreshed);
+        assert_eq!(state.selected, Some(Query(9)));
+        let mut empty = Vec::new();
+        append_query_result(&mut empty, 10);
+        state.reconcile(&empty);
+        assert_eq!(state.selected, Some(Query(10)));
+    }
+
+    #[test]
+    fn only_explicit_all_mode_queries_offer_resolved_addresses_or_searches() {
+        use crate::address::{AddressError, AddressKind};
+        let mut state = SearchState::default();
+        state.open(SearchMode::All);
+        assert_eq!(state.query_destination(), Ok(None));
+        for (query, kind) in [
+            ("example.test/path", AddressKind::Url),
+            ("https://www.google.com/search?q=direct", AddressKind::Url),
+            ("한글 검색", AddressKind::Search),
+            ("site:example.test", AddressKind::Search),
+        ] {
+            state.set_query(query);
+            let (url, actual_kind) = state.query_destination().unwrap().unwrap();
+            assert_eq!(actual_kind, kind);
+            assert_eq!(Some(url), crate::address::resolve(query).unwrap());
+        }
+        for (query, error) in [
+            ("file:///tmp/file", AddressError::UnsupportedScheme),
+            (
+                "https://name:secret@example.test/",
+                AddressError::Credentials,
+            ),
+            ("https://", AddressError::InvalidAddress),
+        ] {
+            state.set_query(query);
+            assert_eq!(state.query_destination(), Err(error));
+        }
+        state.set_query("unmatched search");
+        state.set_mode(SearchMode::History);
+        assert_eq!(state.query_destination(), Ok(None));
+        state.set_mode(SearchMode::All);
+        state.confirm_clear = true;
+        assert_eq!(state.query_destination(), Ok(None));
+        state.close();
+        assert_eq!(state.query_destination(), Ok(None));
+    }
+
+    #[test]
+    fn truncated_queries_require_a_different_edit_before_navigation_is_enabled() {
+        for raw in [
+            format!("https://example.test/{}", "a".repeat(MAX_QUERY_CHARS)),
+            "나".repeat(MAX_QUERY_CHARS + 1),
+        ] {
+            let mut state = SearchState::default();
+            state.open(SearchMode::All);
+            state.set_query(&raw);
+            assert!(state.query_overflow);
+            assert_eq!(state.query.chars().count(), MAX_QUERY_CHARS);
+            // The shortened text parses successfully; opening it would change
+            // the user's input rather than report the truncation.
+            assert!(crate::address::resolve(&state.query).unwrap().is_some());
+            assert_eq!(state.query_destination(), Ok(None));
+            let bounded = state.query.clone();
+            let revision = state.revision;
+            state.set_query(&bounded); // native/programmatic field writeback
+            assert!(state.query_overflow);
+            assert_eq!(state.revision, revision);
+            state.set_mode(SearchMode::History);
+            state.set_mode(SearchMode::All);
+            assert_eq!(state.query_destination(), Ok(None));
+            state.set_query("example.test/edited");
+            assert!(!state.query_overflow);
+            assert!(state.query_destination().unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn query_revision_survives_reopen_and_never_reuses_a_saturated_target() {
+        let mut state = SearchState::default();
+        state.open(SearchMode::All);
+        state.set_query("same input");
+        let first = state.revision;
+        state.set_query("same input");
+        assert_eq!(state.revision, first);
+        state.set_query("other input");
+        state.set_query("same input");
+        assert!(state.revision > first);
+        let before_mode = state.revision;
+        state.set_mode(SearchMode::History);
+        state.set_mode(SearchMode::All);
+        assert!(state.revision > before_mode);
+        let before_close = state.revision;
+        state.close();
+        state.open(SearchMode::All);
+        state.set_query("same input");
+        assert!(state.revision > before_close);
+        state.revision = u64::MAX - 1;
+        state.set_query("last edit");
+        assert_eq!(state.revision, u64::MAX);
+        assert_eq!(state.query_destination(), Ok(None));
+        state.close();
+        state.open(SearchMode::All);
+        state.set_query("same input");
+        assert_eq!(state.revision, u64::MAX);
+        assert_eq!(state.query_destination(), Ok(None));
+        state.reconcile(&[SearchResultId::Tab(7)]);
+        assert_eq!(state.selected, Some(SearchResultId::Tab(7)));
+    }
 
     #[test]
     fn visible_new_tab_alias_preserves_raw_matches_without_matching_ordinary_tabs() {

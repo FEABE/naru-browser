@@ -1,5 +1,63 @@
 # Naru 작업 기록
 
+## 2026-10-16, 검색 탐색과 입력 검증 변경의 커밋, 비공개 푸시 요청
+
+사용자가 커밋에 이어 푸시까지 요청했다. 이번 범위는 기존 미커밋 검색 탐색, 일반 입력값과 편집 영역 입력 검증, 배경 탭 실패 표시와 관련 문서, 검사 파일 19개를 `codex/navigation-readiness`에 커밋하고 기존 `origin`으로 푸시하는 작업이다. 새로운 제품 동작은 추가하지 않았다. 아래 두 작업 기록의 미커밋 표시는 각 구현 작업이 끝났을 당시 상태이며 이번 커밋 범위에 포함한다.
+
+GitHub에서 `FEABE/naru-browser`의 `isPrivate: true`를 확인했다. 원격 작업 브랜치와 로컬 HEAD는 작업 전 모두 `a1e97c775c04fc4eb4bf139f964234593868a2e8`이었다. 최초 원격 조회는 제한 환경의 DNS 접근 오류로 실패했고 네트워크 접근을 허용한 조회는 성공했다.
+
+현재 소스와 Cargo 파일, 기존 앱과 CLI, 모의 DOM 검사 파일의 SHA-256 34개가 직전 검증 기록과 모두 일치했다. 직전 Rust 단위 311개, 모의 DOM 88개 통과와 오프라인 컴파일, 기본 구성과 CLI 전용 구성 검사 결과를 확인했으며 이번에는 같은 검사를 재실행하지 않았다. `git diff --check`도 통과했다. 실제 Naru CEF 통합, 네이티브 검색 조작과 IME, 외부 사이트, 장시간 RAM 검증은 여전히 미실행이며 독립 Chromium 검사와 구분한다.
+
+이번 작업에서는 앱과 서버를 실행하거나 새 빌드를 만들지 않았다. 직전 임시 검사 target의 부재를 다시 확인했으며 기존 앱과 CLI는 변경하지 않았다. 빌드 산출물, 로컬 프로필과 검사 로그는 Git 제외 상태를 유지한다. 커밋과 푸시 후 실제 로컬, 원격 SHA 및 작업 트리 상태는 `artifacts/commit-push-search-fill-20261016.json`에 별도로 기록한다. 독립 브라우저 완성과 Preseller 내장 목표, 탭 복원 보류는 유지한다.
+
+## 2026-10-16, 통합 검색의 새 탐색과 일반 입력값 검증
+
+직전 목표 작업은 배경 탭 실패 표시와 편집 영역 입력의 구현, 단위·독립 Chromium 검증으로 진전이 있었다. 이번에는 Aside식 통합 검색에서 새 탐색으로 이어지는 흐름과 ego lite식 CLI 입력의 성공 판정을 보완했다. 기존 미커밋 변경을 보존했으며 새 커밋, 푸시와 배포는 하지 않았다. 독립 브라우저 전체와 Preseller 내장 목표는 계속 미완료다.
+
+`src/address.rs`는 기존 주소 해석을 `resolve_with_kind`로 공유하고 직접 입력한 주소와 생성한 Google 검색을 구별한다. 기존 resolve의 URL·오류 계약은 유지한다. `src/tab_search.rs`, `src/control_panel.rs`는 내부 결과 아래에 주소 열기 또는 Google 검색 행을 추가한다. 내부 결과를 우선하며 새 행을 포함해 40개, 입력 200자 상한을 유지한다. 초과 입력이 잘렸다면 같은 bounded 문자열 재통지나 모드 왕복으로 새 탐색을 다시 허용하지 않는다. 입력 중에는 외부 요청을 보내지 않는다.
+
+명시적 행 실행은 검색 세대, 실제 필드 문자열과 IME, 모드·선택·표시 공간·창·오버레이를 재확인하고 `src/browser.rs::open_search_url → open_saved_user_url`의 기존 사용자 탭 재사용과 배경 준비 경로로 보낸다. 성공한 경우만 내 공간을 선택하고 검색을 닫는다. AI 작업의 상태와 revision은 바꾸지 않으며 동일 검색의 실패만 안내하고 사용자가 바꾼 새 검색을 덮어쓰지 않는다. 리뷰에서 History만 있던 정확한 URL의 Query를 클릭하면 새 탭에 의한 중복 제거가 선택을 바꿔 정상 생성까지 취소하는 P2를 찾았다. 네이티브 검증 뒤 클릭한 Query를 실행 선택으로 고정하고, 실제 combined_results와 reconcile을 사용하는 History→Tab→History 회귀를 추가했다. 이 결함은 호출 흐름으로 발견했으며 수정 전 앱 재현이나 red 테스트를 실행한 결과는 아니다.
+
+`src/dom_bridge.js`의 일반 input과 textarea fill은 focus, native setter, input과 change 순서를 유지하면서 단계 사이 대상·프레임·문서·참조 세대·입력 종류와 편집 조건을 확인한다. 마지막 원문서 프로토타입 value getter가 요청 문자열과 정확히 일치할 때만 성공한다. 정규화와 페이지의 값 되돌림은 FILL_STATE_NOT_REACHED, 대상 변경은 FILL_STATE_UNCONFIRMED로 구분한다. 요청값과 실제 값, 페이지 예외는 오류에 넣지 않고 기존 Rust fill 오류의 attempted와 trusted boolean 두 개를 사용한다. CRLF 같은 정규화도 엄격한 원문 비교에서는 미도달이다. 새 beforeinput과 이벤트 없는 무동작, 자동 재시도는 추가하지 않았다.
+
+검증은 다음과 같이 구분한다.
+
+- 최종 Rust 단위 311개가 전부 통과했다. 이번 검색의 상태·UI 실행 경계 회귀 7개와 주소 분류 회귀 1개를 포함한다. 오프라인 잠금 의존성 컴파일, 기본 구성과 CLI 전용 구성의 전체 타깃 검사, format도 통과했다. v1 컴파일 뒤 독립 리뷰에서 위 P2를 찾아 같은 격리 target을 재사용해 v2를 다시 컴파일했다. v1 단위 실행은 하지 않았고, 최종 v2에서 방출된 실행 파일의 identity를 확인해 단위 검사만 소켓 허용 환경에서 실행했다. 이전 작업에서 확인한 제한 환경의 Unix socket 오류를 이번에 반복하지 않았다. `artifacts/search-fill-v1-check.json`, `search-fill-v2-check.json`, `search-fill-v2-rust-tests.json`이 근거다. CEF 엔진과 AppKit 입력을 실행한 검사는 아니다.
+- 모의 DOM은 새 회귀 7개를 추가했다. 수정 전에는 새 회귀 1개 통과·6개 실패와 기존 81개 skip을 기록했고, 수정 후 전체 88개가 통과했다. 원본 로그와 소스 해시는 `artifacts/native-fill-v1-dom-before.*`, `native-fill-v1-dom-tests.*`에 있다. 값 정규화 모형, 핸들러 되돌림과 대상 변경, native getter 우회와 오류의 값 비노출을 검사했다.
+- 독립 ego lite Chromium 152의 자체 공간 6에서 수정 전 23사례를 관찰해 값 미달이나 대상 제거 뒤에도 성공으로 반환하는 13사례를 재현했다. 최종 bridge SHA-256 `c35038156a25a24939444c06208cfc73f6540810aff8bad05921e5648f61af7e`는 별도 36개 검사를 모두 통과했다. main world의 fixture와 isolated world의 bridge, 페이지 단위 포커스 에뮬레이션을 사용했다. 숫자·날짜·문자열 정규화, input/change 되돌림, 대상·타입·상태 변경, own getter, Shadow DOM과 같은 출처 iframe, 문서 교체, 가상 비밀번호 오류를 확인했다. `artifacts/native-fill-v1-baseline-probe.json`, `native-fill-v1-final-probe.json`, `native-fill-v1-summary.json`이 근거다. Naru CEF나 물리 입력의 검증으로 확대하지 않는다.
+- `tests/fixtures/native_fill.html`, `tests/native_fill_smoke.py`는 실제 Naru용 후속 검사를 위해 추가했으며 실행하지 않았다. AST와 inline JavaScript 구문 검사만 통과했다. 읽기 리뷰에서 Python dict 비교가 1/0도 boolean처럼 통과시키는 문제를 찾아 키 집합과 is 검사로 수정하고 AST를 다시 확인했다. `artifacts/native-fill-v1-fixture-syntax.json`, `native-fill-v1-smoke-static-v2.json`에 이전과 최종 해시를 구분했다. 검색 P2 수정의 독립 읽기 재검토에서는 추가 확정 결함을 발견하지 못했다.
+- 최신 Naru의 검색 행 클릭·Enter·실제 탭 생성과 실패, IME·주소 초안·AI 선택 보존, 실제 CEF fill 전달, 외부 사이트와 장시간 RAM은 미검증이다. 앱 번들·release 실행 파일과 서명을 새로 만들거나 Naru를 실행하지 않았으며 키체인과 사용자 프로필에 접근하거나 승인 질문을 하지 않았다. 네이티브 windowed 탭에 windowless 전용 WasHidden API가 없다는 이유로 결함을 단정하거나 자동 폐기를 추가하지 않았다. 재시작 탭 복원과 확대의 보류도 유지한다.
+
+README, 아키텍처와 제품 계획, 메모리 문서와 편집 영역 계약을 갱신하고 `docs/search-navigation.md`, `docs/native-fill-control.md`를 추가했다. 새 웹 UI renderer, 상주 worker, 타이머와 저장소는 없다. 일반 value 확인은 페이지의 실제 문자열을 임시로 읽으므로 큰 값의 읽기 비용까지 없애거나 전체 RAM을 절감했다고 설명하지 않는다.
+
+ego 검사 공간은 포커스 에뮬레이션을 해제한 뒤 finish를 정확히 한 번 호출했다. 실제 응답의 closedSpace true, closedManagedLabels p1, preservedUnmanagedCount 0을 `artifacts/native-fill-v1-cleanup.json`에 보존했다. 새 HTTP 서버를 실행하지 않았고 기존 사용자 페이지는 조작하지 않았다. Cargo 세션 12586, 42924와 단위 세션 62866의 exit 0을 확인한 뒤 정확한 `target/.search-fill-test-j9qqwlki`만 제거했다. 파일 2,353개·크기 합계 1,647,449,390바이트·symlink 0개와 폴더 identity를 확인했으며 소스·Cargo와 기존 앱·CLI 해시는 정리 전후 같았다. `artifacts/search-fill-v2-cleanup.json`, `search-fill-v2-processes.json`이 근거다. 파일 크기 합계는 물리 디스크 회수량이나 RAM 감소량이 아니다.
+
+최종 diff 공백 검사와 변경 문서의 로컬 링크 97개 존재 검사를 통과했다. 현재 src·Cargo와 기존 앱·CLI는 최종 Rust 검증 해시와 같고, DOM 소스와 모의 검사 파일도 실행 당시 해시와 같았다. 임시 target의 부재를 다시 확인했다. 근거는 `artifacts/search-fill-v2-final-static.json`이다.
+
+## 2026-10-16, 편집 영역 입력과 배경 탭 실패 표시
+
+직전 작업은 검증한 변경을 `a1e97c7`로 커밋하고 비공개 원격 SHA 일치를 확인한 진전이다. 활성 목표를 이어 Aside의 일상 사용성과 ego lite의 AI 폼 제어 공백 두 가지를 보완했다. 독립 브라우저 전체와 Preseller 내장은 여전히 미완료다. 이번 추가 변경은 별도 미커밋 상태이며 커밋, 푸시와 배포는 하지 않았다.
+
+`src/control_panel.rs`는 기존 탭 행의 갱신 비교, 아이콘, 툴팁과 접근성 문구에 `ShellTab.failure`를 연결한다. 같은 공간의 배경 탭이 실패해도 표시하고, 실패 아이콘을 우선하되 AI 작업과 로딩, 음소거 설명을 함께 유지한다. 복구 중 오래된 renderer 종료 기록을 계속 표시하지 않도록 현재 탐색 상태가 투영한 failure만 사용한다. 기존 컨트롤을 재사용하며 선택, 제어권과 재시도 동작은 바꾸지 않는다. 실패만 바뀐 행의 갱신과 복구, 표시 우선순위, 복합 상태 문구 회귀 3개를 추가했다.
+
+`src/dom_bridge.js`는 기존 fill을 명시적 HTML contenteditable 영역의 전체 텍스트 교체로 확장한다. 빈 속성과 plaintext-only도 관찰한다. 단순 텍스트가 이미 같은 경우를 제외하고 focus, 가용성 재검사, 취소 가능한 beforeinput, 텍스트 교체, input 순서로 실행한다. 각 단계의 참조와 문서, 편집 조건을 확인하고 페이지가 교체 결과를 바꾸면 미확정과 불일치를 구분한다. HTML 문자열은 문자 그대로 넣으며 서식과 임의 편집기 모델, Selection과 undo를 보존하는 기능은 아니다. Naru의 부모 비편집 조건은 지원 정책이며 HTML 표준의 editing host 정의로 단정하지 않는다.
+
+`src/browser.rs`는 원래 fill 요청과 반환 action이 일치할 때만 attempted와 trusted boolean 두 개를 오류 상세에 전달한다. 기존 check의 네 boolean 제한과 취소 후 outcomeUnknown, 늦은 응답 차단을 유지한다. 오류 상세와 취소 회귀를 두 요청으로 확장했다. `src/cli.rs` 도움말, README, 아키텍처와 제품 계획, 메모리 문서, 새 `docs/contenteditable-control.md`에 계약을 반영했다. 아키텍처 표에서 이미 구현된 본문 입력 인계를 미구현으로 적던 항목도 실제 mac 이벤트 호출과 본문의 기존 설명에 맞췄다.
+
+검증 결과는 다음과 같이 구분한다.
+
+- Rust의 오프라인 잠금 의존성 단위 실행 파일 컴파일, 기본 구성과 CLI 전용 구성의 전체 타깃 검사, format이 통과했다. 최초 단위 실행은 300개 통과와 기존 Unix socket bind 권한 오류 3개 실패였다. 원본을 보존하고 같은 emitted 바이너리만 소켓 접근이 가능한 환경에서 실행해 303개 전부 통과했다. 컴파일과 실행 전후 소스와 기존 앱, CLI 해시가 같았다. `artifacts/editing-status-v1-check.json`, `editing-status-v1-rust-tests.json`, `editing-status-v1-rust-tests-escalated.json`이 근거다. 실제 CEF 엔진이나 AppKit 입력을 실행한 검사는 아니다.
+- 모의 DOM은 기존 70개와 새 11개, 총 81개가 통과했다. 최초 성공은 도구 출력만 남아 동일 소스로 한 번 재실행해 원본 로그와 해시를 보존했다. `artifacts/contenteditable-v1-dom-tests.log`, 같은 이름의 JSON에 근거를 남겼다. 전체 textContent 조회 없이 기존 읽기 예산과 4,096 단위 이하의 텍스트 비교를 사용하고, 입력 취소와 단계별 대상 변경, 불일치, iframe 문맥을 검사했다.
+- ego lite의 자체 공간 5에 격리된 JavaScript 환경을 만들고 현재 bridge SHA-256 `f9a9e98cfcb13929a786184d3f69ddeb2941c023bbaf8d2434a6f3b98faa66c9`를 주입했다. Chromium 152의 본 검사 26개 중 25개가 통과했고, 중첩 요소에 ref가 있을 것이라는 검사 가정 한 개가 실패했다. 원본을 보존하고 무tabindex 중첩 요소의 관찰 제외와 tabindex가 있는 ref의 fill 거절을 나눠 검사해 후속 2개가 통과했다. 제품 코드를 검사 가정에 맞춰 바꾸지 않았다. 일반 입력과 textarea 회귀, 열린 Shadow DOM과 같은 출처 iframe, focus와 beforeinput 중 문서 교체도 확인했다. iframe 교체는 동기 document.open/write/close fixture이며 원격 탐색 경합 검증은 아니다. 본 검사에는 페이지 단위 포커스 에뮬레이션을 사용했다. `artifacts/contenteditable-summary.json`, `contenteditable-final-probe.json`, `contenteditable-nested-probe.json`이 근거다. 최신 Naru CEF 연결이나 물리 입력 증거로 확대하지 않는다.
+- `tests/fixtures/contenteditable.html`, `tests/contenteditable_smoke.py`는 후속 로컬 CEF 검사를 위해 추가했다. 기존 CLI와 HTTP fixture 도우미를 재사용하고 자체 작업과 탭의 정리, 사용자 선택 보존을 검사하도록 작성했다. Python AST와 inline JavaScript 구문 검사는 통과했지만 실제 CLI smoke는 실행하지 않았다. 근거는 `artifacts/contenteditable-v1-fixture-syntax.json`이다. 독립 읽기 리뷰에서 DOM 계약, Rust 오류 전달, fixture와 정리에 추가 확정 차단 결함은 발견하지 못했다.
+- 최신 Naru의 배경 실패 표시와 접근성, 실제 CEF fill 전달, 외부 편집기, 물리적 IME 입력과 장시간 RAM은 미검증이다. 앱 번들, release 바이너리와 서명을 새로 만들거나 Naru를 실행하지 않았으며 키체인이나 사용자 프로필에 접근하지 않았다. 기존 input과 textarea의 합성 값 설정 경로는 유지한다. 탭 복원과 페이지 확대 보류도 유지한다.
+
+독립 Chromium 검사는 포커스 에뮬레이션을 해제하고 공간 5에 finish를 정확히 한 번 호출해 정리했다. `artifacts/contenteditable-cleanup.json`에 기록했다. 최초 공간 생성 뒤 상대 경로로 로그를 쓰던 단계만 실패했고, 생성된 공간을 확인해 그대로 재사용했다. 새 로컬 서버는 만들지 않았고 기존 사용자 페이지를 조작하지 않았다.
+
+검사 프로세스와 세션의 종료를 확인하고 격리 `target/.editing-status-test-q414jzec`만 제거했다. 삭제 전 identity와 파일 2,060개, 합계 1,476,949,211바이트, symlink 0개를 확인했다. 제한 환경에서 ps 조회가 차단됐을 때는 삭제하지 않았고, 지정 검사 PID 세 개의 부재를 별도 조회한 뒤 정리했다. 정리 전후 소스와 Cargo 파일, 기존 앱과 CLI 해시는 같고 해당 임시 폴더의 부재를 확인했다. 근거는 `artifacts/editing-status-v1-cleanup.json`, `editing-status-v1-processes.json`이다. 이 파일 크기 합계는 물리 디스크 회수량이나 RAM 절감량이 아니다. 기존 사용자 프로필과 탭은 보존했다.
+
+최종 `git diff --check`와 변경 문서의 로컬 링크 85개 존재 검사를 통과했다. 현재 소스와 기존 앱, CLI 해시가 검증 기록과 일치하고 임시 target이 없는 것을 재확인했다. 근거는 `artifacts/editing-status-v1-final-static.json`이다.
+
 ## 2026-10-16, 검색 키와 요청 큐 보호 검증, 커밋과 비공개 푸시 요청
 
 사용자가 커밋에 이어 푸시까지 요청했다. 기존 미커밋 자동 스크롤과 CLI check, 이번 검색 키 처리와 요청 큐 보호를 관련 문서와 함께 커밋하는 범위로 고정했다. GitHub에서 `FEABE/naru-browser`의 `isPrivate: true`를 확인했고, `origin`의 `codex/navigation-readiness`는 작업 전 로컬 HEAD와 같은 `b512838a1397a0ef4519a130300ab0b2ae294665`였다. 최초 GitHub 조회는 네트워크 제한으로 실패했고 네트워크 접근을 허용한 조회는 성공했다. 기본 브랜치나 배포 설정은 변경하지 않는다. 앞선 기록의 미커밋 표시는 당시 상태이며 이번 커밋 범위에 포함한다.

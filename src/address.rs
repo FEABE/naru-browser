@@ -26,9 +26,21 @@ impl fmt::Display for AddressError {
 
 impl std::error::Error for AddressError {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AddressKind {
+    Url,
+    Search,
+}
+
 /// Empty input does nothing. A recognizable host opens directly; other plain
 /// text becomes a Google search. Schemes and credentials never become searches.
 pub fn resolve(input: &str) -> Result<Option<String>, AddressError> {
+    resolve_with_kind(input).map(|target| target.map(|(url, _)| url))
+}
+
+/// Keep the original input's classification. A directly entered Google search
+/// URL is still an address; its generated URL alone cannot reveal the intent.
+pub fn resolve_with_kind(input: &str) -> Result<Option<(String, AddressKind)>, AddressError> {
     let value = input.trim();
     if value.is_empty() {
         return Ok(None);
@@ -56,12 +68,12 @@ pub fn resolve(input: &str) -> Result<Option<String>, AddressError> {
                 .iter()
                 .any(|supported| operator.eq_ignore_ascii_case(supported))
     }) {
-        return search(value).map(Some);
+        return search(value).map(|url| Some((url, AddressKind::Search)));
     }
 
     if let Some((scheme, _)) = value.split_once("://") {
         if scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http") {
-            return normalize_url(value).map(Some);
+            return normalize_url(value).map(|url| Some((url, AddressKind::Url)));
         }
         if is_scheme(scheme) {
             return Err(AddressError::UnsupportedScheme);
@@ -75,7 +87,8 @@ pub fn resolve(input: &str) -> Result<Option<String>, AddressError> {
         let local = host.eq_ignore_ascii_case("localhost")
             || host.parse::<std::net::Ipv4Addr>().is_ok()
             || authority.starts_with('[');
-        return web_url(if local { "http" } else { "https" }, value).map(Some);
+        return web_url(if local { "http" } else { "https" }, value)
+            .map(|url| Some((url, AddressKind::Url)));
     }
 
     if value
@@ -85,7 +98,7 @@ pub fn resolve(input: &str) -> Result<Option<String>, AddressError> {
         return Err(AddressError::UnsupportedScheme);
     }
 
-    search(value).map(Some)
+    search(value).map(|url| Some((url, AddressKind::Search)))
 }
 
 /// Normalize an explicit HTTP(S) URL without host completion or search fallback.
@@ -237,6 +250,34 @@ fn bounded(url: String) -> Result<String, AddressError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_kind_distinguishes_generated_search_from_direct_provider_urls() {
+        for input in ["한글 검색", "site:example.test naru", "intitle:Naru"] {
+            let (url, kind) = resolve_with_kind(input).unwrap().unwrap();
+            assert_eq!(kind, AddressKind::Search);
+            assert_eq!(resolve(input).unwrap(), Some(url));
+        }
+        for input in [
+            "https://www.google.com/search?q=naru",
+            "www.google.com/search?q=naru",
+            "localhost:8080/search?q=naru",
+            "https://example.test/",
+        ] {
+            let (url, kind) = resolve_with_kind(input).unwrap().unwrap();
+            assert_eq!(kind, AddressKind::Url);
+            assert_eq!(resolve(input).unwrap(), Some(url));
+        }
+        assert_eq!(resolve_with_kind("   ").unwrap(), None);
+        assert_eq!(
+            resolve_with_kind("javascript:alert(1)"),
+            Err(AddressError::UnsupportedScheme)
+        );
+        assert_eq!(
+            resolve_with_kind("https://name:password@example.test"),
+            Err(AddressError::Credentials)
+        );
+    }
 
     fn resolved(value: &str) -> String {
         resolve(value).unwrap().unwrap()

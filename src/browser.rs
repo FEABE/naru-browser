@@ -522,9 +522,40 @@ impl Tab {
     }
 }
 #[derive(Clone, Copy)]
+enum ActionEvidence {
+    Check,
+    Fill,
+}
+
+impl ActionEvidence {
+    fn for_command(command: &Command) -> Option<Self> {
+        match command {
+            Command::Check { .. } => Some(Self::Check),
+            Command::Fill { .. } => Some(Self::Fill),
+            _ => None,
+        }
+    }
+
+    fn fields(self, value: &Json) -> &'static [&'static str] {
+        match self {
+            Self::Check if value["action"] == "check" => {
+                &["attempted", "trusted", "checked", "indeterminate"]
+            }
+            Self::Fill if value["action"] == "fill" => &["attempted", "trusted"],
+            _ => &[],
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 enum Evaluation {
-    Page { mutation: bool, check: bool },
-    ReadyState { token: u64 },
+    Page {
+        mutation: bool,
+        evidence: Option<ActionEvidence>,
+    },
+    ReadyState {
+        token: u64,
+    },
 }
 enum Step {
     Frame(String),
@@ -2264,6 +2295,12 @@ pub(crate) fn open_history_url(url: &str, still_current: impl Fn() -> bool) -> R
     open_saved_user_url(url, still_current)
 }
 
+/// Explicit native search submission shares user-tab reuse and staging. The
+/// caller guards the query revision; merely typing never reaches this path.
+pub(crate) fn open_search_url(url: &str, still_current: impl Fn() -> bool) -> Result<(), String> {
+    open_saved_user_url(url, still_current)
+}
+
 fn user_open_selection(state: &State) -> (String, Option<i32>, bool) {
     (
         state.spaces.active_space().to_owned(),
@@ -2324,8 +2361,8 @@ fn open_saved_user_url(url: &str, still_current: impl Fn() -> bool) -> Result<()
     if !still_current() {
         return Err("열려는 항목이 더 이상 없습니다.".into());
     }
-    // Saved URLs stage in the background too, so a failed attachment or a
-    // history clear during CEF creation preserves the original selection.
+    // Saved URLs and explicit search submissions stage in the background, so
+    // a failed attachment or changed source preserves the original selection.
     let browser = create_user_staging(&url)
         .ok_or_else(|| "주소를 열 새 탭을 만들 수 없습니다.".to_owned())?;
     let tab = browser.identifier();
@@ -3680,7 +3717,7 @@ fn handle(command: &Command, reply: Reply) {
                             epoch: 0,
                             evaluation: Evaluation::Page {
                                 mutation: false,
-                                check: false,
+                                evidence: None,
                             },
                             reply,
                             step: Step::Screenshot(path.clone()),
@@ -3784,7 +3821,7 @@ fn handle(command: &Command, reply: Reply) {
                             epoch,
                             evaluation: Evaluation::Page {
                                 mutation: !matches!(other, Command::Read { .. }),
-                                check: matches!(other, Command::Check { .. }),
+                                evidence: ActionEvidence::for_command(other),
                             },
                             reply,
                             step: Step::Frame(expression),
@@ -4312,12 +4349,14 @@ fn devtools_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) {
                     .as_str()
                     .unwrap_or("The page action did not complete.");
                 let mut details = serde_json::Map::new();
-                if matches!(pending.evaluation, Evaluation::Page { check: true, .. })
-                    && value["action"] == "check"
+                if let Evaluation::Page {
+                    evidence: Some(evidence),
+                    ..
+                } = pending.evaluation
                 {
-                    // A failed click may already have changed the page. Keep
-                    // only bounded boolean evidence for this requested action.
-                    for key in ["attempted", "trusted", "checked", "indeterminate"] {
+                    // A failed action may already have changed the page. Keep
+                    // only bounded boolean evidence for its original request kind.
+                    for &key in evidence.fields(&value) {
                         if let Some(value) = value[key].as_bool() {
                             details.insert(key.into(), Json::Bool(value));
                         }
@@ -7041,7 +7080,7 @@ mod tests {
                         step,
                         evaluation: Evaluation::Page {
                             mutation,
-                            check: false,
+                            evidence: None,
                         },
                     },
                 )
@@ -8287,7 +8326,7 @@ mod tests {
                         step,
                         evaluation: Evaluation::Page {
                             mutation: true,
-                            check: false,
+                            evidence: None,
                         },
                     },
                 )
@@ -8741,10 +8780,10 @@ mod tests {
     }
 
     #[test]
-    fn check_failures_forward_only_boolean_details_for_the_requested_action() {
-        for (requested_check, action, fields, expected) in [
+    fn action_failures_forward_only_boolean_details_for_the_requested_action() {
+        for (requested_evidence, action, fields, expected) in [
             (
-                true,
+                Some(ActionEvidence::Check),
                 "check",
                 json!({"attempted":true,"trusted":false,"checked":false,"indeterminate":true,"pageText":"excluded"}),
                 Some(
@@ -8752,7 +8791,7 @@ mod tests {
                 ),
             ),
             (
-                true,
+                Some(ActionEvidence::Check),
                 "check",
                 json!({"attempted":false,"trusted":false,"checked":true,"indeterminate":false}),
                 Some(
@@ -8760,19 +8799,55 @@ mod tests {
                 ),
             ),
             (
-                true,
+                Some(ActionEvidence::Check),
                 "check",
                 json!({"attempted":true,"trusted":"false","checked":null,"indeterminate":[]} ),
                 Some(json!({"attempted":true})),
             ),
             (
-                true,
+                Some(ActionEvidence::Check),
                 "check",
                 json!({"attempted":1,"trusted":"false","checked":null,"indeterminate":{}}),
                 None,
             ),
-            (true, "click", json!({"attempted":true}), None),
-            (false, "check", json!({"attempted":true}), None),
+            (
+                Some(ActionEvidence::Check),
+                "click",
+                json!({"attempted":true}),
+                None,
+            ),
+            (None, "check", json!({"attempted":true}), None),
+            (
+                Some(ActionEvidence::Fill),
+                "fill",
+                json!({"attempted":true,"trusted":false,"checked":false,"changed":true,"text":"excluded","unknown":{"body":"excluded"}}),
+                Some(json!({"attempted":true,"trusted":false})),
+            ),
+            (
+                Some(ActionEvidence::Fill),
+                "fill",
+                json!({"attempted":false,"trusted":false}),
+                Some(json!({"attempted":false,"trusted":false})),
+            ),
+            (
+                Some(ActionEvidence::Fill),
+                "fill",
+                json!({"attempted":"true","trusted":1,"text":"excluded"}),
+                None,
+            ),
+            (
+                Some(ActionEvidence::Fill),
+                "check",
+                json!({"attempted":true}),
+                None,
+            ),
+            (
+                Some(ActionEvidence::Check),
+                "fill",
+                json!({"attempted":true}),
+                None,
+            ),
+            (None, "fill", json!({"attempted":true}), None),
         ] {
             clear();
             let tab = native_blank_tab();
@@ -8787,7 +8862,7 @@ mod tests {
                         epoch: tab.navigation.epoch,
                         evaluation: Evaluation::Page {
                             mutation: true,
-                            check: requested_check,
+                            evidence: requested_evidence,
                         },
                         reply,
                         step: Step::Evaluate,
@@ -8798,13 +8873,18 @@ mod tests {
             let mut value = fields;
             value["ok"] = json!(false);
             value["action"] = json!(action);
-            value["error"] = json!("CHECK_STATE_NOT_REACHED");
+            let code = if action == "fill" {
+                "FILL_STATE_UNCONFIRMED"
+            } else {
+                "CHECK_STATE_NOT_REACHED"
+            };
+            value["error"] = json!(code);
             value["detail"] = json!("Read again before retrying.");
             let bytes = serde_json::to_vec(&json!({"result":{"value":value}})).unwrap();
             devtools_result(&browser, 42, true, &bytes);
             let response = receiver.try_recv().unwrap();
             let wire = serde_json::to_value(response).unwrap();
-            assert_eq!(wire["error"]["code"], "CHECK_STATE_NOT_REACHED");
+            assert_eq!(wire["error"]["code"], code);
             assert_eq!(wire["error"].get("details"), expected.as_ref());
             // A repeated native callback cannot send a second action result.
             devtools_result(&browser, 42, true, &bytes);
@@ -8814,45 +8894,50 @@ mod tests {
     }
 
     #[test]
-    fn canceled_check_keeps_unknown_outcome_and_ignores_late_boolean_details() {
-        clear();
-        let tab = native_blank_tab();
-        let browser = tab.browser.clone();
-        let (mut reply, receiver) = test_reply(1);
-        reply.scope = Some(TaskScope {
-            task: "check-task".into(),
-            revision: 1,
-        });
-        STATE.with(|state| {
-            let mut state = state.borrow_mut();
-            state.pending.insert(
-                42,
-                Pending {
-                    tab: 7,
-                    epoch: tab.navigation.epoch,
-                    evaluation: Evaluation::Page {
-                        mutation: true,
-                        check: true,
+    fn canceled_actions_keep_unknown_outcome_and_ignore_late_boolean_details() {
+        for (evidence, action) in [
+            (ActionEvidence::Check, "check"),
+            (ActionEvidence::Fill, "fill"),
+        ] {
+            clear();
+            let tab = native_blank_tab();
+            let browser = tab.browser.clone();
+            let (mut reply, receiver) = test_reply(1);
+            reply.scope = Some(TaskScope {
+                task: "check-task".into(),
+                revision: 1,
+            });
+            STATE.with(|state| {
+                let mut state = state.borrow_mut();
+                state.pending.insert(
+                    42,
+                    Pending {
+                        tab: 7,
+                        epoch: tab.navigation.epoch,
+                        evaluation: Evaluation::Page {
+                            mutation: true,
+                            evidence: Some(evidence),
+                        },
+                        reply,
+                        step: Step::Evaluate,
                     },
-                    reply,
-                    step: Step::Evaluate,
-                },
-            );
-            state.tabs.insert(7, tab);
-        });
-        revoke_task_requests("check-task", None);
-        let error = receiver.try_recv().unwrap().error.unwrap();
-        assert_eq!(error.code, "TASK_CONTROL_LOST");
-        assert_eq!(error.details.unwrap()["outcomeUnknown"], true);
-        devtools_result(
+                );
+                state.tabs.insert(7, tab);
+            });
+            revoke_task_requests("check-task", None);
+            let error = receiver.try_recv().unwrap().error.unwrap();
+            assert_eq!(error.code, "TASK_CONTROL_LOST");
+            assert_eq!(error.details.unwrap()["outcomeUnknown"], true);
+            devtools_result(
             &browser,
             42,
             true,
-            br#"{"result":{"value":{"ok":false,"action":"check","attempted":true,"trusted":false}}}"#,
+            &serde_json::to_vec(&json!({"result":{"value":{"ok":false,"action":action,"attempted":true,"trusted":false}}})).unwrap(),
         );
-        assert!(receiver.try_recv().is_err());
-        STATE.with(|state| assert!(state.borrow().pending.is_empty()));
-        clear();
+            assert!(receiver.try_recv().is_err());
+            STATE.with(|state| assert!(state.borrow().pending.is_empty()));
+            clear();
+        }
     }
 
     #[test]
@@ -8944,7 +9029,7 @@ mod tests {
                         epoch: 0,
                         evaluation: Evaluation::Page {
                             mutation: false,
-                            check: false,
+                            evidence: None,
                         },
                         reply,
                         step: Step::Screenshot("unused.png".into()),
@@ -8994,7 +9079,7 @@ mod tests {
                         reply,
                         evaluation: Evaluation::Page {
                             mutation: true,
-                            check: false,
+                            evidence: None,
                         },
                         step,
                     },
@@ -9096,7 +9181,7 @@ mod tests {
                         reply,
                         evaluation: Evaluation::Page {
                             mutation: false,
-                            check: false,
+                            evidence: None,
                         },
                         step: Step::Evaluate,
                     },
@@ -9148,7 +9233,7 @@ mod tests {
                     reply: action_reply,
                     evaluation: Evaluation::Page {
                         mutation: true,
-                        check: false,
+                        evidence: None,
                     },
                     step: Step::Evaluate,
                 },

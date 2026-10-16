@@ -90,6 +90,7 @@ function fixture() {
     constructor(tagName, attributes = {}) {
       super(1);
       this.tagName = tagName;
+      this.namespaceURI = "http://www.w3.org/1999/xhtml";
       this.attributes = { ...attributes };
       this.type = attributes.type || "text";
       this.events = [];
@@ -104,6 +105,18 @@ function fixture() {
     set id(value) { this.setAttribute("id", value); }
     get innerText() { return this.textContent; }
     set innerText(value) { this.textContent = value; }
+    get isContentEditable() {
+      const value = this.getAttribute("contenteditable")?.toLowerCase();
+      if (["", "true", "plaintext-only"].includes(value)) return true;
+      if (value === "false") return false;
+      return this.parentElement?.isContentEditable ?? false;
+    }
+    replaceChildren(...nodes) {
+      this.replacements = (this.replacements || 0) + 1;
+      while (this.firstChild) this.firstChild.remove();
+      this.append(...nodes);
+      this.onReplace?.();
+    }
     get shadowRoot() { return this._shadowRoot?.mode === "open" ? this._shadowRoot : null; }
     attachShadow({ mode }) {
       assert.equal(this._shadowRoot, undefined);
@@ -136,7 +149,7 @@ function fixture() {
         (this.tagName === "INPUT" && this.type !== "hidden") ||
         (this.tagName === "A" && this.getAttribute("href") !== null) ||
         ["button", "link", "textbox", "checkbox", "radio", "combobox"].includes(this.getAttribute("role")) ||
-        this.getAttribute("contenteditable") === "true" || this.getAttribute("tabindex") !== null;
+        this.getAttribute("tabindex") !== null;
     }
     getClientRects() { return this.rects ?? (hasBox(this) ? [{}] : []); }
     getBoundingClientRect() {
@@ -271,6 +284,7 @@ function fixture() {
   document.body = new Element("BODY");
   document.append(document.body);
   document.body.innerText = "Fixture page";
+  document.createTextNode = (value) => new Text(value);
   document.createRange = () => ({
     setStart(node, offset) { this.node = node; this.start = offset; },
     setEnd(node, offset) {
@@ -291,13 +305,20 @@ function fixture() {
   class KeyboardEvent extends Event {
     constructor(type, options) { super(type, options); this.key = options.key; }
   }
+  class InputEvent extends Event {
+    constructor(type, options) {
+      super(type, options);
+      this.data = options.data;
+      this.inputType = options.inputType;
+    }
+  }
   document.defaultView = window;
   document.URL = "https://example.test/";
   window.document = document;
   window.location = { href: document.URL };
   Object.assign(window, {
     HTMLInputElement: Input, HTMLTextAreaElement: TextArea,
-    HTMLSelectElement: Select, HTMLOptionElement: Option, Event, KeyboardEvent,
+    HTMLSelectElement: Select, HTMLOptionElement: Option, Element, Event, KeyboardEvent, InputEvent,
   });
   const context = vm.createContext({
     window, document, location: { href: "https://example.test/" }, crypto: webcrypto,
@@ -1562,10 +1583,409 @@ test("frame changes after input report partial dispatch and stop the old change 
     element.onEvent = (event) => { if (event.type === "input") frame.contentDocument = null; };
     const ref = f.bridge.read().interactive[0].ref;
     const result = f.bridge.act({ action, ref, text: "written", value: "b" });
-    assert.equal(result.ok, true);
+    assert.equal(result.ok, action !== "fill");
     assert.equal(result.trusted, false);
-    assert.match(result.detail, /input.*dispatched/i);
+    if (action === "fill") {
+      assert.equal(result.error, "FILL_STATE_UNCONFIRMED");
+      assert.equal(result.attempted, true);
+    } else assert.match(result.detail, /input.*dispatched/i);
     assert.deepEqual(element.events, ["input"]);
     assert.equal(element.value, action === "fill" ? "written" : "b");
+  }
+});
+
+function editableRef(f, label = "Editor") {
+  return f.bridge.read().interactive.find((item) => item.label === label)?.ref;
+}
+
+test("contenteditable read exposes explicit editing hosts, not inherited or nested editables", () => {
+  const f = fixture();
+  for (const [index, value] of ["", "true", "TRUE", "plaintext-only"].entries()) {
+    const host = f.add("DIV", { contenteditable: value, "aria-label": `Host ${index}` });
+    host.textContent = "  old\n text  ";
+    f.add("SPAN", {}, host).textContent = " inherited";
+    f.add("SPAN", { contenteditable: "true" }, host).textContent = " nested";
+  }
+  const outer = f.add("DIV", { contenteditable: "true", "aria-label": "Outer" });
+  const inherited = f.add("SPAN", { role: "textbox", "aria-label": "Inherited" }, outer);
+  const nested = f.add("SPAN", { contenteditable: "plaintext-only", role: "textbox", "aria-label": "Nested" }, outer);
+  const island = f.add("DIV", { contenteditable: "false" }, outer);
+  f.add("DIV", { contenteditable: "true", "aria-label": "Island host" }, island);
+  const shadow = f.add("DIV").attachShadow({ mode: "open" });
+  f.add("DIV", { contenteditable: "true", "aria-label": "Shadow host" }, shadow);
+  f.add("DIV", { contenteditable: "false" });
+  f.add("DIV", { contenteditable: "invalid" });
+  const page = f.bridge.read();
+  assert.equal(page.interactive.length, 9);
+  for (let index = 0; index < 4; index += 1) {
+    const item = page.interactive.find((entry) => entry.label === `Host ${index}`);
+    assert.equal(item.role, "textbox");
+    assert.equal(item.value, "old text inherited nested");
+  }
+  for (const element of [inherited, nested]) {
+    const ref = page.interactive.find((entry) => entry.label === element.getAttribute("aria-label")).ref;
+    assert.equal(f.bridge.act({ action: "fill", ref, text: "new" }).error, "UNSUPPORTED_ELEMENT");
+    assert.equal(element.replacements, undefined);
+  }
+  for (const label of ["Island host", "Shadow host"]) {
+    const ref = page.interactive.find((entry) => entry.label === label).ref;
+    assert.equal(f.bridge.act({ action: "fill", ref, text: "new" }).ok, true);
+  }
+});
+
+test("contenteditable fill replaces markup with exact literal text and ordered synthetic input events", () => {
+  const f = fixture();
+  const host = f.add("DIV", { contenteditable: "", "aria-label": "Editor" });
+  f.add("B", {}, host).textContent = "old";
+  const text = "  <b>literal</b>\n다음 😀  ";
+  const observed = [];
+  host.onEvent = (event) => observed.push({ type: event.type, text: host.textContent,
+    data: event.data, inputType: event.inputType, cancelable: event.cancelable,
+    bubbles: event.bubbles, composed: event.composed, trusted: event.isTrusted });
+  const result = f.bridge.act({ action: "fill", ref: editableRef(f), text });
+  assert.equal(result.ok, true);
+  assert.equal(result.changed, true);
+  assert.equal(result.trusted, false);
+  assert.equal(host.firstChild.nodeType, 3);
+  assert.equal(host.firstChild.nextSibling, null);
+  assert.equal(host.textContent, text);
+  assert.deepEqual(observed, [
+    { type: "beforeinput", text: "old", data: text, inputType: "insertText", cancelable: true, bubbles: true, composed: true, trusted: false },
+    { type: "input", text, data: text, inputType: "insertText", cancelable: false, bubbles: true, composed: true, trusted: false },
+  ]);
+  assert.equal(f.bridge.act({ action: "fill", ref: editableRef(f), text: "" }).ok, true);
+  assert.equal(host.textContent, "");
+  assert.equal(host.firstChild.nodeType, 3);
+});
+
+test("contenteditable no-op is limited to canonical plain text and avoids focus/events", () => {
+  for (const text of ["", "same", "x".repeat(20000)]) {
+    const f = fixture();
+    const host = f.add("DIV", { contenteditable: "true", "aria-label": "Editor" });
+    if (text) host.textContent = text;
+    const ref = editableRef(f);
+    f.metrics.largestTextSlice = 0;
+    const result = f.bridge.act({ action: "fill", ref, text });
+    assert.equal(result.ok, true);
+    assert.equal(result.changed, false);
+    assert.equal(host.focused, undefined);
+    assert.equal(host.replacements, undefined);
+    assert.deepEqual(host.events, []);
+    assert.ok(f.metrics.largestTextSlice <= 4096);
+  }
+  const f = fixture();
+  const host = f.add("DIV", { contenteditable: "true", "aria-label": "Editor" });
+  const bold = f.add("B", {}, host);
+  bold.textContent = "same";
+  const result = f.bridge.act({ action: "fill", ref: editableRef(f), text: "same" });
+  assert.equal(result.changed, true);
+  assert.equal(bold.isConnected, false);
+  assert.equal(host.firstChild.nodeType, 3);
+});
+
+test("contenteditable beforeinput cancellation preserves the page handler's changes without replacing", () => {
+  const f = fixture();
+  const host = f.add("DIV", { contenteditable: "true", "aria-label": "Editor" });
+  host.textContent = "old";
+  host.onEvent = (event) => {
+    if (event.type === "beforeinput") { event.preventDefault(); host.firstChild.data = "handler side effect"; }
+  };
+  const result = f.bridge.act({ action: "fill", ref: editableRef(f), text: "new" });
+  assert.equal(result.error, "INPUT_CANCELED");
+  assert.equal(result.attempted, false);
+  assert.equal(result.trusted, false);
+  assert.equal(host.textContent, "handler side effect");
+  assert.equal(host.replacements, undefined);
+  assert.deepEqual(host.events, ["beforeinput"]);
+});
+
+test("contenteditable readonly rejects before no-op and focus may reach the requested value", () => {
+  const f = fixture();
+  const host = f.add("DIV", { contenteditable: "true", "aria-readonly": "true", "aria-label": "Editor" });
+  host.textContent = "same";
+  const result = f.bridge.act({ action: "fill", ref: editableRef(f), text: "same" });
+  assert.equal(result.error, "READ_ONLY");
+  assert.equal(result.attempted, false);
+  assert.equal(host.focused, undefined);
+  host.removeAttribute("aria-readonly");
+  host.onFocus = () => { host.firstChild.data = "new"; };
+  const reached = f.bridge.act({ action: "fill", ref: editableRef(f), text: "new" });
+  assert.equal(reached.ok, true);
+  assert.equal(reached.changed, false);
+  assert.equal(host.focused, 1);
+  assert.deepEqual(host.events, []);
+});
+
+test("contenteditable focus and beforeinput revalidate host, ref, document and ancestor control state", () => {
+  const mutations = [
+    (_f, host) => host.remove(),
+    (_f, host) => host.setAttribute("contenteditable", "false"),
+    (_f, host) => host.setAttribute("aria-readonly", "true"),
+    (_f, host) => { host.hidden = true; },
+    (_f, host) => { host.parentElement.inert = true; },
+    (_f, host) => host.parentElement.setAttribute("aria-disabled", "true"),
+    (_f, host) => host.parentElement.setAttribute("contenteditable", "true"),
+    (f) => f.bridge.read(),
+    (_f, host) => { host.ownerDocument = fixture().document; },
+  ];
+  for (const phase of ["focus", "beforeinput"]) for (const mutate of mutations) {
+    const f = fixture();
+    const host = f.add("DIV", { contenteditable: "true", "aria-label": "Editor" });
+    host.textContent = "old";
+    if (phase === "focus") host.onFocus = () => mutate(f, host);
+    else host.onEvent = (event) => { if (event.type === phase) mutate(f, host); };
+    const result = f.bridge.act({ action: "fill", ref: editableRef(f), text: "new" });
+    assert.equal(result.error, "ELEMENT_UNAVAILABLE");
+    assert.equal(result.attempted, false);
+    assert.equal(host.replacements, undefined);
+    assert.equal(host.textContent, "old");
+    assert.deepEqual(host.events, phase === "focus" ? [] : ["beforeinput"]);
+  }
+});
+
+test("contenteditable replacement and input mutations report attempted without false success", () => {
+  const cases = [
+    ["replace", (host) => { host.hidden = true; }, "FILL_STATE_UNCONFIRMED"],
+    ["input", (host) => host.remove(), "FILL_STATE_UNCONFIRMED"],
+    ["input", (host) => host.setAttribute("aria-readonly", "true"), "FILL_STATE_UNCONFIRMED"],
+    ["input", (host) => { host.textContent = "new"; }, "FILL_STATE_UNCONFIRMED"],
+    ["input", (host) => { host.firstChild.data = "reverted"; }, "FILL_STATE_NOT_REACHED"],
+  ];
+  for (const [phase, mutate, error] of cases) {
+    const f = fixture();
+    const host = f.add("DIV", { contenteditable: "true", "aria-label": "Editor" });
+    host.textContent = "old";
+    if (phase === "replace") host.onReplace = () => mutate(host);
+    else host.onEvent = (event) => { if (event.type === "input") mutate(host); };
+    const result = f.bridge.act({ action: "fill", ref: editableRef(f), text: "new" });
+    assert.equal(result.error, error);
+    assert.equal(result.attempted, true);
+    assert.equal(result.trusted, false);
+    assert.equal(host.replacements, 1);
+    assert.deepEqual(host.events, phase === "replace" ? ["beforeinput"] : ["beforeinput", "input"]);
+  }
+});
+
+test("contenteditable exception receipts preserve only bounded attempted evidence", () => {
+  for (const phase of ["focus", "replace", "input"]) {
+    const f = fixture();
+    const host = f.add("DIV", { contenteditable: "true", "aria-label": "Editor" });
+    host.textContent = "old";
+    const fail = () => { throw new Error("private-page-exception-text"); };
+    if (phase === "focus") host.onFocus = fail;
+    else if (phase === "replace") host.onReplace = fail;
+    else host.onEvent = (event) => { if (event.type === "input") fail(); };
+    const result = f.bridge.act({ action: "fill", ref: editableRef(f), text: "new" });
+    assert.equal(result.error, "ACTION_FAILED");
+    assert.equal(result.attempted, phase !== "focus");
+    assert.equal(result.trusted, false);
+    assert.ok(!JSON.stringify(result).includes("private-page-exception-text"));
+  }
+});
+
+test("contenteditable read and equality remain bounded without whole-host text getters", () => {
+  const f = fixture();
+  const host = f.add("DIV", { contenteditable: "true", "aria-label": "Editor" });
+  const long = f.text("x".repeat(1000000), host);
+  for (const node of [host, long]) Object.defineProperty(node, "textContent", { get() { throw new Error("whole text read"); } });
+  Object.defineProperty(host, "innerText", { get() { throw new Error("whole innerText read"); } });
+  const page = f.bridge.read();
+  assert.equal(page.interactive[0].value, "x".repeat(240));
+  assert.ok(f.metrics.largestTextSlice <= 12001);
+  f.metrics.largestTextSlice = 0;
+  const result = f.bridge.act({ action: "fill", ref: page.interactive[0].ref, text: "short" });
+  assert.equal(result.ok, true);
+  assert.equal(host.firstChild.data, "short");
+  assert.ok(f.metrics.largestTextSlice <= 4096);
+});
+
+test("contenteditable uses the accessible frame realm and rejects navigation around input", () => {
+  const f = fixture();
+  const { frame, child } = embed(f);
+  const host = child.add("DIV", { contenteditable: "plaintext-only", "aria-label": "Editor" });
+  host.textContent = "old";
+  child.window.InputEvent = class extends child.window.InputEvent {
+    constructor(...args) { super(...args); this.realm = "child"; }
+  };
+  host.onEvent = (event) => assert.equal(event.realm, "child");
+  assert.equal(f.bridge.act({ action: "fill", ref: editableRef(f), text: "new" }).ok, true);
+  assert.equal(host.firstChild.ownerDocument, child.document);
+  host.onEvent = (event) => { if (event.type === "input") frame.contentDocument = fixture().document; };
+  const result = f.bridge.act({ action: "fill", ref: editableRef(f), text: "later" });
+  assert.equal(result.error, "FILL_STATE_UNCONFIRMED");
+  assert.equal(result.attempted, true);
+  assert.equal(host.firstChild.data, "later");
+});
+
+test("native form controls retain their existing fill policy despite a contenteditable attribute", () => {
+  const f = fixture();
+  const input = f.add("INPUT", { contenteditable: "true", "aria-label": "Input" });
+  input.value = "native value";
+  const file = f.add("INPUT", { type: "file", contenteditable: "true", "aria-label": "File" });
+  const select = f.add("SELECT", { contenteditable: "true", "aria-label": "Select" });
+  const page = f.bridge.read();
+  assert.equal(page.interactive.find((item) => item.label === "Input").value, "native value");
+  for (const element of [file, select]) {
+    const ref = page.interactive.find((item) => item.label === element.getAttribute("aria-label")).ref;
+    assert.equal(f.bridge.act({ action: "fill", ref, text: "new" }).error, "UNSUPPORTED_ELEMENT");
+    assert.equal(element.replacements, undefined);
+  }
+  assert.equal(f.bridge.act({ action: "fill", ref: page.interactive.find((item) => item.label === "Input").ref, text: "new" }).ok, true);
+  assert.equal(input.value, "new");
+  assert.deepEqual(input.events, ["input", "change"]);
+});
+
+test("native fill detects setter normalization instead of claiming exact text success", () => {
+  // Model observable native setter results; actual HTML type sanitization is
+  // verified separately in Chromium, not implemented by this DOM double.
+  for (const [tag, type, text, stored] of [
+    ["INPUT", "number", "not-number", ""], ["INPUT", "date", "bad-date", ""],
+    ["INPUT", "range", "999", "100"], ["INPUT", "text", "a\nb", "ab"],
+    ["TEXTAREA", "textarea", "a\r\nb", "a\nb"],
+  ]) {
+    const f = fixture();
+    const element = f.add(tag, { type });
+    const prototype = Object.getPrototypeOf(element);
+    const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
+    Object.defineProperty(prototype, "value", { ...descriptor, set() { descriptor.set.call(this, stored); } });
+    const ref = f.bridge.read().interactive[0].ref;
+    const result = f.bridge.act({ action: "fill", ref, text });
+    assert.equal(result.error, "FILL_STATE_NOT_REACHED", `${tag}/${type}`);
+    assert.equal(result.attempted, true);
+    assert.equal(result.trusted, false);
+    assert.equal(element.value, stored);
+    assert.deepEqual(element.events, ["input", "change"]);
+  }
+});
+
+test("native fill observes handler rollback after input/change through the native getter", () => {
+  for (const phase of ["input", "change"]) for (const tag of ["INPUT", "TEXTAREA"]) {
+    const f = fixture();
+    const element = f.add(tag);
+    element.onEvent = (event) => { if (event.type === phase) element._value = "page rollback"; };
+    Object.defineProperty(element, "value", { get() { return "requested"; } });
+    const ref = f.bridge.read().interactive[0].ref;
+    const result = f.bridge.act({ action: "fill", ref, text: "requested" });
+    assert.equal(result.error, "FILL_STATE_NOT_REACHED");
+    assert.equal(result.attempted, true);
+    assert.equal(element.value, "requested", "the page's own getter lies about the final state");
+    assert.equal(element._value, "page rollback");
+    assert.deepEqual(element.events, ["input", "change"]);
+  }
+});
+
+test("native fill stops remaining events when setter/input/change invalidate the target", () => {
+  const mutations = [
+    (_f, element) => element.remove(),
+    (_f, element) => { element.hidden = true; },
+    (_f, element) => { element.disabled = true; },
+    (_f, element) => { element.readOnly = true; },
+    (_f, element) => { element.parentElement.inert = true; },
+    (_f, element) => { element.type = "password"; },
+    (_f, element) => { element.type = "checkbox"; },
+    (_f, element) => { element.ownerDocument = fixture().document; },
+    (f) => f.bridge.read(),
+  ];
+  for (const phase of ["setter", "input", "change"]) for (const mutate of mutations) {
+    const f = fixture();
+    const element = f.add("INPUT");
+    if (phase === "setter") {
+      const prototype = Object.getPrototypeOf(element);
+      const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
+      Object.defineProperty(prototype, "value", { ...descriptor, set(value) {
+        descriptor.set.call(this, value); mutate(f, this);
+      } });
+    } else element.onEvent = (event) => { if (event.type === phase) mutate(f, element); };
+    const ref = f.bridge.read().interactive[0].ref;
+    const result = f.bridge.act({ action: "fill", ref, text: "requested" });
+    assert.equal(result.error, "FILL_STATE_UNCONFIRMED", phase);
+    assert.equal(result.attempted, true);
+    assert.equal(result.trusted, false);
+    assert.deepEqual(element.events, phase === "setter" ? [] : phase === "input" ? ["input"] : ["input", "change"]);
+  }
+});
+
+test("native fill verifies accessors and focus target before attempting the setter", () => {
+  for (const change of ["getter", "setter", "tag", "readonly", "stale"]) {
+    const f = fixture();
+    const element = f.add("INPUT");
+    element.value = "old";
+    const ref = f.bridge.read().interactive[0].ref;
+    const prototype = Object.getPrototypeOf(element);
+    const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
+    if (["getter", "setter"].includes(change)) {
+      Object.defineProperty(prototype, "value", { ...descriptor, [change === "getter" ? "get" : "set"]: undefined });
+    } else element.onFocus = () => {
+      if (change === "tag") element.tagName = "TEXTAREA";
+      if (change === "readonly") element.readOnly = true;
+      if (change === "stale") f.bridge.read();
+    };
+    const result = f.bridge.act({ action: "fill", ref, text: "requested" });
+    assert.equal(result.error, ["getter", "setter"].includes(change) ? "ACTION_FAILED" : "ELEMENT_UNAVAILABLE");
+    assert.equal(result.attempted, false);
+    assert.equal(element._value, "old");
+    assert.deepEqual(element.events, []);
+  }
+});
+
+test("native fill preserves attempted evidence on accessor exceptions without exposing password text", () => {
+  for (const phase of ["focus", "setter", "input", "change", "getter"]) {
+    const f = fixture();
+    const element = f.add("INPUT", { type: "password" });
+    const ref = f.bridge.read().interactive[0].ref;
+    const secret = "private-native-fill-value";
+    const fail = () => { throw new Error(secret); };
+    if (phase === "focus") element.onFocus = fail;
+    else if (["input", "change"].includes(phase)) element.onEvent = (event) => { if (event.type === phase) fail(); };
+    else {
+      const prototype = Object.getPrototypeOf(element);
+      const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
+      Object.defineProperty(prototype, "value", { ...descriptor, [phase === "getter" ? "get" : "set"]: fail });
+    }
+    const result = f.bridge.act({ action: "fill", ref, text: secret });
+    assert.equal(result.error, "ACTION_FAILED");
+    assert.equal(result.attempted, phase !== "focus");
+    assert.equal(result.trusted, false);
+    assert.ok(!JSON.stringify(result).includes(secret));
+  }
+});
+
+test("native fill revalidates after reading the final value", () => {
+  const f = fixture();
+  const element = f.add("INPUT");
+  const ref = f.bridge.read().interactive[0].ref;
+  const prototype = Object.getPrototypeOf(element);
+  const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
+  Object.defineProperty(prototype, "value", { ...descriptor, get() {
+    const value = descriptor.get.call(this);
+    this.remove();
+    return value;
+  } });
+  const result = f.bridge.act({ action: "fill", ref, text: "requested" });
+  assert.equal(result.error, "FILL_STATE_UNCONFIRMED");
+  assert.equal(result.attempted, true);
+  assert.deepEqual(element.events, ["input", "change"]);
+});
+
+test("native fill retains ordinary empty/same-value events and accessible shadow/frame behavior", () => {
+  const f = fixture();
+  const shadow = f.add("DIV").attachShadow({ mode: "open" });
+  const input = f.add("INPUT", { "aria-label": "Shadow native" }, shadow);
+  const { child } = embed(f);
+  const textarea = child.add("TEXTAREA", { "aria-label": "Frame native" });
+  child.window.Event = class extends child.window.Event {
+    constructor(...args) { super(...args); this.realm = "child"; }
+  };
+  textarea.onEvent = (event) => assert.equal(event.realm, "child");
+  for (const [element, label] of [[input, "Shadow native"], [textarea, "Frame native"]]) {
+    for (const text of ["", "same", "same"]) {
+      const ref = f.bridge.read().interactive.find((item) => item.label === label).ref;
+      const before = element.events.length;
+      const result = f.bridge.act({ action: "fill", ref, text });
+      assert.equal(result.ok, true);
+      assert.equal(result.trusted, false);
+      assert.equal(element.value, text);
+      assert.deepEqual(element.events.slice(before), ["input", "change"]);
+    }
   }
 });

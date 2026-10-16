@@ -607,8 +607,46 @@ struct TabOrderMenu {
     target: crate::browser::TabOrderTarget,
 }
 
-fn tab_status_symbol(muted: Option<bool>, ai_active: bool, loading: bool) -> &'static str {
-    if muted == Some(true) {
+fn tab_rows_signature(
+    space: &str,
+    active: Option<i32>,
+    collapsed: bool,
+    overview: bool,
+    overlay_open: bool,
+    visible: &[&ShellTab],
+) -> String {
+    format!(
+        "{}:{:?}:{}:{}:{}:{:?}",
+        space,
+        active,
+        collapsed,
+        overview,
+        overlay_open,
+        visible
+            .iter()
+            .map(|tab| (
+                tab.id,
+                &tab.title,
+                &tab.url,
+                tab.loading,
+                tab.audio_muted,
+                tab.failure,
+                &tab.task_status,
+                tab.stop_scope.is_some()
+            ))
+            .collect::<Vec<_>>()
+    )
+}
+
+fn tab_status_symbol(
+    failure: Option<PageFailure>,
+    muted: Option<bool>,
+    ai_active: bool,
+    loading: bool,
+) -> &'static str {
+    if failure.is_some() {
+        "exclamationmark.triangle"
+    } else if muted == Some(true) {
         "speaker.slash"
     } else if ai_active {
         "sparkles"
@@ -617,6 +655,28 @@ fn tab_status_symbol(muted: Option<bool>, ai_active: bool, loading: bool) -> &'s
     } else {
         "globe"
     }
+}
+
+fn tab_status_description(tab: &ShellTab) -> String {
+    format!(
+        "{}{}{}{}",
+        tab.task_status,
+        match tab.failure {
+            Some(PageFailure::Load { .. }) => ", 페이지를 열지 못했습니다",
+            Some(PageFailure::Renderer) => ", 페이지가 종료됐습니다",
+            None => "",
+        },
+        if tab.loading {
+            ", 불러오는 중"
+        } else {
+            ""
+        },
+        if tab.audio_muted == Some(true) {
+            ", 음소거 설정됨"
+        } else {
+            ""
+        },
+    )
 }
 
 struct TabRowFrames {
@@ -689,6 +749,50 @@ struct SearchRow {
     button: Retained<NSButton>,
     title: Retained<NSTextField>,
     detail: Retained<NSTextField>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SearchQueryTarget {
+    revision: u64,
+    query: String,
+    selected: Option<SearchResultId>,
+}
+
+fn search_query_target(state: &SearchState, revision: u64) -> Option<SearchQueryTarget> {
+    if state.revision != revision || state.query_destination().ok().flatten().is_none() {
+        return None;
+    }
+    Some(SearchQueryTarget {
+        revision,
+        query: state.query.clone(),
+        selected: state.selected,
+    })
+}
+
+fn search_query_target_matches(state: &SearchState, target: &SearchQueryTarget) -> bool {
+    state.open
+        && state.mode == SearchMode::All
+        && !state.confirm_clear
+        && !state.query_overflow
+        && state.revision != u64::MAX
+        && state.revision == target.revision
+        && state.query == target.query
+        && state.selected == target.selected
+}
+
+fn select_query_submission(
+    state: &mut SearchState,
+    mut target: SearchQueryTarget,
+) -> Option<SearchQueryTarget> {
+    if !search_query_target_matches(state, &target) {
+        return None;
+    }
+    // The explicit click selects this action before creating a tab. Staging
+    // may replace an exact-URL History match with a Tab result during sync.
+    let selected = Some(SearchResultId::Query(target.revision));
+    state.selected = selected;
+    target.selected = selected;
+    Some(target)
 }
 
 struct AddressDraft {
@@ -2719,7 +2823,7 @@ impl Shell {
             .as_ref()
             .map(|snapshot| snapshot.rows.as_slice())
             .unwrap_or(&[]);
-        let results = tab_search::combined_results(
+        let mut results = tab_search::combined_results(
             tabs.iter().filter_map(|id| {
                 self.tabs
                     .iter()
@@ -2731,6 +2835,10 @@ impl Shell {
                 .map(|item| (item.id, item.url.as_str())),
             history.rows.iter().map(|item| (item.id, item.url.as_str())),
         );
+        let query_destination = self.search.query_destination();
+        if matches!(&query_destination, Ok(Some(_))) {
+            tab_search::append_query_result(&mut results, self.search.revision);
+        }
         self.search.reconcile(&results);
         let rows: Vec<_> = results
             .iter()
@@ -2789,6 +2897,18 @@ impl Shell {
                             ),
                         )
                     }
+                    SearchResultId::Query(_) => {
+                        let (_, kind) = query_destination.as_ref().ok()?.as_ref()?;
+                        let action = match kind {
+                            crate::address::AddressKind::Url => "주소 열기",
+                            crate::address::AddressKind::Search => "Google에서 검색",
+                        };
+                        (
+                            compact(&self.search.query, 120),
+                            format!("{action} · 내 공간에서 열기"),
+                            format!("{action}, {}, 내 공간에서 열기", self.search.query),
+                        )
+                    }
                 };
                 Some((*id, name, detail, accessible))
             })
@@ -2821,6 +2941,10 @@ impl Shell {
             )
         } else if results.is_empty() {
             "일치하는 탭, 북마크, 방문 기록이 없습니다".to_owned()
+        } else if tab_count + bookmark_count + history_count == 0 {
+            format!(
+                "일치하는 탭, 북마크, 기록이 없습니다. 아래 주소·웹 검색 결과를 선택하세요{enter_hint}"
+            )
         } else {
             format!(
                 "탭 {}개, 북마크 {}개, 기록 {}개, 탭 우선, 최대 40개{}",
@@ -2843,7 +2967,7 @@ impl Shell {
             .setPlaceholderString(Some(&NSString::from_str(if history_only {
                 "기록의 제목 또는 URL (최대 200자)"
             } else {
-                "제목, URL 또는 공간 이름 (최대 200자)"
+                "탭, 북마크, 기록, 주소 또는 Google 검색 (최대 200자)"
             })));
         self.history_clear
             .setHidden(!history_only || self.search.confirm_clear);
@@ -2854,6 +2978,14 @@ impl Shell {
         self.history_cancel
             .setHidden(!history_only || !self.search.confirm_clear);
         let mut statuses = Vec::new();
+        if self.search.query_overflow {
+            statuses.push(
+                "입력이 200자를 넘어 잘렸습니다. 주소나 웹 검색을 열려면 입력을 수정하세요."
+                    .to_owned(),
+            );
+        } else if let Err(error) = query_destination {
+            statuses.push(format!("주소 또는 웹 검색을 열 수 없습니다: {error}"));
+        }
         if let Some(bookmarks) = &bookmarks {
             if !bookmarks.ready {
                 statuses.push("북마크를 불러오는 중".to_owned());
@@ -3693,25 +3825,13 @@ impl Shell {
             .filter(|tab| tab.space == self.active_space)
             .collect();
         let overlay_open = self.overlay_is_open();
-        let signature = format!(
-            "{}:{:?}:{}:{}:{}:{:?}",
-            self.active_space,
+        let signature = tab_rows_signature(
+            &self.active_space,
             self.active,
             self.sidebar_collapsed,
             self.overview,
             overlay_open,
-            visible
-                .iter()
-                .map(|tab| (
-                    tab.id,
-                    &tab.title,
-                    &tab.url,
-                    tab.loading,
-                    tab.audio_muted,
-                    &tab.task_status,
-                    tab.stop_scope.is_some()
-                ))
-                .collect::<Vec<_>>()
+            &visible,
         );
         if self.tab_signature == signature {
             return;
@@ -3727,21 +3847,13 @@ impl Shell {
         for (index, tab) in visible.into_iter().enumerate() {
             let name = tab_search::display_title(&tab.title, &tab.url);
             let selected = Some(tab.id) == self.active;
-            let symbol = tab_status_symbol(tab.audio_muted, tab.stop_scope.is_some(), tab.loading);
-            let status = format!(
-                "{}{}{}",
-                tab.task_status,
-                if tab.loading {
-                    ", 불러오는 중"
-                } else {
-                    ""
-                },
-                if tab.audio_muted == Some(true) {
-                    ", 음소거 설정됨"
-                } else {
-                    ""
-                },
+            let symbol = tab_status_symbol(
+                tab.failure,
+                tab.audio_muted,
+                tab.stop_scope.is_some(),
+                tab.loading,
             );
+            let status = tab_status_description(tab);
             let row = previous
                 .get(&tab.id)
                 .filter(|row| row.space == tab.space)
@@ -3806,7 +3918,7 @@ impl Shell {
             row.title.setHidden(self.sidebar_collapsed);
             row.button.setTitle(&NSString::from_str(
                 if self.sidebar_collapsed && row.icon.image().is_none() {
-                    "□"
+                    if tab.failure.is_some() { "!" } else { "□" }
                 } else {
                     ""
                 },
@@ -5507,13 +5619,9 @@ fn open_search(mode: SearchMode) {
         let mut slot = slot.borrow_mut();
         let shell = slot.as_mut()?;
         if !shell.search.open {
-            shell.search = SearchState {
-                open: true,
-                ..SearchState::default()
-            };
             shell.search_signature.clear();
         }
-        shell.search.set_mode(mode);
+        shell.search.open(mode);
         Some((
             shell.window.clone(),
             shell.search_field.clone(),
@@ -5643,7 +5751,7 @@ fn close_tab_search(restore_focus: bool) {
         if !shell.search.open {
             return None;
         }
-        shell.search = SearchState::default();
+        shell.search.close();
         shell.search_results.clear();
         shell.search_signature.clear();
         shell.clear_search_rows();
@@ -5660,20 +5768,32 @@ fn search_text_changed() {
     if search_has_marked_text() {
         return;
     }
-    let field = SHELL.with(|slot| {
+    let controls = SHELL.with(|slot| {
         slot.borrow()
             .as_ref()
             .filter(|shell| shell.search.open)
-            .map(|shell| shell.search_field.clone())
+            .map(|shell| (shell.search_field.clone(), shell.search.revision))
     });
-    let Some(field) = field else { return };
+    let Some((field, revision)) = controls else {
+        return;
+    };
     let text = field.stringValue().to_string();
     let bounded = tab_search::bounded_query(&text);
-    SHELL.with(|slot| {
-        if let Some(shell) = slot.borrow_mut().as_mut().filter(|shell| shell.search.open) {
-            shell.search.set_query(&bounded);
-        }
+    let accepted = SHELL.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(shell) = slot.as_mut().filter(|shell| {
+            shell.search.open
+                && shell.search.revision == revision
+                && std::ptr::eq(&*shell.search_field, &*field)
+        }) else {
+            return false;
+        };
+        shell.search.set_query(&text);
+        true
     });
+    if !accepted {
+        return;
+    }
     if text != bounded {
         field.setStringValue(&NSString::from_str(&bounded));
     }
@@ -5716,9 +5836,15 @@ fn submit_tab_search() {
 }
 
 fn search_submission(state: &SearchState) -> Option<SearchResultId> {
-    (state.open && !state.confirm_clear)
+    let result = (state.open && !state.confirm_clear)
         .then_some(state.selected)
-        .flatten()
+        .flatten()?;
+    if let SearchResultId::Query(revision) = result {
+        if state.revision != revision || state.query_destination().ok()?.is_none() {
+            return None;
+        }
+    }
+    Some(result)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5794,6 +5920,7 @@ fn activate_search_result(result: SearchResultId) {
         SearchResultId::Tab(tab) => crate::browser::shell_action(ShellAction::SelectSearchTab(tab)),
         SearchResultId::Bookmark(id) => crate::bookmark_runtime::open(id),
         SearchResultId::History(id) => crate::history_runtime::open(id),
+        SearchResultId::Query(revision) => return activate_search_query(revision),
     };
     match opened {
         Ok(()) => close_tab_search(true),
@@ -5807,6 +5934,103 @@ fn activate_search_result(result: SearchResultId) {
                     unsafe { let _: () = msg_send![&*shell.search_hint, setAccessibilityHelp: &*NSString::from_str(&message)]; }
                 }
             });
+        }
+    }
+}
+
+fn search_query_is_current(
+    target: &SearchQueryTarget,
+    selection: &(String, Option<i32>, bool),
+    window: &NSWindow,
+    field: &NSTextField,
+) -> bool {
+    let current = || {
+        SHELL.with(|slot| {
+            slot.try_borrow().ok().is_some_and(|slot| {
+                slot.as_ref().is_some_and(|shell| {
+                    search_query_target_matches(&shell.search, target)
+                        && shell.active_space == selection.0
+                        && shell.active == selection.1
+                        && shell.overview == selection.2
+                        && !shell.bookmarks.state.open
+                        && !shell.downloads.open
+                        && shell
+                            .search_results
+                            .contains(&SearchResultId::Query(target.revision))
+                        && std::ptr::eq(&*shell.window, window)
+                        && std::ptr::eq(&*shell.search_field, field)
+                })
+            })
+        })
+    };
+    if !current()
+        || !window.isKeyWindow()
+        || field.window().as_deref() != Some(window)
+        || field.isHiddenOrHasHiddenAncestor()
+        || field.stringValue().to_string() != target.query
+    {
+        return false;
+    }
+    // Retain the shared field editor while asking AppKit about composition.
+    // These native getters run without a shell borrow and can reenter.
+    let editor: Option<Retained<AnyObject>> = unsafe { msg_send![field, currentEditor] };
+    let composing = editor.is_some_and(|editor| unsafe { msg_send![&*editor, hasMarkedText] });
+    !composing && current()
+}
+
+fn activate_search_query(revision: u64) {
+    let controls = SHELL.with(|slot| {
+        let slot = slot.try_borrow().ok()?;
+        let shell = slot.as_ref()?;
+        let target = search_query_target(&shell.search, revision)?;
+        Some((
+            target,
+            (shell.active_space.clone(), shell.active, shell.overview),
+            shell.window.clone(),
+            shell.search_field.clone(),
+        ))
+    });
+    let Some((target, selection, window, field)) = controls else {
+        return;
+    };
+    if !search_query_is_current(&target, &selection, &window, &field) {
+        return;
+    }
+    let target = SHELL.with(|slot| {
+        let mut slot = slot.try_borrow_mut().ok()?;
+        select_query_submission(&mut slot.as_mut()?.search, target)
+    });
+    let Some(target) = target else { return };
+    // Resolve only the current explicit submission. Rendering classifies the
+    // row but never opens a URL, creates a tab, or requests an AI handoff.
+    let Ok(Some((url, _))) = crate::address::resolve_with_kind(&target.query) else {
+        return;
+    };
+    let opened = crate::browser::open_search_url(&url, || {
+        search_query_is_current(&target, &selection, &window, &field)
+    });
+    let current = SHELL.with(|slot| {
+        slot.try_borrow().ok().is_some_and(|slot| {
+            slot.as_ref().is_some_and(|shell| {
+                search_query_target_matches(&shell.search, &target)
+                    && std::ptr::eq(&*shell.window, &*window)
+                    && std::ptr::eq(&*shell.search_field, &*field)
+            })
+        })
+    });
+    if !current {
+        return;
+    }
+    match opened {
+        Ok(()) => close_tab_search(true),
+        Err(error) => {
+            SHELL.with(|slot| {
+                if let Some(shell) = slot.borrow_mut().as_mut() {
+                    shell.search.notice =
+                        Some(format!("주소 또는 웹 검색을 열지 못했습니다: {error}"));
+                }
+            });
+            sync();
         }
     }
 }
@@ -9300,12 +9524,12 @@ mod tests {
         for ai_active in [false, true] {
             for loading in [false, true] {
                 assert_eq!(
-                    tab_status_symbol(Some(true), ai_active, loading),
+                    tab_status_symbol(None, Some(true), ai_active, loading),
                     "speaker.slash"
                 );
                 for muted in [None, Some(false)] {
                     assert_eq!(
-                        tab_status_symbol(muted, ai_active, loading),
+                        tab_status_symbol(None, muted, ai_active, loading),
                         if ai_active {
                             "sparkles"
                         } else if loading {
@@ -9317,6 +9541,68 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn background_tab_failure_changes_the_row_signature_without_other_display_changes() {
+        let mut tab = numbered_tab_fixture(2, "user");
+        let signature =
+            |tab: &ShellTab| tab_rows_signature("user", Some(1), false, false, false, &[tab]);
+        let healthy = signature(&tab);
+        tab.failure = Some(PageFailure::Load { code: -105 });
+        let failed_load = signature(&tab);
+        assert_ne!(failed_load, healthy);
+        tab.failure = Some(PageFailure::Renderer);
+        assert_ne!(signature(&tab), healthy);
+        assert_ne!(signature(&tab), failed_load);
+        // Recovery can retain renderer_exit while its projected failure is
+        // suppressed. The row follows that projection, not the raw crash flag.
+        tab.crashed = true;
+        tab.failure = None;
+        assert_eq!(signature(&tab), healthy);
+    }
+
+    #[test]
+    fn tab_failure_icon_takes_priority_over_muting_ai_and_loading() {
+        for failure in [PageFailure::Load { code: -105 }, PageFailure::Renderer] {
+            for muted in [None, Some(false), Some(true)] {
+                for ai_active in [false, true] {
+                    for loading in [false, true] {
+                        assert_eq!(
+                            tab_status_symbol(Some(failure), muted, ai_active, loading),
+                            "exclamationmark.triangle"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tab_failure_description_preserves_task_loading_and_muted_status() {
+        let mut tab = numbered_tab_fixture(2, "task-1");
+        tab.task_status = "자료 조사, AI 제어 중".into();
+        tab.loading = true;
+        tab.audio_muted = Some(true);
+        for (failure, message) in [
+            (PageFailure::Load { code: -105 }, "페이지를 열지 못했습니다"),
+            (PageFailure::Renderer, "페이지가 종료됐습니다"),
+        ] {
+            tab.failure = Some(failure);
+            assert_eq!(
+                tab_status_description(&tab),
+                format!("자료 조사, AI 제어 중, {message}, 불러오는 중, 음소거 설정됨")
+            );
+        }
+        tab.failure = None;
+        assert_eq!(
+            tab_status_description(&tab),
+            "자료 조사, AI 제어 중, 불러오는 중, 음소거 설정됨"
+        );
+        tab.task_status = "직접 사용 중".into();
+        tab.loading = false;
+        tab.audio_muted = Some(false);
+        assert_eq!(tab_status_description(&tab), "직접 사용 중");
     }
 
     #[test]
@@ -10209,6 +10495,92 @@ mod tests {
         state.open = true;
         state.selected = None;
         assert_eq!(search_submission(&state), None);
+    }
+
+    #[test]
+    fn query_submission_cannot_use_an_old_revision_or_a_truncated_input() {
+        let mut state = SearchState::default();
+        state.open(SearchMode::All);
+        state.set_query("query to open");
+        let original = SearchResultId::Query(state.revision);
+        state.selected = Some(original);
+        assert_eq!(search_submission(&state), Some(original));
+        state.set_query("different query");
+        state.selected = Some(original); // delayed selector from an old row
+        assert_eq!(search_submission(&state), None);
+        state.set_query("query to open");
+        state.selected = Some(original);
+        assert_eq!(search_submission(&state), None);
+        state.set_query(&"a".repeat(tab_search::MAX_QUERY_CHARS + 1));
+        state.selected = Some(SearchResultId::Query(state.revision));
+        assert_eq!(search_submission(&state), None);
+        state.set_query("https://example.test/");
+        state.selected = Some(SearchResultId::Query(state.revision));
+        state.set_mode(SearchMode::History);
+        state.selected = Some(SearchResultId::Query(state.revision));
+        assert_eq!(search_submission(&state), None);
+    }
+
+    #[test]
+    fn query_open_guard_preserves_selection_and_rejects_changed_or_reopened_overlays() {
+        let mut state = SearchState::default();
+        state.open(SearchMode::All);
+        state.set_query("explicit query");
+        // Clicking the last row is allowed while an internal result is selected.
+        state.selected = Some(SearchResultId::Tab(7));
+        let target = search_query_target(&state, state.revision).unwrap();
+        assert!(search_query_target_matches(&state, &target));
+        state.selected = Some(SearchResultId::Query(state.revision));
+        assert!(!search_query_target_matches(&state, &target));
+        state.selected = target.selected;
+        state.confirm_clear = true;
+        assert!(!search_query_target_matches(&state, &target));
+        assert!(search_query_target(&state, state.revision).is_none());
+        state.confirm_clear = false;
+        state.set_mode(SearchMode::History);
+        state.set_mode(SearchMode::All);
+        state.selected = target.selected;
+        assert!(!search_query_target_matches(&state, &target));
+        let before_close = search_query_target(&state, state.revision).unwrap();
+        state.close();
+        state.open(SearchMode::All);
+        state.set_query(&before_close.query);
+        state.selected = before_close.selected;
+        assert!(!search_query_target_matches(&state, &before_close));
+        assert!(search_query_target(&state, before_close.revision).is_none());
+    }
+
+    #[test]
+    fn explicit_query_selection_survives_staging_replacing_an_exact_history_match() {
+        use SearchResultId::{History, Query, Tab};
+        let url = "https://example.test/exact";
+        let mut state = SearchState::default();
+        state.open(SearchMode::All);
+        state.set_query(url);
+        let mut original = tab_search::combined_results([], [], [(7, url)]);
+        tab_search::append_query_result(&mut original, state.revision);
+        state.reconcile(&original);
+        assert_eq!(state.selected, Some(History(7)));
+
+        let captured = search_query_target(&state, state.revision).unwrap();
+        let target = select_query_submission(&mut state, captured).unwrap();
+        assert_eq!(state.selected, Some(Query(state.revision)));
+        // on_after_created -> attach -> sync exposes the staging tab. URL
+        // deduplication removes the previously selected History result.
+        let mut staging = tab_search::combined_results([(11, url)], [], [(7, url)]);
+        tab_search::append_query_result(&mut staging, state.revision);
+        assert_eq!(staging, [Tab(11), Query(state.revision)]);
+        state.reconcile(&staging);
+        assert!(search_query_target_matches(&state, &target));
+
+        // A failed staging cleanup restores History; the clicked Query remains
+        // selected, allowing the same overlay to display its failure notice.
+        state.reconcile(&original);
+        assert!(search_query_target_matches(&state, &target));
+        state.move_selection(&original, false);
+        assert_eq!(state.selected, Some(History(7)));
+        assert!(!search_query_target_matches(&state, &target));
+        assert!(select_query_submission(&mut state, target).is_none());
     }
 
     #[test]
