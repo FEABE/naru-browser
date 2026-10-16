@@ -48,6 +48,31 @@ struct Runtime {
 }
 
 impl Runtime {
+    fn completed_file_path(&self, id: u32) -> Result<&str, String> {
+        if self.shutting_down {
+            return Err("브라우저를 종료하고 있습니다.".into());
+        }
+        if self.dialog.is_some() {
+            return Err("저장 위치 선택 창을 먼저 닫아 주세요.".into());
+        }
+        self.model
+            .entry(id)
+            .and_then(|entry| entry.completed_file_path())
+            .ok_or_else(|| "저장 완료된 파일의 위치를 확인할 수 없습니다.".into())
+    }
+
+    fn update(&mut self, id: u32, progress: Progress) -> bool {
+        let approved = self.callbacks.get(&id).and_then(|handles| {
+            // An outstanding Save As callback has not accepted a destination.
+            handles
+                .before
+                .is_none()
+                .then_some(handles.approved_path.as_deref())
+                .flatten()
+        });
+        self.model.update_with_approval(id, progress, approved)
+    }
+
     fn source_target(&self, id: u32) -> Result<SourceTarget, String> {
         if self.shutting_down {
             return Err("브라우저를 종료하고 있습니다.".into());
@@ -111,6 +136,9 @@ pub fn snapshot() -> Snapshot {
         let state = slot.borrow();
         let mut snapshot = state.model.snapshot();
         snapshot.notice = state.notice.clone();
+        for row in &mut snapshot.rows {
+            row.can_reveal_file &= !state.shutting_down && state.dialog.is_none();
+        }
         if state.dialog.is_some() {
             for row in &mut snapshot.rows {
                 row.can_choose = false;
@@ -148,6 +176,19 @@ pub(crate) fn reveal_source(id: u32) -> Result<i32, String> {
     // Selection is explicit, does not restart a file, and may reenter either
     // runtime when revealing a previously hidden Chromium permission prompt.
     crate::browser::reveal_download_source(&target)
+}
+
+pub(crate) fn reveal_file(id: u32) -> Result<(), String> {
+    let path = RUNTIME.with(|slot| slot.borrow().completed_file_path(id).map(str::to_owned))?;
+    // A completed file outlives its source tab/task. No browser selection or
+    // ownership change is needed, and native dispatch holds no runtime borrow.
+    #[cfg(target_os = "macos")]
+    return crate::mac::reveal_file(&path);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        Err("파일 위치 표시는 macOS에서 지원합니다.".into())
+    }
 }
 
 pub fn activity() -> (usize, usize) {
@@ -333,7 +374,7 @@ pub(crate) fn updated(
     let mut incoming = callback.cloned();
     let (changed, removed, replaced, cancel_now) = RUNTIME.with(|slot| {
         let mut state = slot.borrow_mut();
-        if !state.model.update(id, progress) {
+        if !state.update(id, progress) {
             return (false, None, None, None);
         }
         if status.is_terminal() {
@@ -672,6 +713,65 @@ mod tests {
                 ..Default::default()
             },
         );
+    }
+
+    #[test]
+    fn completed_file_lookup_survives_callback_release_and_preserves_model() {
+        let mut runtime = Runtime::default();
+        approved(&mut runtime, 1, None);
+        assert!(runtime.completed_file_path(1).is_err());
+        assert!(runtime.update(
+            1,
+            Progress {
+                path: Some("/tmp/approved.txt".into()),
+                status: Status::Complete,
+                ..Default::default()
+            }
+        ));
+        runtime.callbacks.remove(&1);
+        let snapshot = runtime.model.snapshot();
+        assert_eq!(runtime.completed_file_path(1).unwrap(), "/tmp/approved.txt");
+        assert_eq!(runtime.model.snapshot(), snapshot);
+        assert!(runtime.completed_file_path(99).is_err());
+        runtime.dialog = Some(Dialog { id: 2, sequence: 1 });
+        assert!(runtime.completed_file_path(1).is_err());
+        runtime.dialog = None;
+        runtime.shutting_down = true;
+        assert!(runtime.completed_file_path(1).is_err());
+        runtime.shutting_down = false;
+        runtime.model.clear_finished();
+        assert!(runtime.completed_file_path(1).is_err());
+    }
+
+    #[test]
+    fn completed_file_lookup_never_uses_unapproved_or_stale_progress_paths() {
+        for (fresh, keep_approval) in [
+            (None, true),
+            (Some("/tmp/different.txt"), true),
+            (Some("/tmp/approved.txt"), false),
+        ] {
+            let mut runtime = Runtime::default();
+            approved(&mut runtime, 1, None);
+            runtime.update(
+                1,
+                Progress {
+                    path: Some("/tmp/approved.txt".into()),
+                    ..Default::default()
+                },
+            );
+            if !keep_approval {
+                runtime.callbacks.remove(&1);
+            }
+            runtime.update(
+                1,
+                Progress {
+                    path: fresh.map(str::to_owned),
+                    status: Status::Complete,
+                    ..Default::default()
+                },
+            );
+            assert!(runtime.completed_file_path(1).is_err());
+        }
     }
 
     #[test]

@@ -48,6 +48,9 @@ pub struct Entry {
     source: String,
     pub(crate) source_target: Option<SourceTarget>,
     path: Option<String>,
+    // Set only by a fresh Complete update matching the user's approved path.
+    // Terminal records are immutable, so no second path string is retained.
+    file_verified: bool,
     received: i64,
     total: i64,
     percent: Option<i32>,
@@ -86,6 +89,7 @@ pub struct DownloadRow {
     pub can_choose: bool,
     pub can_cancel: bool,
     pub can_reveal: bool,
+    pub can_reveal_file: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -154,6 +158,7 @@ impl Model {
             source: bounded_text(source, MAX_SOURCE_CHARS),
             source_target: source_target.filter(|target| target.tab == tab),
             path: None,
+            file_verified: false,
             received: 0,
             total: 0,
             percent: None,
@@ -195,6 +200,15 @@ impl Model {
     /// Ignore unknown and terminal records. Progress must not dismiss a pending
     /// native chooser or reverse an unconfirmed cancellation request.
     pub fn update(&mut self, id: u32, progress: Progress) -> bool {
+        self.update_with_approval(id, progress, None)
+    }
+
+    pub(crate) fn update_with_approval(
+        &mut self,
+        id: u32,
+        progress: Progress,
+        approved_path: Option<&str>,
+    ) -> bool {
         if matches!(
             progress.status,
             Status::Pending | Status::Choosing | Status::Canceling
@@ -208,7 +222,13 @@ impl Model {
         else {
             return false;
         };
-        if let Some(path) = progress.path.filter(|path| validate_path(path).is_ok()) {
+        let path = progress.path.filter(|path| validate_path(path).is_ok());
+        entry.file_verified = matches!(entry.status, Status::Downloading | Status::Canceling)
+            && progress.status == Status::Complete
+            && path
+                .as_deref()
+                .is_some_and(|path| Some(path) == approved_path);
+        if let Some(path) = path {
             entry.name = display_name(&path);
             entry.path = Some(path);
         }
@@ -265,6 +285,7 @@ impl Model {
                     can_choose: entry.status == Status::Pending,
                     can_cancel: !entry.status.is_terminal() && entry.status != Status::Canceling,
                     can_reveal: entry.source_target.is_some(),
+                    can_reveal_file: entry.completed_file_path().is_some(),
                 })
                 .collect(),
             active_count: self.active_count(),
@@ -294,6 +315,12 @@ impl Model {
 }
 
 impl Entry {
+    pub(crate) fn completed_file_path(&self) -> Option<&str> {
+        (self.status == Status::Complete && self.file_verified)
+            .then_some(self.path.as_deref())
+            .flatten()
+    }
+
     fn request_cancel(&mut self) -> bool {
         self.status = match self.status {
             Status::Pending | Status::Choosing => Status::Canceled,
@@ -425,6 +452,151 @@ mod tests {
         model
             .insert(id, id as i32, None, "file.txt", "사용자 공간", None)
             .unwrap();
+    }
+
+    #[test]
+    fn file_reveal_requires_a_fresh_complete_path_matching_user_approval() {
+        let approved = "/tmp/한글 file %.txt";
+        for (fresh, approval, status, expected) in [
+            (Some(approved), Some(approved), Status::Complete, true),
+            (None, Some(approved), Status::Complete, false),
+            (
+                Some("/tmp/other.txt"),
+                Some(approved),
+                Status::Complete,
+                false,
+            ),
+            (Some(approved), None, Status::Complete, false),
+            (Some(approved), Some(approved), Status::Downloading, false),
+            (Some(approved), Some(approved), Status::Canceled, false),
+            (Some(approved), Some(approved), Status::Interrupted, false),
+            (Some("relative"), Some("relative"), Status::Complete, false),
+        ] {
+            let mut model = Model::new();
+            insert(&mut model, 1);
+            model.choose(1);
+            model.start(1, approved).unwrap();
+            // Earlier matching progress is insufficient if the completion omits it.
+            model.update_with_approval(
+                1,
+                Progress {
+                    path: Some(approved.into()),
+                    ..Default::default()
+                },
+                Some(approved),
+            );
+            assert!(model.update_with_approval(
+                1,
+                Progress {
+                    path: fresh.map(str::to_owned),
+                    status,
+                    ..Default::default()
+                },
+                approval
+            ));
+            assert_eq!(
+                model.snapshot().rows[0].can_reveal_file,
+                expected,
+                "{fresh:?}, {approval:?}, {status:?}"
+            );
+            assert_eq!(
+                model.entry(1).unwrap().completed_file_path(),
+                expected.then_some(approved)
+            );
+        }
+        let oversized = format!("/{}", "x".repeat(MAX_PATH_BYTES));
+        let mut model = Model::new();
+        insert(&mut model, 1);
+        model.choose(1);
+        model.start(1, approved).unwrap();
+        model.update_with_approval(
+            1,
+            Progress {
+                path: Some(oversized.clone()),
+                status: Status::Complete,
+                ..Default::default()
+            },
+            Some(&oversized),
+        );
+        assert!(!model.snapshot().rows[0].can_reveal_file);
+    }
+
+    #[test]
+    fn verified_completion_survives_cancel_race_but_not_record_removal_or_reuse() {
+        let path = "/tmp/completed.txt";
+        let mut model = Model::new();
+        insert(&mut model, 1);
+        model.choose(1);
+        model.start(1, path).unwrap();
+        model.cancel(1);
+        assert!(!model.snapshot().rows[0].can_reveal_file);
+        assert!(model.update_with_approval(
+            1,
+            Progress {
+                path: Some(path.into()),
+                status: Status::Complete,
+                ..Default::default()
+            },
+            Some(path)
+        ));
+        assert_eq!(model.entry(1).unwrap().completed_file_path(), Some(path));
+        // A late update cannot change an already verified terminal destination.
+        assert!(!model.update_with_approval(
+            1,
+            Progress {
+                path: Some("/tmp/late.txt".into()),
+                status: Status::Complete,
+                ..Default::default()
+            },
+            Some("/tmp/late.txt")
+        ));
+        assert_eq!(model.entry(1).unwrap().completed_file_path(), Some(path));
+        assert_eq!(model.clear_finished(), 1);
+        assert!(!model.update_with_approval(
+            1,
+            Progress {
+                path: Some(path.into()),
+                status: Status::Complete,
+                ..Default::default()
+            },
+            Some(path)
+        ));
+        insert(&mut model, 1);
+        // Even a matching path cannot approve a fresh pending record.
+        model.update_with_approval(
+            1,
+            Progress {
+                path: Some(path.into()),
+                status: Status::Complete,
+                ..Default::default()
+            },
+            Some(path),
+        );
+        assert!(!model.snapshot().rows[0].can_reveal_file);
+    }
+
+    #[test]
+    fn file_reveal_metadata_is_evicted_with_its_bounded_download_record() {
+        let mut model = Model::new();
+        for id in 1..=(MAX_RECORDS + 1) as u32 {
+            insert(&mut model, id);
+            model.choose(id);
+            model.start(id, "/tmp/completed.txt").unwrap();
+            model.update_with_approval(
+                id,
+                Progress {
+                    path: Some("/tmp/completed.txt".into()),
+                    status: Status::Complete,
+                    ..Default::default()
+                },
+                Some("/tmp/completed.txt"),
+            );
+        }
+        assert_eq!(model.snapshot().rows.len(), MAX_RECORDS);
+        assert!(model.entry(1).is_none());
+        assert!(model.snapshot().rows.iter().all(|row| row.can_reveal_file));
+        assert_eq!(model.clear_finished(), MAX_RECORDS);
+        assert!(model.snapshot().rows.is_empty());
     }
 
     #[test]

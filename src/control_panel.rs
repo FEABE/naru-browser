@@ -919,6 +919,7 @@ struct BookmarkPanel {
 struct DownloadRow {
     id: u32,
     can_reveal: bool,
+    can_reveal_file: bool,
     surface: Retained<SurfaceView>,
     name: Retained<NSTextField>,
     source: Retained<NSTextField>,
@@ -926,6 +927,7 @@ struct DownloadRow {
     choose: Retained<NSButton>,
     cancel: Retained<NSButton>,
     reveal: Retained<NSButton>,
+    reveal_file: Retained<NSButton>,
 }
 
 struct DownloadPermissionRow {
@@ -1811,6 +1813,8 @@ define_class!(
         fn cancel_download(&self, sender: &NSButton) { download_row_action(sender, false); }
         #[unsafe(method(revealDownloadSource:))]
         fn reveal_download_source(&self, sender: &NSButton) { reveal_download_source(sender, false); }
+        #[unsafe(method(revealDownloadFile:))]
+        fn reveal_download_file(&self, sender: &NSButton) { reveal_download_file(sender); }
         #[unsafe(method(allowMultipleDownloads:))]
         fn allow_multiple_downloads(&self, sender: &NSButton) { download_permission_action(sender, true); }
         #[unsafe(method(cancelMultipleDownloadsRequest:))]
@@ -2588,7 +2592,7 @@ impl DownloadPanel {
             self.permissions.push(row);
         }
         let responder = window.firstResponder();
-        let mut reveal_focus_removed = false;
+        let mut action_focus_removed = false;
         let mut previous = std::mem::take(&mut self.rows);
         for item in snapshot.rows.into_iter().take(24) {
             let row = if let Some(index) = previous.iter().position(|row| row.id == item.id) {
@@ -2624,6 +2628,16 @@ impl DownloadPanel {
                     "파일이 접수된 탭 보기, 접수 이후 페이지나 제어권이 바뀌면 이동하지 않음",
                     marker,
                 );
+                // A distinct selector keeps a delayed Save As action from
+                // becoming a Finder action when this stable row completes.
+                let reveal_file = button(
+                    &surface,
+                    "Finder에서 보기",
+                    target,
+                    sel!(revealDownloadFile:),
+                    "완료한 다운로드 파일의 위치를 Finder에서 보기",
+                    marker,
+                );
                 for control in [&choose, &cancel] {
                     unsafe {
                         let _: () = msg_send![&**control, setTag: item.id as isize];
@@ -2632,6 +2646,7 @@ impl DownloadPanel {
                 DownloadRow {
                     id: item.id,
                     can_reveal: item.can_reveal,
+                    can_reveal_file: item.can_reveal_file,
                     surface,
                     name,
                     source,
@@ -2639,6 +2654,7 @@ impl DownloadPanel {
                     choose,
                     cancel,
                     reveal,
+                    reveal_file,
                 }
             };
             let mut row = row;
@@ -2652,18 +2668,33 @@ impl DownloadPanel {
             }
             row.choose.setEnabled(item.can_choose);
             row.cancel.setEnabled(item.can_cancel);
-            if !item.can_reveal {
-                let reveal_view: &NSView = &row.reveal;
-                reveal_focus_removed |= responder
-                    .as_ref()
-                    .and_then(|responder| responder.downcast_ref::<NSView>())
-                    .is_some_and(|view| std::ptr::eq(view, reveal_view));
+            let save_visible = !item.can_reveal_file && (item.can_choose || item.can_cancel);
+            row.choose.setHidden(!save_visible);
+            row.reveal_file.setHidden(!item.can_reveal_file);
+            row.reveal_file.setEnabled(item.can_reveal_file);
+            for (control, available) in [
+                (&row.reveal, item.can_reveal),
+                (&row.reveal_file, item.can_reveal_file),
+                (&row.choose, save_visible),
+            ] {
+                if !available {
+                    let control_view: &NSView = control;
+                    action_focus_removed |= responder
+                        .as_ref()
+                        .and_then(|responder| responder.downcast_ref::<NSView>())
+                        .is_some_and(|view| std::ptr::eq(view, control_view));
+                }
             }
             row.can_reveal = item.can_reveal;
+            row.can_reveal_file = item.can_reveal_file;
             row.reveal.setEnabled(item.can_reveal);
             for (control, action) in [
                 (&row.choose, "저장 위치 선택"),
                 (&row.cancel, "다운로드 취소"),
+                (
+                    &row.reveal_file,
+                    "완료한 다운로드 파일의 위치를 Finder에서 보기",
+                ),
                 (
                     &row.reveal,
                     "파일이 접수된 탭 보기, 접수 이후 페이지나 제어권이 바뀌면 이동하지 않음. 추가 파일이 보이지 않으면 접수 탭에서 확인하세요.",
@@ -2694,7 +2725,7 @@ impl DownloadPanel {
         for row in previous {
             row.surface.removeFromSuperview();
         }
-        focus_removed || site_focus_removed || reveal_focus_removed
+        focus_removed || site_focus_removed || action_focus_removed
     }
 
     fn layout(&self, size: NSSize) {
@@ -2749,6 +2780,7 @@ impl DownloadPanel {
             row.detail.setFrame(rect(14.0, 45.0, text_width, 18.0));
             let [reveal, choose, cancel] = download_action_frames(width, false);
             row.choose.setFrame(choose);
+            row.reveal_file.setFrame(choose);
             row.cancel.setFrame(cancel);
             row.reveal.setFrame(reveal);
         }
@@ -4453,6 +4485,75 @@ fn download_row_action(sender: &NSButton, choose: bool) {
     };
     set_download_notice(result.err());
     sync();
+}
+
+fn reveal_download_file(sender: &NSButton) {
+    let controls = SHELL.with(|slot| {
+        let slot = slot.try_borrow().ok()?;
+        let shell = slot.as_ref().filter(|shell| shell.downloads.open)?;
+        Some((shell.window.clone(), shell.downloads.surface.clone()))
+    });
+    let Some((window, surface)) = controls else {
+        return;
+    };
+    // Finder is an explicit native action. Validate the live control after
+    // AppKit getters, which may reenter without retaining a shell borrow.
+    if !window.isKeyWindow()
+        || !window.isVisible()
+        || window.isMiniaturized()
+        || surface.window().as_deref() != Some(&*window)
+        || surface.isHiddenOrHasHiddenAncestor()
+        || page_find_has_marked_text()
+    {
+        return;
+    }
+    let id = SHELL.with(|slot| {
+        let slot = slot.try_borrow().ok()?;
+        let shell = slot.as_ref().filter(|shell| {
+            shell.downloads.open
+                && !shell.search.open
+                && !shell.bookmarks.state.open
+                && std::ptr::eq(&*shell.window, &*window)
+                && std::ptr::eq(&*shell.downloads.surface, &*surface)
+        })?;
+        shell
+            .downloads
+            .rows
+            .iter()
+            .find(|row| row.can_reveal_file && std::ptr::eq(sender, &*row.reveal_file))
+            .map(|row| row.id)
+    });
+    let Some(id) = id else { return };
+    // The runtime revalidates the completed file. Keep the browser's current
+    // space, tab, address draft and panel while Finder handles the request.
+    let notice = match crate::download_runtime::reveal_file(id) {
+        Ok(()) => "Finder에 파일 위치 표시를 요청했습니다.".to_owned(),
+        Err(error) => error,
+    };
+    let current = SHELL.with(|slot| {
+        let Ok(mut slot) = slot.try_borrow_mut() else {
+            return false;
+        };
+        let Some(shell) = slot.as_mut().filter(|shell| {
+            shell.downloads.open
+                && !shell.search.open
+                && !shell.bookmarks.state.open
+                && std::ptr::eq(&*shell.window, &*window)
+                && std::ptr::eq(&*shell.downloads.surface, &*surface)
+                && shell
+                    .downloads
+                    .rows
+                    .iter()
+                    .any(|row| row.id == id && std::ptr::eq(sender, &*row.reveal_file))
+        }) else {
+            return false;
+        };
+        shell.downloads.notice = Some(notice);
+        true
+    });
+    if current {
+        sync();
+    }
 }
 
 enum DownloadSource {
@@ -9698,7 +9799,8 @@ mod tests {
     #[test]
     fn download_source_buttons_fit_both_row_kinds_at_narrow_content_widths() {
         // Includes the 584pt minimum content minus panel margins and a legacy
-        // vertical scroller. This checks geometry, not native rendering.
+        // vertical scroller. File rows share the primary frame between Save As
+        // and Finder. This checks geometry, not native rendering.
         for width in [480.0, 497.0, 512.0, 800.0] {
             for permission in [false, true] {
                 let [reveal, primary, cancel] = download_action_frames(width, permission);

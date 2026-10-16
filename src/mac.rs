@@ -7,9 +7,9 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSApp, NSApplication, NSApplicationActivationPolicy, NSApplicationDidUnhideNotification,
-    NSEvent, NSEventType,
+    NSEvent, NSEventType, NSWorkspace,
 };
-use objc2_foundation::{NSNotification, NSNotificationCenter};
+use objc2_foundation::{NSNotification, NSNotificationCenter, NSString};
 use std::cell::Cell;
 
 #[derive(Default)]
@@ -99,5 +99,21 @@ pub fn setup() {
             Some(NSApplicationDidUnhideNotification),
             Some(&app),
         );
+    }
+}
+
+/// Request Finder selection, never launch the downloaded file. The native
+/// return value is not proof of visible selection or file identity/existence.
+pub(crate) fn reveal_file(path: &str) -> Result<(), String> {
+    let _main_thread = MainThreadMarker::new()
+        .ok_or_else(|| "파일 위치 표시는 브라우저 UI에서 실행해 주세요.".to_owned())?;
+    let path = NSString::from_str(path);
+    let root = NSString::from_str("");
+    let accepted =
+        NSWorkspace::sharedWorkspace().selectFile_inFileViewerRootedAtPath(Some(&path), &root);
+    if accepted {
+        Ok(())
+    } else {
+        Err("파일 위치를 표시하지 못했습니다. 파일이 이동되거나 삭제됐는지 확인해 주세요.".into())
     }
 }

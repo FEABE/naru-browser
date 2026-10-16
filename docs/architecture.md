@@ -4,6 +4,10 @@ Naru는 사람이 사용하는 Chromium 브라우저를 로컬 CLI에서도 읽�
 
 프로젝트 이름은 Naru지만 현재 앱 번들, 실행 파일, 프로필 식별자는 `Light Browser.app`, `lightbrowser`, `local.lightbrowser.dev`를 사용한다. 이름 변경과 프로필 이전은 별도 작업이다.
 
+## 완료 다운로드의 파일 위치 표시
+
+`updated → Runtime::update → Model::update_with_approval`은 이번 Complete 경로가 승인된 Save As 경로와 일치할 때만 완료 기록의 확인 bit를 설정한다. 기존 terminal 불변 정책과 경로를 재사용하며 승인 경로의 활성 콜백 보관 상한은 유지한다. 현재 행, 창, 패널과 입력기 검증을 통과한 버튼만 `reveal_file → mac::reveal_file → NSWorkspace`로 요청한다. 파일 실행, 브라우저 선택과 AI 제어권 변경, 새로운 영속 저장은 없다. 반환값과 실제 Finder 선택의 증거 범위를 [다운로드 설계](downloads-design.md)에 구분한다.
+
 ## 제품 목표와 재사용 경계
 
 Naru를 먼저 독립 브라우저로 완성한 뒤, 같은 Rust·CEF 브라우저 기능을 Preseller 내부에 내장한다. 독립 앱의 사용성과 CLI를 계속 개발하며 창·앱 수명주기와 공통 브라우저 구현의 의존성을 나눌 준비를 한다. 현재 외부 호스트를 받는 API나 공통 코어 패키지는 없으며, 아래 요청 흐름은 독립 앱의 실제 구현이다. 후속 구조와 완료 기준은 [독립 완성과 내장 계획](preseller-integration.md)을 따른다.
