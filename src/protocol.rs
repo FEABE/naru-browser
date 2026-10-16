@@ -125,6 +125,12 @@ pub enum Command {
         #[serde(rename = "ref")]
         reference: String,
     },
+    Check {
+        tab: i32,
+        #[serde(rename = "ref")]
+        reference: String,
+        checked: bool,
+    },
     Fill {
         tab: i32,
         #[serde(rename = "ref")]
@@ -166,6 +172,7 @@ impl Command {
             | Self::Read { tab }
             | Self::Scroll { tab, .. }
             | Self::Click { tab, .. }
+            | Self::Check { tab, .. }
             | Self::Fill { tab, .. }
             | Self::Select { tab, .. }
             | Self::Press { tab, .. }
@@ -883,6 +890,7 @@ fn validate_command_fields(value: &Value, allow_task: bool) -> Result<(), Protoc
                     | "read"
                     | "scroll"
                     | "click"
+                    | "check"
                     | "fill"
                     | "select"
                     | "press"
@@ -1060,6 +1068,72 @@ mod tests {
         frame.push(b'\n');
         writer.write_all(&frame).unwrap();
         read_request(&mut reader)
+    }
+
+    #[test]
+    fn check_boolean_round_trips_through_global_and_task_requests() {
+        for checked in [false, true] {
+            let command = Command::Check {
+                tab: 3,
+                reference: "9/doc:1:1".into(),
+                checked,
+            };
+            let value = json!({"type":"check","tab":3,"ref":"9/doc:1:1","checked":checked});
+            assert_eq!(serde_json::to_value(&command).unwrap(), value);
+            assert_eq!(
+                serde_json::from_value::<Command>(value.clone()).unwrap(),
+                command
+            );
+            assert_eq!(
+                request_from_command_value(value.clone()).unwrap().command,
+                command
+            );
+            assert_eq!(command.tab_id(), Some(3));
+            assert!(!command.is_task_command());
+            let nested = json!({"type":"task_run","task":"task-1","revision":2,"command":value});
+            let request = request_from_command_value(nested.clone()).unwrap();
+            assert_eq!(request.command.tab_id(), Some(3));
+            assert_eq!(serde_json::to_value(request.command).unwrap(), nested);
+        }
+    }
+
+    #[test]
+    fn check_wire_requires_a_boolean_and_rejects_invalid_fields_in_both_scopes() {
+        let base = json!({"type":"check","tab":3,"ref":"9/doc:1:1","checked":true});
+        let mut invalid = Vec::new();
+        for checked in [
+            json!("true"),
+            json!("false"),
+            json!(0),
+            json!(1),
+            json!(1.0),
+            Value::Null,
+            json!([]),
+            json!({}),
+        ] {
+            let mut command = base.clone();
+            command["checked"] = checked;
+            invalid.push(command);
+        }
+        invalid.extend([
+            json!({"type":"check","tab":3,"ref":"9/doc:1:1"}),
+            json!({"type":"check","tab":3,"checked":true}),
+            json!({"type":"check","tab":0,"ref":"9/doc:1:1","checked":false}),
+            json!({"type":"check","tab":-1,"ref":"9/doc:1:1","checked":true}),
+            json!({"type":"check","tab":"3","ref":"9/doc:1:1","checked":true}),
+            json!({"type":"check","tab":3,"ref":"9/doc:1:1","checked":true,"value":true}),
+        ]);
+        for command in invalid {
+            for value in [
+                command.clone(),
+                json!({"type":"task_run","task":"task-1","revision":2,"command":command}),
+            ] {
+                assert_eq!(
+                    request_from_command_value(value).unwrap_err().code,
+                    "INVALID_REQUEST"
+                );
+            }
+        }
     }
 
     #[test]

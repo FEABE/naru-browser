@@ -16,8 +16,8 @@ use std::{
     os::unix::net::{UnixListener, UnixStream},
     path::Path,
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Sender},
     },
     thread,
@@ -27,6 +27,36 @@ use std::{
 const DOM_BRIDGE: &str = include_str!("dom_bridge.js");
 const ACTION_TIMEOUT: Duration = Duration::from_secs(45);
 const MAX_CONNECTIONS: usize = 16;
+
+struct CommandPermit {
+    outstanding: Arc<AtomicUsize>,
+}
+
+impl CommandPermit {
+    fn acquire(outstanding: &Arc<AtomicUsize>, id: &str) -> Result<Self, Response> {
+        outstanding
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < MAX_CONNECTIONS).then_some(count + 1)
+            })
+            .map_err(|_| {
+                Response::error(
+                    id,
+                    "APP_BUSY",
+                    "The browser command queue is full. Try again later.",
+                )
+                .with_details(json!({"outcomeUnknown":false}))
+            })?;
+        Ok(Self {
+            outstanding: outstanding.clone(),
+        })
+    }
+}
+
+impl Drop for CommandPermit {
+    fn drop(&mut self) {
+        self.outstanding.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 #[derive(Clone)]
 struct Reply {
@@ -493,7 +523,7 @@ impl Tab {
 }
 #[derive(Clone, Copy)]
 enum Evaluation {
-    Page { mutation: bool },
+    Page { mutation: bool, check: bool },
     ReadyState { token: u64 },
 }
 enum Step {
@@ -2755,6 +2785,9 @@ fn tab_info(tab: &Tab) -> Json {
 pub fn start_server(listener: UnixListener, stopped: Arc<AtomicBool>) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut workers: Vec<thread::JoinHandle<()>> = Vec::new();
+        // Unlike worker slots, queued commands retain their permit after the
+        // connection times out while the UI thread is not draining its queue.
+        let outstanding_commands = Arc::new(AtomicUsize::new(0));
         let mut token = 0u64;
         for connection in listener.incoming() {
             if stopped.load(Ordering::Acquire) {
@@ -2778,8 +2811,9 @@ pub fn start_server(listener: UnixListener, stopped: Arc<AtomicBool>) -> thread:
             }
             token += 1;
             let stopped = stopped.clone();
+            let outstanding_commands = outstanding_commands.clone();
             workers.push(thread::spawn(move || {
-                serve_connection(stream, stopped, token)
+                serve_connection(stream, stopped, token, outstanding_commands)
             }));
         }
         for worker in workers {
@@ -2788,7 +2822,12 @@ pub fn start_server(listener: UnixListener, stopped: Arc<AtomicBool>) -> thread:
     })
 }
 
-fn serve_connection(mut stream: UnixStream, stopped: Arc<AtomicBool>, token: u64) {
+fn serve_connection(
+    mut stream: UnixStream,
+    stopped: Arc<AtomicBool>,
+    token: u64,
+    outstanding_commands: Arc<AtomicUsize>,
+) {
     let request = match protocol::read_request(&mut stream) {
         Ok(request) => request,
         Err(error) => {
@@ -2800,19 +2839,31 @@ fn serve_connection(mut stream: UnixStream, stopped: Arc<AtomicBool>, token: u64
         }
     };
     let id = request.id.clone();
+    let permit = match CommandPermit::acquire(&outstanding_commands, &id) {
+        Ok(permit) => permit,
+        Err(response) => {
+            let _ = protocol::write_response(&mut stream, &response);
+            return;
+        }
+    };
     let active = Arc::new(AtomicBool::new(true));
     let (sender, receiver) = mpsc::channel();
-    let mut task = CommandTask::new(
+    let mut task = CommandTask::new(Arc::new(Mutex::new(Some(QueuedCommand {
         request,
-        Reply {
+        reply: Reply {
             id: id.clone(),
             token,
             active: active.clone(),
             sender,
             scope: None,
         },
-    );
-    if stopped.load(Ordering::Acquire) || post_task(ThreadId::UI, Some(&mut task)) == 0 {
+        _permit: permit,
+    }))));
+    let posted = !stopped.load(Ordering::Acquire) && post_task(ThreadId::UI, Some(&mut task)) != 0;
+    // CEF's accepted post owns a reference. Do not retain the task payload in
+    // the worker until the response deadline, or after a rejected post.
+    drop(task);
+    if !posted {
         let _ = protocol::write_response(
             &mut stream,
             &Response::error(id, "APP_NOT_READY", "The browser event loop is not ready."),
@@ -2853,12 +2904,25 @@ fn serve_connection(mut stream: UnixStream, stopped: Arc<AtomicBool>, token: u64
     let _ = protocol::write_response(&mut stream, &response);
 }
 
+struct QueuedCommand {
+    request: Request,
+    reply: Reply,
+    _permit: CommandPermit,
+}
+
 wrap_task! {
-    struct CommandTask { request: Request, reply: Reply }
+    // The generated wrapper requires Clone. Share one payload and permit rather
+    // than cloning either; a discarded native task releases both on last drop.
+    struct CommandTask { work: Arc<Mutex<Option<QueuedCommand>>> }
     impl Task {
         fn execute(&self) {
-            if self.reply.active.load(Ordering::Acquire) {
-                handle(&self.request.command, self.reply.clone());
+            let work = self.work.lock().unwrap_or_else(|error| error.into_inner()).take();
+            if let Some(work) = work {
+                // Neither the mutex nor a queued payload is retained by an
+                // asynchronous Pending request. The permit drops after handle.
+                if work.reply.active.load(Ordering::Acquire) {
+                    handle(&work.request.command, work.reply.clone());
+                }
             }
         }
     }
@@ -3010,7 +3074,7 @@ fn control_detached(tab: i32) {
     });
     for request in pending {
         if matches!(request.step, Step::Evaluate)
-            && matches!(request.evaluation, Evaluation::Page { mutation: true })
+            && matches!(request.evaluation, Evaluation::Page { mutation: true, .. })
         {
             request.reply.error_details(
                 "CONTROL_DISCONNECTED",
@@ -3061,7 +3125,7 @@ fn renderer_terminated(tab: i32, reason: Json) {
     });
     for request in pending {
         let unknown = matches!(request.step, Step::Evaluate)
-            && matches!(request.evaluation, Evaluation::Page { mutation: true });
+            && matches!(request.evaluation, Evaluation::Page { mutation: true, .. });
         request.reply.error_details(
             "RENDERER_TERMINATED",
             "The renderer stopped. Inspect the tab before retrying an action.",
@@ -3118,7 +3182,7 @@ fn revoke_task_requests(task: &str, only_tab: Option<i32>) {
     });
     for request in pending {
         let unknown = matches!(request.step, Step::Evaluate)
-            && matches!(request.evaluation, Evaluation::Page { mutation: true });
+            && matches!(request.evaluation, Evaluation::Page { mutation: true, .. });
         request.reply.error_details(
             "TASK_CONTROL_LOST",
             "Task control changed. Inspect the page before continuing.",
@@ -3495,6 +3559,7 @@ fn handle(command: &Command, reply: Reply) {
             let tab_id = match other {
                 Command::Read { tab }
                 | Command::Click { tab, .. }
+                | Command::Check { tab, .. }
                 | Command::Fill { tab, .. }
                 | Command::Select { tab, .. }
                 | Command::Press { tab, .. }
@@ -3613,7 +3678,10 @@ fn handle(command: &Command, reply: Reply) {
                         Pending {
                             tab: tab_id,
                             epoch: 0,
-                            evaluation: Evaluation::Page { mutation: false },
+                            evaluation: Evaluation::Page {
+                                mutation: false,
+                                check: false,
+                            },
                             reply,
                             step: Step::Screenshot(path.clone()),
                         },
@@ -3645,12 +3713,21 @@ fn handle(command: &Command, reply: Reply) {
                         Command::Click { reference, .. } => {
                             action_expression("click", reference, None, epoch, &reply)
                         }
+                        Command::Check {
+                            reference, checked, ..
+                        } => action_expression(
+                            "check",
+                            reference,
+                            Some(("checked", ActionValue::Bool(*checked))),
+                            epoch,
+                            &reply,
+                        ),
                         Command::Fill {
                             reference, text, ..
                         } => action_expression(
                             "fill",
                             reference,
-                            Some(("text", text)),
+                            Some(("text", ActionValue::String(text))),
                             epoch,
                             &reply,
                         ),
@@ -3659,7 +3736,7 @@ fn handle(command: &Command, reply: Reply) {
                         } => action_expression(
                             "select",
                             reference,
-                            Some(("value", value)),
+                            Some(("value", ActionValue::String(value))),
                             epoch,
                             &reply,
                         ),
@@ -3671,7 +3748,13 @@ fn handle(command: &Command, reply: Reply) {
                                 );
                                 return;
                             }
-                            action_expression("press", reference, Some(("key", key)), epoch, &reply)
+                            action_expression(
+                                "press",
+                                reference,
+                                Some(("key", ActionValue::String(key))),
+                                epoch,
+                                &reply,
+                            )
                         }
                         Command::Scroll { x, y, .. } => {
                             if !(-10000..=10000).contains(x) || !(-10000..=10000).contains(y) {
@@ -3701,6 +3784,7 @@ fn handle(command: &Command, reply: Reply) {
                             epoch,
                             evaluation: Evaluation::Page {
                                 mutation: !matches!(other, Command::Read { .. }),
+                                check: matches!(other, Command::Check { .. }),
                             },
                             reply,
                             step: Step::Frame(expression),
@@ -3811,10 +3895,15 @@ fn navigate(browser: &Browser, command: &Command, reply: Reply) {
     reply.ok(json!({"tab":tab_id,"action":action,"navigationRequested":true}));
 }
 
+enum ActionValue<'a> {
+    String(&'a str),
+    Bool(bool),
+}
+
 fn action_expression(
     action: &str,
     reference: &str,
-    value: Option<(&str, &String)>,
+    value: Option<(&str, ActionValue<'_>)>,
     epoch: u64,
     reply: &Reply,
 ) -> String {
@@ -3838,7 +3927,10 @@ fn action_expression(
     };
     let mut args = json!({"action":action,"ref":reference});
     if let Some((key, value)) = value {
-        args[key] = json!(value);
+        args[key] = match value {
+            ActionValue::String(value) => json!(value),
+            ActionValue::Bool(value) => json!(value),
+        };
     }
     format!("window.__lightBrowserBridge.act({args})")
 }
@@ -4032,7 +4124,7 @@ fn dispatch(browser: &Browser, method: &str, params: Json, pending: Pending) {
         // Reads, screenshots and action preparation leave native input alone.
         // An actual page mutation gives the CEF document its visible surface.
         let start_page_revoked = matches!(pending.step, Step::Evaluate)
-            && matches!(pending.evaluation, Evaluation::Page { mutation: true })
+            && matches!(pending.evaluation, Evaluation::Page { mutation: true, .. })
             && state
                 .tabs
                 .get_mut(&pending.tab)
@@ -4087,7 +4179,7 @@ fn devtools_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) {
     // Check every preparation step. An action's own navigation is allowed
     // after evaluation has been dispatched, and is not retried.
     let already_dispatched_action = matches!(pending.step, Step::Evaluate)
-        && matches!(pending.evaluation, Evaluation::Page { mutation: true });
+        && matches!(pending.evaluation, Evaluation::Page { mutation: true, .. });
     if !matches!(pending.step, Step::Screenshot(_)) && !already_dispatched_action {
         let current = STATE.with(|state| {
             state.borrow().tabs.get(&pending.tab).is_some_and(|tab| {
@@ -4219,10 +4311,32 @@ fn devtools_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) {
                 let message = value["detail"]
                     .as_str()
                     .unwrap_or("The page action did not complete.");
-                reply.error(code, message);
+                let mut details = serde_json::Map::new();
+                if matches!(pending.evaluation, Evaluation::Page { check: true, .. })
+                    && value["action"] == "check"
+                {
+                    // A failed click may already have changed the page. Keep
+                    // only bounded boolean evidence for this requested action.
+                    for key in ["attempted", "trusted", "checked", "indeterminate"] {
+                        if let Some(value) = value[key].as_bool() {
+                            details.insert(key.into(), Json::Bool(value));
+                        }
+                    }
+                }
+                if details.is_empty() {
+                    reply.error(code, message);
+                } else {
+                    reply.error_details(code, message, Json::Object(details));
+                }
             } else {
                 let mut page = value.clone();
-                if matches!(pending.evaluation, Evaluation::Page { mutation: false }) {
+                if matches!(
+                    pending.evaluation,
+                    Evaluation::Page {
+                        mutation: false,
+                        ..
+                    }
+                ) {
                     if let Some(elements) = page["interactive"].as_array_mut() {
                         for element in elements {
                             if let Some(reference) = element["ref"].as_str() {
@@ -6746,6 +6860,108 @@ mod tests {
         )
     }
 
+    fn admitted_test_command(
+        outstanding: &Arc<AtomicUsize>,
+        token: u64,
+    ) -> (Task, mpsc::Receiver<Response>, Arc<AtomicBool>) {
+        let (reply, receiver) = test_reply(token);
+        let active = reply.active.clone();
+        let permit = CommandPermit::acquire(outstanding, &reply.id).ok().unwrap();
+        let task = CommandTask::new(Arc::new(Mutex::new(Some(QueuedCommand {
+            request: Request {
+                id: reply.id.clone(),
+                command: Command::TaskInfo {
+                    task: "missing-task".into(),
+                },
+            },
+            reply,
+            _permit: permit,
+        }))));
+        (task, receiver, active)
+    }
+
+    #[test]
+    fn stalled_command_queue_stays_bounded_after_timeouts_and_reconnects() {
+        let outstanding = Arc::new(AtomicUsize::new(0));
+        let mut queued = Vec::new();
+        for token in 1..=MAX_CONNECTIONS {
+            let (worker, receiver, active) = admitted_test_command(&outstanding, token as u64);
+            // Model CEF retaining the accepted post after its worker times out.
+            queued.push(worker.clone());
+            active.store(false, Ordering::Release);
+            drop(worker);
+            drop(receiver);
+        }
+        for _ in 0..3 * MAX_CONNECTIONS {
+            let response = match CommandPermit::acquire(&outstanding, "reconnect") {
+                Ok(_) => panic!("A timed-out worker must not free its queued command slot"),
+                Err(response) => response,
+            };
+            assert_eq!(response.id, "reconnect");
+            let error = response.error.unwrap();
+            assert_eq!(error.code, "APP_BUSY");
+            assert_eq!(error.details.unwrap()["outcomeUnknown"], false);
+        }
+        assert_eq!(outstanding.load(Ordering::Acquire), MAX_CONNECTIONS);
+        // Draining one expired command does no work but frees exactly one slot.
+        queued[0].execute();
+        assert_eq!(outstanding.load(Ordering::Acquire), MAX_CONNECTIONS - 1);
+        let replacement = CommandPermit::acquire(&outstanding, "replacement")
+            .ok()
+            .unwrap();
+        assert_eq!(outstanding.load(Ordering::Acquire), MAX_CONNECTIONS);
+        queued[0].execute();
+        assert_eq!(outstanding.load(Ordering::Acquire), MAX_CONNECTIONS);
+        drop(replacement);
+        drop(queued);
+        assert_eq!(outstanding.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn command_execution_releases_payload_even_while_native_handles_remain() {
+        clear();
+        let outstanding = Arc::new(AtomicUsize::new(0));
+        let (task, receiver, _) = admitted_test_command(&outstanding, 1);
+        let native_handle = task.clone();
+        task.execute();
+        assert_eq!(
+            receiver.try_recv().unwrap().error.unwrap().code,
+            "TASK_NOT_FOUND"
+        );
+        assert_eq!(outstanding.load(Ordering::Acquire), 0);
+        native_handle.execute();
+        assert!(receiver.try_recv().is_err());
+        drop(task);
+        drop(native_handle);
+        assert_eq!(outstanding.load(Ordering::Acquire), 0);
+        clear();
+    }
+
+    #[test]
+    fn rejected_posts_and_discarded_native_tasks_return_only_their_server_permit() {
+        let first_server = Arc::new(AtomicUsize::new(0));
+        let second_server = Arc::new(AtomicUsize::new(0));
+        let (rejected, rejected_result, _) = admitted_test_command(&first_server, 1);
+        let (queued, queued_result, _) = admitted_test_command(&first_server, 2);
+        let (other, _, _) = admitted_test_command(&second_server, 3);
+        // A failed native post releases its parameter reference before returning.
+        let rejected_parameter = rejected.clone();
+        drop(rejected_parameter);
+        drop(rejected);
+        assert_eq!(first_server.load(Ordering::Acquire), 1);
+        assert_eq!(second_server.load(Ordering::Acquire), 1);
+        assert!(rejected_result.try_recv().is_err());
+        // An accepted task discarded without execute releases on its last handle.
+        let native_queue = queued.clone();
+        drop(queued);
+        assert_eq!(first_server.load(Ordering::Acquire), 1);
+        drop(native_queue);
+        assert_eq!(first_server.load(Ordering::Acquire), 0);
+        assert!(queued_result.try_recv().is_err());
+        drop(other);
+        assert_eq!(second_server.load(Ordering::Acquire), 0);
+    }
+
     #[test]
     fn renderer_failure_requires_a_new_navigation_and_commit_before_readiness() {
         let mut nav = Navigation {
@@ -6823,7 +7039,10 @@ mod tests {
                         epoch: 0,
                         reply,
                         step,
-                        evaluation: Evaluation::Page { mutation },
+                        evaluation: Evaluation::Page {
+                            mutation,
+                            check: false,
+                        },
                     },
                 )
             });
@@ -8066,7 +8285,10 @@ mod tests {
                         epoch: 0,
                         reply,
                         step,
-                        evaluation: Evaluation::Page { mutation: true },
+                        evaluation: Evaluation::Page {
+                            mutation: true,
+                            check: false,
+                        },
                     },
                 )
             });
@@ -8386,40 +8608,251 @@ mod tests {
     }
 
     #[test]
-    fn select_uses_epoch_guard_and_serializes_option_values_as_data() {
+    fn string_actions_use_epoch_guard_and_serialize_exact_values_as_data() {
         let value = "  \"});window.unexpected=true;//\n🧭  ".to_owned();
-        let (reply, receiver) = test_reply(1);
-        assert!(
-            action_expression(
-                "select",
-                "8/document:1:1",
-                Some(("value", &value)),
+        for (action, key) in [("fill", "text"), ("select", "value")] {
+            let (reply, receiver) = test_reply(1);
+            assert!(
+                action_expression(
+                    action,
+                    "8/document:1:1",
+                    Some((key, ActionValue::String(&value))),
+                    9,
+                    &reply
+                )
+                .is_empty()
+            );
+            assert_eq!(
+                receiver.try_recv().unwrap().error.unwrap().code,
+                "STALE_REF"
+            );
+            let (reply, _) = test_reply(2);
+            let expression = action_expression(
+                action,
+                "9/document:1:1",
+                Some((key, ActionValue::String(&value))),
                 9,
-                &reply
-            )
-            .is_empty()
+                &reply,
+            );
+            let args = expression
+                .strip_prefix("window.__lightBrowserBridge.act(")
+                .unwrap()
+                .strip_suffix(')')
+                .unwrap();
+            let mut expected = json!({"action":action,"ref":"document:1:1"});
+            expected[key] = json!(value);
+            assert_eq!(serde_json::from_str::<Json>(args).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn check_serializes_boolean_data_and_rejects_stale_or_invalid_refs() {
+        for checked in [false, true] {
+            let (reply, _) = test_reply(1);
+            let expression = action_expression(
+                "check",
+                "9/document:1:1",
+                Some(("checked", ActionValue::Bool(checked))),
+                9,
+                &reply,
+            );
+            let args = expression
+                .strip_prefix("window.__lightBrowserBridge.act(")
+                .unwrap()
+                .strip_suffix(')')
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Json>(args).unwrap(),
+                json!({"action":"check","ref":"document:1:1","checked":checked})
+            );
+            for (reference, code) in [
+                ("8/document:1:1", "STALE_REF"),
+                ("9/", "STALE_REF"),
+                ("", "INVALID_REF"),
+                ("9/doc\n:1", "INVALID_REF"),
+            ] {
+                let (reply, receiver) = test_reply(2);
+                assert!(
+                    action_expression(
+                        "check",
+                        reference,
+                        Some(("checked", ActionValue::Bool(checked))),
+                        9,
+                        &reply
+                    )
+                    .is_empty()
+                );
+                assert_eq!(receiver.try_recv().unwrap().error.unwrap().code, code);
+            }
+        }
+    }
+
+    #[test]
+    fn check_preserves_task_access_and_epoch_guards_before_dispatch() {
+        clear();
+        let scope = STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let task = state.tasks.create("check owner").unwrap();
+            let scope = TaskScope {
+                task: task.id,
+                revision: task.revision,
+            };
+            state.tasks.attach(&scope, 7, Origin::Borrowed).unwrap();
+            state.tabs.insert(7, native_blank_tab());
+            scope
+        });
+        let command = Command::Check {
+            tab: 7,
+            reference: "3/document:1:1".into(),
+            checked: false,
+        };
+        let (reply, receiver) = test_reply(1);
+        handle(&command, reply);
+        assert_eq!(
+            receiver.try_recv().unwrap().error.unwrap().code,
+            "TASK_REQUIRED"
         );
+        let scoped = Command::TaskRun {
+            task: scope.task.clone(),
+            revision: scope.revision,
+            command: Box::new(command),
+        };
+        let (reply, receiver) = test_reply(2);
+        handle(&scoped, reply);
         assert_eq!(
             receiver.try_recv().unwrap().error.unwrap().code,
             "STALE_REF"
         );
-        let (reply, _) = test_reply(2);
-        let expression = action_expression(
-            "select",
-            "9/document:1:1",
-            Some(("value", &value)),
-            9,
-            &reply,
-        );
-        let args = expression
-            .strip_prefix("window.__lightBrowserBridge.act(")
-            .unwrap()
-            .strip_suffix(')')
-            .unwrap();
+        STATE.with(|state| {
+            state.borrow_mut().tasks.handoff(&scope).unwrap();
+        });
+        let (reply, receiver) = test_reply(3);
+        handle(&scoped, reply);
         assert_eq!(
-            serde_json::from_str::<Json>(args).unwrap(),
-            json!({"action":"select","ref":"document:1:1","value":value})
+            receiver.try_recv().unwrap().error.unwrap().code,
+            "TASK_STALE_REVISION"
         );
+        STATE.with(|state| {
+            let state = state.borrow();
+            assert!(state.pending.is_empty());
+            assert_eq!(state.next_message, 0);
+        });
+        clear();
+    }
+
+    #[test]
+    fn check_failures_forward_only_boolean_details_for_the_requested_action() {
+        for (requested_check, action, fields, expected) in [
+            (
+                true,
+                "check",
+                json!({"attempted":true,"trusted":false,"checked":false,"indeterminate":true,"pageText":"excluded"}),
+                Some(
+                    json!({"attempted":true,"trusted":false,"checked":false,"indeterminate":true}),
+                ),
+            ),
+            (
+                true,
+                "check",
+                json!({"attempted":false,"trusted":false,"checked":true,"indeterminate":false}),
+                Some(
+                    json!({"attempted":false,"trusted":false,"checked":true,"indeterminate":false}),
+                ),
+            ),
+            (
+                true,
+                "check",
+                json!({"attempted":true,"trusted":"false","checked":null,"indeterminate":[]} ),
+                Some(json!({"attempted":true})),
+            ),
+            (
+                true,
+                "check",
+                json!({"attempted":1,"trusted":"false","checked":null,"indeterminate":{}}),
+                None,
+            ),
+            (true, "click", json!({"attempted":true}), None),
+            (false, "check", json!({"attempted":true}), None),
+        ] {
+            clear();
+            let tab = native_blank_tab();
+            let browser = tab.browser.clone();
+            let (reply, receiver) = test_reply(1);
+            STATE.with(|state| {
+                let mut state = state.borrow_mut();
+                state.pending.insert(
+                    42,
+                    Pending {
+                        tab: 7,
+                        epoch: tab.navigation.epoch,
+                        evaluation: Evaluation::Page {
+                            mutation: true,
+                            check: requested_check,
+                        },
+                        reply,
+                        step: Step::Evaluate,
+                    },
+                );
+                state.tabs.insert(7, tab);
+            });
+            let mut value = fields;
+            value["ok"] = json!(false);
+            value["action"] = json!(action);
+            value["error"] = json!("CHECK_STATE_NOT_REACHED");
+            value["detail"] = json!("Read again before retrying.");
+            let bytes = serde_json::to_vec(&json!({"result":{"value":value}})).unwrap();
+            devtools_result(&browser, 42, true, &bytes);
+            let response = receiver.try_recv().unwrap();
+            let wire = serde_json::to_value(response).unwrap();
+            assert_eq!(wire["error"]["code"], "CHECK_STATE_NOT_REACHED");
+            assert_eq!(wire["error"].get("details"), expected.as_ref());
+            // A repeated native callback cannot send a second action result.
+            devtools_result(&browser, 42, true, &bytes);
+            assert!(receiver.try_recv().is_err());
+            clear();
+        }
+    }
+
+    #[test]
+    fn canceled_check_keeps_unknown_outcome_and_ignores_late_boolean_details() {
+        clear();
+        let tab = native_blank_tab();
+        let browser = tab.browser.clone();
+        let (mut reply, receiver) = test_reply(1);
+        reply.scope = Some(TaskScope {
+            task: "check-task".into(),
+            revision: 1,
+        });
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.pending.insert(
+                42,
+                Pending {
+                    tab: 7,
+                    epoch: tab.navigation.epoch,
+                    evaluation: Evaluation::Page {
+                        mutation: true,
+                        check: true,
+                    },
+                    reply,
+                    step: Step::Evaluate,
+                },
+            );
+            state.tabs.insert(7, tab);
+        });
+        revoke_task_requests("check-task", None);
+        let error = receiver.try_recv().unwrap().error.unwrap();
+        assert_eq!(error.code, "TASK_CONTROL_LOST");
+        assert_eq!(error.details.unwrap()["outcomeUnknown"], true);
+        devtools_result(
+            &browser,
+            42,
+            true,
+            br#"{"result":{"value":{"ok":false,"action":"check","attempted":true,"trusted":false}}}"#,
+        );
+        assert!(receiver.try_recv().is_err());
+        STATE.with(|state| assert!(state.borrow().pending.is_empty()));
+        clear();
     }
 
     #[test]
@@ -8509,7 +8942,10 @@ mod tests {
                     Pending {
                         tab: 7,
                         epoch: 0,
-                        evaluation: Evaluation::Page { mutation: false },
+                        evaluation: Evaluation::Page {
+                            mutation: false,
+                            check: false,
+                        },
                         reply,
                         step: Step::Screenshot("unused.png".into()),
                     },
@@ -8556,7 +8992,10 @@ mod tests {
                         tab: 7,
                         epoch: 1,
                         reply,
-                        evaluation: Evaluation::Page { mutation: true },
+                        evaluation: Evaluation::Page {
+                            mutation: true,
+                            check: false,
+                        },
                         step,
                     },
                 );
@@ -8655,7 +9094,10 @@ mod tests {
                         tab: 1,
                         epoch: 0,
                         reply,
-                        evaluation: Evaluation::Page { mutation: false },
+                        evaluation: Evaluation::Page {
+                            mutation: false,
+                            check: false,
+                        },
                         step: Step::Evaluate,
                     },
                 );
@@ -8704,7 +9146,10 @@ mod tests {
                     tab: 7,
                     epoch: 1,
                     reply: action_reply,
-                    evaluation: Evaluation::Page { mutation: true },
+                    evaluation: Evaluation::Page {
+                        mutation: true,
+                        check: false,
+                    },
                     step: Step::Evaluate,
                 },
             );

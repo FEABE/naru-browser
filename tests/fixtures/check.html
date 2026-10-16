@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-src 'self' about:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Naru native check fixture</title>
+  <style>
+    body { margin: 24px; font: 16px system-ui; color: #183832; background: #f2f7f5; }
+    label, fieldset, .row { display: block; margin: 10px 0; }
+    button { padding: 8px; font: inherit; }
+    iframe { display: block; width: 400px; height: 90px; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; background: white; padding: 12px; }
+  </style>
+</head>
+<body>
+  <h1>Native checkbox and radio fixture</h1>
+  <p>Local DOM actions only. A synthetic click is not trusted native input. Its browser-generated input/change events are recorded separately.</p>
+  <label><input id="normal" type="checkbox" aria-label="Normal checkbox"> Normal checkbox</label>
+  <label><input id="disabled" type="checkbox" disabled aria-label="Disabled checkbox"> Disabled checkbox</label>
+  <fieldset disabled><legend>Disabled fieldset</legend><label><input id="fieldset" type="checkbox" aria-label="Fieldset checkbox"> Fieldset checkbox</label></fieldset>
+  <label><input id="radio-a" type="radio" name="group" checked aria-label="Radio A"> Radio A</label>
+  <label><input id="radio-b" type="radio" name="group" aria-label="Radio B"> Radio B</label>
+  <label><input id="mixed" type="checkbox" aria-label="Mixed checkbox"> Mixed checkbox</label>
+  <div role="checkbox" tabindex="0" aria-checked="false" aria-label="Custom checkbox">Custom checkbox (unsupported)</div>
+  <label><input id="cancel" type="checkbox" aria-label="Canceled checkbox"> Canceled checkbox</label>
+  <label><input id="cancel-radio-a" type="radio" name="cancel-group" checked aria-label="Cancel group previous"> Cancel group previous</label>
+  <label><input id="cancel-radio-b" type="radio" name="cancel-group" aria-label="Canceled radio"> Canceled radio</label>
+  <label><input id="reset" type="checkbox" aria-label="Reset on change"> Reset on change</label>
+  <label><input id="mixed-after" type="checkbox" aria-label="Mixed on change"> Mixed on change</label>
+  <label><input id="remove-click" type="checkbox" aria-label="Remove on click"> Remove on click</label>
+  <label><input id="retype-click" type="checkbox" aria-label="Retype on click"> Retype on click</label>
+  <label><input id="disable-click" type="checkbox" aria-label="Disable on click"> Disable on click</label>
+  <label><input id="replace-focus" type="checkbox" aria-label="Replace on focus"> Replace on focus</label>
+  <label><input id="retype-focus" type="checkbox" aria-label="Retype on focus"> Retype on focus</label>
+  <label><input id="finish-focus" type="checkbox" aria-label="Reach state on focus"> Reach state on focus</label>
+  <label><input id="mixed-focus" type="checkbox" aria-label="Mixed on focus"> Mixed on focus</label>
+  <div id="shadow-host"></div>
+  <iframe id="child" title="Same-origin checkbox" srcdoc="&lt;label&gt;&lt;input id='frame-check' type='checkbox' aria-label='Frame checkbox'&gt;Frame checkbox&lt;/label&gt;"></iframe>
+  <button id="hide-normal" type="button">Hide normal after read</button>
+  <button id="refresh" type="button">Refresh check diagnostic</button>
+  <pre id="receipt" aria-label="Check receipt"></pre>
+  <script>
+    const root = document.querySelector('#shadow-host').attachShadow({ mode: 'open' });
+    root.innerHTML = '<label><input id="shadow-check" type="checkbox" aria-label="Shadow checkbox">Shadow checkbox</label>';
+    const counts = { click: 0, input: 0, change: 0 };
+    const focuses = {};
+    const events = [];
+    let childReady = false;
+    const inputs = () => [...document.querySelectorAll('input'), ...root.querySelectorAll('input'),
+      ...(childReady ? document.querySelector('#child').contentDocument.querySelectorAll('input') : [])];
+    function show() {
+      const states = Object.fromEntries(inputs().map(input => [input.id, {
+        checked: input.checked, indeterminate: input.indeterminate,
+        type: input.type, disabled: input.matches(':disabled'),
+      }]));
+      const state = { states, counts, focuses, events, childReady,
+        hasFocus: document.hasFocus(), visibilityState: document.visibilityState };
+      document.querySelector('#receipt').textContent = `CHECK_STATE_BEGIN ${encodeURIComponent(JSON.stringify(state))} CHECK_STATE_END`;
+    }
+    document.querySelector('#mixed').indeterminate = true;
+    for (const id of ['cancel', 'cancel-radio-b']) {
+      document.getElementById(id).addEventListener('click', event => event.preventDefault());
+    }
+    document.querySelector('#reset').addEventListener('change', event => { event.target.checked = false; });
+    document.querySelector('#mixed-after').addEventListener('change', event => { event.target.indeterminate = true; });
+    document.querySelector('#remove-click').addEventListener('click', event => event.target.remove());
+    document.querySelector('#retype-click').addEventListener('click', event => { event.target.type = 'radio'; });
+    document.querySelector('#disable-click').addEventListener('click', event => { event.target.disabled = true; });
+    document.querySelector('#replace-focus').addEventListener('focus', event => {
+      event.target.replaceWith(event.target.cloneNode(true));
+    }, { once: true });
+    document.querySelector('#retype-focus').addEventListener('focus', event => { event.target.type = 'radio'; }, { once: true });
+    document.querySelector('#finish-focus').addEventListener('focus', event => { event.target.checked = true; }, { once: true });
+    document.querySelector('#mixed-focus').addEventListener('focus', event => { event.target.indeterminate = true; }, { once: true });
+    function observe(input) {
+      input.addEventListener('focus', () => { focuses[input.id] = (focuses[input.id] || 0) + 1; show(); });
+      for (const type of ['click', 'input', 'change']) {
+        input.addEventListener(type, event => {
+          counts[type] += 1;
+          events.push({ type, target: input.id, trusted: event.isTrusted, checked: input.checked });
+          if (events.length > 9) events.shift();
+          // Canceled checkbox/radio activation restores state after click
+          // dispatch. Capture the final state after that restoration as well.
+          show();
+          queueMicrotask(show);
+        });
+      }
+    }
+    for (const input of inputs()) observe(input);
+    document.querySelector('#child').addEventListener('load', () => {
+      childReady = true;
+      for (const input of document.querySelector('#child').contentDocument.querySelectorAll('input')) observe(input);
+      show();
+    }, { once: true });
+    document.querySelector('#hide-normal').addEventListener('click', () => {
+      document.querySelector('#normal').hidden = true;
+      show();
+    });
+    document.querySelector('#refresh').addEventListener('click', show);
+    show();
+  </script>
+</body>
+</html>

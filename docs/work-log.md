@@ -1,5 +1,71 @@
 # Naru 작업 기록
 
+## 2026-10-16, 검색 키와 요청 큐 보호 검증, 커밋과 비공개 푸시 요청
+
+사용자가 커밋에 이어 푸시까지 요청했다. 기존 미커밋 자동 스크롤과 CLI check, 이번 검색 키 처리와 요청 큐 보호를 관련 문서와 함께 커밋하는 범위로 고정했다. GitHub에서 `FEABE/naru-browser`의 `isPrivate: true`를 확인했고, `origin`의 `codex/navigation-readiness`는 작업 전 로컬 HEAD와 같은 `b512838a1397a0ef4519a130300ab0b2ae294665`였다. 최초 GitHub 조회는 네트워크 제한으로 실패했고 네트워크 접근을 허용한 조회는 성공했다. 기본 브랜치나 배포 설정은 변경하지 않는다. 앞선 기록의 미커밋 표시는 당시 상태이며 이번 커밋 범위에 포함한다.
+
+`src/control_panel.rs`는 검색 입력의 편집기가 현재 first responder일 때만 Enter와 위아래 화살표를 처리한다. 삭제 확인 중에는 결과 열기와 선택 이동을 막고 Enter 안내를 숨긴다. 입력 필드의 submit 경로에도 확인 상태 검사를 넣었다. 버튼에 포커스가 있을 때는 AppKit에 키를 전달하며 명시적인 결과 클릭과 Escape 동작은 유지한다. 순수 키 정책과 submit 상태 회귀 3개를 추가했다.
+
+`src/browser.rs`는 UI에 게시한 요청 payload를 서버별 16개로 제한한다. 연결 worker가 시간 초과돼도 미실행 task는 자리를 유지하며 실행 종료나 마지막 task 참조 해제 때 반환한다. task 복제는 payload를 공유하고 실행 시 한 번만 꺼낸다. 새 요청을 게시하기 전 상한에 도달하면 `APP_BUSY`, `outcomeUnknown:false`를 반환한다. 새 worker나 타이머, 저장소는 추가하지 않았다. 큐 정체와 재연결, 중복 실행, 게시 실패와 폐기 모형, 서버별 독립 상한 회귀 3개를 추가했다. `docs/architecture.md`, `docs/memory.md`, `docs/history-design.md`, `docs/product-plan.md`에 계약과 한계를 반영했다.
+
+검증 결과는 다음과 같이 구분한다.
+
+- 오프라인 잠금 의존성의 단위 실행 파일 컴파일, 기본 구성과 CLI 전용 구성의 전체 타깃 검사, format이 통과했다. 최초 제한 환경 단위 검사는 297개 통과와 Unix socket bind 권한 오류 3개 실패였다. 원본 로그를 보존하고 같은 실행 파일만 소켓 접근이 가능한 환경에서 다시 실행해 300개 전부 통과했다. 실행 파일 SHA-256은 `a45f305ee886b9c8cd7163692c1c17290d29f549ee3e866ae9529ec0a9e66ee2`다. 소스와 기존 앱, CLI의 해시는 검사 전후 동일했다. 근거는 `artifacts/interaction-bounds-v1-check.json`, `interaction-bounds-v1-rust-tests.json`, `interaction-bounds-v1-rust-tests-escalated.json`과 해당 로그다.
+- 큐 검사는 실제 Rust CEF task 래퍼의 clone, execute, drop을 사용하지만 엔진을 초기화하거나 실제 CEF UI를 정지시키지 않았다. native post 실패의 참조 해제는 바인딩과 소유권 계약을 검토한 범위이며 앱 실행으로 확인하지 않았다. 검색 키 검사는 순수 정책 검사로 실제 AppKit 포커스와 입력기 검증을 대신하지 않는다.
+- 앞선 check 검증의 CLI, protocol, DOM bridge 소스 해시가 현재와 같음을 확인했다. 기존 모의 DOM 70개 통과 로그를 확인했으며 재실행하지 않았다. `tests/check_smoke.py` 구문 검사와 변경 문서의 로컬 링크 83개 존재 검사는 통과했다. 독립 검토에서 커밋 후보 16개 파일에 프로필, 비밀값, 바이너리와 빌드 산출물이 섞인 것은 발견하지 못했다.
+- 최신 Naru의 로컬 CEF 통합, 네이티브 키 입력과 드래그, 외부 사이트, 장시간 사용과 RAM 측정은 미실행이다. 앱 실행과 재서명, 키체인 접근이나 추가 승인 요청은 하지 않았다. 독립 브라우저 전체 완성과 Preseller 내장은 남아 있고 재시작 탭 복원 보류도 유지한다.
+
+격리 `target/.interaction-bounds-test-4jhzbtyf`의 identity를 확인한 뒤 파일 2,060개, 디렉터리 290개, 파일 크기 합계 1,476,453,544바이트, symlink 0개를 기록하고 해당 폴더만 제거했다. 모든 검사 세션의 종료와 폴더 부재를 확인했다. 소스와 기존 앱, CLI 해시는 정리 후에도 같으며 근거는 `artifacts/interaction-bounds-v1-cleanup.json`이다. 이 크기는 물리 디스크 회수량이나 RAM 절감량이 아니다. 새 제품 앱이나 서버는 실행하지 않았고 기존 프로필과 탭은 보존했다.
+
+커밋과 푸시의 실제 명령 결과, 최종 로컬과 원격 SHA는 `artifacts/commit-push-20261016.json`에 별도로 기록한다. 검증 자료와 사용자 데이터, 앱 번들은 Git에 포함하지 않는다.
+
+## 2026-10-15, CLI 체크박스와 라디오 상태 지정
+
+직전 목표 작업은 탭 자동 스크롤의 구현과 검증으로 진전이 있었고, 이어진 사용자 푸시 요청은 원격 `b512838` 일치를 재확인해 마쳤다. 활성 목표를 재개한 이번 작업은 독립 Naru의 AI 폼 제어를 보완한다. 전체 브라우저 완성과 Preseller 내장은 미완료이며 목표를 작은 기능의 완료로 대체하지 않는다. 새 커밋, 푸시와 배포는 하지 않았다.
+
+`src/cli.rs`, `src/protocol.rs`, `src/browser.rs`에 `check TAB REF true|false`와 작업 범위 명령을 연결했다. 정확한 boolean을 JSON 데이터로 전달하고 기존 작업 소유권, revision, 탐색 epoch와 mutation 취소 경로를 사용한다. 실제 요청이 check였을 때만 DOM 실패의 시도 여부와 현재 상태를 최대 네 boolean으로 오류 상세에 보존한다. 동작을 시도한 뒤 제어권이 바뀐 경우는 기존 `outcomeUnknown`을 유지하며 늦은 응답을 다시 전달하지 않는다.
+
+`src/dom_bridge.js`는 현재 상태가 같으면 포커스와 클릭 없이 반환한다. 변경이 필요하면 focus 후 가용성을 다시 검사하고 DOM 클릭 한 번을 사용한다. 클릭 취소와 핸들러의 되돌림, 대상 제거와 타입 변경을 구분하며 성공으로 간주하거나 자동 재시도하지 않는다. 체크박스의 혼합 상태를 read에 표시하고 혼합 상태의 변경, 라디오 해제와 사용자 정의 ARIA 컨트롤은 거절한다. 동작 도중 새 read가 실행된 경우도 captured ref의 세대를 검사하도록 공통 참조 검사를 보완했다. source의 자동 스크롤 설명 주석 한 곳도 현재 동작에 맞췄다.
+
+`tests/dom_bridge.test.mjs`에 네이티브 activation의 제한된 모형과 15개 회귀 검사를 추가했다. `tests/fixtures/check.html`, `tests/check_smoke.py`는 Naru의 후속 로컬 CEF 통합 검사용이다. `docs/check-control.md`에 CLI 응답과 한계를 기록하고 README, 아키텍처, 제품 계획, 메모리 문서를 갱신했다. 기존 사용자 입력 handoff와 접수된 다운로드 권한의 상태 갱신은 소스에서 이미 연결된 것을 확인했다. 제품 계획의 미완료 권한 항목을 숨긴 탭에서 CEF 전달 전 대기 감지로 구체화했으며 새 알림 기능을 구현한 것으로 표시하지 않는다.
+
+검증 결과는 다음과 같이 구분한다.
+
+- Rust는 offline, locked 단위 실행 파일 컴파일, 기본 구성과 CLI 전용 구성의 전체 타깃 검사, format을 통과했다. 최초 제한 환경의 단위 실행은 291개 통과와 Unix socket bind 권한 오류 3개 실패였다. 원본 로그를 보존하고 같은 emitted 바이너리만 로컬 소켓 허용 환경에서 재실행해 최종 294개 전부 통과했다. 이번 신규 8개는 CLI와 원본 JSON boolean, task allowlist와 소유권, epoch, 안전한 JSON 직렬화, 실패 상세의 필드 제한과 취소 후 응답을 검사한다. 실제 CEF 엔진 실행은 아니다. 근거는 `artifacts/check-control-v1-check.json`, `check-control-v1-rust-tests.json`, `check-control-v1-rust-tests-escalated.json`과 해당 로그다. 기존 단위 dead_code 3개, CLI 라이브러리 9개와 단위 get 경고 1개는 남는다.
+- 모의 DOM 최종 v3는 70개 전부 통과했다. 최초 실행의 68개 통과와 2개 실패에서 focus나 클릭 핸들러의 재진입 read 뒤 참조 세대 검사 누락을 발견해 수정했다. 최초 전체 TAP 파일은 저장하지 않아 `artifacts/check-dom-v1-summary.json`에 실제 assertion을 전사한 요약임을 명시했다. 수정 뒤 v2의 70개 통과 로그를 보존했고, 이후 실제 Chromium에서 확인한 분리 요소의 후속 이벤트 생략을 모형과 검사에 반영한 최종 근거는 `artifacts/check-dom-v3.log`다. 제품 코드를 검사 모형에 맞춰 이벤트를 추가하지 않았다.
+- 독립 Chromium은 설치된 ego lite 공간 4의 자체 로컬 HTTP 페이지에서 검사했다. 현재 bridge SHA-256 `0dc58288f0be294f1f8522d91d4cae496d7aa0f1ec678230caed99fe85bed4aa`를 격리된 JavaScript 환경에 주입해 24개 시나리오가 통과했다. 최초 실행은 14개 통과 뒤 분리된 input에서도 input/change가 발생할 것이라는 검사 가정에서 실패했다. 같은 페이지의 실제 상태와 HTML 규격을 확인해 기대값을 고쳤으며 실패 JSON을 보존했다. 이때 document.hasFocus는 false였고 focus 이벤트도 발생하지 않았다. 최종 실행은 검사 페이지에만 CDP 포커스 에뮬레이션을 사용해 focus 핸들러와 교체 보호까지 확인했다. 클릭은 untrusted였고 브라우저가 만든 후속 input/change는 별도로 기록했다. `artifacts/check-control-v1-ego-result.json`, `check-control-v1-ego-first-failure.json`이 근거다. 이는 Naru 소켓과 Rust 요청 전달, 실제 CEF 통합이나 macOS 포커스의 증거가 아니다.
+- `check_smoke.py`와 fixture의 inline JavaScript는 구문 검사를 통과했다. 실제 Naru CEF smoke, 네이티브 UI, 외부 사이트, 장시간 실행과 RAM 측정은 미실행이다. 앱 서명과 번들을 새로 만들거나 Naru를 실행하지 않았다. 사용자 프로필과 키체인에 접근하거나 추가 승인을 요청하지 않았다. 독립 읽기 교차 리뷰에서는 추가 확정 blocker를 발견하지 못했다.
+
+최종 `git diff --check`와 변경 문서의 로컬 링크 83개 존재 검사를 통과했다. 빌드와 단위 검사 세션은 끝났다. 동일 source와 retained 앱, CLI 해시를 확인하고 격리 `target/.check-control-test-b6ak2wp6`의 파일 2,060개, 크기 합계 1,475,279,110바이트, symlink 0개를 검사한 뒤 해당 폴더만 제거했다. 제거 후 source와 기존 실행 파일의 해시는 그대로였다. 이 합계는 물리 디스크 회수량이나 RAM 절감량이 아니다. `artifacts/check-control-v1-cleanup.json`에 근거를 남겼다.
+
+ego 검사 공간은 포커스 에뮬레이션을 해제한 뒤 `finish({keep:[]})` 한 번으로 종료했다. 도구 응답에서 검사 페이지 p1과 공간 닫힘, 보존된 unmanaged 탭 0개를 확인했다. 기존 사용자 페이지는 조작하지 않았다. 임시 HTTP 서버 PID 31353, 실행 세션 80172는 Ctrl-C의 KeyboardInterrupt로 exit 1 종료를 확인했다. 최초 로컬 bind 제한과 ego 앱 bootstrap 제한, CLI 내부 상대 경로 파일 조회 실패는 각각 재시도 전에 상태를 확인했으며 같은 공간을 재사용했다. 제품 앱 프로세스는 실행하지 않았고 기존 Naru 프로세스 목록은 새로 조회하지 않았다. 기존 앱과 CLI, 프로필을 보존하고 검사 소스와 로그만 Git에서 제외한 artifacts에 남겼다.
+
+## 2026-10-15, 현재 커밋의 비공개 원격 푸시 재확인
+
+사용자의 “푸시까지 해야지” 요청에 따라 `codex/navigation-readiness`의 현재 커밋 `b512838a1397a0ef4519a130300ab0b2ae294665`를 기존 `origin`으로 푸시했다. GitHub 조회에서 `FEABE/naru-browser`의 `isPrivate: true`와 원격 커밋 일치를 확인했다. 최초 조회는 네트워크 제한으로 실패했으며 권한을 조정한 조회와 `git push --porcelain origin HEAD:refs/heads/codex/navigation-readiness`는 성공했다. 푸시 결과는 `[up to date]`였다.
+
+추가 개발 중이던 편집을 중지하고 기존 미커밋 파일을 보존했다. 자동 스크롤 변경과 작성 중인 `check`의 Rust 연결, DOM 테스트, fixture는 이번 푸시에 포함하지 않았다. `check`의 DOM 구현과 통합 검증은 아직 미완료이며 성공한 기능으로 기록하지 않는다. 새 커밋과 배포는 하지 않았다. 관련 파일은 이 작업 기록이며 이번 푸시 확인 때문에 제품 동작을 변경하지 않았다.
+
+이번 검증은 Git 상태, 원격 커밋, 저장소 공개 범위와 푸시 결과 확인으로 한정한다. 단위, 모의 DOM, 로컬 CEF 통합, 네이티브 UI와 외부 사이트 검사는 실행하지 않았다. 앱과 서버를 시작하거나 빌드 생성물을 만들지 않아 이번 요청으로 새로 정리할 프로세스와 생성물은 없다. 사용자 프로필과 기존 앱은 변경하지 않았다.
+
+## 2026-10-15, 긴 탭 목록의 드래그 자동 스크롤
+
+직전 커밋과 비공개 푸시는 `b512838a1397a0ef4519a130300ab0b2ae294665` 원격 일치까지 완료했다. 이후 활성 목표의 일상 사용성을 이어서 긴 탭 목록을 드래그로 정리할 수 있게 했다. 이번 추가 변경은 미커밋이며 추가 푸시와 배포는 하지 않았다. 이전 목표 작업은 코드와 검증 근거를 만든 진행으로 분류하며 전체 독립 브라우저 완성과 Preseller 내장은 여전히 미완료다.
+
+`src/control_panel.rs`에서 탭 목록의 위아래 24pt 안에 포인터가 있으면 12pt씩 자동 스크롤한다. 작은 표시 영역에서는 가장자리 폭을 높이의 절반 이하로 줄인다. 네이티브 타이머 한 개를 명목 30Hz와 10% tolerance로 common mode와 event tracking mode에 등록한다. 포인터를 멈춰도 이동하고 중앙이나 문서 끝에서는 타이머만 해제해 드롭을 유지한다. 다시 가장자리로 이동하면 재시작한다. 드롭과 취소, 창 상태 변화와 종료는 기존 취소 경로에서 타이머를 해제한다. 대기 중 상주 타이머나 새 worker, 웹 renderer, 패키지와 저장소는 추가하지 않았다.
+
+드래그 동안 저장한 window 좌표를 현재 문서 좌표로 변환한다. NSClipView의 제한된 세로 이동과 실제 clip bounds, viewport가 일치할 때만 예상 표시 영역을 갱신한다. 창과 문서, 원본 행과 clip frame, 가로 위치와 크기, 공간과 선택, 전체 순서가 바뀌면 취소한다. native 호출 사이에 RefCell borrow를 유지하지 않으며 세션과 타이머 identity를 다시 확인한다. 이전 타이머의 늦은 호출은 새 타이머를 건드리지 않는다. Ended 상태의 tick은 최종 드롭을 취소하지 않고 타이머만 멈춘다. 최신 viewport로 삽입 위치를 계산하고 기존 순서 변경 API로 드롭 시 한 번 반영한다. 선택과 AI 제어권은 직접 변경하지 않는다. README와 아키텍처, 제품 계획, 메모리, 탭 순서 문서에 동작과 검증 경계를 반영했다.
+
+검증 결과는 다음과 같이 구분한다.
+
+- 최종 `tab-autoscroll-v1`에서 오프라인 잠금 의존성 단위 실행 파일 빌드, 기본 구성과 CLI 전용 구성의 전체 타깃 컴파일, format이 모두 통과했다. Rust 단위 286개가 전부 통과했다. 신규 4개는 가장자리와 범위 검사, 고정 포인터의 끝 도달과 반대 방향 재시작, 허용한 세로 이동만 채택하는 조건, 기타 native 배치 변경 거절을 확인한다. 실제 NSTimer나 CEF 엔진을 실행하는 단위 검사는 아니다. 기존 Unix 소켓 검사 때문에 단위 실행 파일만 별도 권한으로 실행했다. 전체 src와 Cargo 파일 해시는 검사 전후 동일하다. 기존 단위 dead_code 3개, CLI 라이브러리 9개와 CLI 단위 get 경고 1개는 남는다. 근거는 `artifacts/tab-autoscroll-v1-check.json`과 구성별 로그다.
+- 독립 소스 교차 리뷰에서 타이머와 세션 수명, 재진입, 늦은 호출, Ended 드롭 보존과 기존 취소 연결을 확인했고 추가 확정 P1, P2 결함은 발견하지 못했다. `git diff --check`와 변경 문서의 로컬 링크 검사도 통과했다. 기존 Graphify 그래프는 경로 탐색에만 사용했으며 새 드래그 코드를 포함하지 않아 현재 소스 호출 흐름으로 다시 확인했다.
+- 분리된 숨긴 AppKit 창의 최초 제한 환경 실행은 macOS XPC 연결 오류로 10초 후 해당 PID 19207만 종료했다. 이후 GUI 실험 권한으로 실행한 PID 19339의 v1은 17개 검사와 21회 tick을 통과했다. 이 버전은 8pt 이동과 1e-5 오차 허용 비교를 사용했다. 제품과 스크롤바 설정 차이를 확인해 v2를 별도로 실행했고 최초 실패와 v1 원문 기록은 보존했다.
+- v2는 제품과 같은 스크롤바 자동 숨김, contentSize에 맞춘 문서 너비, 12pt 이동, 30Hz와 10% tolerance를 사용했다. PID 21518, exit 0에서 17개 검사와 21회 tick을 통과했다. 기본 mode와 tracking mode에서 고정 window 포인터의 문서 좌표, clip bounds와 visibleRect 이동량을 정확한 동등 비교로 확인했다. 타이머 해제 뒤 150ms 동안 추가 호출과 스크롤은 0회였고 타이머와 대상 객체 해제를 확인했다. 자체 recognizer 메서드를 직접 호출한 플랫폼 API 검사이며 실제 Naru의 가장자리 정책 연결, 취소 이벤트나 물리적 드래그를 검증한 결과는 아니다. `artifacts/tab-autoscroll-native-probe/summary-cleanup-v2.json`, `run-v2.log`가 근거다.
+- DOM bridge를 변경하지 않아 모의 DOM 검사는 반복하지 않았다. 최신 Naru 앱의 로컬 CEF 통합, 실제 드래그와 Escape, 입력기와 주소 초안, 배경 CLI 경합, 접근성과 외부 사이트, 장시간 사용과 RAM 측정은 미실행이다. 제품 앱 번들과 서명을 만들거나 CEF 엔진을 초기화하지 않았고 사용자 프로필과 키체인에 접근하거나 승인을 요청하지 않았다. 공간 간 드래그는 추가하지 않았으며 재시작 탭 복원 보류도 유지한다.
+
+빌드와 단위 검사 세션은 종료됐다. 격리 `target/.tab-autoscroll-test-6zf33ody`의 파일 2,060개, 합계 1,473,321,507바이트와 symlink 0개를 확인한 뒤 해당 폴더만 제거했다. 기존 앱과 CLI, 전체 src와 Cargo 파일 해시는 정리 전후 동일하다. 독립 AppKit 검사 PID 19207, 19339, 21518의 부재를 확인했고 실행 파일 79,960바이트와 96,744바이트를 제거했다. 실행 소스와 로그는 Git에서 제외한 artifacts에 보존했다. 제품 앱과 서버는 시작하지 않았고 기존 Naru 프로세스는 다시 조회하지 않았다. 파일 크기 합계를 물리 디스크 회수량이나 RAM 절감량으로 설명하지 않는다.
+
 ## 2026-10-15, 탭 드래그 변경 커밋과 비공개 푸시 요청
 
 사용자가 커밋에 이어 푸시까지 요청했다. 이번 범위는 기존 미커밋 탭 드래그 정렬과 관련 문서 10개를 `codex/navigation-readiness` 브랜치에 커밋하고 기존 `origin`으로 푸시하는 작업이다. 새로운 기능 구현은 하지 않았다. GitHub 조회에서 `FEABE/naru-browser`의 `isPrivate: true`를 확인했고 작업 전 원격 브랜치는 로컬 HEAD와 같은 `f0d60b1435d599180b30fea551c3846e46b3bd71`이었다. 최초 네트워크 제한으로 실패한 조회는 권한을 조정해 다시 확인했다.

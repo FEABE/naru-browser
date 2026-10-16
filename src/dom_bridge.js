@@ -61,7 +61,7 @@
   }
 
   function refIsCurrent(reference) {
-    return !!reference?.context && reference.element.isConnected &&
+    return !!reference?.context && reference.generation === generation && reference.element.isConnected &&
       reference.element.ownerDocument === reference.context.document &&
       contextIsCurrent(reference.context);
   }
@@ -322,7 +322,7 @@
     for (const element of elements) {
       const ref = `${documentId}:${generation}:${interactive.length + 1}`;
       const context = contexts.get(element.ownerDocument);
-      const reference = { element, context };
+      const reference = { element, context, generation };
       if (!refIsCurrent(reference)) continue;
       refs.set(ref, reference);
       const item = {
@@ -339,6 +339,7 @@
       }
       if (element.tagName === "INPUT" && ["checkbox", "radio"].includes(element.type)) {
         item.checked = element.checked;
+        if (element.type === "checkbox") item.indeterminate = element.indeterminate;
       }
       if (element.tagName === "SELECT") readOptions(element, item, budget);
       interactive.push(item);
@@ -432,13 +433,67 @@
       detail: changed ? "Option selected and input/change events dispatched; read again to verify its effect." : "The option is already selected; no events dispatched." };
   }
 
+  function checkState(element, checked) {
+    if (element.tagName !== "INPUT" || !["checkbox", "radio"].includes(element.type)) {
+      return failure("check", "UNSUPPORTED_ELEMENT", "Check supports native checkbox and radio inputs only.");
+    }
+    if ((element.type === "radio" && !checked) || (element.type === "checkbox" && element.indeterminate)) {
+      return failure("check", "UNSUPPORTED_STATE", "Select a radio with true; mixed checkboxes require page-specific handling.");
+    }
+    return null;
+  }
+
+  function checkValue(reference, checked) {
+    const { element } = reference;
+    if (typeof checked !== "boolean") {
+      return failure("check", "INVALID_VALUE", "Checked must be a boolean.");
+    }
+    const unsupported = checkState(element, checked);
+    if (unsupported) return unsupported;
+    const unchanged = () => ({ ok: true, action: "check", trusted: false, changed: false, checked,
+      detail: "The requested state is already set; no click, input or change events dispatched by this action." });
+    if (element.checked === checked) return unchanged();
+
+    const originalType = element.type;
+    element.focus();
+    const unavailable = refFailure(reference, "check", "The input changed while receiving focus; read again.", "ELEMENT_UNAVAILABLE");
+    if (unavailable) return unavailable;
+    if (element.tagName !== "INPUT" || element.type !== originalType) {
+      return failure("check", "ELEMENT_UNAVAILABLE", "The input type changed while receiving focus; read again.");
+    }
+    const afterFocus = checkState(element, checked);
+    if (afterFocus) return afterFocus;
+    if (element.checked === checked) return unchanged();
+
+    // Native activation handles radio groups and cancellation. Do not assign
+    // checked or manufacture input/change events; never retry a dispatched click.
+    try {
+      element.click();
+      if (refFailure(reference, "check") || element.tagName !== "INPUT" || element.type !== originalType) {
+        return { ...failure("check", "CHECK_STATE_UNCONFIRMED", "DOM click dispatched, but the input changed or became unavailable. Read again before deciding whether to retry."),
+          trusted: false, attempted: true };
+      }
+      const current = { checked: element.checked };
+      if (originalType === "checkbox") current.indeterminate = element.indeterminate;
+      if (current.checked !== checked || current.indeterminate) {
+        return { ...failure("check", "CHECK_STATE_NOT_REACHED", "DOM click dispatched, but the requested state was not reached. Page handlers may have canceled or changed it; read again."),
+          trusted: false, attempted: true, ...current };
+      }
+      return { ok: true, action: "check", trusted: false, changed: true, ...current,
+        detail: "DOM click dispatched and the requested state observed synchronously; read again to verify later page effects." };
+    } catch (_error) {
+      return { ...failure("check", "ACTION_FAILED", "The click or its state check raised an exception. Read again before deciding whether to retry."),
+        trusted: false, attempted: true };
+    }
+  }
+
   function act(request) {
     if (!request || typeof request !== "object" || Array.isArray(request)) {
       return failure(null, "INVALID_REQUEST", "Expected an action object.");
     }
     const action = request.action;
-    if (!["click", "fill", "press", "scroll", "select"].includes(action)) {
-      return failure(null, "UNSUPPORTED_ACTION", "Use click, fill, press, scroll or select.");
+    if (!["click", "fill", "press", "scroll", "select", "check"].includes(action)) {
+      return failure(null, "UNSUPPORTED_ACTION", "Use click, fill, press, scroll, select or check.");
     }
     try {
       if (action === "scroll") {
@@ -457,6 +512,7 @@
       if (unavailable) return unavailable;
       const { element, context } = reference;
       if (action === "select") return selectValue(reference, request.value);
+      if (action === "check") return checkValue(reference, request.checked);
 
       if (action === "click") {
         if (typeof element.click !== "function") {

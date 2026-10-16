@@ -12,13 +12,15 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSApp, NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua,
-    NSBackingStoreType, NSButton, NSCellImagePosition, NSColor, NSEvent, NSEventModifierFlags,
-    NSEventType, NSFont, NSFontWeightMedium, NSGestureRecognizer, NSGestureRecognizerState,
-    NSImage, NSImageSymbolConfiguration, NSImageSymbolScale, NSImageView, NSMenu, NSMenuDelegate,
-    NSMenuItem, NSScrollView, NSTextField, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSBackingStoreType, NSButton, NSCellImagePosition, NSClipView, NSColor, NSEvent,
+    NSEventModifierFlags, NSEventTrackingRunLoopMode, NSEventType, NSFont, NSFontWeightMedium,
+    NSGestureRecognizer, NSGestureRecognizerState, NSImage, NSImageSymbolConfiguration,
+    NSImageSymbolScale, NSImageView, NSMenu, NSMenuDelegate, NSMenuItem, NSScrollView, NSTextField,
+    NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
-    NSArray, NSData, NSNotification, NSObject, NSPoint, NSRect, NSSize, NSString,
+    NSArray, NSData, NSNotification, NSObject, NSPoint, NSRect, NSRunLoop, NSRunLoopCommonModes,
+    NSSize, NSString, NSTimer,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -491,19 +493,25 @@ struct TabDragSession {
     button: Retained<NSButton>,
     window: Retained<NSWindow>,
     scroll: Retained<NSScrollView>,
+    clip: Retained<NSClipView>,
     document: Retained<TopDownView>,
     indicator: Retained<SurfaceView>,
     geometry: TabDragGeometry,
+    viewport: Cell<NSRect>,
+    clip_bounds: Cell<NSRect>,
+    timer: RefCell<Option<Retained<NSTimer>>>,
     collapsed: bool,
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct TabDragGeometry {
     window: NSRect,
     scroll: NSRect,
     document: NSRect,
     viewport: NSRect,
     source: NSRect,
+    clip_frame: NSRect,
+    clip_bounds: NSRect,
 }
 
 #[derive(Default)]
@@ -1631,6 +1639,8 @@ define_class!(
         }
         #[unsafe(method(dragTab:))]
         fn drag_tab(&self, sender: &TabDragRecognizer) { tab_drag_action(sender); }
+        #[unsafe(method(scrollDraggedTab:))]
+        fn scroll_dragged_tab(&self, timer: &NSTimer) { tab_drag_timer_fired(timer); }
         #[unsafe(method(closeTabRow:))]
         fn close_tab_row(&self, sender: &NSButton) {
             tab_row_action(sender, true);
@@ -2795,23 +2805,28 @@ impl Shell {
             .iter()
             .filter(|id| matches!(id, SearchResultId::History(_)))
             .count();
+        self.history_clear_available = history.ready && history.writable && !history.clearing;
+        if !self.history_clear_available {
+            self.search.confirm_clear = false;
+        }
+        let enter_hint = if self.search.confirm_clear {
+            ""
+        } else {
+            ", Enter로 열기"
+        };
         let summary = if history_only {
             format!(
-                "기록 {}개, 전체 {}개, 최신순, 최대 40개, Enter로 열기",
-                history_count, history.total
+                "기록 {}개, 전체 {}개, 최신순, 최대 40개{}",
+                history_count, history.total, enter_hint
             )
         } else if results.is_empty() {
             "일치하는 탭, 북마크, 방문 기록이 없습니다".to_owned()
         } else {
             format!(
-                "탭 {}개, 북마크 {}개, 기록 {}개, 탭 우선, 최대 40개, Enter로 열기",
-                tab_count, bookmark_count, history_count
+                "탭 {}개, 북마크 {}개, 기록 {}개, 탭 우선, 최대 40개{}",
+                tab_count, bookmark_count, history_count, enter_hint
             )
         };
-        self.history_clear_available = history.ready && history.writable && !history.clearing;
-        if !self.history_clear_available {
-            self.search.confirm_clear = false;
-        }
         self.search_title
             .setStringValue(&NSString::from_str(if history_only {
                 "방문 기록"
@@ -5693,12 +5708,70 @@ fn submit_tab_search() {
     let result = SHELL.with(|slot| {
         slot.borrow()
             .as_ref()
-            .filter(|shell| shell.search.open)
-            .and_then(|shell| shell.search.selected)
+            .and_then(|shell| search_submission(&shell.search))
     });
     if let Some(result) = result {
         activate_search_result(result);
     }
+}
+
+fn search_submission(state: &SearchState) -> Option<SearchResultId> {
+    (state.open && !state.confirm_clear)
+        .then_some(state.selected)
+        .flatten()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchQueryKey {
+    Move(bool),
+    Submit,
+    Consume,
+}
+
+fn search_query_key(key: u16, query_focus: bool, confirm_clear: bool) -> Option<SearchQueryKey> {
+    if !query_focus || !matches!(key, 36 | 76 | 125 | 126) {
+        return None;
+    }
+    if confirm_clear {
+        return Some(SearchQueryKey::Consume);
+    }
+    Some(match key {
+        125 => SearchQueryKey::Move(true),
+        126 => SearchQueryKey::Move(false),
+        _ => SearchQueryKey::Submit,
+    })
+}
+
+fn search_query_has_focus() -> bool {
+    let controls = SHELL.with(|slot| {
+        let slot = slot.try_borrow().ok()?;
+        let shell = slot.as_ref().filter(|shell| shell.search.open)?;
+        Some((shell.window.clone(), shell.search_field.clone()))
+    });
+    let Some((window, field)) = controls else {
+        return false;
+    };
+    if !window.isKeyWindow() {
+        return false;
+    }
+    // AppKit shares a field editor. Its existence alone must not route a
+    // focused button's Return or arrow keys through the query's selection.
+    let focused = unsafe {
+        let editor: *mut AnyObject = msg_send![&*field, currentEditor];
+        let responder: *mut AnyObject = msg_send![&*window, firstResponder];
+        !editor.is_null() && editor == responder
+    };
+    // Native getters run outside the borrow and may reenter the shell.
+    focused
+        && SHELL.with(|slot| {
+            slot.try_borrow().ok().is_some_and(|slot| {
+                slot.as_ref().is_some_and(|shell| {
+                    shell.search.open
+                        && std::ptr::eq(&*shell.window, &*window)
+                        && std::ptr::eq(&*shell.search_field, &*field)
+                })
+            })
+        })
 }
 
 fn select_search_result(sender: &NSButton) {
@@ -6831,6 +6904,7 @@ fn tab_drag_geometry(
     scroll: &NSScrollView,
     document: &NSView,
     button: &NSButton,
+    clip: &NSClipView,
 ) -> TabDragGeometry {
     TabDragGeometry {
         window: window.frame(),
@@ -6838,7 +6912,28 @@ fn tab_drag_geometry(
         document: document.frame(),
         viewport: document.visibleRect(),
         source: button.frame(),
+        clip_frame: clip.frame(),
+        clip_bounds: clip.bounds(),
     }
+}
+
+fn tab_drag_geometry_matches(
+    original: &TabDragGeometry,
+    actual: &TabDragGeometry,
+    viewport: NSRect,
+    clip_bounds: NSRect,
+) -> bool {
+    original.window == actual.window
+        && original.scroll == actual.scroll
+        && original.document == actual.document
+        && original.source == actual.source
+        && original.clip_frame == actual.clip_frame
+        && original.viewport.origin.x == viewport.origin.x
+        && original.viewport.size == viewport.size
+        && original.clip_bounds.origin.x == clip_bounds.origin.x
+        && original.clip_bounds.size == clip_bounds.size
+        && actual.viewport == viewport
+        && actual.clip_bounds == clip_bounds
 }
 
 fn tab_drag_shell_matches(session: &TabDragSession) -> bool {
@@ -6880,6 +6975,20 @@ fn tab_drag_is_stored(session: &Rc<TabDragSession>) -> bool {
 }
 
 fn tab_drag_current(session: &Rc<TabDragSession>, stored: bool) -> bool {
+    tab_drag_current_at(
+        session,
+        stored,
+        session.viewport.get(),
+        session.clip_bounds.get(),
+    )
+}
+
+fn tab_drag_current_at(
+    session: &Rc<TabDragSession>,
+    stored: bool,
+    viewport: NSRect,
+    clip_bounds: NSRect,
+) -> bool {
     if (stored && !tab_drag_is_stored(session)) || !tab_drag_shell_matches(session) {
         return false;
     }
@@ -6897,12 +7006,23 @@ fn tab_drag_current(session: &Rc<TabDragSession>, stored: bool) -> bool {
             .button
             .window()
             .is_some_and(|window| std::ptr::eq(&*window, &*session.window))
-        && tab_drag_geometry(
-            &session.window,
-            &session.scroll,
-            &session.document,
-            &session.button,
-        ) == session.geometry
+        && std::ptr::eq(&*session.scroll.contentView(), &*session.clip)
+        && session
+            .clip
+            .documentView()
+            .is_some_and(|view| std::ptr::eq::<NSView>(&*view, &**session.document))
+        && tab_drag_geometry_matches(
+            &session.geometry,
+            &tab_drag_geometry(
+                &session.window,
+                &session.scroll,
+                &session.document,
+                &session.button,
+                &session.clip,
+            ),
+            viewport,
+            clip_bounds,
+        )
         && !page_find_has_marked_text();
     native
         && (!stored || tab_drag_is_stored(session))
@@ -6914,7 +7034,10 @@ fn cancel_tab_drag() {
     TAB_DRAG_EPOCH.with(|epoch| epoch.set(epoch.get().saturating_add(1)));
     let session = TAB_DRAG.with(|slot| slot.borrow_mut().take());
     if let Some(session) = session {
-        session.indicator.setHidden(true);
+        stop_tab_drag_timer(&session);
+        if TAB_DRAG.with(|slot| slot.borrow().is_none()) {
+            session.indicator.setHidden(true);
+        }
     }
 }
 
@@ -6984,21 +7107,307 @@ fn begin_tab_drag(sender: &TabDragRecognizer) {
     else {
         return;
     };
-    let geometry = tab_drag_geometry(&window, &scroll, &document, &button);
+    let clip = scroll.contentView();
+    let geometry = tab_drag_geometry(&window, &scroll, &document, &button, &clip);
     let session = Rc::new(TabDragSession {
         target,
         recognizer,
         button,
         window,
         scroll,
+        clip,
         document,
         indicator,
         geometry,
+        viewport: Cell::new(geometry.viewport),
+        clip_bounds: Cell::new(geometry.clip_bounds),
+        timer: RefCell::new(None),
         collapsed,
     });
     if tab_drag_current(&session, false) && TAB_DRAG_EPOCH.with(Cell::get) == epoch {
         TAB_DRAG.with(|slot| *slot.borrow_mut() = Some(session));
     }
+}
+
+fn tab_drag_point_inside(point: NSPoint, viewport: NSRect) -> bool {
+    [
+        point.x,
+        point.y,
+        viewport.origin.x,
+        viewport.origin.y,
+        viewport.size.width,
+        viewport.size.height,
+        viewport.origin.x + viewport.size.width,
+        viewport.origin.y + viewport.size.height,
+    ]
+    .into_iter()
+    .all(f64::is_finite)
+        && viewport.size.width > 0.0
+        && viewport.size.height > 0.0
+        && point.x >= viewport.origin.x
+        && point.x < viewport.origin.x + viewport.size.width
+        && point.y >= viewport.origin.y
+        && point.y < viewport.origin.y + viewport.size.height
+}
+
+/// Fixed 12-point steps in the inner 24-point edge bands, nominally at 30 Hz.
+/// A central pointer, a short document, or a reached edge needs no timer.
+fn tab_drag_scroll_origin(point: NSPoint, viewport: NSRect, document_height: f64) -> Option<f64> {
+    if !tab_drag_point_inside(point, viewport)
+        || !document_height.is_finite()
+        || document_height <= viewport.size.height
+        || viewport.origin.y < 0.0
+    {
+        return None;
+    }
+    let limit = document_height - viewport.size.height;
+    if viewport.origin.y > limit {
+        return None;
+    }
+    let band = 24.0f64.min(viewport.size.height / 2.0);
+    let next = if point.y < viewport.origin.y + band {
+        (viewport.origin.y - 12.0).max(0.0)
+    } else if point.y >= viewport.origin.y + viewport.size.height - band {
+        (viewport.origin.y + 12.0).min(limit)
+    } else {
+        return None;
+    };
+    (next != viewport.origin.y).then_some(next)
+}
+
+/// Only the constrained, requested vertical movement may become our new
+/// expected viewport. A native getter cannot authorize another scroll or size.
+fn tab_drag_scrolled_viewport(
+    viewport: NSRect,
+    current: NSRect,
+    proposed: NSRect,
+    constrained: NSRect,
+) -> Option<NSRect> {
+    let requested = proposed.origin.y - current.origin.y;
+    let actual = constrained.origin.y - current.origin.y;
+    if ![requested, actual, viewport.origin.y + actual]
+        .into_iter()
+        .all(f64::is_finite)
+        || proposed.origin.x != current.origin.x
+        || proposed.size != current.size
+        || constrained.origin.x != current.origin.x
+        || constrained.size != current.size
+        || requested == 0.0
+        || (requested > 0.0 && !(0.0..=requested).contains(&actual))
+        || (requested < 0.0 && !(requested..=0.0).contains(&actual))
+    {
+        return None;
+    }
+    Some(NSRect::new(
+        NSPoint::new(viewport.origin.x, viewport.origin.y + actual),
+        viewport.size,
+    ))
+}
+
+fn stop_tab_drag_timer(session: &TabDragSession) {
+    let timer = session.timer.borrow_mut().take();
+    // The run loop retains the timer, and the timer retains ShellTarget.
+    // Invalidate releases both edges. ShellTarget owns neither this session
+    // nor the timer, so there is no ownership cycle.
+    if let Some(timer) = timer {
+        timer.invalidate();
+    }
+}
+
+fn tab_drag_timer_is_current(session: &Rc<TabDragSession>, timer: &NSTimer) -> bool {
+    tab_drag_is_stored(session)
+        && session
+            .timer
+            .borrow()
+            .as_ref()
+            .is_some_and(|current| std::ptr::eq(timer, &**current))
+}
+
+fn cancel_tab_drag_session(session: &Rc<TabDragSession>) {
+    if tab_drag_is_stored(session) {
+        cancel_tab_drag();
+    } else {
+        stop_tab_drag_timer(session);
+    }
+}
+
+fn update_tab_drag_timer(session: &Rc<TabDragSession>) {
+    let state = session.recognizer.state();
+    let point = session
+        .document
+        .convertPoint_fromView(session.recognizer.ivars().location.get(), None);
+    if !tab_drag_current(session, true) {
+        cancel_tab_drag_session(session);
+        return;
+    }
+    if !matches!(
+        state,
+        NSGestureRecognizerState::Began | NSGestureRecognizerState::Changed
+    ) || tab_drag_scroll_origin(
+        point,
+        session.viewport.get(),
+        session.geometry.document.size.height,
+    )
+    .is_none()
+    {
+        stop_tab_drag_timer(session);
+        return;
+    }
+    if session.timer.borrow().is_some() {
+        return;
+    }
+    let target = SHELL.with(|slot| {
+        slot.try_borrow()
+            .ok()?
+            .as_ref()
+            .map(|shell| shell.target.clone())
+    });
+    let Some(target) = target else {
+        cancel_tab_drag_session(session);
+        return;
+    };
+    // Unscheduled first: do not permit a callback before storing its identity.
+    let interval = 1.0 / 30.0;
+    let timer = unsafe {
+        NSTimer::timerWithTimeInterval_target_selector_userInfo_repeats(
+            interval,
+            &target,
+            sel!(scrollDraggedTab:),
+            None,
+            true,
+        )
+    };
+    timer.setTolerance(interval / 10.0);
+    if !tab_drag_current(session, true) || session.timer.borrow().is_some() {
+        timer.invalidate();
+        return;
+    }
+    *session.timer.borrow_mut() = Some(timer.clone());
+    let run_loop = NSRunLoop::mainRunLoop();
+    if !tab_drag_timer_is_current(session, &timer) || !tab_drag_current(session, true) {
+        stop_tab_drag_timer(session);
+        return;
+    }
+    unsafe {
+        run_loop.addTimer_forMode(&timer, NSRunLoopCommonModes);
+    }
+    if !tab_drag_timer_is_current(session, &timer) || !tab_drag_current(session, true) {
+        stop_tab_drag_timer(session);
+        return;
+    }
+    // The same timer may belong to multiple modes. Register tracking explicitly
+    // instead of depending on the application's current common-mode contents.
+    unsafe {
+        run_loop.addTimer_forMode(&timer, NSEventTrackingRunLoopMode);
+    }
+    if !tab_drag_timer_is_current(session, &timer) || !tab_drag_current(session, true) {
+        stop_tab_drag_timer(session);
+    }
+}
+
+fn tab_drag_timer_fired(timer: &NSTimer) {
+    let session = TAB_DRAG.with(|slot| slot.borrow().clone());
+    let Some(session) = session.filter(|session| tab_drag_timer_is_current(session, timer)) else {
+        // An obsolete callback must not stop a newer session's timer.
+        timer.invalidate();
+        return;
+    };
+    if TAB_DRAG_QUERYING.with(|busy| busy.replace(true)) {
+        return;
+    }
+    scroll_dragged_tab(&session, timer);
+    TAB_DRAG_QUERYING.with(|busy| busy.set(false));
+}
+
+fn scroll_dragged_tab(session: &Rc<TabDragSession>, timer: &NSTimer) {
+    let state = session.recognizer.state();
+    if !tab_drag_timer_is_current(session, timer) {
+        return;
+    }
+    if state == NSGestureRecognizerState::Ended {
+        // The final action can be queued behind this tick. Preserve its drop.
+        stop_tab_drag_timer(session);
+        return;
+    }
+    if !matches!(
+        state,
+        NSGestureRecognizerState::Began | NSGestureRecognizerState::Changed
+    ) || !tab_drag_current(session, true)
+    {
+        cancel_tab_drag_session(session);
+        return;
+    }
+    let window_point = session.recognizer.ivars().location.get();
+    let point = session.document.convertPoint_fromView(window_point, None);
+    let viewport = session.viewport.get();
+    if !tab_drag_timer_is_current(session, timer) || !tab_drag_current(session, true) {
+        cancel_tab_drag_session(session);
+        return;
+    }
+    if !tab_drag_point_inside(point, viewport) {
+        cancel_tab_drag_session(session);
+        return;
+    }
+    let Some(next_y) =
+        tab_drag_scroll_origin(point, viewport, session.geometry.document.size.height)
+    else {
+        stop_tab_drag_timer(session);
+        return;
+    };
+    let bounds = session.clip_bounds.get();
+    let proposed = NSRect::new(
+        NSPoint::new(
+            bounds.origin.x,
+            bounds.origin.y + next_y - viewport.origin.y,
+        ),
+        bounds.size,
+    );
+    let constrained = session.clip.constrainBoundsRect(proposed);
+    let Some(next_viewport) = tab_drag_scrolled_viewport(viewport, bounds, proposed, constrained)
+    else {
+        cancel_tab_drag_session(session);
+        return;
+    };
+    let state = session.recognizer.state();
+    if !tab_drag_timer_is_current(session, timer) || !tab_drag_current(session, true) {
+        cancel_tab_drag_session(session);
+        return;
+    }
+    if state == NSGestureRecognizerState::Ended {
+        stop_tab_drag_timer(session);
+        return;
+    }
+    if !matches!(
+        state,
+        NSGestureRecognizerState::Began | NSGestureRecognizerState::Changed
+    ) {
+        cancel_tab_drag_session(session);
+        return;
+    }
+    if session.recognizer.ivars().location.get() != window_point {
+        return;
+    }
+    if next_viewport == viewport {
+        stop_tab_drag_timer(session);
+        return;
+    }
+    session.clip.scrollToPoint(constrained.origin);
+    if !tab_drag_timer_is_current(session, timer)
+        || !tab_drag_current_at(session, true, next_viewport, constrained)
+    {
+        cancel_tab_drag_session(session);
+        return;
+    }
+    // Only this verified native scroll advances expected geometry. Reentrant
+    // cancellation cannot restore an old session or accept an arbitrary offset.
+    session.viewport.set(next_viewport);
+    session.clip_bounds.set(constrained);
+    session.scroll.reflectScrolledClipView(&session.clip);
+    if !tab_drag_timer_is_current(session, timer) || !tab_drag_current(session, true) {
+        cancel_tab_drag_session(session);
+        return;
+    }
+    update_tab_drag(&session.recognizer, false);
 }
 
 /// Return an insertion anchor and its line using actual native row frames.
@@ -7011,24 +7420,7 @@ fn tab_drag_drop(
     mut frame: impl FnMut(i32) -> Option<NSRect>,
 ) -> Option<(Option<i32>, f64)> {
     let source_index = order.iter().position(|id| *id == source)?;
-    if order.len() < 2
-        || ![
-            point.x,
-            point.y,
-            viewport.origin.x,
-            viewport.origin.y,
-            viewport.size.width,
-            viewport.size.height,
-        ]
-        .into_iter()
-        .all(f64::is_finite)
-        || viewport.size.width <= 0.0
-        || viewport.size.height <= 0.0
-        || point.x < viewport.origin.x
-        || point.x >= viewport.origin.x + viewport.size.width
-        || point.y < viewport.origin.y
-        || point.y >= viewport.origin.y + viewport.size.height
-    {
+    if order.len() < 2 || !tab_drag_point_inside(point, viewport) {
         return None;
     }
     let mut row_frame = |id| {
@@ -7093,6 +7485,9 @@ fn update_tab_drag(sender: &TabDragRecognizer, ended: bool) {
     let Some(session) = session.filter(|session| std::ptr::eq(sender, &*session.recognizer)) else {
         return;
     };
+    if ended {
+        stop_tab_drag_timer(&session);
+    }
     if !tab_drag_current(&session, true) {
         cancel_tab_drag();
         return;
@@ -7102,7 +7497,7 @@ fn update_tab_drag(sender: &TabDragRecognizer, ended: bool) {
         &session.target.order,
         session.target.tab,
         point,
-        session.geometry.viewport,
+        session.viewport.get(),
         |id| {
             let button = SHELL.with(|slot| {
                 let slot = slot.try_borrow().ok()?;
@@ -7150,7 +7545,9 @@ fn update_tab_drag(sender: &TabDragRecognizer, ended: bool) {
         }
         session.indicator.setHidden(false);
         if !tab_drag_current(&session, true) {
-            cancel_tab_drag();
+            cancel_tab_drag_session(&session);
+        } else {
+            update_tab_drag_timer(&session);
         }
     }
 }
@@ -7989,7 +8386,7 @@ pub fn observe_page_input(event: &NSEvent) {
         return;
     };
     let kind = event.r#type();
-    // This first version keeps the drag viewport fixed. Wheel scrolling
+    // Only validated autoscroll advances drag geometry. Manual wheel scrolling
     // cancels rather than assigning an anchor from an obsolete row location.
     if kind == NSEventType::ScrollWheel {
         cancel_tab_drag();
@@ -8221,7 +8618,8 @@ pub fn handle_shortcut(event: &NSEvent) -> bool {
                 | NSEventModifierFlags::Option,
         ) && !search_has_marked_text()
         {
-            match event.keyCode() {
+            let search_key = event.keyCode();
+            match search_key {
                 53 => {
                     let cancelled = SHELL.with(|slot| {
                         let mut slot = slot.borrow_mut();
@@ -8242,19 +8640,23 @@ pub fn handle_shortcut(event: &NSEvent) -> bool {
                     }
                     return true;
                 }
-                125 => {
-                    move_search_selection(true);
-                    return true;
-                }
-                126 => {
-                    move_search_selection(false);
-                    return true;
-                }
-                36 | 76 => {
-                    submit_tab_search();
-                    return true;
-                }
                 _ => {}
+            }
+            if matches!(search_key, 36 | 76 | 125 | 126) {
+                let query_focus = search_query_has_focus();
+                let action = SHELL.with(|slot| {
+                    let slot = slot.borrow();
+                    let shell = slot.as_ref().filter(|shell| shell.search.open)?;
+                    search_query_key(search_key, query_focus, shell.search.confirm_clear)
+                });
+                if let Some(action) = action {
+                    match action {
+                        SearchQueryKey::Move(forward) => move_search_selection(forward),
+                        SearchQueryKey::Submit => submit_tab_search(),
+                        SearchQueryKey::Consume => {}
+                    }
+                    return true;
+                }
             }
         }
         if command
@@ -9357,6 +9759,179 @@ mod tests {
     }
 
     #[test]
+    fn tab_drag_autoscroll_runs_only_inside_available_edge_bands() {
+        let viewport = rect(0.0, 120.0, 200.0, 100.0);
+        assert_eq!(
+            tab_drag_scroll_origin(NSPoint::new(10.0, 121.0), viewport, 500.0),
+            Some(108.0)
+        );
+        assert_eq!(
+            tab_drag_scroll_origin(NSPoint::new(10.0, 219.0), viewport, 500.0),
+            Some(132.0)
+        );
+        assert_eq!(
+            tab_drag_scroll_origin(NSPoint::new(10.0, 144.0), viewport, 500.0),
+            None
+        );
+        assert_eq!(
+            tab_drag_scroll_origin(NSPoint::new(10.0, 195.0), viewport, 500.0),
+            None
+        );
+        for point in [
+            NSPoint::new(-1.0, 121.0),
+            NSPoint::new(200.0, 219.0),
+            NSPoint::new(10.0, 119.0),
+            NSPoint::new(10.0, 220.0),
+            NSPoint::new(f64::NAN, 121.0),
+        ] {
+            assert_eq!(tab_drag_scroll_origin(point, viewport, 500.0), None);
+        }
+        assert_eq!(
+            tab_drag_scroll_origin(NSPoint::new(10.0, 1.0), rect(0.0, 0.0, 200.0, 100.0), 500.0),
+            None
+        );
+        assert_eq!(
+            tab_drag_scroll_origin(
+                NSPoint::new(10.0, 499.0),
+                rect(0.0, 400.0, 200.0, 100.0),
+                500.0
+            ),
+            None
+        );
+        assert_eq!(
+            tab_drag_scroll_origin(
+                NSPoint::new(10.0, 99.0),
+                rect(0.0, 0.0, 200.0, 100.0),
+                100.0
+            ),
+            None
+        );
+        assert_eq!(
+            tab_drag_scroll_origin(NSPoint::new(10.0, 219.0), viewport, f64::INFINITY),
+            None
+        );
+        assert_eq!(
+            tab_drag_scroll_origin(NSPoint::new(10.0, 1.0), rect(0.0, 0.0, 200.0, 0.0), 500.0),
+            None
+        );
+    }
+
+    #[test]
+    fn tab_drag_autoscroll_stationary_pointer_reaches_bounds_and_can_reverse() {
+        let mut viewport = rect(0.0, 0.0, 200.0, 100.0);
+        let mut point = NSPoint::new(20.0, 99.0);
+        let mut ticks = 0;
+        while let Some(next) = tab_drag_scroll_origin(point, viewport, 401.0) {
+            point.y += next - viewport.origin.y;
+            viewport.origin.y = next;
+            ticks += 1;
+            assert!(ticks < 30);
+        }
+        assert_eq!(viewport.origin.y, 301.0);
+        assert_eq!(point.y, 400.0);
+        assert_eq!(ticks, 26);
+        // Returning to the center stops; moving to the opposite edge restarts.
+        point.y = viewport.origin.y + 50.0;
+        assert_eq!(tab_drag_scroll_origin(point, viewport, 401.0), None);
+        point.y = viewport.origin.y + 1.0;
+        assert_eq!(tab_drag_scroll_origin(point, viewport, 401.0), Some(289.0));
+        assert_eq!(
+            tab_drag_scroll_origin(NSPoint::new(10.0, 19.0), rect(0.0, 0.0, 60.0, 20.0), 100.0),
+            Some(12.0)
+        );
+    }
+
+    #[test]
+    fn tab_drag_autoscroll_accepts_only_the_constrained_vertical_delta() {
+        let viewport = rect(0.0, 100.0, 200.0, 100.0);
+        let bounds = viewport;
+        let proposed = rect(0.0, 112.0, 200.0, 100.0);
+        assert_eq!(
+            tab_drag_scrolled_viewport(viewport, bounds, proposed, proposed),
+            Some(proposed)
+        );
+        let clamped = rect(0.0, 105.5, 200.0, 100.0);
+        assert_eq!(
+            tab_drag_scrolled_viewport(viewport, bounds, proposed, clamped),
+            Some(clamped)
+        );
+        assert_eq!(
+            tab_drag_scrolled_viewport(viewport, bounds, proposed, bounds),
+            Some(viewport)
+        );
+        let upward = rect(0.0, 88.0, 200.0, 100.0);
+        assert_eq!(
+            tab_drag_scrolled_viewport(viewport, bounds, upward, upward),
+            Some(upward)
+        );
+        for constrained in [
+            rect(1.0, 112.0, 200.0, 100.0),
+            rect(0.0, 112.0, 199.0, 100.0),
+            rect(0.0, 113.0, 200.0, 100.0),
+            rect(0.0, 99.0, 200.0, 100.0),
+            rect(0.0, f64::NAN, 200.0, 100.0),
+        ] {
+            assert!(tab_drag_scrolled_viewport(viewport, bounds, proposed, constrained).is_none());
+        }
+        assert!(tab_drag_scrolled_viewport(viewport, bounds, bounds, bounds).is_none());
+        assert!(
+            tab_drag_scrolled_viewport(viewport, bounds, rect(1.0, 112.0, 200.0, 100.0), proposed)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn tab_drag_geometry_accepts_expected_scroll_but_not_other_native_changes() {
+        let original = TabDragGeometry {
+            window: rect(10.0, 20.0, 800.0, 600.0),
+            scroll: rect(0.0, 0.0, 200.0, 100.0),
+            document: rect(0.0, 0.0, 200.0, 500.0),
+            source: rect(2.0, 4.0, 174.0, 36.0),
+            viewport: rect(0.0, 0.0, 200.0, 100.0),
+            clip_frame: rect(0.0, 0.0, 200.0, 100.0),
+            clip_bounds: rect(0.0, 0.0, 200.0, 100.0),
+        };
+        let mut scrolled = original;
+        scrolled.viewport.origin.y = 12.0;
+        scrolled.clip_bounds.origin.y = 12.0;
+        assert!(tab_drag_geometry_matches(
+            &original,
+            &scrolled,
+            scrolled.viewport,
+            scrolled.clip_bounds
+        ));
+        assert!(!tab_drag_geometry_matches(
+            &original,
+            &scrolled,
+            original.viewport,
+            original.clip_bounds
+        ));
+        for mutation in 0..7 {
+            let mut changed = scrolled;
+            match mutation {
+                0 => changed.viewport.origin.x += 1.0,
+                1 => changed.viewport.size.height -= 1.0,
+                2 => changed.source.origin.y += 1.0,
+                3 => changed.document.size.height += 1.0,
+                4 => changed.window.origin.x += 1.0,
+                5 => changed.clip_frame.size.width -= 1.0,
+                _ => changed.clip_bounds.origin.x += 1.0,
+            }
+            assert!(!tab_drag_geometry_matches(
+                &original,
+                &changed,
+                scrolled.viewport,
+                scrolled.clip_bounds
+            ));
+        }
+        // Even a forged expected value cannot authorize horizontal/size changes.
+        let horizontal = rect(1.0, 12.0, 200.0, 100.0);
+        assert!(!tab_drag_geometry_matches(
+            &original, &scrolled, horizontal, horizontal
+        ));
+    }
+
+    #[test]
     fn tab_drag_threshold_preserves_small_click_motion() {
         let origin = NSPoint::new(12.0, 20.0);
         for point in [origin, NSPoint::new(13.0, 20.0), NSPoint::new(15.0, 24.0)] {
@@ -9576,6 +10151,64 @@ mod tests {
         let narrow = tab_row_frames(1.0, true, 0.0);
         assert_eq!(narrow.selection.size.width, 0.0);
         assert_eq!(narrow.close.size.width, 0.0);
+    }
+
+    #[test]
+    fn search_query_keys_preserve_focused_buttons_and_other_native_keys() {
+        for (key, expected) in [
+            (36, SearchQueryKey::Submit),
+            (76, SearchQueryKey::Submit),
+            (125, SearchQueryKey::Move(true)),
+            (126, SearchQueryKey::Move(false)),
+        ] {
+            assert_eq!(search_query_key(key, true, false), Some(expected));
+            // Close, mode, history controls and result buttons keep AppKit keys.
+            assert_eq!(search_query_key(key, false, false), None);
+            assert_eq!(search_query_key(key, false, true), None);
+        }
+        // Escape keeps its separate overlay cancellation path; text and Tab
+        // must never become selection commands, even while confirming deletion.
+        for key in [0, 48, 49, 53, 123, 124] {
+            for confirm in [false, true] {
+                assert_eq!(search_query_key(key, true, confirm), None);
+            }
+        }
+    }
+
+    #[test]
+    fn history_confirmation_consumes_query_submission_and_arrows_without_an_action() {
+        for key in [36, 76, 125, 126] {
+            assert_eq!(
+                search_query_key(key, true, true),
+                Some(SearchQueryKey::Consume)
+            );
+        }
+        assert_eq!(
+            search_query_key(36, true, false),
+            Some(SearchQueryKey::Submit)
+        );
+    }
+
+    #[test]
+    fn search_submission_selector_cannot_bypass_confirmation_or_a_closed_overlay() {
+        let selected = SearchResultId::History(7);
+        let mut state = SearchState {
+            open: true,
+            mode: SearchMode::History,
+            selected: Some(selected),
+            ..SearchState::default()
+        };
+        assert_eq!(search_submission(&state), Some(selected));
+        state.confirm_clear = true;
+        assert_eq!(search_submission(&state), None);
+        assert_eq!(state.selected, Some(selected));
+        state.confirm_clear = false;
+        assert_eq!(search_submission(&state), Some(selected));
+        state.open = false;
+        assert_eq!(search_submission(&state), None);
+        state.open = true;
+        state.selected = None;
+        assert_eq!(search_submission(&state), None);
     }
 
     #[test]

@@ -144,7 +144,7 @@ function fixture() {
         ? { width: 20, height: 10 } : { width: 0, height: 0 };
     }
     click() { this.clicked = (this.clicked || 0) + 1; }
-    focus() { this.onFocus?.(); }
+    focus() { this.focused = (this.focused || 0) + 1; this.onFocus?.(); }
     dispatchEvent(event) {
       this.events.push(event.type);
       this.onEvent?.(event);
@@ -152,9 +152,60 @@ function fixture() {
     }
   }
   class Input extends Element {
-    constructor(attributes) { super("INPUT", attributes); }
+    constructor(attributes) {
+      super("INPUT", attributes);
+      this._checked = Object.hasOwn(attributes, "checked");
+      this._indeterminate = false;
+      this.checkedWrites = 0;
+      this.indeterminateWrites = 0;
+    }
     get value() { return this._value; }
     set value(value) { this._value = value; }
+    get checked() { return this._checked; }
+    set checked(value) { this.checkedWrites += 1; this._checked = !!value; }
+    get indeterminate() { return this._indeterminate; }
+    set indeterminate(value) { this.indeterminateWrites += 1; this._indeterminate = !!value; }
+    click() {
+      if (!["checkbox", "radio"].includes(this.type)) return super.click();
+      this.clicked = (this.clicked || 0) + 1;
+      if (this.matches(":disabled")) return;
+      // Small activation double, not browser evidence: model pre-click toggle,
+      // canceled activation rollback and resulting input/change only. Native
+      // event trust, full radio-group rules and handler exceptions need CEF.
+      const type = this.type;
+      const checked = this._checked;
+      const indeterminate = this._indeterminate;
+      const peers = [];
+      const name = this.getAttribute("name");
+      if (type === "radio" && name) {
+        const visit = (parent) => {
+          for (const child of parent.children) {
+            if (child instanceof Input && child !== this && child.type === "radio" &&
+                child.getAttribute("name") === name && child.form === this.form) {
+              peers.push([child, child._checked]);
+            }
+            visit(child);
+          }
+        };
+        visit(this.getRootNode());
+      }
+      this._checked = type === "checkbox" ? !checked : true;
+      if (type === "checkbox") this._indeterminate = false;
+      else for (const [peer] of peers) peer._checked = false;
+      const accepted = this.dispatchEvent(new Event("click", {
+        bubbles: true, cancelable: true, composed: true,
+      }));
+      if (!accepted) {
+        this._checked = checked;
+        this._indeterminate = indeterminate;
+        for (const [peer, wasChecked] of peers) peer._checked = wasChecked;
+      } else if (this.isConnected && (type === "checkbox" || !checked)) {
+        // Native activation stops before input/change when a click handler
+        // removes the input from its document. The click already happened.
+        this.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+        this.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+    }
   }
   class TextArea extends Element {
     constructor(attributes) { super("TEXTAREA", attributes); }
@@ -632,6 +683,318 @@ test("invisible text ranges and hidden native labels do not leak or suppress a s
   assert.equal(page.interactive[0].label, "Safe placeholder");
   assert.equal(page.text.includes("Hidden native label"), false);
   assert.equal(page.text.includes("Text without rendered boxes"), false);
+});
+
+function checkFixture(type = "checkbox", checked = false) {
+  const f = fixture();
+  const input = f.add("INPUT", { type, "aria-label": "Native check" });
+  input.checked = checked;
+  input.checkedWrites = 0;
+  return { ...f, input, ref: f.bridge.read().interactive[0].ref };
+}
+
+test("check toggles a native checkbox once without setters or manual events", () => {
+  for (const checked of [false, true]) {
+    const f = checkFixture("checkbox", !checked);
+    const inputPrototype = Object.getPrototypeOf(f.input);
+    for (const property of ["checked", "indeterminate"]) {
+      const descriptor = Object.getOwnPropertyDescriptor(inputPrototype, property);
+      Object.defineProperty(f.input, property, {
+        get() { return descriptor.get.call(this); },
+        set() { throw new Error(`Bridge must not assign ${property}`); },
+      });
+    }
+    const observed = [];
+    f.input.onEvent = (event) => {
+      observed.push({ type: event.type, checked: f.input.checked });
+      if (event.type === "click") assert.equal(event.isTrusted, false);
+    };
+    const result = f.bridge.act({ action: "check", ref: f.ref, checked });
+    assert.equal(result.ok, true);
+    assert.equal(result.action, "check");
+    assert.equal(result.trusted, false);
+    assert.equal(result.changed, true);
+    assert.equal(result.checked, checked);
+    assert.equal(f.input.checked, checked);
+    assert.equal(f.input.focused, 1);
+    assert.equal(f.input.clicked, 1);
+    assert.equal(f.input.checkedWrites, 0);
+    assert.equal(f.input.indeterminateWrites, 0);
+    assert.deepEqual(observed, ["click", "input", "change"].map((type) => ({ type, checked })));
+  }
+});
+
+test("check of the current state does not focus, click, set properties or dispatch events", () => {
+  for (const [type, checked] of [["checkbox", false], ["checkbox", true], ["radio", true]]) {
+    const f = checkFixture(type, checked);
+    f.input.onFocus = () => assert.fail("A no-op must not focus the input");
+    const result = f.bridge.act({ action: "check", ref: f.ref, checked });
+    assert.equal(result.ok, true);
+    assert.equal(result.changed, false);
+    assert.equal(result.checked, checked);
+    assert.equal(result.trusted, false);
+    assert.equal(f.input.focused || 0, 0);
+    assert.equal(f.input.clicked || 0, 0);
+    assert.equal(f.input.checkedWrites, 0);
+    assert.deepEqual(f.input.events, []);
+  }
+});
+
+test("check only accepts boolean checked and supported native controls", () => {
+  for (const checked of [undefined, null, 0, 1, "true", "false", {}, [true]]) {
+    const f = checkFixture();
+    const result = f.bridge.act({ action: "check", ref: f.ref, checked });
+    assert.equal(result.error, "INVALID_VALUE");
+    assert.equal(f.input.focused || 0, 0);
+    assert.equal(f.input.clicked || 0, 0);
+    assert.equal(f.input.checkedWrites, 0);
+  }
+  for (const [tag, attributes] of [
+    ["INPUT", { type: "text" }], ["INPUT", { type: "password" }],
+    ["INPUT", { type: "file" }], ["BUTTON", {}],
+    ["DIV", { role: "checkbox" }], ["DIV", { role: "radio" }],
+  ]) {
+    const f = fixture();
+    const input = f.add(tag, attributes);
+    const ref = f.bridge.read().interactive[0].ref;
+    assert.equal(f.bridge.act({ action: "check", ref, checked: true }).error, "UNSUPPORTED_ELEMENT");
+    assert.equal(input.focused || 0, 0);
+    assert.equal(input.clicked || 0, 0);
+    assert.deepEqual(input.events, []);
+  }
+});
+
+test("check refuses radio false and mixed checkboxes even when checked already matches", () => {
+  for (const checked of [false, true]) {
+    const radio = checkFixture("radio", checked);
+    assert.equal(radio.bridge.act({ action: "check", ref: radio.ref, checked: false }).error, "UNSUPPORTED_STATE");
+    assert.equal(radio.input.checked, checked);
+    assert.equal(radio.input.focused || 0, 0);
+    assert.equal(radio.input.clicked || 0, 0);
+    for (const desired of [false, true]) {
+      const f = checkFixture("checkbox", checked);
+      f.input.indeterminate = true;
+      f.input.indeterminateWrites = 0;
+      assert.equal(f.bridge.act({ action: "check", ref: f.ref, checked: desired }).error, "UNSUPPORTED_STATE");
+      assert.equal(f.input.checked, checked);
+      assert.equal(f.input.indeterminate, true);
+      assert.equal(f.input.indeterminateWrites, 0);
+      assert.equal(f.input.checkedWrites, 0);
+      assert.equal(f.input.focused || 0, 0);
+      assert.equal(f.input.clicked || 0, 0);
+    }
+  }
+});
+
+test("check validates ref, visibility and disabled state before treating a request as a no-op", () => {
+  for (const [name, mutate, error] of [
+    ["new read", (f) => f.bridge.read(), "STALE_REF"],
+    ["removed", (f) => f.input.remove(), "STALE_REF"],
+    ["hidden", (f) => { f.input.hidden = true; }, "ELEMENT_UNAVAILABLE"],
+    ["disabled", (f) => { f.input.disabled = true; }, "ELEMENT_UNAVAILABLE"],
+    ["inert", (f) => { f.input.inert = true; }, "ELEMENT_UNAVAILABLE"],
+    ["aria disabled", (f) => f.input.setAttribute("aria-disabled", "true"), "ELEMENT_UNAVAILABLE"],
+  ]) {
+    const f = checkFixture("checkbox", true);
+    mutate(f);
+    assert.equal(f.bridge.act({ action: "check", ref: f.ref, checked: true }).error, error, name);
+    assert.equal(f.input.focused || 0, 0, name);
+    assert.equal(f.input.clicked || 0, 0, name);
+    assert.deepEqual(f.input.events, [], name);
+  }
+});
+
+test("check revalidates reference, type and availability after focus before clicking", () => {
+  for (const [name, mutate] of [
+    ["new read", (f) => f.bridge.read()],
+    ["remove", (f) => f.input.remove()],
+    ["replace", (f) => { f.input.remove(); f.replacement = f.add("INPUT", { type: "checkbox" }); }],
+    ["retype to text", (f) => { f.input.type = "text"; }],
+    ["retype to radio", (f) => { f.input.type = "radio"; }],
+    ["hide", (f) => { f.input.hidden = true; }],
+    ["disable", (f) => { f.input.disabled = true; }],
+  ]) {
+    const f = checkFixture();
+    f.input.onFocus = () => mutate(f);
+    const result = f.bridge.act({ action: "check", ref: f.ref, checked: true });
+    assert.equal(result.ok, false, name);
+    assert.equal(f.input.focused, 1, name);
+    assert.equal(f.input.clicked || 0, 0, name);
+    assert.equal(f.input.checkedWrites, 0, name);
+    assert.deepEqual(f.input.events, [], name);
+    if (name.startsWith("retype")) assert.equal(result.error, "ELEMENT_UNAVAILABLE", name);
+    if (f.replacement) assert.equal(f.replacement.clicked || 0, 0);
+  }
+});
+
+test("check accepts a focus handler reaching the requested state without a click", () => {
+  for (const checked of [false, true]) {
+    const f = checkFixture("checkbox", !checked);
+    f.input.onFocus = () => { f.input.checked = checked; };
+    const result = f.bridge.act({ action: "check", ref: f.ref, checked });
+    assert.equal(result.ok, true);
+    assert.equal(result.changed, false);
+    assert.equal(result.checked, checked);
+    assert.equal(result.trusted, false);
+    assert.equal(f.input.focused, 1);
+    assert.equal(f.input.clicked || 0, 0);
+    assert.equal(f.input.checkedWrites, 1); // Only the page's focus handler wrote.
+    assert.deepEqual(f.input.events, []);
+  }
+  const mixed = checkFixture();
+  mixed.input.onFocus = () => { mixed.input.indeterminate = true; };
+  assert.equal(mixed.bridge.act({ action: "check", ref: mixed.ref, checked: true }).error, "UNSUPPORTED_STATE");
+  assert.equal(mixed.input.clicked || 0, 0);
+  assert.equal(mixed.input.indeterminate, true);
+});
+
+test("check reports canceled activation without retrying or manufacturing change events", () => {
+  for (const type of ["checkbox", "radio"]) {
+    const f = checkFixture(type);
+    f.input.onEvent = (event) => { if (event.type === "click") event.preventDefault(); };
+    const result = f.bridge.act({ action: "check", ref: f.ref, checked: true });
+    assert.equal(result.error, "CHECK_STATE_NOT_REACHED", type);
+    assert.equal(result.attempted, true, type);
+    assert.equal(result.trusted, false, type);
+    assert.equal(result.checked, false, type);
+    assert.equal(f.input.checked, false, type);
+    assert.equal(f.input.clicked, 1, type);
+    assert.equal(f.input.checkedWrites, 0, type);
+    assert.deepEqual(f.input.events, ["click"], type);
+  }
+});
+
+test("check lets native radio activation uncheck only its own named group", () => {
+  const f = checkFixture("radio");
+  f.input.setAttribute("name", "group");
+  const previous = f.add("INPUT", { type: "radio", name: "group", checked: "" });
+  const unrelated = f.add("INPUT", { type: "radio", name: "other", checked: "" });
+  const result = f.bridge.act({ action: "check", ref: f.ref, checked: true });
+  assert.equal(result.ok, true);
+  assert.equal(result.changed, true);
+  assert.equal(f.input.checked, true);
+  assert.equal(previous.checked, false);
+  assert.equal(unrelated.checked, true);
+  assert.deepEqual(previous.events, []);
+  assert.deepEqual(unrelated.events, []);
+  assert.equal(f.input.clicked, 1);
+  assert.equal(previous.clicked || 0, 0);
+  assert.equal(previous.checkedWrites, 0);
+});
+
+test("check reports the state left by page handlers without a second click", () => {
+  for (const eventType of ["click", "input", "change"]) {
+    const f = checkFixture();
+    f.input.onEvent = (event) => { if (event.type === eventType) f.input.checked = false; };
+    const result = f.bridge.act({ action: "check", ref: f.ref, checked: true });
+    assert.equal(result.error, "CHECK_STATE_NOT_REACHED", eventType);
+    assert.equal(result.attempted, true);
+    assert.equal(result.trusted, false);
+    assert.equal(result.checked, false);
+    assert.equal(result.indeterminate, false);
+    assert.equal(f.input.clicked, 1);
+    assert.equal(f.input.checkedWrites, 1); // Only the page handler wrote.
+    assert.deepEqual(f.input.events, ["click", "input", "change"]);
+  }
+  const mixed = checkFixture();
+  mixed.input.onEvent = (event) => { if (event.type === "change") mixed.input.indeterminate = true; };
+  const result = mixed.bridge.act({ action: "check", ref: mixed.ref, checked: true });
+  assert.equal(result.error, "CHECK_STATE_NOT_REACHED");
+  assert.equal(result.checked, true);
+  assert.equal(result.indeterminate, true);
+  assert.equal(result.attempted, true);
+  assert.equal(mixed.input.clicked, 1);
+  assert.equal(mixed.input.indeterminateWrites, 1);
+});
+
+test("check cannot confirm a clicked target replaced, retyped or made unavailable by a handler", () => {
+  for (const [name, mutate] of [
+    ["new read", (f) => f.bridge.read()],
+    ["remove", (f) => f.input.remove()],
+    ["replace", (f) => { f.input.remove(); f.replacement = f.add("INPUT", { type: "checkbox" }); }],
+    ["retype", (f) => { f.input.type = "radio"; }],
+    ["hide", (f) => { f.input.hidden = true; }],
+    ["disable", (f) => { f.input.disabled = true; }],
+  ]) {
+    const f = checkFixture();
+    f.input.onEvent = (event) => { if (event.type === "click") mutate(f); };
+    const result = f.bridge.act({ action: "check", ref: f.ref, checked: true });
+    assert.equal(result.error, "CHECK_STATE_UNCONFIRMED", name);
+    assert.equal(result.attempted, true, name);
+    assert.equal(result.trusted, false, name);
+    assert.equal(Object.hasOwn(result, "checked"), false, name);
+    assert.equal(Object.hasOwn(result, "indeterminate"), false, name);
+    assert.equal(f.input.clicked, 1, name);
+    assert.equal(f.input.checkedWrites, 0, name);
+    if (name === "remove" || name === "replace") {
+      assert.deepEqual(f.input.events, ["click"], name);
+    }
+    if (f.replacement) assert.equal(f.replacement.clicked || 0, 0);
+  }
+});
+
+test("check marks a throwing click as attempted without disclosing exception data or retrying", () => {
+  const f = checkFixture();
+  f.input.click = () => { f.input.clicked = (f.input.clicked || 0) + 1; throw new Error("private-handler-data"); };
+  const result = f.bridge.act({ action: "check", ref: f.ref, checked: true });
+  assert.equal(result.error, "ACTION_FAILED");
+  assert.equal(result.attempted, true);
+  assert.equal(result.trusted, false);
+  assert.equal(f.input.clicked, 1);
+  assert.equal(f.input.checked, false);
+  assert.equal(JSON.stringify(result).includes("private-handler-data"), false);
+});
+
+test("read exposes indeterminate only for native checkboxes without changing the state", () => {
+  const f = fixture();
+  const mixed = f.add("INPUT", { type: "checkbox", "aria-label": "Mixed checkbox" });
+  mixed.checked = true;
+  mixed.indeterminate = true;
+  f.add("INPUT", { type: "checkbox", "aria-label": "Normal checkbox" });
+  f.add("INPUT", { type: "radio", "aria-label": "Radio" });
+  f.add("DIV", { role: "checkbox", "aria-checked": "mixed", "aria-label": "Custom checkbox" });
+  const page = f.bridge.read();
+  const item = (label) => page.interactive.find((entry) => entry.label === label);
+  assert.equal(item("Mixed checkbox").checked, true);
+  assert.equal(item("Mixed checkbox").indeterminate, true);
+  assert.equal(item("Normal checkbox").indeterminate, false);
+  assert.equal(Object.hasOwn(item("Radio"), "indeterminate"), false);
+  assert.equal(Object.hasOwn(item("Custom checkbox"), "indeterminate"), false);
+  assert.equal(mixed.focused || 0, 0);
+  assert.equal(mixed.clicked || 0, 0);
+});
+
+test("check uses open-shadow and same-origin iframe refs and rejects a replaced frame document", () => {
+  const f = fixture();
+  const host = f.add("DIV");
+  const shadow = host.attachShadow({ mode: "open" });
+  const checkbox = f.add("INPUT", { type: "checkbox", "aria-label": "Shadow checkbox" }, shadow);
+  const { frame, child } = embed(f);
+  const radio = child.add("INPUT", { type: "radio", "aria-label": "Child radio" });
+  const page = f.bridge.read();
+  const item = (label) => page.interactive.find((entry) => entry.label === label);
+  assert.equal(f.bridge.act({ action: "check", ref: item("Shadow checkbox").ref, checked: true }).ok, true);
+  assert.equal(f.bridge.act({ action: "check", ref: item("Child radio").ref, checked: true }).ok, true);
+  assert.equal(checkbox.clicked, 1);
+  assert.equal(radio.clicked, 1);
+  frame.contentDocument = fixture().document;
+  assert.equal(f.bridge.act({ action: "check", ref: item("Child radio").ref, checked: true }).error, "STALE_REF");
+  assert.equal(radio.clicked, 1);
+});
+
+test("check cannot confirm a child input after click replaces its iframe document", () => {
+  const f = fixture();
+  const { frame, child } = embed(f);
+  const input = child.add("INPUT", { type: "checkbox" });
+  const ref = f.bridge.read().interactive[0].ref;
+  input.onEvent = (event) => { if (event.type === "click") frame.contentDocument = fixture().document; };
+  const result = f.bridge.act({ action: "check", ref, checked: true });
+  assert.equal(result.error, "CHECK_STATE_UNCONFIRMED");
+  assert.equal(result.attempted, true);
+  assert.equal(result.trusted, false);
+  assert.equal(Object.hasOwn(result, "checked"), false);
+  assert.equal(Object.hasOwn(result, "indeterminate"), false);
+  assert.equal(input.clicked, 1);
 });
 
 function selectFixture(values = ["initial", "target"]) {
