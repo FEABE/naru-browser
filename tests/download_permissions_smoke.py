@@ -5,8 +5,10 @@ Uses one ephemeral loopback server and four owned task spaces. Run exclusively
 with the user space selected and no active downloads or permission requests.
 Close native downloads, search and bookmarks overlays before running this test.
 No permission is accepted and no save dialog is opened. Initial tabs are never
-navigated, adopted or closed. This verifies real CEF lifecycle callbacks through
-synthetic CLI clicks; it does not inspect native permission cards or Save UI.
+navigated, adopted or closed. This checks CEF lifecycle callbacks through CLI
+clicks; it does not inspect native permission cards or Save UI. The recorded
+passing run used synthetic clicks. Chromium pointer input may change user
+activation and download permission behavior; this sequence needs a new CEF run.
 Explicit test space selection is needed to surface Chromium hidden prompts.
 This does not verify automatic permission presentation for background tasks.
 """
@@ -22,7 +24,7 @@ import time
 import uuid
 
 from download_fixture import State, handler
-from smoke import BrowserCli, CheckFailed, ROOT, element, require
+from smoke import BrowserCli, CheckFailed, ROOT, element, require, require_native_click_ack
 
 
 def poll(read, ready, message):
@@ -39,7 +41,7 @@ def poll(read, ready, message):
 def run(args):
     cli = BrowserCli(args.cli.resolve(), args.data_dir.resolve())
     report = {"ok": False,
-              "scope": "real CEF permission lifecycle through synthetic CLI clicks; explicit test space selection needed to surface Chromium hidden prompts",
+              "scope": "CEF permission lifecycle through Chromium CLI clicks; user activation behavior requires revalidation",
               "checks": [], "receipts": {}, "spaceSelections": [],
               "notRun": ["paused user request then resume requires native fixture button"]}
     tasks = {}
@@ -132,7 +134,7 @@ def run(args):
         require(page.get("title") == "Naru 다운로드 검증", "Wrong download fixture document")
         reference = element(page, label)["ref"]
         result = scoped(task, "click", tab, reference) if task else call("click", tab, reference)
-        require(result.get("page", {}).get("ok") is True, "Synthetic click did not succeed")
+        require_native_click_ack(result.get("page"))
         return reference
 
     def queue_hidden(case, tab, task=None):

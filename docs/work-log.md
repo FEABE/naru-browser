@@ -1,5 +1,39 @@
 # Naru 작업 기록
 
+## 2026-10-16, Chromium 클릭 변경의 커밋과 비공개 푸시 요청
+
+사용자의 커밋 요청과 이어진 푸시 요청에 따라 CLI 클릭 구현, 테스트, 문서의 15개 파일을 기존 `codex/navigation-readiness` 브랜치에 커밋하고 같은 원격 브랜치로 올리는 범위다. 새로고침과 로딩 중지 보완은 설계만 진행한 상태에서 멈췄으며 이번 커밋에 포함하지 않는다. 제품 코드를 추가로 수정하지 않았고 아래 구현 기록의 미커밋 표시는 당시 상태다.
+
+GitHub 조회에서 `FEABE/naru-browser`의 `isPrivate: true`를 확인했다. 작업 전 로컬 HEAD와 원격 작업 브랜치는 모두 `d3a0d8b28783530652679b7d390924521d7ff702`이었다. 제한 환경의 첫 네트워크 조회는 실패했으며 네트워크 접근을 허용한 조회는 성공했다. 푸시 대상은 기본 브랜치 main이 아닌 기존 작업 브랜치다.
+
+기존 검사 기록에는 Rust 단위 330개, 모의 DOM 106개, 독립 Chromium의 고유 계약 32개 통과와 기본 구성, CLI 전용 구성 검사 결과가 있다. 커밋 전 현재 소스와 검사 파일의 해시를 이 기록과 대조하며 동일 소스의 빌드와 실행 검사를 반복하지 않는다. 최신 Naru CEF 통합, 네이티브 UI와 배경 선택 보존, 외부 사이트와 장시간 RAM 검증은 여전히 미완료다.
+
+이번 작업에서 앱, 서버와 빌드를 실행하지 않는다. 빌드 산출물, 사용자 프로필과 검증 원본은 Git 제외 상태를 유지한다. 해시 대조, 공백 검사, 기존 임시 target 정리 상태, 커밋과 푸시의 실제 결과, 최종 로컬과 원격 SHA, 작업 트리는 `artifacts/commit-push-native-click-20261016.json`에 기록한다.
+
+## 2026-10-16, CLI 클릭을 Chromium 포인터 입력으로 연결
+
+직전 턴은 Enter 변경을 `d3a0d8b`로 커밋하고 비공개 원격 SHA 일치를 확인한 진전이다. 독립 브라우저 목표를 이어 이번에는 합성 DOM click을 Chromium 포인터 입력으로 바꿨다. 이번 변경은 커밋하거나 푸시하지 않았으며 Naru 완성과 같은 구현의 Preseller 내장 목표는 여전히 미완료다.
+
+`src/dom_bridge.js`는 현재 ref, 문서와 활성 상태를 검사하고 viewport 안의 후보를 hit test한다. 대상 자체와 비대화형 자식은 허용하고 다른 대화형 자식은 거절한다. 필요할 때 대상과 부모 iframe을 한 번씩 스크롤하고 다시 계산한다. 검사 한 번의 후보는 최대 9개, iframe은 최대 8단계, shadow와 조상 탐색은 64단계다. 같은 출처 iframe의 border, padding과 검증한 양수 배율을 반영하고 계산한 박스 크기를 실제 크기와 대조한다. 독립 검사에서 display: contents의 individual scale을 곱하면 잘못된 좌표가 나온 것을 확인해 박스 변환은 제외하고 실제 적용되는 zoom은 유지했다. SVG 조상, motion path와 지원하지 않는 프레임 변환은 명시적으로 거절한다. quirks viewport는 body의 client 크기를 사용한다.
+
+`src/browser.rs`는 기존 Enter 배치를 공통 입력 배치로 바꿨다. 포인터 이동 한 요청의 접수와 응답 뒤 원래 isolated context, ref와 같은 좌표를 DOM에서 다시 확인한다. 이 재검사는 스크롤하거나 새 점을 고르지 않는다. 통과하면 같은 호스트에 왼쪽 mousePressed와 mouseReleased를 차례로 접수한다. 단계마다 기존 pending을 교체해 TAB_BUSY를 유지하고 네이티브 getter 뒤와 제출 직전에 활성 요청, 제어권, Browser와 문서 세대를 재검사한다. 이동부터 attempted가 true이며 이후 DOM 거절이나 누름 전 취소에도 보존한다. 두 입력의 접수 반환값과 응답을 확인한 최종 결과는 dispatchAcknowledged만 표현한다. 자동 반복과 DOM click fallback은 없고 check, fill, select의 기존 의미는 유지한다.
+
+`src/cli.rs`의 도움말을 바꾸고 `tests/fixtures/native_click.html`, `tests/native_click_smoke.py`를 준비했다. 기본 smoke와 shadow smoke는 새 ACK 계약과 기존 페이지 효과를 함께 확인하도록 연결했다. 다운로드 권한 smoke도 새 계약을 검사하지만 과거 합성 click의 통과 결과를 재사용하지 않는다. 사용자 활성화에 따라 권한 순서가 달라질 수 있어 실제 앱에서 다시 확인해야 한다. README, 아키텍처, 제품 계획, 메모리 문서와 새 `docs/pointer-input.md`에 현재 구현과 한계를 반영했다. 입력 배치는 최대 두 pending을 유지하며 새 프로세스, renderer, 반복 타이머와 저장소는 없다.
+
+검증은 다음과 같이 구분한다.
+
+- 모의 DOM 최종 106개가 전부 통과했다. 기존 94개와 새 12개를 포함하며 위치 준비, 스크롤, 가림, 다른 대화형 자식, SVG 대상, shadow와 슬롯, iframe 변환, verifyOnly의 같은 점 검사와 참조 변경을 다룬다. 최종 bridge SHA-256은 `d7cdb500230ad645440c5cfc089464724b890d77b6084b140a04de39ec90ff0e`다. `artifacts/pointer-native-v1-dom-after.log`와 JSON에 명령, 결과와 해시를 보존했다.
+- Rust 단위 330개가 전부 통과했다. 기존 Enter 회귀 8개를 유지하고 클릭 회귀 6개를 추가했다. 실제 reserve, pending 교체와 응답 처리를 stub 전송으로 실행해 이동 ACK 뒤 접수 실패, 잘못된 준비 결과, 변경된 좌표, hover 거절, 문서와 제어권 변경, 취소 후 attempted, 단계 사이 TAB_BUSY를 확인한다. CEF 엔진 실행 검사는 아니다. 오프라인 잠금 의존성 단위 실행 파일 컴파일, 기본 구성과 CLI 전용 구성의 전체 타깃 검사, format도 통과했다. `artifacts/pointer-native-v1-check.json`, `pointer-native-v1-rust-tests.json`이 근거다. 기본 구성의 test 전용 dead_code 경고 3개, CLI 전용 lib 경고 9개와 lib test 경고 1개를 확인했으며 경고 문구는 직전 Enter 검사와 같다.
+- 독립 ego Chromium 152의 자체 공간 9에서 최종 bridge를 isolated world에 넣고 main world fixture와 연결했다. 기본 동작 8개, geometry 18개, 추가 경계 6개의 고유 계약 32개를 확인했다. 실제 pointer, mouse, click과 checkbox 기본 동작을 ACK와 따로 관찰했다. 추가 경계의 첫 실행은 4개 통과, 2개 실패였으며 문서 observer가 검사 사이 누적되어 같은 이벤트를 여러 번 기록한 검사기 문제였다. 원본을 보존하고 AbortController로 리스너를 정리한 뒤 해당 두 사례만 다시 실행해 통과했다. 제품 소스는 바꾸지 않았다. `artifacts/pointer-native-v1-browser-summary.json`과 연결된 원본이 근거다. BackCompat의 오른쪽 아래 fixed 대상도 클릭했지만 이 실행에서는 root와 body의 client 크기가 같았으므로 둘의 차이로 생기는 결함까지 직접 재현한 증거는 아니다.
+- 앞선 좌표 조사 11개와 추가 CSS 경계 7개에서 display: contents, SVG와 motion path의 계산 차이를 관찰했다. 이를 최종 소스의 통과 개수에 합산하지 않는다. 설치된 CEF의 Chromium 156.0.8078.17 소스에서 좌표 배율, 페이지 포커스와 소비 여부를 보장하지 않는 ACK 경로를 확인했다. `artifacts/pointer-native-v1-primary.json`에 URL과 해시를 기록했다. Chromium 152 실행과 Chromium 156 소스 확인은 서로 다른 증거다.
+- Python AST 4개와 새 fixture의 JavaScript 구문 1개가 통과했다. `artifacts/pointer-native-v1-integration-static.json`에 파일 해시를 기록했다. 준비한 Naru CLI smoke, 실제 CEF 통합과 네이티브 UI, 외부 사이트는 실행하지 않았다. ego SDK의 CDP는 대상 탭을 활성화하므로 이번 독립 검사로 Naru의 배경 선택 보존을 입증하지 않는다.
+
+DOM 재검사 이후의 이동과 가림, mousedown 중 대상 변경, 서브프레임 교체와 사용자 입력 경합은 원자적으로 막지 못한다. 취소나 문서 변경으로 release를 생략하면 이전 페이지의 버튼 상태가 남을 수 있다. 실제 Naru의 배경 포인터, 팝업과 다운로드 권한, 파일 선택, 장시간 메모리와 반복 요청 회수는 남은 검증이다. source 변경을 최신 앱의 실행 완료로 설명하지 않는다. 앱 번들, release 바이너리와 서명을 만들거나 Naru, CEF 엔진과 HTTP 서버를 실행하지 않았고 키체인 승인 질문도 하지 않았다.
+
+검증 공간 9는 finish를 정확히 한 번 호출해 closedSpace true, closedManagedLabels p1, preservedUnmanagedCount 0을 확인했다. 실제 응답은 `artifacts/pointer-native-v1-browser-cleanup.json`에 있다. 컴파일 세션 6096과 단위 세션 52497은 모두 exit 0으로 종료됐다. `target/.pointer-native-test-vfjpwg63`의 identity와 symlink 0개를 확인하고 파일 2,060개, 크기 합계 1,489,185,461바이트를 정리했다. 소스와 기존 앱, CLI 해시가 검사와 정리 전후 일치했다. `artifacts/pointer-native-v1-cleanup.json`이 근거이며 이 합계는 물리 디스크 회수량이나 RAM 측정값이 아니다.
+
+최종 공백 검사와 변경 문서의 로컬 링크 103개 존재 검사를 통과했다. 소스, 검사 파일과 기존 앱, CLI의 해시 39개가 검증 기록과 일치했으며 임시 target 부재를 확인했다. `artifacts/pointer-native-v1-final-static.json`에 기록했다. HEAD는 `d3a0d8b`이고 이번 변경 15개 파일은 미커밋 상태다.
+
 ## 2026-10-16, Chromium Enter 변경의 커밋과 비공개 푸시 요청
 
 사용자의 커밋 요청과 이어진 푸시 요청에 따라 CLI Enter 구현, 테스트, 문서의 14개 파일을 기존 `codex/navigation-readiness` 브랜치에 커밋하고 같은 원격 브랜치로 올리는 범위다. 새 클릭 입력 설계 조사는 파일 변경 없이 중단했다. 제품 코드를 추가로 수정하지 않았으며 아래 구현 기록의 미커밋 표시는 당시 상태다.

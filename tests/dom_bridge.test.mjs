@@ -63,6 +63,10 @@ function fixture() {
       }
       return null;
     }
+    elementFromPoint(x, y) {
+      metrics.hitTests = (metrics.hitTests || 0) + 1;
+      return this.hitTest ? this.hitTest(x, y) : this.hitTarget || null;
+    }
   }
   class Text extends Node {
     constructor(value) { super(3); this.data = value; }
@@ -95,7 +99,10 @@ function fixture() {
       this.type = attributes.type || "text";
       this.events = [];
       this._value = "";
-      this.style = { display: "block", visibility: "visible" };
+      this.style = { display: "block", visibility: "visible", transform: "none", scale: "none",
+        rotate: "none", perspective: "none", zoom: "1", borderLeftWidth: "0px", borderTopWidth: "0px",
+        borderRightWidth: "0px", borderBottomWidth: "0px", paddingLeft: "0px", paddingTop: "0px",
+        paddingRight: "0px", paddingBottom: "0px", boxSizing: "content-box", width: "400px", height: "300px", offsetPath: "none" };
       this.form = null;
       this.labels = [];
       this.assignedSlot = null;
@@ -153,9 +160,12 @@ function fixture() {
     }
     getClientRects() { return this.rects ?? (hasBox(this) ? [{}] : []); }
     getBoundingClientRect() {
-      return hasBox(this) && this.rects?.length !== 0
-        ? { width: 20, height: 10 } : { width: 0, height: 0 };
+      if (!hasBox(this) || this.rects?.length === 0) return { left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 };
+      const rect = this.box || (this.tagName === "IFRAME"
+        ? { left: 0, top: 0, width: 400, height: 300 } : { left: 10, top: 10, width: 20, height: 10 });
+      return { ...rect, right: rect.left + rect.width, bottom: rect.top + rect.height };
     }
+    scrollIntoView(options) { this.scrolls = (this.scrolls || 0) + 1; this.onScroll?.(options); }
     click() { this.clicked = (this.clicked || 0) + 1; }
     focus() {
       this.focused = (this.focused || 0) + 1;
@@ -297,6 +307,8 @@ function fixture() {
   document.ownerDocument = null;
   document.title = "Fixture";
   document.readyState = "interactive";
+  document.compatMode = "CSS1Compat";
+  document.documentElement = { clientWidth: 1280, clientHeight: 800 };
   document.body = new Element("BODY");
   document.append(document.body);
   document.activeElement = document.body;
@@ -316,6 +328,7 @@ function fixture() {
   });
   const window = {
     innerWidth: 1280, innerHeight: 800, scrollX: 0, scrollY: 0,
+    visualViewport: { scale: 1, offsetLeft: 0, offsetTop: 0 },
     getComputedStyle: (element) => element.style,
     scrollBy({ left, top }) { this.scrollX += left; this.scrollY += top; },
   };
@@ -345,6 +358,15 @@ function fixture() {
   vm.runInContext(source, context);
   return {
     bridge: window.__lightBrowserBridge, document, window, context, metrics,
+    pointAt(element) {
+      // Explicit hit maps exercise policy/coordinate checks, not a fake layout
+      // engine. Actual browser paint order and geometry need Chromium evidence.
+      for (let current = element, depth = 0; current && depth < 100; depth += 1) {
+        const root = current.getRootNode();
+        root.hitTarget = current;
+        current = root.host || root.defaultView?.frameElement;
+      }
+    },
     add(tagName = "BUTTON", attributes = {}, parent = document.body) {
       const element = tagName === "INPUT" ? new Input(attributes)
         : tagName === "TEXTAREA" ? new TextArea(attributes)
@@ -367,8 +389,9 @@ test("refs expire after another read and never alias a new document", () => {
   const staleRef = first.bridge.read().interactive[0].ref;
   const currentRef = first.bridge.read().interactive[0].ref;
   assert.equal(first.bridge.act({ action: "click", ref: staleRef }).error, "STALE_REF");
-  assert.equal(first.bridge.act({ action: "click", ref: currentRef }).ok, true);
-  assert.equal(button.clicked, 1);
+  first.pointAt(button);
+  assert.equal(first.bridge.act({ action: "click", ref: currentRef }).prepared, true);
+  assert.equal(button.clicked, undefined);
   const second = fixture();
   second.add();
   const secondRef = second.bridge.read().interactive[0].ref;
@@ -622,6 +645,256 @@ test("Enter preparation bounds focus-chain inspection and rejects stale refs bef
   assert.deepEqual(target.events, []);
 });
 
+test("click prepares and verifies a point without DOM activation or focus", () => {
+  const f = fixture();
+  const target = f.add("BUTTON");
+  f.pointAt(target);
+  const ref = f.bridge.read().interactive[0].ref;
+  target.getClientRects = () => assert.fail("Do not allocate all layout fragments");
+  const prepared = f.bridge.act({ action: "click", ref });
+  assert.deepEqual(JSON.parse(JSON.stringify(prepared)), {
+    ok: true, action: "click", prepared: true, attempted: false, point: { x: 20, y: 15 },
+  });
+  const verified = f.bridge.act({ action: "click", ref, verifyOnly: true, point: prepared.point });
+  assert.deepEqual(JSON.parse(JSON.stringify(verified)), JSON.parse(JSON.stringify(prepared)));
+  assert.equal(target.scrolls, undefined);
+  assert.equal(target.focused, undefined);
+  assert.equal(target.clicked, undefined);
+  assert.deepEqual(target.events, []);
+});
+
+test("click samples bounded visible points and reports occlusion without activation", () => {
+  for (const partial of [false, true]) {
+    const f = fixture();
+    const target = f.add("BUTTON", { "aria-label": "Target" });
+    const overlay = f.add("DIV");
+    f.document.hitTest = (x) => partial && x > 25 ? target : overlay;
+    const ref = f.bridge.read().interactive[0].ref;
+    const result = f.bridge.act({ action: "click", ref });
+    if (partial) {
+      assert.equal(result.prepared, true);
+      assert.ok(result.point.x > 25);
+      assert.equal(target.scrolls, undefined);
+    } else {
+      assert.equal(result.error, "CLICK_POINT_UNAVAILABLE");
+      assert.equal(target.scrolls, 1);
+    }
+    assert.equal(result.attempted, false);
+    assert.ok(f.metrics.hitTests <= 18);
+    assert.equal(target.clicked, undefined);
+  }
+});
+
+test("click scrolls once when needed and rechecks identity before using new geometry", () => {
+  for (const invalidate of [false, true]) {
+    const f = fixture();
+    const target = f.add("BUTTON");
+    target.box = { left: 2000, top: 10, width: 20, height: 10 };
+    f.pointAt(target);
+    const ref = f.bridge.read().interactive[0].ref;
+    target.onScroll = (options) => {
+      assert.equal(options.behavior, "instant");
+      target.box.left = 10;
+      if (invalidate) f.bridge.read();
+    };
+    const result = f.bridge.act({ action: "click", ref });
+    assert.equal(target.scrolls, 1);
+    if (invalidate) assert.equal(result.error, "ELEMENT_UNAVAILABLE");
+    else assert.deepEqual({ ...result.point }, { x: 20, y: 15 });
+    assert.equal(result.attempted, false);
+    assert.equal(target.clicked, undefined);
+  }
+});
+
+test("click verifyOnly never scrolls or retargets after hover changes layout", () => {
+  const f = fixture();
+  const target = f.add("BUTTON");
+  f.pointAt(target);
+  const ref = f.bridge.read().interactive[0].ref;
+  const prepared = f.bridge.act({ action: "click", ref });
+  target.box = { left: 100, top: 100, width: 20, height: 10 };
+  target.onScroll = () => assert.fail("Verification must not scroll");
+  const result = f.bridge.act({ action: "click", ref, verifyOnly: true, point: prepared.point });
+  assert.equal(result.error, "CLICK_POINT_UNAVAILABLE");
+  assert.equal(result.attempted, false);
+  assert.equal(target.scrolls, undefined);
+  assert.equal(target.clicked, undefined);
+  for (const point of [null, {}, { x: NaN, y: 15 }, { x: 20, y: Infinity }, { x: 1000001, y: 15 }, { x: -1, y: 15 }]) {
+    assert.equal(f.bridge.act({ action: "click", ref, verifyOnly: true, point }).ok, false);
+  }
+});
+
+test("click accepts composed noninteractive descendants but rejects a nested link/button", () => {
+  for (const descendant of ["SPAN", "A", "BUTTON", "ARIA"]) {
+    const f = fixture();
+    const target = f.add("BUTTON", { "aria-label": "Target" });
+    const inner = f.add(descendant === "ARIA" ? "SPAN" : descendant,
+      descendant === "A" ? { href: "https://example.test/other" } : descendant === "ARIA" ? { role: "button" } : {}, target);
+    f.pointAt(inner);
+    const ref = f.bridge.read().interactive.find((item) => item.label === "Target").ref;
+    const result = f.bridge.act({ action: "click", ref });
+    if (descendant === "SPAN") assert.equal(result.prepared, true);
+    else assert.equal(result.error, "CLICK_POINT_UNAVAILABLE", descendant);
+    assert.equal(target.clicked, undefined);
+    assert.equal(inner.clicked, undefined);
+  }
+  const f = fixture();
+  const target = f.add("SVG", { role: "button" });
+  target.namespaceURI = "http://www.w3.org/2000/svg";
+  target.click = undefined;
+  f.pointAt(target);
+  assert.equal(f.bridge.act({ action: "click", ref: f.bridge.read().interactive[0].ref }).prepared, true);
+});
+
+test("click converts fractional iframe content offsets and positive composed scales", () => {
+  const f = fixture();
+  const host = f.add("DIV");
+  host.style.scale = "2 3";
+  host.style.zoom = "1.5";
+  const shadow = host.attachShadow({ mode: "open" });
+  const { frame, child } = embed(f, {}, shadow);
+  frame.style.transform = "matrix(1.25, 0, 0, 0.5, 18, 30)";
+  Object.assign(frame.style, { borderLeftWidth: "1.25px", paddingLeft: "2.5px",
+    borderTopWidth: "0.5px", paddingTop: "1.25px" });
+  frame.box = { left: 100, top: 50, width: 403.75 * 3.75, height: 301.75 * 2.25 };
+  const target = child.add("BUTTON");
+  target.box = { left: 10, top: 20, width: 20, height: 10 };
+  f.pointAt(target);
+  const ref = f.bridge.read().interactive[0].ref;
+  const result = f.bridge.act({ action: "click", ref });
+  assert.deepEqual({ ...result.point }, { x: 189.0625, y: 110.1875 });
+  assert.equal(result.attempted, false);
+  assert.equal(f.bridge.act({ action: "click", ref, verifyOnly: true, point: result.point }).prepared, true);
+  frame.box.left += 300;
+  assert.equal(f.bridge.act({ action: "click", ref, verifyOnly: true, point: result.point }).error, "CLICK_POINT_UNAVAILABLE");
+  assert.equal(frame.scrolls, undefined);
+  assert.equal(target.clicked, undefined);
+});
+
+test("click validates every parent hit through nested frames and open shadows", () => {
+  const f = fixture();
+  const first = embed(f);
+  first.frame.box = { left: 100, top: 50, width: 800, height: 600 };
+  first.frame.style.transform = "matrix(2, 0, 0, 2, 0, 0)";
+  const second = embed(first.child);
+  second.frame.box = { left: 20, top: 15, width: 200, height: 150 };
+  second.frame.style.zoom = "0.5";
+  const shadow = second.child.add("DIV").attachShadow({ mode: "open" });
+  const target = second.child.add("BUTTON", {}, shadow);
+  f.pointAt(target);
+  const ref = f.bridge.read().interactive[0].ref;
+  const prepared = f.bridge.act({ action: "click", ref });
+  assert.deepEqual({ ...prepared.point }, { x: 160, y: 95 });
+  for (const boundary of [f.document, first.child.document, second.child.document, shadow]) {
+    const original = boundary.hitTarget;
+    boundary.hitTarget = null;
+    const result = f.bridge.act({ action: "click", ref, verifyOnly: true, point: prepared.point });
+    assert.equal(result.error, "CLICK_POINT_UNAVAILABLE");
+    assert.equal(result.attempted, false);
+    boundary.hitTarget = original;
+  }
+});
+
+test("click rejects unsupported frame transforms and visual viewport mappings", () => {
+  for (const mutate of [
+    (f, frame) => { frame.style.transform = "matrix(1, 0.1, 0, 1, 0, 0)"; },
+    (f, frame) => { frame.style.transform = "matrix(-1, 0, 0, 1, 0, 0)"; },
+    (f, frame) => { frame.style.transform = "matrix3d(1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1)"; },
+    (f, frame) => { frame.style.rotate = "10deg"; },
+    (f, frame) => { frame.style.perspective = "100px"; },
+    (f, frame) => { frame.style.zoom = "0"; },
+    (f, frame) => { frame.style.scale = "1 -2"; },
+    (f, frame) => { frame.style.offsetPath = "path('M 0 0 L 50 50')"; },
+    (f, frame) => { frame.box = { left: 0, top: 0, width: 401, height: 300 }; },
+    (f) => { f.document.body.namespaceURI = "http://www.w3.org/2000/svg"; },
+    (f) => { f.document.body.style.transform = "matrix(1, 0, 0.2, 1, 0, 0)"; },
+    (f) => { f.window.visualViewport.scale = 2; },
+    (f, frame, child) => { child.window.visualViewport.offsetLeft = 1; },
+  ]) {
+    const f = fixture();
+    const { frame, child } = embed(f);
+    const target = child.add("BUTTON");
+    f.pointAt(target);
+    const ref = f.bridge.read().interactive[0].ref;
+    mutate(f, frame, child);
+    const result = f.bridge.act({ action: "click", ref });
+    assert.equal(result.error, "UNSUPPORTED_GEOMETRY");
+    assert.equal(result.attempted, false);
+    assert.equal(target.clicked, undefined);
+  }
+});
+
+test("click ignores display contents box transforms while retaining its zoom", () => {
+  const f = fixture();
+  const host = f.add("DIV");
+  Object.assign(host.style, { display: "contents", transform: "matrix(2, 0, 0, 2, 0, 0)",
+    scale: "3", rotate: "30deg", perspective: "100px", zoom: "1.5" });
+  const { frame, child } = embed(f, {}, host);
+  frame.box = { left: 100, top: 50, width: 600, height: 450 };
+  const target = child.add("BUTTON");
+  f.pointAt(target);
+  const ref = f.bridge.read().interactive[0].ref;
+  const result = f.bridge.act({ action: "click", ref });
+  assert.deepEqual({ ...result.point }, { x: 130, y: 72.5 });
+  assert.equal(f.bridge.act({ action: "click", ref, verifyOnly: true, point: result.point }).prepared, true);
+  // A mismatch cannot be excused by an otherwise plausible hit-test map.
+  frame.box.width += 0.03;
+  assert.equal(f.bridge.act({ action: "click", ref, verifyOnly: true, point: result.point }).error, "UNSUPPORTED_GEOMETRY");
+});
+
+test("click uses quirks body viewport dimensions without excluding ordinary document height", () => {
+  const f = fixture();
+  f.document.compatMode = "BackCompat";
+  Object.assign(f.document.documentElement, { clientWidth: 1280, clientHeight: 5 });
+  Object.assign(f.document.body, { clientWidth: 100, clientHeight: 60 });
+  const target = f.add("BUTTON");
+  target.box = { left: 90, top: 50, width: 40, height: 40 };
+  f.pointAt(target);
+  const ref = f.bridge.read().interactive[0].ref;
+  const result = f.bridge.act({ action: "click", ref });
+  assert.deepEqual({ ...result.point }, { x: 95, y: 55 });
+  assert.equal(f.bridge.act({ action: "click", ref, verifyOnly: true, point: { x: 105, y: 55 } }).error,
+    "CLICK_POINT_UNAVAILABLE");
+  assert.equal(target.scrolls, undefined);
+});
+
+test("click excludes scrollbar coordinates and clips partially visible bounds", () => {
+  const f = fixture();
+  f.document.documentElement.clientWidth = 100;
+  f.document.documentElement.clientHeight = 60;
+  const target = f.add("BUTTON");
+  target.box = { left: 90, top: 50, width: 40, height: 40 };
+  f.pointAt(target);
+  const ref = f.bridge.read().interactive[0].ref;
+  const prepared = f.bridge.act({ action: "click", ref });
+  assert.deepEqual({ ...prepared.point }, { x: 95, y: 55 });
+  const result = f.bridge.act({ action: "click", ref, verifyOnly: true, point: { x: 105, y: 55 } });
+  assert.equal(result.error, "CLICK_POINT_UNAVAILABLE");
+  assert.equal(result.attempted, false);
+});
+
+test("click rechecks geometry and hit-test side effects without leaking page errors", () => {
+  for (const kind of ["read", "detach", "frame-replaced", "exception"]) {
+    const f = fixture();
+    const { frame, child } = embed(f);
+    const target = child.add("BUTTON");
+    f.pointAt(target);
+    const ref = f.bridge.read().interactive[0].ref;
+    child.document.hitTest = () => {
+      if (kind === "exception") throw new Error("private-click-error");
+      if (kind === "read") f.bridge.read();
+      if (kind === "detach") target.remove();
+      if (kind === "frame-replaced") frame.contentDocument = fixture().document;
+      return target;
+    };
+    const result = f.bridge.act({ action: "click", ref });
+    assert.equal(result.error, kind === "exception" ? "ACTION_FAILED" : "ELEMENT_UNAVAILABLE");
+    assert.equal(result.attempted, false);
+    assert.ok(!JSON.stringify(result).includes("private-click-error"));
+    assert.equal(target.clicked, undefined);
+  }
+});
+
 test("snapshot bounds text and interactive elements and excludes hidden content", () => {
   const f = fixture();
   f.document.body.innerText = "x".repeat(12001);
@@ -647,8 +920,9 @@ test("repeated injection preserves the current refs", () => {
   const button = f.add();
   const ref = f.bridge.read().interactive[0].ref;
   vm.runInContext(source, f.context);
-  assert.equal(f.window.__lightBrowserBridge.act({ action: "click", ref }).ok, true);
-  assert.equal(button.clicked, 1);
+  f.pointAt(button);
+  assert.equal(f.window.__lightBrowserBridge.act({ action: "click", ref }).prepared, true);
+  assert.equal(button.clicked, undefined);
 });
 
 test("scroll rejects invalid offsets and snapshots report the resulting viewport", () => {
@@ -700,8 +974,9 @@ test("open and nested shadow roots use root-local labels and preserve ref action
   assert.equal(f.document.activeElement, host);
   assert.deepEqual(input.events, ["input", "change"]);
   const nestedRef = page.interactive.find((item) => item.label === "Nested action").ref;
-  assert.equal(f.bridge.act({ action: "click", ref: nestedRef }).ok, true);
-  assert.equal(button.clicked, 1);
+  f.pointAt(button);
+  assert.equal(f.bridge.act({ action: "click", ref: nestedRef }).prepared, true);
+  assert.equal(button.clicked, undefined);
   f.bridge.read();
   assert.equal(f.bridge.act({ action: "click", ref: nestedRef }).error, "STALE_REF");
 });
@@ -749,10 +1024,11 @@ test("assigned slot controls appear once and recheck the slot ancestor", () => {
   assert.equal(page.interactive[0].label, "Slotted action");
   assert.equal(page.text.includes("Fallback hidden by assignment"), false);
   assert.equal(page.text.includes("Unassigned light action"), false);
-  assert.equal(f.bridge.act({ action: "click", ref: page.interactive[0].ref }).ok, true);
+  f.pointAt(assigned);
+  assert.equal(f.bridge.act({ action: "click", ref: page.interactive[0].ref }).prepared, true);
   slot.setAttribute("aria-disabled", "true");
   assert.equal(f.bridge.act({ action: "click", ref: page.interactive[0].ref }).error, "ELEMENT_UNAVAILABLE");
-  assert.equal(assigned.clicked, 1);
+  assert.equal(assigned.clicked, undefined);
   slot.removeAttribute("aria-disabled");
   slot.inert = true;
   assert.equal(f.bridge.act({ action: "click", ref: page.interactive[0].ref }).error, "ELEMENT_UNAVAILABLE");
@@ -792,7 +1068,7 @@ test("shadow output keeps the existing 120-item and 12000-character caps", () =>
 test("visited-node budget stops before a late shadow control and keeps earlier explicit labels", () => {
   const f = fixture();
   const root = f.add("DIV").attachShadow({ mode: "open" });
-  f.add("BUTTON", { "aria-label": "Before node cap" }, root);
+  const early = f.add("BUTTON", { "aria-label": "Before node cap" }, root);
   for (let i = 0; i < 10050; i += 1) f.add("SPAN", {}, root);
   const late = f.add("BUTTON", { "aria-label": "Past node cap" }, root);
   late.getBoundingClientRect = () => { throw new Error("Late node was inspected beyond the cap"); };
@@ -800,7 +1076,8 @@ test("visited-node budget stops before a late shadow control and keeps earlier e
   assert.equal(page.truncated.nodes, true);
   assert.equal(page.interactive.length, 1);
   assert.equal(page.interactive[0].label, "Before node cap");
-  assert.equal(f.bridge.act({ action: "click", ref: page.interactive[0].ref }).ok, true);
+  f.pointAt(early);
+  assert.equal(f.bridge.act({ action: "click", ref: page.interactive[0].ref }).prepared, true);
 });
 
 test("label scans share the node budget with the document traversal", () => {
@@ -1351,7 +1628,8 @@ test("select checks option and optgroup state without requiring option layout bo
     }
   }
   const f = selectFixture();
-  assert.deepEqual(f.options[1].getBoundingClientRect(), { width: 0, height: 0 });
+  assert.equal(f.options[1].getBoundingClientRect().width, 0);
+  assert.equal(f.options[1].getBoundingClientRect().height, 0);
   assert.equal(f.bridge.act({ action: "select", ref: f.ref, value: "target" }).ok, true);
 });
 
@@ -1517,6 +1795,8 @@ function embed(parent, attributes = {}, container = parent.document.body) {
   frame.contentDocument = child.document;
   frame.contentWindow = child.window;
   child.window.frameElement = frame;
+  child.window.innerWidth = child.document.documentElement.clientWidth = 400;
+  child.window.innerHeight = child.document.documentElement.clientHeight = 300;
   return { frame, child };
 }
 
@@ -1569,8 +1849,9 @@ test("same-origin frames expose bounded context and flat refs with nested shadow
   assert.equal(childWrites, 1);
   assert.equal(f.bridge.act({ action: "select", ref: item("Child choice").ref, value: "b" }).ok, true);
   assert.equal(select.value, "b");
-  assert.equal(f.bridge.act({ action: "click", ref: item("Nested shadow action").ref }).ok, true);
-  assert.equal(button.clicked, 1);
+  f.pointAt(button);
+  assert.equal(f.bridge.act({ action: "click", ref: item("Nested shadow action").ref }).prepared, true);
+  assert.equal(button.clicked, undefined);
   let submitted = 0;
   input.form = { requestSubmit() { submitted += 1; } };
   assert.equal(f.bridge.act({ action: "press", ref: item("Child input").ref, key: "Enter" }).prepared, true);

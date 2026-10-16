@@ -11,7 +11,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use cef::*;
 use serde_json::{Value as Json, json};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
     os::unix::net::{UnixListener, UnixStream},
     path::Path,
@@ -522,11 +522,12 @@ impl Tab {
         self.native_start_page &= url == "about:blank";
     }
 }
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum ActionEvidence {
     Check,
     Fill,
     Press,
+    Click(Shared<ClickTarget>),
 }
 
 impl ActionEvidence {
@@ -535,11 +536,17 @@ impl ActionEvidence {
             Command::Check { .. } => Some(Self::Check),
             Command::Fill { .. } => Some(Self::Fill),
             Command::Press { .. } => Some(Self::Press),
+            Command::Click { reference, .. } => Some(Self::Click(Shared::new(ClickTarget {
+                reference: reference.clone(),
+                context: Cell::new(None),
+                point: Cell::new(None),
+                attempted: Cell::new(false),
+            }))),
             _ => None,
         }
     }
 
-    fn fields(self, value: &Json) -> &'static [&'static str] {
+    fn fields(&self, value: &Json) -> &'static [&'static str] {
         match self {
             Self::Check if value["action"] == "check" => {
                 &["attempted", "trusted", "checked", "indeterminate"]
@@ -551,7 +558,7 @@ impl ActionEvidence {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Evaluation {
     Page {
         mutation: bool,
@@ -566,9 +573,10 @@ enum Step {
     Frame(String),
     World(String),
     Evaluate,
+    ClickVerify,
     Screenshot(String),
-    Press {
-        batch: Shared<PressBatch>,
+    Input {
+        batch: Shared<InputBatch>,
         part: usize,
     },
 }
@@ -582,16 +590,18 @@ struct Pending {
 }
 impl Pending {
     fn mutation_dispatched(&self) -> bool {
-        matches!(self.step, Step::Evaluate | Step::Press { .. })
-            && matches!(self.evaluation, Evaluation::Page { mutation: true, .. })
+        matches!(
+            self.step,
+            Step::Evaluate | Step::ClickVerify | Step::Input { .. }
+        ) && matches!(self.evaluation, Evaluation::Page { mutation: true, .. })
     }
 
-    fn press_preparation(&self) -> bool {
-        matches!(self.step, Step::Evaluate)
+    fn input_preparation(&self) -> bool {
+        matches!(self.step, Step::Evaluate | Step::ClickVerify)
             && matches!(
                 self.evaluation,
                 Evaluation::Page {
-                    evidence: Some(ActionEvidence::Press),
+                    evidence: Some(ActionEvidence::Press | ActionEvidence::Click(_)),
                     ..
                 }
             )
@@ -599,39 +609,143 @@ impl Pending {
 
     fn outcome_details(&self) -> Json {
         let mut details = json!({"outcomeUnknown":self.mutation_dispatched()});
-        if let Step::Press { batch, .. } = &self.step {
-            details["attempted"] =
-                json!(batch.progress.borrow().attempted.iter().any(|value| *value));
-        } else if self.press_preparation() {
+        if let Step::Input { batch, .. } = &self.step {
+            details["attempted"] = json!(
+                batch.kind.prior_attempted()
+                    || batch.progress.borrow().attempted.iter().any(|value| *value)
+            );
+        } else if let Some(target) = self.click_target() {
+            details["attempted"] = json!(target.attempted.get());
+        } else if self.input_preparation() {
             details["attempted"] = json!(false);
         }
         details
     }
+
+    fn click_target(&self) -> Option<&Shared<ClickTarget>> {
+        match &self.evaluation {
+            Evaluation::Page {
+                evidence: Some(ActionEvidence::Click(target)),
+                ..
+            } => Some(target),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ClickPoint {
+    x: f64,
+    y: f64,
+}
+
+impl ClickPoint {
+    fn from_json(value: &Json) -> Option<Self> {
+        let point = Self {
+            x: value["x"].as_f64()?,
+            y: value["y"].as_f64()?,
+        };
+        [point.x, point.y]
+            .iter()
+            .all(|value| value.is_finite() && (0.0..=1_000_000.0).contains(value))
+            .then_some(point)
+    }
+}
+
+struct ClickTarget {
+    reference: String,
+    context: Cell<Option<i64>>,
+    point: Cell<Option<ClickPoint>>,
+    attempted: Cell<bool>,
+}
+
+enum NativeInput {
+    Enter,
+    MouseMove(Shared<ClickTarget>),
+    Click(ClickPoint),
+}
+
+impl NativeInput {
+    fn count(&self) -> usize {
+        if matches!(self, Self::MouseMove(_)) {
+            1
+        } else {
+            2
+        }
+    }
+    fn prior_attempted(&self) -> bool {
+        matches!(self, Self::Click(_))
+    }
+    fn method(&self) -> &'static str {
+        if matches!(self, Self::Enter) {
+            "Input.dispatchKeyEvent"
+        } else {
+            "Input.dispatchMouseEvent"
+        }
+    }
+    fn params(&self, part: usize) -> Json {
+        match self {
+            Self::Enter => {
+                let mut params = json!({"type":if part == 0 {"keyDown"} else {"keyUp"},"key":"Enter","code":"Enter",
+                    "windowsVirtualKeyCode":13,"nativeVirtualKeyCode":0});
+                if part == 0 {
+                    params["text"] = json!("\r");
+                    params["unmodifiedText"] = json!("\r");
+                }
+                params
+            }
+            Self::MouseMove(target) => {
+                let point = target
+                    .point
+                    .get()
+                    .expect("mouse move follows point preparation");
+                json!({"type":"mouseMoved","x":point.x,"y":point.y,"button":"none","buttons":0,"clickCount":0,"modifiers":0,"pointerType":"mouse"})
+            }
+            Self::Click(point) => {
+                json!({"type":if part == 0 {"mousePressed"} else {"mouseReleased"},
+                "x":point.x,"y":point.y,"button":"left","buttons":if part == 0 {1} else {0},"clickCount":1,"modifiers":0,"pointerType":"mouse"})
+            }
+        }
+    }
+    fn success_page(&self) -> Json {
+        match self {
+            Self::Enter => json!({"ok":true,"action":"press","key":"Enter","input":"chromium",
+                "attempted":true,"dispatchAcknowledged":true,
+                "detail":"Chromium acknowledged Enter keyDown and keyUp; read again to verify effects."}),
+            Self::Click(_) => json!({"ok":true,"action":"click","input":"chromium",
+                "attempted":true,"dispatchAcknowledged":true,
+                "detail":"Chromium acknowledged mousePressed and mouseReleased; read again to verify effects."}),
+            Self::MouseMove(_) => {
+                unreachable!("a pointer move must be verified before completing a click")
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
-struct PressFailure {
+struct InputFailure {
     code: &'static str,
     message: &'static str,
 }
 
-struct PressProgress {
+struct InputProgress {
     enqueuing: bool,
     attempted: [bool; 2],
     accepted: [Option<bool>; 2],
     acknowledged: [bool; 2],
-    failure: Option<PressFailure>,
+    failure: Option<InputFailure>,
 }
 
-struct PressBatch {
+struct InputBatch {
     ids: [i32; 2],
+    kind: NativeInput,
     tab: i32,
     epoch: u64,
     // Retain the original browser until both parts finish; raw identity cannot
     // be recycled while a late callback is being checked.
     browser: Browser,
     reply: Reply,
-    progress: RefCell<PressProgress>,
+    progress: RefCell<InputProgress>,
 }
 struct Waiter {
     tab: i32,
@@ -4191,42 +4305,42 @@ fn create_browser_with_history(
     )
 }
 
-fn press_target_failure(
+fn input_target_failure(
     state: &State,
     browser: &Browser,
     tab: i32,
     epoch: u64,
     reply: &Reply,
     allow_navigation: bool,
-) -> Option<PressFailure> {
+) -> Option<InputFailure> {
     if !reply.active.load(Ordering::Acquire) {
-        return Some(PressFailure {
+        return Some(InputFailure {
             code: "COMMAND_CANCELED",
-            message: "The Enter request is no longer active.",
+            message: "The input request is no longer active.",
         });
     }
     if let Err(error) = state.tasks.check_tab(reply.scope.as_ref(), tab) {
-        return Some(PressFailure {
+        return Some(InputFailure {
             code: error.code,
             message: error.message,
         });
     }
     let Some(tab) = state.tabs.get(&tab) else {
-        return Some(PressFailure {
+        return Some(InputFailure {
             code: "TAB_CLOSED",
-            message: "The tab closed during Enter preparation.",
+            message: "The tab closed during input preparation.",
         });
     };
     if tab.rejected_creation || tab.browser.get_raw() != browser.get_raw() {
-        return Some(PressFailure {
+        return Some(InputFailure {
             code: "TAB_CLOSED",
             message: "The original browser is no longer available.",
         });
     }
     if tab.navigation.renderer_exit.is_some() {
-        return Some(PressFailure {
+        return Some(InputFailure {
             code: "RENDERER_TERMINATED",
-            message: "The renderer stopped during Enter. Inspect before retrying.",
+            message: "The renderer stopped during input. Inspect before retrying.",
         });
     }
     if !allow_navigation
@@ -4235,67 +4349,77 @@ fn press_target_failure(
             || !tab.navigation.committed
             || !tab.navigation.document_available)
     {
-        return Some(PressFailure {
+        return Some(InputFailure {
             code: "PAGE_CHANGED",
-            message: "The document changed before Enter finished dispatching. Read again; do not automatically repeat Enter.",
+            message: "The document changed before input finished dispatching. Read again; do not automatically repeat the action.",
         });
     }
     None
 }
 
-fn press_registered(state: &State, batch: &Shared<PressBatch>) -> bool {
-    batch.ids.iter().all(|id| state.pending.get(id).is_some_and(|pending| {
-        matches!(&pending.step, Step::Press { batch: current, .. } if Shared::ptr_eq(current, batch))
+fn input_registered(state: &State, batch: &Shared<InputBatch>) -> bool {
+    batch.ids.iter().take(batch.kind.count()).all(|id| state.pending.get(id).is_some_and(|pending| {
+        matches!(&pending.step, Step::Input { batch: current, .. } if Shared::ptr_eq(current, batch))
     }))
 }
 
-fn remove_press_batch(batch: &Shared<PressBatch>) {
+fn remove_input_batch(batch: &Shared<InputBatch>) {
     STATE.with(|state| {
         let mut state = state.borrow_mut();
-        for id in batch.ids {
-            if state.pending.get(&id).is_some_and(|pending| {
-                matches!(&pending.step, Step::Press { batch: current, .. } if Shared::ptr_eq(current, batch))
+        for id in batch.ids.iter().take(batch.kind.count()) {
+            if state.pending.get(id).is_some_and(|pending| {
+                matches!(&pending.step, Step::Input { batch: current, .. } if Shared::ptr_eq(current, batch))
             }) {
-                state.pending.remove(&id);
+                state.pending.remove(id);
             }
         }
     });
 }
 
-fn finish_press_batch(batch: &Shared<PressBatch>) {
+// True advances a completed pointer move to DOM verification. Keep its pending
+// entry until that continuation replaces it, so callers cannot observe a gap.
+fn finish_input_batch(batch: &Shared<InputBatch>) -> bool {
     let (enqueuing, failure, acknowledged, attempted) = {
         let progress = batch.progress.borrow();
         (
             progress.enqueuing,
             progress.failure,
-            progress.accepted == [Some(true); 2] && progress.acknowledged == [true; 2],
-            progress.attempted.iter().any(|value| *value),
+            progress.accepted[..batch.kind.count()]
+                .iter()
+                .all(|value| *value == Some(true))
+                && progress.acknowledged[..batch.kind.count()]
+                    .iter()
+                    .all(|value| *value),
+            batch.kind.prior_attempted() || progress.attempted.iter().any(|value| *value),
         )
     };
     if enqueuing {
-        return;
+        return false;
     }
     let current = STATE.with(|state| {
         let state = state.borrow();
-        press_registered(&state, batch).then(|| {
-            press_target_failure(
+        input_registered(&state, batch).then(|| {
+            input_target_failure(
                 &state,
                 &batch.browser,
                 batch.tab,
                 batch.epoch,
                 &batch.reply,
-                true,
+                !matches!(batch.kind, NativeInput::MouseMove(_)),
             )
         })
     });
     let Some(current_failure) = current else {
-        return;
+        return false;
     };
     let failure = failure.or(current_failure);
     if failure.is_none() && !acknowledged {
-        return;
+        return false;
     }
-    remove_press_batch(batch);
+    if failure.is_none() && matches!(batch.kind, NativeInput::MouseMove(_)) {
+        return true;
+    }
+    remove_input_batch(batch);
     if let Some(failure) = failure {
         batch.reply.error_details(
             failure.code,
@@ -4303,25 +4427,24 @@ fn finish_press_batch(batch: &Shared<PressBatch>) {
             json!({"tab":batch.tab,"outcomeUnknown":true,"attempted":attempted}),
         );
     } else {
-        batch.reply.ok(json!({"tab":batch.tab,"page":{
-            "ok":true,"action":"press","key":"Enter","input":"chromium",
-            "attempted":true,"dispatchAcknowledged":true,
-            "detail":"Chromium acknowledged Enter keyDown and keyUp; read again to verify effects."
-        }}));
+        batch
+            .reply
+            .ok(json!({"tab":batch.tab,"page":batch.kind.success_page()}));
     }
+    false
 }
 
 // CEF documents asynchronous results. Keep both entries even if a transport
 // re-enters its observer before returning; a callback alone cannot acknowledge
 // dispatch. These adjacent UI submissions are not an atomic renderer operation.
-fn enqueue_press_batch(
-    batch: &Shared<PressBatch>,
+fn enqueue_input_batch(
+    batch: &Shared<InputBatch>,
     mut native_available: impl FnMut() -> bool,
     mut submit: impl FnMut(usize, i32) -> i32,
-) {
-    for part in 0..2 {
-        if !STATE.with(|state| press_registered(&state.borrow(), batch)) {
-            return;
+) -> bool {
+    for part in 0..batch.kind.count() {
+        if !STATE.with(|state| input_registered(&state.borrow(), batch)) {
+            return false;
         }
         if batch.progress.borrow().failure.is_some() {
             break;
@@ -4330,8 +4453,8 @@ fn enqueue_press_batch(
         // Native getters can re-enter cancellation, handoff, navigation or close.
         let checked = STATE.with(|state| {
             let state = state.borrow();
-            press_registered(&state, batch).then(|| {
-                press_target_failure(
+            input_registered(&state, batch).then(|| {
+                input_target_failure(
                     &state,
                     &batch.browser,
                     batch.tab,
@@ -4342,15 +4465,15 @@ fn enqueue_press_batch(
             })
         });
         let Some(failure) = checked else {
-            return;
+            return false;
         };
         if batch.progress.borrow().failure.is_some() {
             break;
         }
         let failure = failure.or_else(|| {
-            (!available).then_some(PressFailure {
+            (!available).then_some(InputFailure {
                 code: "TAB_CLOSED",
-                message: "The browser is unavailable during Enter dispatch.",
+                message: "The browser is unavailable during input dispatch.",
             })
         });
         if let Some(failure) = failure {
@@ -4358,29 +4481,32 @@ fn enqueue_press_batch(
             break;
         }
         batch.progress.borrow_mut().attempted[part] = true;
+        if let NativeInput::MouseMove(target) = &batch.kind {
+            target.attempted.set(true);
+        }
         let receipt = submit(part, batch.ids[part]);
-        if !STATE.with(|state| press_registered(&state.borrow(), batch)) {
-            return;
+        if !STATE.with(|state| input_registered(&state.borrow(), batch)) {
+            return false;
         }
         let mut progress = batch.progress.borrow_mut();
         progress.accepted[part] = Some(receipt == batch.ids[part]);
         if receipt != batch.ids[part] {
-            progress.failure = Some(PressFailure {
+            progress.failure = Some(InputFailure {
                 code: "CONTROL_UNAVAILABLE",
-                message: "Chromium rejected an Enter event. Inspect before retrying.",
+                message: "Chromium rejected an input event. Inspect before retrying.",
             });
             break;
         }
     }
     batch.progress.borrow_mut().enqueuing = false;
-    finish_press_batch(batch);
+    finish_input_batch(batch)
 }
 
-fn press_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) -> bool {
+fn input_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) -> bool {
     let part = STATE.with(|state| {
         let state = state.borrow();
         match &state.pending.get(&id)?.step {
-            Step::Press { batch, part } => Some((batch.clone(), *part)),
+            Step::Input { batch, part } => Some((batch.clone(), *part)),
             _ => None,
         }
     });
@@ -4394,7 +4520,14 @@ fn press_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) -> bool
             && serde_json::from_slice::<Json>(bytes).is_ok_and(|value| value.is_object()));
     let current = STATE.with(|state| {
         let state = state.borrow();
-        press_target_failure(&state, browser, batch.tab, batch.epoch, &batch.reply, true)
+        input_target_failure(
+            &state,
+            browser,
+            batch.tab,
+            batch.epoch,
+            &batch.reply,
+            !matches!(batch.kind, NativeInput::MouseMove(_)),
+        )
     });
     {
         let mut progress = batch.progress.borrow_mut();
@@ -4402,32 +4535,35 @@ fn press_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) -> bool
             return true;
         }
         if !progress.attempted[part] || !valid_json {
-            progress.failure = Some(PressFailure {
+            progress.failure = Some(InputFailure {
                 code: "INVALID_RESULT",
-                message: "Chromium returned an invalid Enter acknowledgement. Inspect before retrying.",
+                message: "Chromium returned an invalid input acknowledgement. Inspect before retrying.",
             });
         } else if !success {
-            progress.failure = Some(PressFailure {
+            progress.failure = Some(InputFailure {
                 code: "CONTROL_ERROR",
-                message: "Chromium could not dispatch Enter. Inspect before retrying.",
+                message: "Chromium could not dispatch input. Inspect before retrying.",
             });
         } else if let Some(failure) = current {
             progress.failure = Some(failure);
         }
         progress.acknowledged[part] = true;
     }
-    finish_press_batch(&batch);
+    if finish_input_batch(&batch) {
+        dispatch_click_verification(&batch);
+    }
     true
 }
 
-fn reserve_press_batch(
+fn reserve_input_batch(
     id: i32,
     pending: &Pending,
     browser: &Browser,
-) -> Result<Shared<PressBatch>, PressFailure> {
+    kind: NativeInput,
+) -> Result<Shared<InputBatch>, InputFailure> {
     STATE.with(|state| {
         let mut state = state.borrow_mut();
-        if let Some(failure) = press_target_failure(
+        if let Some(failure) = input_target_failure(
             &state,
             browser,
             pending.tab,
@@ -4438,26 +4574,32 @@ fn reserve_press_batch(
             return Err(failure);
         }
         if !state.pending.get(&id).is_some_and(|current| {
-            current.reply.token == pending.reply.token && current.press_preparation()
+            current.reply.token == pending.reply.token && current.input_preparation()
         }) {
-            return Err(PressFailure {
+            return Err(InputFailure {
                 code: "COMMAND_CANCELED",
-                message: "The Enter preparation is no longer current.",
+                message: "The input preparation is no longer current.",
             });
         }
-        let Some(last) = state.next_message.checked_add(2) else {
-            return Err(PressFailure {
+        let count = kind.count();
+        let Some(last) = state.next_message.checked_add(count as i32) else {
+            return Err(InputFailure {
                 code: "CONTROL_UNAVAILABLE",
                 message: "The control message identifiers are exhausted.",
             });
         };
-        let batch = Shared::new(PressBatch {
-            ids: [last - 1, last],
+        let batch = Shared::new(InputBatch {
+            ids: if count == 1 {
+                [last, 0]
+            } else {
+                [last - 1, last]
+            },
+            kind,
             tab: pending.tab,
             epoch: pending.epoch,
             browser: browser.clone(),
             reply: pending.reply.clone(),
-            progress: RefCell::new(PressProgress {
+            progress: RefCell::new(InputProgress {
                 enqueuing: true,
                 attempted: [false; 2],
                 accepted: [None; 2],
@@ -4467,11 +4609,11 @@ fn reserve_press_batch(
         });
         state.next_message = last;
         state.pending.remove(&id);
-        for (part, id) in batch.ids.iter().enumerate() {
+        for (part, id) in batch.ids.iter().take(count).enumerate() {
             state.pending.insert(
                 *id,
                 Pending {
-                    step: Step::Press {
+                    step: Step::Input {
                         batch: batch.clone(),
                         part,
                     },
@@ -4483,56 +4625,157 @@ fn reserve_press_batch(
     })
 }
 
-fn dispatch_press(browser: &Browser, id: i32, pending: &Pending) {
+fn dispatch_input(browser: &Browser, id: i32, pending: &Pending, kind: NativeInput) {
     let host = browser.host();
-    let mut dictionaries = ["keyDown", "keyUp"].map(|kind| {
-        let mut params = json!({"type":kind,"key":"Enter","code":"Enter","windowsVirtualKeyCode":13,
-            "nativeVirtualKeyCode":0});
-        if kind == "keyDown" {
-            params["text"] = json!("\r");
-            params["unmodifiedText"] = json!("\r");
+    let count = kind.count();
+    let mut dictionaries: [Option<DictionaryValue>; 2] = std::array::from_fn(|part| {
+        if part >= count {
+            return None;
         }
+        parse_json(
+            Some(&CefString::from(kind.params(part).to_string().as_str())),
+            JsonParserOptions::default(),
+        )
+        .and_then(|value| value.dictionary())
+    });
+    // Enter's native code zero prevents native browser key fallback. Pointer
+    // input also avoids set_focus, frontmost-window and current-space changes.
+    let available = browser.is_valid() != 0 && browser.has_document() != 0;
+    if host.is_none() || dictionaries[..count].iter().any(Option::is_none) || !available {
+        finish_input_preparation(
+            id,
+            pending,
+            "CONTROL_UNAVAILABLE",
+            "Chromium is unavailable for input.",
+        );
+        return;
+    }
+    let batch = match reserve_input_batch(id, pending, browser, kind) {
+        Ok(batch) => batch,
+        Err(failure) => {
+            finish_input_preparation(id, pending, failure.code, failure.message);
+            return;
+        }
+    };
+    let host = host.unwrap();
+    let method = CefString::from(batch.kind.method());
+    if enqueue_input_batch(
+        &batch,
+        || browser.is_valid() != 0 && browser.has_document() != 0,
+        |part, message| {
+            host.execute_dev_tools_method(message, Some(&method), dictionaries[part].as_mut())
+        },
+    ) {
+        dispatch_click_verification(&batch);
+    }
+}
+
+fn click_verification_params(batch: &InputBatch) -> Option<Json> {
+    let NativeInput::MouseMove(target) = &batch.kind else {
+        return None;
+    };
+    let point = target.point.get()?;
+    let context = target.context.get()?;
+    let prefix = format!("{}/", batch.epoch);
+    let reference = target
+        .reference
+        .strip_prefix(&prefix)
+        .filter(|value| !value.is_empty())?;
+    let request = json!({"action":"click","ref":reference,"point":{"x":point.x,"y":point.y},"verifyOnly":true});
+    Some(
+        json!({"expression":format!("window.__lightBrowserBridge.act({request})"),"contextId":context,
+        "returnByValue":true,"awaitPromise":false,"timeout":5000}),
+    )
+}
+
+fn reserve_click_verification(
+    batch: &Shared<InputBatch>,
+) -> Result<Option<(i32, Pending)>, InputFailure> {
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        if !input_registered(&state, batch) {
+            return Ok(None);
+        }
+        if let Some(failure) = input_target_failure(
+            &state,
+            &batch.browser,
+            batch.tab,
+            batch.epoch,
+            &batch.reply,
+            false,
+        ) {
+            return Err(failure);
+        }
+        let Some(id) = state.next_message.checked_add(1) else {
+            return Err(InputFailure {
+                code: "CONTROL_UNAVAILABLE",
+                message: "The control message identifiers are exhausted.",
+            });
+        };
+        let pending = Pending {
+            step: Step::ClickVerify,
+            ..state.pending[&batch.ids[0]].clone()
+        };
+        state.next_message = id;
+        for previous in batch.ids.iter().take(batch.kind.count()) {
+            state.pending.remove(previous);
+        }
+        state.pending.insert(id, pending.clone());
+        Ok(Some((id, pending)))
+    })
+}
+
+fn dispatch_click_verification(batch: &Shared<InputBatch>) {
+    let params = click_verification_params(batch);
+    let host = batch.browser.host();
+    let mut dictionary = params.and_then(|params| {
         parse_json(
             Some(&CefString::from(params.to_string().as_str())),
             JsonParserOptions::default(),
         )
         .and_then(|value| value.dictionary())
     });
-    // Native code zero prevents Chromium's fallback into native browser key
-    // handling. No set_focus, frontmost-window or current-space mutation.
-    let available = browser.is_valid() != 0 && browser.has_document() != 0;
-    if host.is_none() || dictionaries.iter().any(Option::is_none) || !available {
-        finish_press_preparation(
-            id,
-            pending,
-            "CONTROL_UNAVAILABLE",
-            "Chromium is unavailable for Enter.",
-        );
+    let available = batch.browser.is_valid() != 0 && batch.browser.has_document() != 0;
+    if host.is_none() || dictionary.is_none() || !available {
+        batch.progress.borrow_mut().failure = Some(InputFailure {
+            code: "CONTROL_UNAVAILABLE",
+            message: "Chromium is unavailable for click verification. Inspect before retrying.",
+        });
+        finish_input_batch(batch);
         return;
     }
-    let batch = match reserve_press_batch(id, pending, browser) {
-        Ok(batch) => batch,
+    // Native getters above can re-enter. Keep the pointer-move pending until
+    // this checked replacement; no fresh read, ref or document context is used.
+    let (id, _) = match reserve_click_verification(batch) {
+        Ok(Some(reserved)) => reserved,
+        Ok(None) => return,
         Err(failure) => {
-            finish_press_preparation(id, pending, failure.code, failure.message);
+            batch.progress.borrow_mut().failure = Some(failure);
+            finish_input_batch(batch);
             return;
         }
     };
-    let host = host.unwrap();
-    let method = CefString::from("Input.dispatchKeyEvent");
-    enqueue_press_batch(
-        &batch,
-        || browser.is_valid() != 0 && browser.has_document() != 0,
-        |part, message| {
-            host.execute_dev_tools_method(message, Some(&method), dictionaries[part].as_mut())
-        },
-    );
+    if host.unwrap().execute_dev_tools_method(
+        id,
+        Some(&CefString::from("Runtime.evaluate")),
+        dictionary.as_mut(),
+    ) == 0
+    {
+        if let Some(pending) = complete_control_request(id) {
+            pending_error(
+                &pending,
+                "CONTROL_UNAVAILABLE",
+                "Chromium rejected click verification. Inspect before retrying.",
+            );
+        }
+    }
 }
 
-fn finish_press_preparation(id: i32, pending: &Pending, code: &str, message: &str) {
+fn finish_input_preparation(id: i32, pending: &Pending, code: &str, message: &str) {
     let removed = STATE.with(|state| {
         let mut state = state.borrow_mut();
         if state.pending.get(&id).is_some_and(|current| {
-            current.reply.token == pending.reply.token && current.press_preparation()
+            current.reply.token == pending.reply.token && current.input_preparation()
         }) {
             state.pending.remove(&id);
             true
@@ -4543,26 +4786,63 @@ fn finish_press_preparation(id: i32, pending: &Pending, code: &str, message: &st
     if !removed {
         return;
     }
-    // Preparation can focus a page element, but has dispatched no native keys.
+    // Preparation may focus or scroll. Click verification also follows a real
+    // pointer move; its engine-attempted evidence must survive a DOM rejection.
     pending
         .reply
         .error_details(code, message, pending.outcome_details());
 }
 
-fn press_preparation_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) -> bool {
+fn prepared_input_kind(pending: &Pending, value: &Json) -> Option<NativeInput> {
+    let action = if pending.click_target().is_some() {
+        "click"
+    } else {
+        "press"
+    };
+    if value["ok"] != true
+        || value["action"] != action
+        || value["prepared"] != true
+        || value["attempted"] != false
+    {
+        return None;
+    }
+    if let Some(target) = pending.click_target() {
+        let point = ClickPoint::from_json(&value["point"])?;
+        if matches!(pending.step, Step::ClickVerify) {
+            (target.attempted.get() && target.point.get() == Some(point))
+                .then_some(NativeInput::Click(point))
+        } else if target.context.get().is_some()
+            && target.point.get().is_none_or(|existing| existing == point)
+        {
+            target.point.set(Some(point));
+            Some(NativeInput::MouseMove(target.clone()))
+        } else {
+            None
+        }
+    } else {
+        (value["key"] == "Enter").then_some(NativeInput::Enter)
+    }
+}
+
+fn input_preparation_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) -> bool {
     let pending = STATE.with(|state| {
         state
             .borrow()
             .pending
             .get(&id)
-            .filter(|pending| pending.press_preparation())
+            .filter(|pending| pending.input_preparation())
             .cloned()
     });
     let Some(pending) = pending else {
         return false;
     };
+    let action = if pending.click_target().is_some() {
+        "click"
+    } else {
+        "press"
+    };
     let failure = STATE.with(|state| {
-        press_target_failure(
+        input_target_failure(
             &state.borrow(),
             browser,
             pending.tab,
@@ -4572,51 +4852,46 @@ fn press_preparation_result(browser: &Browser, id: i32, success: bool, bytes: &[
         )
     });
     if let Some(failure) = failure {
-        finish_press_preparation(id, &pending, failure.code, failure.message);
+        finish_input_preparation(id, &pending, failure.code, failure.message);
         return true;
     }
     let result = (bytes.len() <= 64 * 1024)
         .then(|| serde_json::from_slice::<Json>(bytes).ok())
         .flatten();
     let Some(result) = result else {
-        finish_press_preparation(
+        finish_input_preparation(
             id,
             &pending,
             "INVALID_RESULT",
-            "Chromium returned an invalid Enter preparation.",
+            "Chromium returned an invalid input preparation.",
         );
         return true;
     };
     let value = &result["result"]["value"];
     if !success || result.get("exceptionDetails").is_some() {
-        finish_press_preparation(
+        finish_input_preparation(
             id,
             &pending,
             "PAGE_SCRIPT_ERROR",
-            "Enter preparation failed. Read again before repeating it.",
+            "Input preparation failed. Read again before repeating it.",
         );
-    } else if value["ok"] == false && value["action"] == "press" {
-        finish_press_preparation(
+    } else if value["ok"] == false && value["action"] == action {
+        finish_input_preparation(
             id,
             &pending,
             value["error"].as_str().unwrap_or("ACTION_FAILED"),
             value["detail"]
                 .as_str()
-                .unwrap_or("Enter preparation did not complete."),
+                .unwrap_or("Input preparation did not complete."),
         );
-    } else if value["ok"] == true
-        && value["action"] == "press"
-        && value["key"] == "Enter"
-        && value["prepared"] == true
-        && value["attempted"] == false
-    {
-        dispatch_press(browser, id, &pending);
+    } else if let Some(kind) = prepared_input_kind(&pending, value) {
+        dispatch_input(browser, id, &pending, kind);
     } else {
-        finish_press_preparation(
+        finish_input_preparation(
             id,
             &pending,
             "INVALID_PAGE_RESULT",
-            "The page did not confirm Enter preparation. Read again.",
+            "The page did not confirm input preparation. Read again.",
         );
     }
     true
@@ -4656,14 +4931,14 @@ fn dispatch(browser: &Browser, method: &str, params: Json, pending: Pending) {
     if matches!(
         pending.evaluation,
         Evaluation::Page {
-            evidence: Some(ActionEvidence::Press),
+            evidence: Some(ActionEvidence::Press | ActionEvidence::Click(_)),
             ..
         }
     ) {
         let available =
             browser.is_valid() != 0 && browser.has_document() != 0 && dictionary.is_some();
         let failure = STATE.with(|state| {
-            press_target_failure(
+            input_target_failure(
                 &state.borrow(),
                 browser,
                 pending.tab,
@@ -4680,7 +4955,7 @@ fn dispatch(browser: &Browser, method: &str, params: Json, pending: Pending) {
             pending_error(
                 &pending,
                 "CONTROL_UNAVAILABLE",
-                "The browser is unavailable for Enter preparation.",
+                "The browser is unavailable for input preparation.",
             );
             return;
         }
@@ -4730,8 +5005,8 @@ fn devtools_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) {
     if complete_preview(id, success, bytes) {
         return;
     }
-    if press_result(browser, id, success, bytes)
-        || press_preparation_result(browser, id, success, bytes)
+    if input_result(browser, id, success, bytes)
+        || input_preparation_result(browser, id, success, bytes)
     {
         return;
     }
@@ -4819,6 +5094,9 @@ fn devtools_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) {
                 );
                 return;
             };
+            if let Some(target) = pending.click_target() {
+                target.context.set(Some(context));
+            }
             dispatch(
                 browser,
                 "Runtime.evaluate",
@@ -4889,7 +5167,7 @@ fn devtools_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) {
                 if let Evaluation::Page {
                     evidence: Some(evidence),
                     ..
-                } = pending.evaluation
+                } = &pending.evaluation
                 {
                     // A failed action may already have changed the page. Keep
                     // only bounded boolean evidence for its original request kind.
@@ -4939,8 +5217,8 @@ fn devtools_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) {
                 ),
             }
         }
-        Step::Press { .. } => {
-            unreachable!("Enter results are aggregated before completing a pending request")
+        Step::Input { .. } | Step::ClickVerify => {
+            unreachable!("Native input results are handled before completing a pending request")
         }
     }
 }
@@ -9498,7 +9776,7 @@ mod tests {
         assert!(!reply.active.load(Ordering::Acquire));
     }
 
-    fn test_press_preparation() -> (Pending, Browser, mpsc::Receiver<Response>) {
+    fn test_input_preparation() -> (Pending, Browser, mpsc::Receiver<Response>) {
         clear();
         let tab = native_blank_tab();
         let browser = tab.browser.clone();
@@ -9538,10 +9816,10 @@ mod tests {
         (pending, browser, receiver)
     }
 
-    fn test_press_batch() -> (Shared<PressBatch>, mpsc::Receiver<Response>) {
-        let (pending, browser, receiver) = test_press_preparation();
+    fn test_press_batch() -> (Shared<InputBatch>, mpsc::Receiver<Response>) {
+        let (pending, browser, receiver) = test_input_preparation();
         (
-            reserve_press_batch(42, &pending, &browser).unwrap(),
+            reserve_input_batch(42, &pending, &browser, NativeInput::Enter).unwrap(),
             receiver,
         )
     }
@@ -9550,14 +9828,14 @@ mod tests {
     fn enter_synchronous_acknowledgements_keep_the_lock_until_both_receipts() {
         let (batch, receiver) = test_press_batch();
         let mut sent = Vec::new();
-        enqueue_press_batch(
+        enqueue_input_batch(
             &batch,
             || true,
             |part, id| {
                 sent.push(part);
                 devtools_result(&batch.browser, id, true, b"{}");
                 assert!(receiver.try_recv().is_err());
-                STATE.with(|state| assert!(press_registered(&state.borrow(), &batch)));
+                STATE.with(|state| assert!(input_registered(&state.borrow(), &batch)));
                 // The normal command admission path must still see TAB_BUSY even
                 // when both callbacks arrived before ExecuteDevToolsMethod returned.
                 let (mut reply, blocked) = test_reply(702);
@@ -9588,7 +9866,7 @@ mod tests {
     #[test]
     fn enter_async_reversed_results_wait_for_both_and_allow_own_navigation() {
         let (batch, receiver) = test_press_batch();
-        enqueue_press_batch(&batch, || true, |_, id| id);
+        enqueue_input_batch(&batch, || true, |_, id| id);
         assert!(receiver.try_recv().is_err());
         STATE.with(|state| {
             let mut state = state.borrow_mut();
@@ -9611,7 +9889,7 @@ mod tests {
         for rejected in 0..2 {
             let (batch, receiver) = test_press_batch();
             let mut sent = Vec::new();
-            enqueue_press_batch(
+            enqueue_input_batch(
                 &batch,
                 || true,
                 |part, id| {
@@ -9641,7 +9919,7 @@ mod tests {
     fn enter_navigation_during_keydown_never_sends_keyup_to_the_new_document() {
         let (batch, receiver) = test_press_batch();
         let mut sent = Vec::new();
-        enqueue_press_batch(
+        enqueue_input_batch(
             &batch,
             || true,
             |part, id| {
@@ -9672,7 +9950,7 @@ mod tests {
         for cancel in [false, true] {
             let (batch, receiver) = test_press_batch();
             let mut sent = 0;
-            enqueue_press_batch(
+            enqueue_input_batch(
                 &batch,
                 || {
                     if cancel {
@@ -9710,7 +9988,7 @@ mod tests {
         for cause in 0..3 {
             let (batch, receiver) = test_press_batch();
             let mut sent = Vec::new();
-            enqueue_press_batch(
+            enqueue_input_batch(
                 &batch,
                 || true,
                 |part, id| {
@@ -9753,7 +10031,7 @@ mod tests {
         for immediate in [false, true] {
             let (batch, receiver) = test_press_batch();
             let mut sent = Vec::new();
-            enqueue_press_batch(
+            enqueue_input_batch(
                 &batch,
                 || true,
                 |part, id| {
@@ -9788,7 +10066,7 @@ mod tests {
     #[test]
     fn enter_preparation_rejects_legacy_success_and_stale_documents_without_keys() {
         for stale in [false, true] {
-            let (_pending, browser, receiver) = test_press_preparation();
+            let (_pending, browser, receiver) = test_input_preparation();
             if stale {
                 STATE.with(|state| {
                     state
@@ -9819,6 +10097,318 @@ mod tests {
                 assert_eq!(state.borrow().next_message, 42);
             });
         }
+        clear();
+    }
+
+    fn test_click_preparation() -> (Pending, Browser, mpsc::Receiver<Response>) {
+        let (mut pending, browser, receiver) = test_input_preparation();
+        pending.evaluation = Evaluation::Page {
+            mutation: true,
+            evidence: ActionEvidence::for_command(&Command::Click {
+                tab: 7,
+                reference: "4/document:3:8".into(),
+            }),
+        };
+        pending.click_target().unwrap().context.set(Some(17));
+        STATE.with(|state| {
+            state.borrow_mut().pending.insert(42, pending.clone());
+        });
+        (pending, browser, receiver)
+    }
+
+    fn click_prepared(point: Json) -> Json {
+        json!({"ok":true,"action":"click","prepared":true,"attempted":false,"point":point})
+    }
+
+    fn test_click_move() -> (Shared<InputBatch>, mpsc::Receiver<Response>) {
+        let (pending, browser, receiver) = test_click_preparation();
+        let kind =
+            prepared_input_kind(&pending, &click_prepared(json!({"x":42.5,"y":90.25}))).unwrap();
+        (
+            reserve_input_batch(42, &pending, &browser, kind).unwrap(),
+            receiver,
+        )
+    }
+
+    fn assert_input_busy(scope: Option<TaskScope>) {
+        let (mut reply, blocked) = test_reply(702);
+        reply.scope = scope;
+        handle(&Command::Read { tab: 7 }, reply);
+        assert_eq!(blocked.try_recv().unwrap().error.unwrap().code, "TAB_BUSY");
+    }
+
+    #[test]
+    fn click_move_verify_and_button_pair_keep_one_operation_and_the_original_ref() {
+        let (batch, receiver) = test_click_move();
+        let mut events = Vec::new();
+        let verify = enqueue_input_batch(
+            &batch,
+            || true,
+            |part, id| {
+                events.push(batch.kind.params(part));
+                devtools_result(&batch.browser, id, true, b"{}");
+                assert_input_busy(batch.reply.scope.clone());
+                assert!(receiver.try_recv().is_err());
+                id
+            },
+        );
+        assert!(verify);
+        assert_input_busy(batch.reply.scope.clone());
+        STATE.with(|state| assert_eq!(state.borrow().pending.len(), 1));
+        let params = click_verification_params(&batch).unwrap();
+        assert_eq!(params["contextId"], 17);
+        assert_eq!(
+            params["expression"],
+            format!(
+                "window.__lightBrowserBridge.act({})",
+                json!({"action":"click","ref":"document:3:8","point":{"x":42.5,"y":90.25},"verifyOnly":true})
+            )
+        );
+        let (id, pending) = reserve_click_verification(&batch).unwrap().unwrap();
+        assert_input_busy(batch.reply.scope.clone());
+        STATE.with(|state| assert_eq!(state.borrow().pending.len(), 1));
+        // A duplicate pointer acknowledgement cannot advance the replacement.
+        devtools_result(&batch.browser, batch.ids[0], true, b"{}");
+        assert!(receiver.try_recv().is_err());
+        let kind =
+            prepared_input_kind(&pending, &click_prepared(json!({"x":42.5,"y":90.25}))).unwrap();
+        let click = reserve_input_batch(id, &pending, &batch.browser, kind).unwrap();
+        assert_input_busy(batch.reply.scope.clone());
+        assert!(!enqueue_input_batch(
+            &click,
+            || true,
+            |part, id| {
+                events.push(click.kind.params(part));
+                devtools_result(&click.browser, id, true, b"{}");
+                assert_input_busy(click.reply.scope.clone());
+                id
+            }
+        ));
+        assert_eq!(
+            events,
+            [
+                json!({"type":"mouseMoved","x":42.5,"y":90.25,"button":"none","buttons":0,"clickCount":0,"modifiers":0,"pointerType":"mouse"}),
+                json!({"type":"mousePressed","x":42.5,"y":90.25,"button":"left","buttons":1,"clickCount":1,"modifiers":0,"pointerType":"mouse"}),
+                json!({"type":"mouseReleased","x":42.5,"y":90.25,"button":"left","buttons":0,"clickCount":1,"modifiers":0,"pointerType":"mouse"}),
+            ]
+        );
+        let wire = serde_json::to_value(receiver.try_recv().unwrap()).unwrap();
+        assert_eq!(wire["result"]["page"]["action"], "click");
+        assert_eq!(wire["result"]["page"]["dispatchAcknowledged"], true);
+        assert!(wire["result"]["page"].get("key").is_none());
+        assert!(wire["result"]["page"].get("trusted").is_none());
+        STATE.with(|state| {
+            let state = state.borrow();
+            assert!(state.pending.is_empty());
+            assert_eq!(state.spaces.active_space(), USER_SPACE);
+            assert_eq!(state.spaces.active_tab(), Some(8));
+        });
+        assert!(receiver.try_recv().is_err());
+        clear();
+    }
+
+    #[test]
+    fn click_rejected_move_receipt_never_verifies_or_dispatches_buttons() {
+        let (batch, receiver) = test_click_move();
+        let mut sent = 0;
+        assert!(!enqueue_input_batch(
+            &batch,
+            || true,
+            |_, id| {
+                sent += 1;
+                devtools_result(&batch.browser, id, true, b"{}");
+                assert!(receiver.try_recv().is_err());
+                0
+            }
+        ));
+        assert_eq!(sent, 1);
+        let error = receiver.try_recv().unwrap().error.unwrap();
+        assert_eq!(error.code, "CONTROL_UNAVAILABLE");
+        assert_eq!(
+            error.details.unwrap(),
+            json!({"tab":7,"outcomeUnknown":true,"attempted":true})
+        );
+        assert!(reserve_click_verification(&batch).unwrap().is_none());
+        devtools_result(&batch.browser, batch.ids[0], true, b"{}");
+        assert!(receiver.try_recv().is_err());
+        STATE.with(|state| assert!(state.borrow().pending.is_empty()));
+        clear();
+    }
+
+    #[test]
+    fn click_hover_rejection_or_changed_point_keeps_engine_attempted_evidence() {
+        for changed_point in [false, true] {
+            let (batch, receiver) = test_click_move();
+            assert!(enqueue_input_batch(
+                &batch,
+                || true,
+                |_, id| {
+                    devtools_result(&batch.browser, id, true, b"{}");
+                    id
+                }
+            ));
+            let (id, _) = reserve_click_verification(&batch).unwrap().unwrap();
+            let value = if changed_point {
+                click_prepared(json!({"x":43.0,"y":90.25}))
+            } else {
+                json!({"ok":false,"action":"click","attempted":false,"error":"CLICK_TARGET_CHANGED","detail":"The fixed point no longer reaches the reference."})
+            };
+            devtools_result(
+                &batch.browser,
+                id,
+                true,
+                &serde_json::to_vec(&json!({"result":{"value":value}})).unwrap(),
+            );
+            let error = receiver.try_recv().unwrap().error.unwrap();
+            assert_eq!(
+                error.code,
+                if changed_point {
+                    "INVALID_PAGE_RESULT"
+                } else {
+                    "CLICK_TARGET_CHANGED"
+                }
+            );
+            assert_eq!(
+                error.details.unwrap(),
+                json!({"outcomeUnknown":true,"attempted":true})
+            );
+            STATE.with(|state| {
+                let state = state.borrow();
+                assert!(state.pending.is_empty());
+                assert_eq!(state.next_message, id); // No mousePressed allocation.
+            });
+        }
+        clear();
+    }
+
+    #[test]
+    fn click_verification_getter_boundary_rejects_navigation_handoff_and_timeout() {
+        for cause in 0..3 {
+            let (batch, receiver) = test_click_move();
+            assert!(enqueue_input_batch(
+                &batch,
+                || true,
+                |_, id| {
+                    devtools_result(&batch.browser, id, true, b"{}");
+                    id
+                }
+            ));
+            match cause {
+                0 => STATE.with(|state| {
+                    state
+                        .borrow_mut()
+                        .tabs
+                        .get_mut(&7)
+                        .unwrap()
+                        .navigation
+                        .epoch += 1;
+                }),
+                1 => revoke_task_requests(&batch.reply.scope.as_ref().unwrap().task, Some(7)),
+                _ => {
+                    batch.reply.active.store(false, Ordering::Release);
+                    remove_wait(batch.reply.token);
+                }
+            }
+            match reserve_click_verification(&batch) {
+                Err(failure) => {
+                    assert_eq!(failure.code, "PAGE_CHANGED");
+                    batch.progress.borrow_mut().failure = Some(failure);
+                    assert!(!finish_input_batch(&batch));
+                }
+                Ok(result) => assert!(result.is_none()),
+            }
+            if cause < 2 {
+                let error = receiver.try_recv().unwrap().error.unwrap();
+                assert_eq!(error.details.unwrap()["attempted"], true);
+            }
+            assert!(receiver.try_recv().is_err());
+            devtools_result(&batch.browser, batch.ids[0], true, b"{}");
+            STATE.with(|state| assert!(state.borrow().pending.is_empty()));
+        }
+        clear();
+    }
+
+    #[test]
+    fn click_malformed_preparation_never_sets_a_point_or_attempts_native_input() {
+        for value in [
+            json!({"ok":true,"action":"click","trusted":false}),
+            click_prepared(json!({"x":-1,"y":5})),
+            click_prepared(json!({"x":5,"y":1_000_001})),
+            click_prepared(json!({"x":"5","y":5})),
+            click_prepared(json!({"x":null,"y":5})),
+            click_prepared(json!({"x":5})),
+        ] {
+            let (pending, browser, receiver) = test_click_preparation();
+            let target = pending.click_target().unwrap();
+            devtools_result(
+                &browser,
+                42,
+                true,
+                &serde_json::to_vec(&json!({"result":{"value":value}})).unwrap(),
+            );
+            let error = receiver.try_recv().unwrap().error.unwrap();
+            assert_eq!(error.code, "INVALID_PAGE_RESULT");
+            assert_eq!(error.details.unwrap()["attempted"], false);
+            assert_eq!(target.point.get(), None);
+            STATE.with(|state| assert_eq!(state.borrow().next_message, 42));
+        }
+        let (pending, browser, receiver) = test_click_preparation();
+        pending.click_target().unwrap().context.set(None);
+        let value = click_prepared(json!({"x":42.5,"y":90.25}));
+        devtools_result(
+            &browser,
+            42,
+            true,
+            &serde_json::to_vec(&json!({"result":{"value":value}})).unwrap(),
+        );
+        assert_eq!(
+            receiver.try_recv().unwrap().error.unwrap().code,
+            "INVALID_PAGE_RESULT"
+        );
+        assert_eq!(pending.click_target().unwrap().point.get(), None);
+        clear();
+    }
+
+    #[test]
+    fn click_button_pair_preserves_move_attempt_when_canceled_before_press() {
+        let (batch, receiver) = test_click_move();
+        assert!(enqueue_input_batch(
+            &batch,
+            || true,
+            |_, id| {
+                devtools_result(&batch.browser, id, true, b"{}");
+                id
+            }
+        ));
+        let (id, pending) = reserve_click_verification(&batch).unwrap().unwrap();
+        let kind =
+            prepared_input_kind(&pending, &click_prepared(json!({"x":42.5,"y":90.25}))).unwrap();
+        let click = reserve_input_batch(id, &pending, &batch.browser, kind).unwrap();
+        let mut sent = 0;
+        assert!(!enqueue_input_batch(
+            &click,
+            || {
+                STATE.with(|state| {
+                    state
+                        .borrow_mut()
+                        .tabs
+                        .get_mut(&7)
+                        .unwrap()
+                        .navigation
+                        .epoch += 1
+                });
+                true
+            },
+            |_, id| {
+                sent += 1;
+                id
+            }
+        ));
+        assert_eq!(sent, 0);
+        let error = receiver.try_recv().unwrap().error.unwrap();
+        assert_eq!(error.code, "PAGE_CHANGED");
+        assert_eq!(error.details.unwrap()["attempted"], true);
+        STATE.with(|state| assert!(state.borrow().pending.is_empty()));
         clear();
     }
 

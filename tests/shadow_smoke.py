@@ -16,7 +16,7 @@ import threading
 import time
 from urllib.parse import urlsplit
 
-from smoke import BrowserCli, CheckFailed, ROOT, element, require, require_native_press_ack
+from smoke import BrowserCli, CheckFailed, ROOT, element, require, require_native_press_ack, require_native_click_ack
 
 
 PASSWORD = "SHADOW_FAKE_PASSWORD_MUST_NOT_BE_EXPOSED"
@@ -223,7 +223,9 @@ def run(args):
         return page
 
     def click(page, label):
-        return command("click", tab, element(page, label)["ref"])
+        result = command("click", tab, element(page, label)["ref"])
+        require_native_click_ack(result["page"])
+        return result
 
     def navigate(url):
         command("navigate", tab, url)

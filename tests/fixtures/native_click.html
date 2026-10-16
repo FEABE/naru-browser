@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-src 'self' about:; connect-src 'none'; form-action 'none'; base-uri 'none'">
+  <title>Naru native click fixture</title>
+  <style>
+    body { font: 16px system-ui; margin: 100px 24px 24px; }
+    #receipt { position: fixed; inset: 0 0 auto; height: 74px; margin: 0; overflow: auto; pointer-events: none; white-space: pre-wrap; overflow-wrap: anywhere; font: 9px monospace; }
+    button, label { margin: 4px; padding: 8px; }
+    .row { display: flex; align-items: center; gap: 12px; margin: 8px 0; }
+    #covered-wrap { position: relative; width: 180px; height: 50px; }
+    #covered { width: 160px; }
+    #overlay { position: absolute; inset: 0; background: #ddd; }
+    #hover { transition: none; }
+    #scrollbox { width: 250px; height: 100px; overflow: auto; border: 1px solid; }
+    #scroll-content { height: 800px; padding-top: 600px; box-sizing: border-box; }
+    #frame-wrap { transform: scale(1.1, .95); transform-origin: 0 0; }
+    #outer { display: block; width: 380.5px; height: 170.75px; border: 3.25px solid; padding: 5.5px 7.25px; zoom: 1.1; }
+  </style>
+</head>
+<body>
+  <pre id="receipt"></pre>
+  <div class="row">
+    <button id="button" type="button" aria-label="Native click button">Button</button>
+    <label id="label" for="checkbox" tabindex="0" aria-label="Native checkbox label">Toggle checkbox</label>
+    <input id="checkbox" type="checkbox" aria-label="Native checkbox">
+    <input id="canceled" type="checkbox" aria-label="Canceled checkbox">
+    <div id="shadow-host"></div>
+  </div>
+  <div class="row">
+    <div id="covered-wrap"><button id="covered" type="button" aria-label="Covered button">Covered</button><div id="overlay">Overlay</div></div>
+    <button id="hover" type="button" aria-label="Moving hover button">Moves on hover</button>
+  </div>
+  <div id="scrollbox"><div id="scroll-content"><button id="overflow" type="button" aria-label="Overflow button">Scroll to click</button></div></div>
+  <div id="frame-wrap"><iframe id="outer" title="Scaled nested click frame"></iframe></div>
+  <script>
+    const counts = { pointerdown: 0, mousedown: 0, pointerup: 0, mouseup: 0, click: 0, input: 0, change: 0 };
+    const clicks = { button: 0, label: 0, checkbox: 0, canceled: 0, shadow: 0, covered: 0, overlay: 0, hover: 0, overflow: 0, nested: 0 };
+    const events = [];
+    let sequence = 0, moves = 0, hoverMoves = 0, frameReady = false;
+    const shadow = document.querySelector('#shadow-host').attachShadow({ mode: 'open' });
+    shadow.innerHTML = '<button id="shadow" type="button" aria-label="Shadow click button">Shadow</button>';
+    function show() {
+      const state = { counts, clicks, events, sequence, moves, hoverMoves, frameReady,
+        checked: document.querySelector('#checkbox').checked, canceledChecked: document.querySelector('#canceled').checked,
+        scrollTop: document.querySelector('#scrollbox').scrollTop, hasFocus: document.hasFocus(), visibility: document.visibilityState };
+      document.querySelector('#receipt').textContent = `NATIVE_CLICK_STATE_BEGIN ${encodeURIComponent(JSON.stringify(state))} NATIVE_CLICK_STATE_END`;
+    }
+    function observe(doc) {
+      doc.addEventListener('mousemove', () => { moves += 1; show(); });
+      for (const type of Object.keys(counts)) doc.addEventListener(type, event => {
+        const target = event.composedPath()[0]?.id ?? '';
+        counts[type] += 1;
+        if (type === 'click' && Object.hasOwn(clicks, target)) clicks[target] += 1;
+        events.push({ sequence: ++sequence, type, target, trusted: event.isTrusted, button: event.button ?? null,
+          buttons: event.buttons ?? null, defaultPrevented: event.defaultPrevented });
+        if (events.length > 12) events.shift();
+        // Checkbox cancellation rolls back after the click dispatch completes.
+        setTimeout(show, 0);
+      });
+      doc.addEventListener('scroll', show, true);
+    }
+    document.querySelector('#canceled').addEventListener('click', event => event.preventDefault());
+    document.querySelector('#hover').addEventListener('pointerover', event => {
+      if (hoverMoves) return;
+      hoverMoves += 1; event.currentTarget.style.transform = 'translateX(260px)'; show();
+    });
+    observe(document);
+    const outer = document.querySelector('#outer');
+    outer.addEventListener('load', function outerLoaded() {
+      if (!outer.contentDocument?.querySelector('#inner')) return;
+      outer.removeEventListener('load', outerLoaded);
+      const inner = outer.contentDocument.querySelector('#inner');
+      observe(outer.contentDocument);
+      inner.addEventListener('load', function innerLoaded() {
+        if (!inner.contentDocument?.querySelector('#nested')) return;
+        inner.removeEventListener('load', innerLoaded);
+        observe(inner.contentDocument); frameReady = true; show();
+      });
+      inner.srcdoc = '<!doctype html><body style="margin:0"><button id="nested" type="button" aria-label="Nested frame button" style="margin:20.25px;width:140.5px;height:35.5px">Nested</button></body>';
+    });
+    outer.srcdoc = '<!doctype html><body style="margin:0"><iframe id="inner" title="Inner click frame" style="margin:8.25px;width:250.5px;height:100.25px;border:2.5px solid;padding:4.25px;transform:scale(.9,1.05);transform-origin:0 0;zoom:1.1"></iframe></body>';
+    show();
+  </script>
+</body>
+</html>

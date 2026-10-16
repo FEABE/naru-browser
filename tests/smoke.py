@@ -139,6 +139,17 @@ def require_native_press_ack(page):
             "press: engine acknowledgement must not claim event trust or form submission")
 
 
+def require_native_click_ack(page):
+    """Check pointer dispatch receipts; callers must verify the page effect."""
+    require(isinstance(page, dict) and page.get("ok") is True and
+            page.get("action") == "click" and page.get("input") == "chromium" and
+            page.get("attempted") is True and page.get("dispatchAcknowledged") is True and
+            isinstance(page.get("detail"), str),
+            "click: expected Chromium pointer dispatch acknowledgement")
+    require("trusted" not in page and "key" not in page and "prepared" not in page,
+            "click: internal preparation or event trust must not be reported as success")
+
+
 def run(args):
     cli = BrowserCli(args.cli.resolve(), args.data_dir.resolve())
     checks = []
@@ -176,12 +187,12 @@ def run(args):
         page = cli.success("read", tab)["page"]
         cli.success("wait", tab, "dom")  # Readiness checks must preserve current refs.
         cli.error("STALE_REF", "click", tab, old_counter_ref)
-        cli.success("click", tab, element(page, "Increment counter")["ref"])
+        require_native_click_ack(cli.success("click", tab, element(page, "Increment counter")["ref"])["page"])
         page = cli.wait_for_page(tab, lambda value: "Clicks: 1" in value.get("text", ""), "button event")
-        checks.append("refs expire after read, survive wait, and DOM click reaches page handlers")
+        checks.append("refs expire after read, survive wait, and Chromium click reaches page handlers")
 
         target_ref = element(page, "Target button")["ref"]
-        cli.success("click", tab, element(page, "Disable target")["ref"])
+        require_native_click_ack(cli.success("click", tab, element(page, "Disable target")["ref"])["page"])
         cli.error("ELEMENT_UNAVAILABLE", "click", tab, target_ref)
         checks.append("disabled state revalidated before action")
 
