@@ -1,6 +1,26 @@
 # Naru 메모리 관리
 
+## 임시 페이지 포커스와 fill 이벤트 관찰
+
+2026-10-18 후속 소스는 탭당 하나·전체 최대 16개의 focus lease를 pending과 따로 유지한다. 원 Browser·session과 작은 전송 상태를 보관하며 실패 격리 시 요청 텍스트와 실행 continuation을 버린다. ACK별 5초 단발 task와 활성 요청 동안만 사용하는 전역 감시 task 하나가 있고, 후자는 1초마다 기존 45초 수명 초과를 확인한다. 실패 상태만 남으면 반복하지 않는다. 자동 입력 재시도·추가 프로세스·UI renderer·저장소는 없다.
+
+input/textarea fill은 insert와 bridge당 하나의 임시 receipt를 공유한다. beforeinput·input에 최대 네 passive listener를 붙이고 결과 소비·새 읽기·동작·5초 단발 만료에 해제한다. 요청 텍스트는 기존 1Mi UTF-16 제한을 사용하며 fill은 insert의 예상 값 사본을 추가로 만들지 않는다. 관찰 closure의 원 대상·문맥 참조와 멈춘 renderer의 만료 지연은 남는다. [포커스 준비 계약](focus-input.md)에 해제 미확정 상태와 늦은 응답을 기록한다. 실제 메모리 수치와 장시간 회수는 E2E에서 확인한다.
+
+## 텍스트 fill의 요청 수명
+
+후속 텍스트 입력은 기존 단일 요청과 입력 배치 안에서 준비, Chromium 입력, 값 확인을 이어 간다. 원 요청 문자열과 ref, isolated context, 입력 종류 및 원 Browser와 문서, 소유권을 요청 동안 유지한다. 비밀번호를 포함한 입력값을 결과나 오류에 복사하지 않는다. 기존 취소와 마감으로 pending을 제거하며 새 worker, 반복 타이머, renderer나 영속 저장은 없다. 준비와 사후 확인에서 현재 value를 읽는 비용, JSON 직렬화와 IPC의 문자열 복사 비용은 남는다. 기존 요청 크기와 동시 요청 상한을 사용하며 RAM 절감 수치로 해석하지 않는다. 검증 범위와 정확한 생성물 정리는 [작업 기록](work-log.md)을 따른다.
+
 Naru는 Rust로 앱과 CLI를 구현하지만 웹페이지의 DOM, JavaScript, 이미지, GPU 자원은 Chromium이 관리한다. Rust 사용만으로 브라우저 전체 메모리가 작아지는 것은 아니다. 현재 제한은 자동화가 늘리는 CEF 탭, 큰 응답 버퍼의 겹침, 페이지 관찰과 공간 미리보기의 추가 자원에 적용한다. 브라우저 창 하나 안에서도 각 페이지는 별도의 CEF browser ID를 유지한다. 표시 공간을 나누어도 프로필이나 Chromium 엔진을 추가로 실행하지 않는다.
+
+## 화면 상태 읽기
+
+화면 스냅샷은 조회 한 번 동안 현재 탭 수에 비례한 Browser 참조와 관측 값을 유지하고 반환 때 해제한다. 탭별 로딩 관측 세대와 중첩 조회 표시를 추가하며 영속 캐시, 새 프로세스와 반복 타이머는 없다. 유효하지 않은 결과는 기존 100ms 알림으로 합쳐 다시 읽는다. 주소 초안 보존 증표는 Browser 참조 하나, 기존 상태 가드와 URL을 동기 명령 호출 동안만 유지한다. [상태 읽기 계약](shell-snapshot.md)의 자원 범위이며 실제 RAM이나 갱신 속도 측정값은 아니다.
+
+CLI의 [탭 상태 관측](cli-state-observation.md)도 한 번의 조회 동안 대상 Browser와 Frame 참조, 실제 URL과 작은 상태 값을 보관한다. 목록은 조회 대상 탭 수에 비례하고 단일 탭 진단과 로딩 대기는 한 탭을 확인한다. 기존 대기 타이머와 요청의 활성 표시를 재사용하며 새 worker, 반복 타이머나 영속 저장을 추가하지 않는다. DOM 준비 확인은 대기당 한 요청만 진행한다. 변경 중인 탭을 다시 관측해도 대기 시작 시간을 늘리지 않으며, 종료 후 늦은 결과로 새 대기를 만들지 않는다. 실제 RAM과 네이티브 참조 회수의 장시간 측정은 남아 있다.
+
+## 새로고침과 로딩 중지
+
+네이티브 메뉴의 표시 대상 한 개와 동기 실행 문맥 한 개만 유지한다. 문맥은 현재 컨트롤과 Browser 참조, URL과 상태 기준을 보관하며 새 주소 문자열을 복사해 복원하지 않는다. 종료 시 성공과 실패 모두 정확한 호출의 임시 문맥을 해제한다. 새 worker, 반복 타이머, 영속 저장과 renderer는 없으며 실제 앱의 RAM과 반복 실행 뒤 참조 회수는 후속 검증이다. [동작 계약](reload-stop.md)을 따른다.
 
 ## Chromium 포인터 입력
 
@@ -30,7 +50,7 @@ Naru는 Rust로 앱과 CLI를 구현하지만 웹페이지의 DOM, JavaScript, �
 
 ## iframe 관찰의 자원
 
-2026-10-15 소스는 한 read에서 최대 16개 iframe 문맥과 메타데이터, 깊이 8까지의 부모 연결을 보관한다. 기존 120개 refs는 요소와 원문서 문맥을 묶어 다음 read에서 교체한다. 기존 전체 노드, 본문, 옵션, Shadow DOM 예산을 모든 문서가 공유하며 문서마다 Range와 스타일의 임시 캐시를 사용한다. child WindowProxy 조회로 기존 renderer 안의 isolated context가 추가될 수 있다. 반복 read가 다른 프레임에 접근하면 context가 더 생길 수 있으므로 전체 context 16개 상한이 아니다. 전체 페이지 메모리나 context 크기를 제한하는 기능은 아니며 실제 RAM 비교는 미실행이다. 별도 worker, 타이머, renderer나 저장 파일을 만들지 않는다. [iframe 설계](iframe-control.md)를 따른다.
+기존 `read`는 한 호출에서 최대 16개 iframe 문맥과 메타데이터, 깊이 8까지의 부모 연결을 보관한다. 기존 120개 refs는 요소와 원문서 문맥을 묶어 다음 read에서 교체한다. 기존 전체 노드, 본문, 옵션, Shadow DOM 예산을 모든 문서가 공유하며 문서마다 Range와 스타일의 임시 캐시를 사용한다. child WindowProxy 조회로 기존 renderer 안의 isolated context가 추가될 수 있다. 반복 read가 다른 프레임에 접근하면 context가 더 생길 수 있으므로 전체 context 16개 상한이 아니다. 전체 페이지 메모리나 context 크기를 제한하는 기능은 아니며 실제 RAM 비교는 미실행이다. 별도 worker, 타이머, renderer나 저장 파일을 만들지 않는다. [iframe 설계](iframe-control.md)를 따른다. 별도 `read-frame`과 `read-page`는 아래의 문서별 읽기·공통 예산과 action용 약한 ref를 사용하며, Browser당 최신 읽기 묶음 하나를 유지한다. [공통 예산 계약](page-read.md)을 따른다.
 
 ## 탭 음소거
 
@@ -66,9 +86,11 @@ Naru는 Rust로 앱과 CLI를 구현하지만 웹페이지의 DOM, JavaScript, �
 
 같은 URL의 비사용자 후속 탐색이 시작되면 기존 오류 JSON 하나를 내부 후보로 이동한다. 문자열 전체를 별도 복제한 이력 목록을 만들지 않는다. 진행 중에는 공개 오류와 분리하고, 같은 URL의 후속 ABORTED에서만 복원하며 새 명시적 탐색·다른 오류·정상 commit·중지·렌더러 종료 등에서 폐기한다. 선택 진단은 원문 주소·오류 문자열 없이 코드·세대·일치 여부만 기록한다. 이는 추가 상태의 수명과 개수에 대한 설명이며 Chromium 전체 RAM 상한이나 메모리 절감 측정값은 아니다. 검증 수준은 [작업 기록](work-log.md)의 recovery-v1/v2를 따른다.
 
-## Enter 입력 요청의 수명
+## 키 입력 요청의 수명
 
-Enter는 포커스 준비 요청에 이어 고정된 키 요청 두 개와 공유 결과 상태 하나를 유지한다. 응답이 일부만 와도 전체 요청이 끝날 때까지 탭의 진행 상태를 유지하며 완료, 오류, 취소와 연결 종료 때 해제한다. 새 상주 프로세스, 타이머나 저장소는 추가하지 않는다. DOM의 포커스 연결은 기존 최대 깊이 64 안에서 확인하고 새 전체 문서 순회를 하지 않는다. 엔진 내부 입력 큐와 전체 RAM 사용량이 줄었다는 측정 결과는 아니다.
+지원하는 키 42개 형식은 작은 KeyPress 값으로 원 요청을 보관하고 포커스 준비 응답과 대조한다. 고정된 키 요청 두 개와 공유 결과 상태 하나를 유지한다. 응답이 일부만 와도 전체 요청이 끝날 때까지 탭의 진행 상태를 유지하며 완료, 오류, 취소와 연결 종료 때 해제한다. 새 상주 프로세스, 타이머나 저장소는 추가하지 않는다. DOM의 포커스 연결은 기존 최대 깊이 64 안에서 확인한다. read의 focusedRef는 기존 순회에서 모은 context와 root, 최대 120개 반환 참조를 재사용한다. 전체 문서 재순회나 포커스 이력 저장은 없다. 엔진 내부 입력 큐와 전체 RAM 사용량이 줄었다는 측정 결과는 아니다.
+
+2026-10-18의 편집 조합은 기존 KeyPress 안의 키와 u8 modifier를 재사용한다. editing command는 정적 문자열 한 개이며 keydown 매개변수에만 임시로 넣는다. hover는 기존 포인터 대상에 boolean 하나를 추가하고 같은 고정 좌표와 요청 배치를 재사용한다. 클릭 버튼 배치를 만들지 않고 사후 확인에서 종료한다. 새 프로세스, 반복 타이머, DOM 전체 사본과 저장소는 없다. 실제 메모리 변화는 아직 측정하지 않았다.
 
 ## 완료 파일의 Finder 표시
 
@@ -115,7 +137,7 @@ RSS는 공유 매핑을 중복 계산하므로 고유 물리 RAM이 아니다. �
 
 ## 적용한 제한
 
-2026-10-16의 contenteditable 읽기는 기존 240자 요약과 공통 노드 순회 예산을 사용한다. 입력의 무동작 판정은 자식이 없거나 텍스트 노드 하나인 경우만 비교하고 한 번에 4,096 UTF-16 단위 이하를 읽는다. 교체 뒤에도 삽입 노드 identity와 같은 비교를 사용하며 전체 textContent를 복제하거나 별도 순회를 만들지 않는다. 요청 문자열과 새 텍스트 노드, 이벤트의 수명은 일시적으로 겹칠 수 있다. fill 오류에는 boolean 두 개만 더 전달한다. 이 제한은 실제 RAM 절감 측정이나 Chromium 전체 상한이 아니다.
+2026-10-16의 contenteditable 읽기는 기존 240자 요약과 공통 순회 예산을 유지한다. 후속 fill은 전체 Range 선택과 Chromium 입력, native innerText 확인으로 변경했다. innerText 전에 10,000개 노드와 깊이 64, 텍스트 최대 1Mi UTF-16 상한을 확인한다. 검증 시 텍스트 예산은 요청 길이와 노드 상한을 기준으로 더 제한한다. 키 입력의 passive keydown 관찰자는 bridge당 하나이며 결과 소비와 다음 읽기 또는 동작, 5초 단발 만료에서 해제한다. renderer가 멈추면 타이머 해제 시각도 늦어질 수 있다. Event 객체와 입력값을 관찰 상태에 보관하지 않는다. 실제 RAM 절감이나 장시간 회수는 통합 E2E에서 별도로 확인한다.
 
 배경 탭의 실패 표시는 기존 행의 갱신 비교와 아이콘, 툴팁, 접근성 문구를 사용한다. 실패 종류를 기존 비교 문자열에 포함하며 행과 이미지 컨트롤을 재사용한다. 이 두 변경으로 새 worker, 타이머, renderer와 영속 저장소는 추가하지 않았다.
 
@@ -169,7 +191,7 @@ Rust 178개와 전체 타깃 검사·format·release 빌드가 통과했다. 같
 
 ## 관찰과 브라우저 UI
 
-열린 Shadow DOM 지원은 페이지 관찰 범위를 넓힌다. 순회 상한에 도달하면 `read.page.truncated`의 `nodes`, `shadowRoots`, `depth`로 알리고, 출력 상한은 기존 `text`, `interactive`로 구분한다. 후속 소스는 접근 가능한 iframe 16개 슬롯, 중첩 8단계에서 기존 read 예산을 공유하며 `frames`, `frameDepth` 잘림을 추가한다. 문서별 isolated context가 지연 생성될 수 있어 이 상한을 contentDocument 조회 전에 적용한다. 닫힌 Shadow DOM, 접근 불가능한 iframe 내부, 캔버스 내부는 수집하지 않는다. 이 제한은 관찰용 작업과 응답 크기를 줄이는 장치다. 이미 로드된 페이지 DOM, JavaScript heap, 이미지, renderer 프로세스의 메모리를 줄이거나 10,000노드로 만드는 기능은 아니다.
+열린 Shadow DOM 지원은 페이지 관찰 범위를 넓힌다. 순회 상한에 도달하면 `read.page.truncated`의 `nodes`, `shadowRoots`, `depth`로 알리고, 출력 상한은 기존 `text`, `interactive`로 구분한다. 후속 소스는 접근 가능한 iframe 16개 슬롯, 중첩 8단계에서 기존 read 예산을 공유하며 `frames`, `frameDepth` 잘림을 추가한다. 문서별 isolated context가 지연 생성될 수 있어 이 상한을 contentDocument 조회 전에 적용한다. 기존 `read`는 접근 불가능한 iframe 내부를 수집하지 않으며, 교차 출처의 한 프레임 본문은 별도 [read-frame](frame-read.md), 여러 문서는 [read-page](page-read.md)의 공통 예산으로 읽는다. 닫힌 Shadow DOM과 캔버스 내부는 이 경로들에서도 수집하지 않는다. 이 제한은 관찰용 작업과 응답 크기를 줄이는 장치다. 이미 로드된 페이지 DOM, JavaScript heap, 이미지, renderer 프로세스의 메모리를 줄이거나 10,000노드로 만드는 기능은 아니다.
 
 `src/control_panel.rs`는 NSWindow 하나 안의 접는 세로 탭, 공간 카드, 탐색 막대, 상태 표시와 중지 버튼을 AppKit 컨트롤로 구성한다. CEF Alloy 페이지 뷰를 같은 콘텐츠 영역에 붙이며 별도 작업 제어 창이나 UI용 웹 renderer는 추가하지 않는다. `src/spaces.rs`는 탭 ID와 선택, 빌린 탭의 복귀 위치를 보관하며 빈 작업 공간 생성은 CEF 탭을 만들지 않는다. 공간들이 같은 프로필을 공유하므로 공간 수를 프로필이나 renderer 프로세스 수와 같다고 볼 수 없다.
 
@@ -291,3 +313,43 @@ python3 tests/spaces_smoke.py --data-dir "$LIGHT_BROWSER_DATA_DIR"
 다음 최적화는 같은 프로필·페이지·창 수·대기 시간에서 브라우저, renderer, GPU, network, storage를 함께 측정한 뒤 진행한다. 시작 직후, 동일 페이지를 읽고 캡처한 뒤, 작업 종료 뒤의 값을 구분한다. 샌드박스와 프로세스 격리, 기본 웹 기능을 유지한 상태에서 비교한다.
 
 자동 freeze나 탭 폐기는 아직 없다. freeze를 RAM 해제로 간주하지 않으며, 폐기로 인한 입력 내용과 작업 상태의 손실을 먼저 설계해야 한다. 사용자 소유 탭과 borrowed·keep 탭을 자동 폐기하지 않는다. CEF/Chromium 자체의 메모리 상한도 구현하지 않았다.
+
+## 선택 영역 텍스트 삽입의 임시 상태
+
+2026-10-18 insert는 기존 요청 텍스트와 FillTarget을 재사용하고 작은 mode와 관찰 token을 추가한다. bridge의 임시 관찰은 하나이며 새 read와 다른 act, 결과 소비, 5초 단발 만료에서 해제한다. 입력칸의 예상 값은 최대 1Mi UTF-16, 편집 영역의 구조 확인은 노드 10,000개와 깊이 64를 사용한다. 기존 값의 native getter 순간 할당까지 보장하는 상한은 아니다. 입력 원문과 비밀번호를 응답이나 로그에 추가하지 않으며 새 renderer, 프로세스, 반복 타이머와 파일 저장은 없다. 실제 앱의 RAM과 장시간 회수 검증은 남는다. [삽입 계약](insert-text.md)을 따른다.
+
+## 2026-10-18, DevTools raw envelope 수명
+
+기존 params를 빌려 JSON 바이트로 바로 직렬화하며 중간 CEF Dictionary 생성을 제거했다. 응답의 result와 error는 callback 바이트를 빌려 기존 처리로 넘기며 새 전체 Value 트리와 재직렬화를 피한다. 이 단계 이후 아래의 제한된 frame session registry를 추가했으며 기존 pending, capture 수명을 유지한다. 새 renderer, 프로세스, 영속 저장이나 반복 타이머는 없다. Rust parser scratch, 기존 결과 JSON과 이미지 디코딩의 할당까지 없다고 주장하지 않으며 실제 RAM은 미측정이다.
+
+## 2026-10-18, 하위 프레임 수집 예산
+
+`frames TAB`, `read-frame TAB FRAME`, `read-page TAB`과 frame ref action은 명시적 호출에서 현재 Browser의 child 연결을 사용한다. registry는 탭당 child session 16개·연결 깊이 8이고 worker나 다른 탭을 탐색하지 않는다. 수집별 최대 17개 session 방문(루트 포함), 프레임 결과 최대 128개, tree 깊이 32, URL 4,096·이름 256 UTF-8 byte로 제한한다. session별 중간 tree도 128개 방문으로 제한한다. FrameTree 등 본문 Read 외 단계 응답은 파싱 전 256 KiB, 관심 이벤트는 32 KiB다. 결과용 inventory는 요청 종료 후 해제하고 ready session은 재사용한다.
+
+취소·오류·인계·렌더러 종료에서 Rust snapshot과 수집 참조, 로컬 registry를 비운다. root owner object group이 남으면 release, root Runtime을 활성화했을 가능성이 있으면 disable, root auto-attach 해제를 각각 독립 ID와 ACK로 관리한다. child의 객체와 Runtime은 session 폐기로 정리하며 자손별 detach 이벤트를 모두 기다리지 않는다. 정리 실패나 ACK 미수신을 완료로 추정하지 않고 새 수집을 거절한다. 탭 닫힘·DevTools 연결 종료는 해당 상태를 제거한다.
+
+이 상한은 Chromium이 이미 잠시 붙인 session이나 전체 renderer 메모리의 상한이 아니다. root 해제의 자손 정리 의미는 고정 엔진 소스에서 확인한 것이며 실제 메모리 회수와 장시간 동작은 E2E 대상이다. UI renderer, 프로세스, 저장 파일과 반복 타이머는 추가하지 않았다.
+
+## 2026-10-18, 프레임 읽기와 입력의 자원
+
+`read-frame`은 새 inventory에서 FrameRecord와 context tracker를 확정한다. 정확한 session에서 Runtime disable ACK → enable replay → 고정 `LightBrowserFrameControl` world를 거치고 numeric ID를 이벤트와 대조한 뒤 uniqueContextId로 평가한다. 결과 JSON은 마지막 Runtime disable ACK까지만 요청 안에 보관한다. Read 응답은 파싱 전 2 MiB이나 파싱 결과·page JSON·전송 버퍼가 겹치는 전체 RAM 상한은 아니다.
+
+DOM 기본 예산은 본문 12,000 UTF-16 units, 요소 120개, 노드 방문 10,000회, 열린 Shadow DOM 64개, 옵션 240개, 로컬 iframe 메타데이터 16개다. 자식 iframe 본문은 따라가지 않는다. read-page는 이 여섯 예산을 모든 문서가 공유하고 사용한 양을 차감한 남은 예산만 다음 읽기에 전달한다. 순회 깊이 64는 문서별로 적용하며 node 사용량에 포함되지 않는 ancestor·style·focus 검사의 별도 상한도 유지한다.
+
+read-page는 최대 128개 FrameRecord의 너비 우선 목록에서 루트를 포함해 문서를 최대 16번 시도한다. 수집한 문서의 JSON과 context tracker는 전체 요청의 마지막 Runtime disable ACK와 최종 검증까지 보관한다. 문서별 `{frame,page}` 직렬화 크기의 합계와 metadata를 포함한 최종 응답 크기를 각각 2 MiB로 제한하며, 크기를 세기 위한 전체 직렬화 사본은 만들지 않는다. 예산 사용량이 0인 PAGE_LOADING 문서도 시도 횟수에는 포함한다. 이 상한은 파싱 중간 자료·기존 page JSON·출력 버퍼가 겹치는 전체 RAM 상한이 아니다. 상세 반환과 생략 정책은 [여러 프레임 읽기](page-read.md)를 따른다.
+
+현재 CLI는 readFrameActions를 호출한다. Rust는 Browser당 최신 읽기 묶음 하나를 유지한다. read-frame은 문서 하나, read-page는 최대 16개 문서 snapshot과 합계 120개 ref를 게시한다. 각 snapshot은 Browser 참조, 세대·소유권·FrameRecord·unique context·document binding을 보관하며 본문 사본이나 CEF Frame 객체는 넣지 않는다. 새 read-frame/read-page가 inventory 준비 단계에 수락되거나 수명이 바뀌면 이전 묶음을 무효화한다. 수락 뒤 실패해도 이전 참조를 복구하지 않지만 시작 전 PAGE_LOADING·TAB_BUSY 거절은 이전 묶음을 보존한다. DOM refs Map의 요소는 WeakRef이고 contexts는 WeakMap이며, 같은 world의 다음 read에서 교체한다. 수거되거나 문서가 달라진 요소는 입력 때 거절한다. WeakRef가 없으면 강한 refs로 대체하지 않는다.
+
+Rust의 최신 묶음 하나는 모든 frame world의 Map이 하나라는 뜻은 아니다. 방문했던 world의 약한 ref Map과 primitive snapshot 상태는 다음 read 또는 문서·world 수명 종료까지 남을 수 있다. 내부 content-only readFrame의 finally는 refs와 contexts를 비우지만 현재 CLI 경로와 다르다. clearFrame(binding)은 일치하는 DOM binding을 비우는 내부 함수이며 현재 Rust가 모든 이전 world에 일괄 실행하는 정리 단계는 아니다. 약한 참조로 바꾼 사실을 즉시 RAM 회수로 설명하지 않는다.
+
+frame action은 최신 묶음에서 해당 ref의 문서 snapshot을 공유하며 기존 fill/insert/press의 입력 배치·관찰 상태, check/select DOM 경로와 click/hover 포인터 배치를 재사용한다. 본문을 다시 수집하거나 ref 이력을 쌓지 않는다. 지원 action은 일곱 가지이고 `pointerActionsSupported:true`를 반환하지만 입력 시 기하 조건을 별도로 검사한다. 실제 입력은 기존 요소·입력값 제한과 단발 관찰 수명을 유지한다.
+
+부모 검사에는 최대 32개 FrameRecord/context tracker를 요청 동안 보관한다. 순차 처리 중 owner objectId와 요청별 objectGroup 한 쌍만 유지한다. Resolve 전 group을 기록하고 같은 group을 callFunctionOn에도 지정해 예외 객체까지 release 대상에 포함한다. 정상 release ACK와 부모 Runtime disable ACK 후 다음 부모로 이동하며, 취소·실패 시 root group은 별도 release ACK, child group은 session 폐기로 정리한다. getFrameOwner backend ID 자체는 약한 노드 식별자지만 resolveNode의 remote object는 강한 V8 handle이므로 release를 Runtime.disable로 대체하지 않는다. 같은 session의 context 이벤트는 대상과 모든 부모 tracker, 이미 수집한 문서의 tracker에 전달하며 현재 검사 중인 문서나 부모만 관찰하지 않는다.
+
+v8 frame 포인터는 이 부모 목록에 geometry를 하나씩 추가하고 leaf rect·viewport·clip, leaf/root CSS point 한 쌍과 후보 목록 두 개를 요청 동안 보관한다. 원본 후보와 변환·필터된 후보는 각각 최대 9개다. 부모 geometry를 합칠 때 최대 32개짜리 임시 목록을 만들며 DOM 사본, 전체 fragment rect 목록과 프레임별 screenshot은 만들지 않는다. 후보 생성은 최초 9개와 leaf 스크롤 후 9개로 최대 18개이며 부모별 hit-test 횟수 전체를 뜻하지 않는다.
+
+유효 후보가 없을 때만 포인터 입력 전에 leaf를 한 번 스크롤하고 기존 후보·clip·부모 geometry를 비운 뒤 전체를 다시 측정한다. mouseMoved 뒤에는 원래 leaf point·root point만 재검사한다. 각 parent pass는 새 owner object를 잠깐 resolve해 검사하고 release ACK를 받으므로 반복 pass의 객체를 누적 보관하지 않는다. DOM 평가의 원 child session/context와 root 마우스 전송을 분리하되 기존 `TAB_BUSY`와 마지막 Runtime disable ACK 수명은 유지한다. [프레임 포인터](frame-pointer.md)의 지원 기하 제한과 비동기 스크롤 경합을 따른다.
+
+대상 `LightBrowserFrameControl`과 부모 `LightBrowserFrameAncestors`는 고정 world 이름을 재사용한다. Runtime.disable은 reporting을 정리할 뿐 JS context·bridge·remote object group을 없애거나 진행 중 evaluate를 취소하지 않는다. 반복해서 다른 frame을 방문하면 world별 context가 추가될 수 있으며 session·snapshot 상한이 그 전체 크기의 상한은 아니다.
+
+새 renderer, 프로세스, worker, 반복 타이머와 영속 저장은 없다. 이전 content-only 읽기의 [v6 release 빌드](../artifacts/ego-parity-v6-build.json)와 다섯 입력 연결의 [v7 통합 빌드](../artifacts/ego-parity-v7-build.json)는 exit 0이다. 포인터 연결의 [v8 통합 빌드](../artifacts/ego-parity-v8-build.json)도 exit 0, 91.49초이며 제품 소스·Cargo 35개의 전후 해시가 일치한다. 이후 read-page 변경의 [v9 통합 빌드](../artifacts/ego-parity-v9-build.json)는 exit 0, 95.05초이며 제품 소스·Cargo 36개의 전후 해시가 일치한다. 앱·CEF·E2E와 전체 회귀 검사는 실행하지 않았다. 반복 읽기·입력·취소 후 RAM 회수도 미측정이다. [프레임 상세](frame-read.md), [context 조사](../artifacts/frame-read-v1-sources.json), [입력·객체 수명 조사](../artifacts/frame-input-v1-sources.json), [포인터 조사](../artifacts/frame-pointer-v1-sources.json)를 따른다. 요청별 자료 상한을 Chromium renderer 전체 메모리 상한이나 실측 절감량으로 설명하지 않는다.

@@ -128,13 +128,13 @@ def element(page, label):
     return matches[0]
 
 
-def require_native_press_ack(page):
+def require_native_press_ack(page, key="Enter"):
     """Validate engine dispatch acknowledgement, not the resulting page effect."""
     require(isinstance(page, dict) and page.get("ok") is True and
-            page.get("action") == "press" and page.get("key") == "Enter" and
+            page.get("action") == "press" and page.get("key") == key and
             page.get("input") == "chromium" and page.get("attempted") is True and
             page.get("dispatchAcknowledged") is True and isinstance(page.get("detail"), str),
-            "press: expected Chromium Enter dispatch acknowledgement")
+            "press: expected Chromium key dispatch acknowledgement")
     require("trusted" not in page and "formSubmissionRequested" not in page,
             "press: engine acknowledgement must not claim event trust or form submission")
 

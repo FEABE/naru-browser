@@ -2,6 +2,8 @@
 
 방향 확정일: 2026-10-11. 사용자는 Naru를 먼저 ego lite처럼 사람과 AI가 함께 사용하는 독립 브라우저로 완성한 뒤, 같은 Naru를 Preseller 화면 안에 내장하려는 목적을 명확히 했다. Rust·CEF·Chromium과 CLI를 유지한다. 이 문서는 제품 방향과 후속 설계이며 공통 코어 추출이나 내장 구현의 완료 기록이 아니다.
 
+2026-10-16부터 독립판의 남은 기능을 먼저 구현하고 통합 빌드 후 [단일 E2E 체크리스트](ego-parity-e2e.md)로 실제 앱을 검증한다. 반복 전체 회귀 결과를 쌓는 대신 같은 앱 해시에서 사람과 AI의 공동 사용, 파일 처리, 복구와 지속 사용을 확인한다. 이 완료 기준을 Preseller 연결 성공이나 별도 Naru 창의 원격 제어로 대체하지 않는다. 독립판 완성 후 같은 엔진을 내장하는 목표는 진행 중이다.
+
 ## 확정된 개발 순서
 
 1. **Naru 독립 브라우저 완성:** 사용자 공간과 AI 작업 공간, 탐색·로그인·입력·파일 처리와 중지·복구를 실제 사용 흐름에서 안정화한다.
@@ -15,13 +17,19 @@
 - Naru의 `src/main.rs`는 AppKit 준비, CEF 초기화, 메시지 루프와 종료를 직접 소유한다. `src/control_panel.rs`의 `Shell::new`가 자체 NSWindow를 만들며 `src/browser.rs`의 `create_browser_with_context`는 그 창의 부모 뷰와 크기를 사용한다. 외부 앱의 뷰와 수명주기를 받는 연결 API는 없다.
 - `src/protocol.rs`는 동일 사용자 로컬 소켓에서 요청당 JSON 응답 하나를 반환한다. CLI 명령과 작업 범위는 재사용할 수 있지만 호스트에 상태 변화를 전달하는 구독 계약은 없다.
 - 사용자 공간과 AI 공간은 탭 선택·소유권을 구분한다. 모든 탭이 공유하는 프로필을 계정별로 격리하는 기능은 아니다.
-- DOM 읽기와 입력은 메인 프레임과 열린 Shadow DOM을 대상으로 한다. 후속 소스에 접근 가능한 iframe과 내부 열린 Shadow DOM의 관찰과 합성 입력을 추가했고 모의 DOM 검사를 통과했다. 실제 CEF 다중 프레임 검증은 남아 있으며 교차 출처 iframe과 trusted 입력은 구현 전이다. 파일 입력은 `fill`에서 거부한다. 일반적인 CEF 파일 선택창이나 HTTP(S) 로그인 redirect까지 작동하지 않는다는 판단은 하지 않았다. [iframe 계약과 검증 경계](iframe-control.md)를 따른다.
+- 기존 DOM `read`는 메인 프레임, 열린 Shadow DOM과 접근 가능한 iframe을 대상으로 한다. 후속 소스는 클릭, hover와 지원 키 42개 형식을 대상 확인 뒤 Chromium 입력으로 연결한다. 읽기의 focusedRef로 관찰 가능한 다음 포커스 대상을 찾으며 OS 포커스와 구별한다. 후속 텍스트 fill은 Chromium 입력 뒤 원래 대상의 값을 확인한다. insert는 현재 커서와 선택 영역을 유지해 부분 입력하며 입력칸의 값 확인과 HTML 편집기의 이벤트 관찰을 구분한다. contenteditable도 Chromium 입력을 사용하며 다른 입력 유형과 select, check는 DOM 동작을 유지하며 파일 입력은 `fill`에서 거부한다. 모의 DOM 검사와 독립 Chromium 관찰은 실제 Naru CEF 다중 프레임 검증과 구분한다. 엔진 접수 응답으로 페이지 효과나 물리 입력을 입증하지 않는다. 교차 출처 iframe의 읽기와 입력 7개는 아래 별도 API의 소스 구현 단계이며 포인터는 부모 좌표와 hit-test를 통과하는 축 정렬 기하만 지원한다. 일반적인 CEF 파일 선택창이나 HTTP(S) 로그인 redirect까지 작동하지 않는다는 판단은 하지 않았다. [iframe 계약](iframe-control.md), [포인터 입력](pointer-input.md), [키 입력](keyboard-input.md)의 검증 경계를 따른다.
+- 기존 제어 명령의 raw 전송과 원 Browser 응답 확인을 공통 경로로 모았다. [프레임 연결](devtools-routing.md)은 현재 탭의 제한된 child session과 `frames TAB` 메타데이터 조회를 소스로 연결했다. 2026-10-18에는 `read-frame TAB FRAME`으로 교차 출처를 포함한 현재 문서 하나의 내용 조회를 연결했다. 원 Browser·session·문서·소유권과 정확한 context identity를 검사하고 고정 이름의 isolated world를 재사용한다. 정상 읽기는 Runtime 해제 ACK 뒤 응답하며 실패·취소 시 필요한 Runtime 및 autoAttach 정리 ACK를 추적한다. Runtime 해제는 이미 시작한 JavaScript 취소나 world 해제를 보장하지 않는다.
+- 후속 `read-frame`은 원 문서에 결합한 ref와 focusedRef를 제공하며 `supportedActions`에 click·hover·fill·insert·press·check·select를 명시한다. [프레임 입력](frame-input.md)은 같은 session·unique context로 준비·입력·사후 확인을 연결하고, 부모 iframe의 상태와 원격 객체 해제를 확인한다. 탭마다 최신 묶음 하나에 최대 16개 문서·전체 120개 ref와 약한 DOM 참조를 보관한다. [read-page](page-read.md)는 기존 Rust·CEF 경로에서 문서들을 순차 조회하고 공통 예산과 각 원 문서의 바인딩을 유지한다. [프레임 포인터](frame-pointer.md)는 후보의 부모별 변환·clip·가림 검사와 mouseMoved 뒤 같은 위치 확인을 거쳐 root session으로 입력한다. 지원 밖 좌표 변환과 Preseller 호스트 연결 API는 미구현이다. [고정 엔진 조사](../artifacts/frame-input-v1-sources.json)와 소스 검토를 마쳤으나 실제 Naru CEF 입력·정리·지속 메모리와 E2E는 실행하지 않았다. 최신 빌드와 실행 여부는 [체크리스트](ego-parity-e2e.md)를 따른다.
 - 다운로드 진행, 파일 지정, 권한 요청, 인증 완료 등을 Preseller에 전달하는 명시적 계약은 없다.
 - 참조 대화 [preseller-app 완성 설계 및 구현](thread://01a00e45-5985-7803-9b45-1ac2449137fa?hostId=local)의 최근 기록에는 Electron 내부 저장·IPC와 Kotlin 서버가 등장한다. 상품 작업본, 재수집 충돌, 이미지 처리와 저장 복구가 이미 별도의 개발 대상이다. 이번에는 해당 프로젝트 소스를 직접 읽거나 실행하지 않았으므로 현재 구현 계약은 연결 전에 다시 확인해야 한다.
+
+임시 페이지 포커스 준비와 해제, 입력칸 이벤트 대상 확인도 독립 앱의 공통 브라우저 계층에 둔다. [포커스 준비](focus-input.md)는 별도 UI renderer나 호스트 창 활성화 없이 요청의 exact session에서 처리한다. Preseller 내장에서도 이 수명과 사용자 화면 보존을 함께 검증해야 하며, 현재 소스 구현을 내장 완료나 실제 동시 입력 보장의 증거로 보지 않는다.
 
 ## 독립 브라우저의 완료 기준
 
 ego lite는 사용자·AI 공간과 CLI 협업의 참고 제품이다. 기능이 동등하다고 판단하려면 항목별 실제 검증이 필요하며, 외관이나 로컬 검사 수로 동등성을 주장하지 않는다. 우선 다음 기준으로 Naru의 독립 사용 가능 여부를 판단한다.
+
+아래 기준의 실제 판정은 [14개 사용 여정](ego-parity-e2e.md#하나의-통합-체크리스트)에 한 번만 기록한다. 같은 최종 바이너리의 근거가 없는 항목은 `pending`이나 `blocked`로 남기며 핵심 실패가 있으면 독립판 완료가 아니다. 소스 검사, 독립 Chromium 관찰과 이전 Naru 앱 결과는 현재 통합 실행과 구분한다. 로그인은 선택한 대표 서비스에서 사용자가 직접 진행하고, 탭 복원과 페이지 확대의 보류는 유지한다.
 
 | 영역 | 필요한 동작과 검증 |
 | --- | --- |

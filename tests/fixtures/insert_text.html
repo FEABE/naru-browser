@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-src 'self' about:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Naru insertion fixture</title>
+  <style>
+    body { font: 16px system-ui; margin: 24px; }
+    label { display: block; margin: 8px; }
+    [contenteditable] { border: 1px solid #aaa; min-height: 24px; margin: 8px; }
+    iframe { width: 440px; height: 70px; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <h1>Insertion at an existing caret or selection</h1>
+  <p>This local fixture does not submit or contact an external service.</p>
+  <pre id="receipt"></pre>
+  <label>Caret <input id="caret" aria-label="Insertion caret" value="alpha"></label>
+  <label>Keyboard selection <input id="replace" aria-label="Insertion keyboard selection" value="abcde"></label>
+  <label>Multiline <textarea id="multiline" aria-label="Insertion multiline">alpha
+beta</textarea></label>
+  <label>Password <input id="password" type="password" aria-label="Insertion password"></label>
+  <label>Empty caret <input id="empty-caret" aria-label="Insertion empty caret" value="keep"></label>
+  <label>Empty selection <input id="empty-selection" aria-label="Insertion empty selection" value="abcdef"></label>
+  <label>Maximum length <input id="maxlength" maxlength="4" aria-label="Insertion maximum length" value="ab"></label>
+  <label>Cancelled <input id="cancel" aria-label="Insertion canceled" value="stay"></label>
+  <label>Retype after input <input id="retype" aria-label="Insertion retype" value="old"></label>
+  <label>Remove after input <input id="remove" aria-label="Insertion remove" value="old"></label>
+  <label>Change focus after input <input id="blur" aria-label="Insertion blur" value="old"></label>
+  <label>Other target <input id="other" aria-label="Insertion other target" value="other"></label>
+  <label>Change range on focus <input id="focus-range" aria-label="Insertion focus range" value="alpha"></label>
+  <label>Change value on focus <input id="focus-value" aria-label="Insertion focus value" value="alpha"></label>
+  <button type="button" data-setup="plain" aria-label="Prepare plain insertion">Prepare plain caret</button>
+  <div id="plain" contenteditable="plaintext-only" role="textbox" aria-label="Insertion plain editor">hello</div>
+  <button type="button" data-setup="rich" aria-label="Prepare rich insertion">Prepare rich caret</button>
+  <div id="rich" contenteditable="true" role="textbox" aria-label="Insertion rich editor"><b>alpha</b><i> beta</i></div>
+  <button type="button" data-setup="selected" aria-label="Prepare selected insertion">Prepare editor selection</button>
+  <div id="selected" contenteditable="true" role="textbox" aria-label="Insertion selected editor"><b>alpha</b><i> beta</i></div>
+  <button type="button" data-setup="empty-editor" aria-label="Prepare empty editor insertion">Prepare empty editor caret</button>
+  <div id="empty-editor" contenteditable="true" role="textbox" aria-label="Insertion empty editor">keep</div>
+  <button type="button" data-setup="cancel-editor" aria-label="Prepare canceled editor insertion">Prepare canceled editor caret</button>
+  <div id="cancel-editor" contenteditable="true" role="textbox" aria-label="Insertion canceled editor">stay</div>
+  <div id="shadow-host"></div>
+  <iframe id="child" title="Same-origin insertion"></iframe>
+  <script>
+    const shadow = document.querySelector('#shadow-host').attachShadow({ mode: 'open' });
+    shadow.innerHTML = '<input id="shadow" aria-label="Insertion shadow" value="shadow">';
+    const controls = [...document.querySelectorAll('input, textarea, [contenteditable]'), shadow.querySelector('input')];
+    const events = [];
+    let sequence = 0;
+    let childReady = false;
+    let focusRangeChanges = 0;
+    let focusValueChanges = 0;
+    let preparedEditor = null;
+    function nativeValue(control) {
+      if (control.isContentEditable) return control.textContent;
+      const view = control.ownerDocument.defaultView;
+      const prototype = control.tagName === 'TEXTAREA' ? view.HTMLTextAreaElement.prototype : view.HTMLInputElement.prototype;
+      return Object.getOwnPropertyDescriptor(prototype, 'value').get.call(control);
+    }
+    function show() {
+      const states = Object.fromEntries(controls.map(control => {
+        const value = nativeValue(control);
+        const selection = control.ownerDocument.defaultView.getSelection();
+        const ownSelection = control.isContentEditable && selection?.rangeCount &&
+          control.contains(selection.anchorNode) && control.contains(selection.focusNode);
+        return [control.id, {
+          ...(control.type === 'password' || control.id === 'password' ? { length: value.length } : { value }),
+          connected: control.isConnected,
+          type: control.type || 'contenteditable',
+          start: control.selectionStart ?? null, end: control.selectionEnd ?? null,
+          ...(control.isContentEditable ? { html: control.innerHTML, selected: ownSelection ? selection.toString() : null } : {}),
+        }];
+      }));
+      document.querySelector('#receipt').textContent = `INSERT_STATE_BEGIN ${encodeURIComponent(JSON.stringify({ states, sequence, events, childReady, focusRangeChanges, focusValueChanges, preparedEditor, active: document.activeElement?.id || null }))} INSERT_STATE_END`;
+    }
+    function record(control, event) {
+      // Password values and event.data are never stored, even on a failing test.
+      const secret = control.type === 'password' || control.id === 'password';
+      events.push({ sequence: ++sequence, type: event.type, target: control.id,
+        trusted: event.isTrusted, inputType: event.inputType || null,
+        data: secret ? null : typeof event.data === 'string' ? event.data.slice(0, 32) : null,
+        canceled: event.defaultPrevented });
+      if (events.length > 12) events.shift();
+      show();
+    }
+    function observe(control) {
+      for (const type of ['beforeinput', 'input', 'change', 'keyup']) {
+        control.addEventListener(type, event => record(control, event));
+      }
+    }
+    for (const [id, start, end] of [
+      ['caret', 5, 5], ['replace', 5, 5], ['multiline', 5, 5], ['password', 0, 0],
+      ['empty-caret', 2, 2], ['empty-selection', 2, 4], ['maxlength', 2, 2],
+      ['cancel', 2, 2], ['retype', 3, 3], ['remove', 3, 3], ['blur', 3, 3],
+      ['other', 5, 5], ['focus-range', 2, 2], ['focus-value', 2, 2],
+    ]) document.getElementById(id).setSelectionRange(start, end);
+    shadow.querySelector('input').setSelectionRange(3, 3);
+    for (const id of ['cancel', 'cancel-editor']) {
+      document.getElementById(id).addEventListener('beforeinput', event => event.preventDefault());
+    }
+    document.getElementById('retype').addEventListener('input', event => { event.target.type = 'password'; });
+    document.getElementById('remove').addEventListener('input', event => event.target.remove());
+    document.getElementById('blur').addEventListener('input', () => document.getElementById('other').focus());
+    document.getElementById('focus-range').addEventListener('focus', event => {
+      focusRangeChanges += 1; event.target.setSelectionRange(4, 4); show();
+    });
+    document.getElementById('focus-value').addEventListener('focus', event => {
+      focusValueChanges += 1; event.target.value = 'changed'; show();
+    });
+    document.querySelectorAll('[data-setup]').forEach(button => button.addEventListener('click', () => {
+      const host = document.getElementById(button.dataset.setup);
+      host.focus();
+      const range = document.createRange();
+      if (host.id === 'selected') range.selectNodeContents(host);
+      else {
+        const node = host.id === 'rich' ? host.querySelector('b').firstChild : host.firstChild;
+        const offset = host.id === 'rich' ? 2 : node.length;
+        range.setStart(node, offset); range.collapse(true);
+      }
+      const selection = window.getSelection();
+      selection.removeAllRanges(); selection.addRange(range); preparedEditor = host.id; show();
+    }));
+    controls.forEach(observe);
+    document.addEventListener('selectionchange', show);
+    const frame = document.getElementById('child');
+    function childLoaded() {
+      const control = frame.contentDocument.querySelector('input');
+      if (!control) return;
+      frame.removeEventListener('load', childLoaded);
+      control.setSelectionRange(2, 2); controls.push(control); observe(control);
+      frame.contentDocument.addEventListener('selectionchange', show);
+      childReady = true; show();
+    }
+    frame.addEventListener('load', childLoaded);
+    frame.srcdoc = '<!doctype html><input id="frame" aria-label="Insertion frame" value="frame">';
+    show();
+  </script>
+</body>
+</html>

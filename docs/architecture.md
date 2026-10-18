@@ -19,8 +19,8 @@ Naru를 먼저 독립 브라우저로 완성한 뒤, 같은 Rust·CEF 브라우�
 | 브라우저 | Rust, CEF Alloy, Chromium, 단일 AppKit 창, 접는 세로 탭과 공간 카드 | 공간 전환과 창 수명주기의 실행 검증 확대 |
 | 표시 공간 | 내 공간과 작업별 공간, 공간별 선택, 요청 시 대표 탭 미리보기 | 여러 공간의 사용성 검증 |
 | 제어 | 로컬 CLI, 탐색, DOM 조작, 캡처, 작업 상태와 중지 버튼, 본문 입력 시 해당 AI 작업 인계 | 실제 IME와 네이티브 입력 중 대기 요청 취소 검증 |
-| 관찰 | 메인 문서와 열린 Shadow DOM, 참조, viewport, 탐색·렌더러 상태. 접근 가능한 iframe 관찰과 입력은 소스 추가, 실제 앱 미검증 | 교차 출처 frame과 native 입력, 접근성 정보 등 범위 확장 |
-| 입력 | 위치 재검사 후 Chromium 클릭, 포커스 확인 후 Chromium Enter, 나머지 DOM 값 입력, 제어권 변경 시 요청과 참조 만료 | 실제 CEF 포인터와 Enter 통합, 나머지 엔진 입력 |
+| 관찰 | 메인 문서와 열린 Shadow DOM, 참조, viewport, 탐색·렌더러 상태. 접근 가능한 iframe 관찰·입력과 교차 출처 프레임의 읽기·7개 입력 API는 소스 연결, 최신 실제 앱 미검증 | 지원 밖 좌표 변환, 실제 CEF·E2E 검증 |
+| 입력 | 위치 재검사 후 Chromium 클릭과 hover, 포커스 확인 후 42개 키 형식, 텍스트 fill의 Chromium 입력과 값 확인, 나머지 DOM 입력, 제어권 변경 시 요청과 참조 만료 | 최신 CEF 통합, 일반 조합키와 IME, 외부 편집기 호환성 |
 | 제어권 | 작업별 소유권과 revision, CLI의 handoff와 resume, 네이티브 탐색과 본문 클릭, 키와 휠 입력 전 handoff | 외부 서비스와 복합 입력 경합 검증 |
 | AI | 외부 프로그램이 CLI 사용 가능, 내장 모델 연결 없음 | 모델 연결, 페이지 정보 전송과 실행 승인 정책 |
 | 배포 | 프로젝트 안에서 기본 빌드만 수행, 명시적 실행과 서명자 검사, 산출물 정리 | 지속 서명, 공증, 배포와 업데이트 |
@@ -50,11 +50,13 @@ flowchart LR
 
 연결 worker는 최대 16개다. 이와 별개로 UI에 게시한 요청 payload도 서버별 최대 16개로 제한한다. 연결이 45초 후 시간 초과돼도 미실행 요청은 자리를 유지하며, UI 실행 종료나 task의 마지막 참조 해제 때 반환한다. 상한에 도달한 새 요청은 게시 전에 `APP_BUSY`, `outcomeUnknown:false`로 거절한다. 게시한 요청의 시간 초과는 기존 `outcomeUnknown:true`를 유지한다. 새 worker나 반복 타이머는 추가하지 않는다.
 
-페이지 관찰과 조작은 `src/browser.rs`의 내부 DevTools 요청에서 시작한다. 메인 프레임과 격리 실행 영역을 확보한 뒤 `src/dom_bridge.js`를 실행한다. 외부 디버깅 포트를 열지는 않는다. 페이지가 정의한 같은 이름의 JavaScript 객체를 신뢰하지 않는다.
+페이지 관찰과 조작은 `src/browser.rs`의 내부 DevTools 요청에서 시작한다. 기존 `read`와 입력은 메인 프레임의 격리 실행 영역에서 `src/dom_bridge.js`를 실행한다. 별도 `read-frame`은 현재 탭에서 찾은 프레임의 정확한 DevTools session과 격리 context에 내용 조회와 문서에 묶인 참조를 연결한다. 그 참조의 입력 7개는 같은 원 context를 다시 확인한 뒤 처리한다. 포인터의 native 전송만 루트 session 좌표를 사용한다. 외부 디버깅 포트를 열지는 않는다. 페이지가 정의한 같은 이름의 JavaScript 객체를 신뢰하지 않는다.
 
 `src/mac.rs`는 macOS 앱 이벤트와 브라우저 단축키를 연결하고, `src/control_panel.rs`는 단일 AppKit 브라우저 창을 구성한다. 창 안의 중지 버튼은 `src/browser.rs`의 기존 TaskHandoff 처리 경로를 호출한다. `src/bin/helper.rs`는 CEF 보조 프로세스와 sandbox 초기화를 담당한다. 런타임은 고정된 CEF 156.0.1 beta이며 로컬 파생 바인딩과 API 15600을 함께 사용한다. 버전 교차 검증과 앱 시작 시 API 해시 확인은 서로 다른 CEF 조합의 실행을 막는다.
 
 `src/tasks.rs`는 CLI 작업 소유권과 revision을 관리한다. `src/spaces.rs`는 표시 공간, 공간별 탭 선택과 실행 중 표시 순서, 빌린 탭의 원래 공간을 관리한다. 표시 순서는 `SpaceView.tabs`와 shell snapshot에 공통으로 전달하며 같은 공간의 메뉴 이동과 드래그 정렬은 선택, 탐색, AI 인계 없이 메타데이터만 바꾼다. 드래그는 시작 당시 전체 순서를 재검사하고 지정한 탭 앞이나 목록 끝으로 이동한다. [탭 순서 계약](tab-order.md)에 메뉴 대상 수명과 자원 제한을 기록했다. `src/browser.rs`가 작업 생성과 소유권 변경 뒤 두 상태를 맞추고 `src/control_panel.rs`에 스냅샷을 전달한다. 표시 공간과 작업 소유권은 별개다. 완료 공간에 남긴 결과 탭은 작업 소유권 없이도 그 공간에 표시할 수 있다.
+
+네이티브 화면의 `shell_snapshot`은 내부 상태를 빌리지 않은 구간에서 CEF getter를 호출한다. 각 조회와 최종 조립 시점의 탭, 문서와 로딩 세대를 검증하며 변경되면 기존 화면을 유지한 채 갱신을 보류한다. [상태 읽기 계약](shell-snapshot.md)에 중첩 조회와 CLI, AppKit의 남은 경계를 구분한다.
 
 ## 작업 공간과 제어권
 
@@ -157,6 +159,8 @@ CEF clip은 최대 240×150 포인트를 목표로 축소 요청한다. 수신 P
 
 ## 관찰과 입력
 
+새로고침과 로딩 중지는 표시한 `NavigationControlTarget`을 런타임에 전달한다. CEF 로딩 상태를 다시 읽어도 의도를 뒤집지 않으며, 탭과 문서, 소유권 검증 뒤 필요한 작업만 기존 handoff 경로로 인계한다. 중지 중 주소 표시 보류는 호출 수명 안에만 유지하고 실제 문서 변화에는 초안 보존을 허용하지 않는다. [동작 계약과 검증 경계](reload-stop.md)를 따른다.
+
 `check`는 CLI와 원본 JSON의 boolean을 `Command::Check`로 받고 기존 탭 소유권, 작업 revision과 탐색 epoch 검사 후 isolated DOM bridge에 전달한다. 요청 준비와 취소 경로에서는 페이지 변경 동작으로 분류한다. 실패 응답의 시도 여부와 현재 상태는 원래 요청 종류를 확인한 뒤 최대 네 boolean만 오류 상세로 전달한다. 기존 `fill`, `select`, `press`의 문자열은 타입을 보존한 JSON으로 직렬화한다.
 
 체크박스와 라디오 활성화는 브라우저의 DOM 클릭 한 번에 맡기고 후속 상태를 확인한다. ref는 원래 문서와 읽기 세대를 보관하므로 동작 도중 새 read가 실행돼도 이전 참조로 후속 작업을 계속하지 않는다. 혼합 상태와 라디오 해제는 거절하며 실패 후 자동으로 다시 클릭하지 않는다. [체크 제어 계약](check-control.md)에 오류와 검증 수준을 기록한다.
@@ -167,23 +171,53 @@ CEF clip은 최대 240×150 포인트를 목표로 축소 요청한다. 수신 P
 
 `open`과 탐색 명령은 요청 수락을 반환한다. `wait dom`은 현재 문서의 파싱 상태를, `wait load`는 전체 로딩 완료를 확인한다. 네트워크 실패, 204 응답, 명시적 stop을 이전 문서의 준비 상태와 구분한다. 시간 초과는 탐색이나 탭을 자동으로 취소하지 않는다.
 
+[CLI 상태 관측](cli-state-observation.md)은 native 값의 조회와 JSON 조립을 분리한다. 실제 main-frame URL을 유지하며 조회 전후의 Browser, 문서, 로딩 세대와 작업 권한을 확인한다. 탭 목록은 부분 결과를 성공으로 반환하지 않고 대기는 원래 마감 시간을 유지한다. 생성 후 조회 실패는 생성된 탭 ID를 명시하며, 대기 만료 때 상태 관측을 확정하지 못하면 `stateUnavailable:true`로 구분한다.
+
 DOM 준비 확인의 최종 응답이 도착하면 해당 요청은 더 이상 진행 중인 probe가 아니다. 탐색 오류나 기한 만료로 결과를 채택하지 못할 때도 이 표시를 해제하며, 최종 실패 응답과 현재 탭 상태는 기존 대기 타이머가 반환한다. 다음 타이머 전에 새 탐색이 오류를 지운 경우 문서 상태를 다시 확인할 수 있어야 한다. 이 처리는 페이지 변경 작업의 재시도가 아니다.
 
-read는 메인 문서와 열린 Shadow DOM의 본문, 조작 가능한 요소와 참조, documentId, readyState, viewport를 반환한다. 중첩된 열린 root와 슬롯으로 배치된 요소를 관찰하며 라벨은 요소가 속한 root에서 찾는다. 비밀번호 입력값과 숨김·inert 영역은 제외한다. 후속 소스는 접근 가능한 iframe과 그 안의 열린 Shadow DOM도 함께 읽는다. frame별 문맥과 접근 불가 상태는 `page.frames`로 구분한다. 닫힌 Shadow DOM, 접근 불가능한 iframe 내부, 캔버스 내부는 검사하지 않는다. 본문은 DOM과 열린 root의 순회 순서로 텍스트 노드를 정규화해 구성한다. 슬롯의 화면 순서나 원래 줄바꿈, 화면 전체·접근성 트리 전체를 재현하는 결과는 아니다.
+read는 메인 문서와 열린 Shadow DOM의 본문, 조작 가능한 요소와 참조, documentId, readyState, viewport를 반환한다. 중첩된 열린 root와 슬롯으로 배치된 요소를 관찰하며 라벨은 요소가 속한 root에서 찾는다. 비밀번호 입력값과 숨김·inert 영역은 제외한다. 후속 소스는 접근 가능한 iframe과 그 안의 열린 Shadow DOM도 함께 읽는다. frame별 문맥과 접근 불가 상태는 `page.frames`로 구분한다. 기존 `read`는 접근 불가능한 iframe 내부를 순회하지 않으며 교차 출처 문서의 별도 조회는 아래 `read-frame` 경로를 사용한다. 닫힌 Shadow DOM과 캔버스 내부는 검사하지 않는다. 본문은 DOM과 열린 root의 순회 순서로 텍스트 노드를 정규화해 구성한다. 슬롯의 화면 순서나 원래 줄바꿈, 화면 전체·접근성 트리 전체를 재현하는 결과는 아니다.
 
 본문 12,000자와 조작 요소 120개 외에 방문 노드 10,000개, 열린 shadow root 64개, 순회 깊이 64를 적용한다. 라벨 조회도 방문 예산을 사용하므로 예산이 소진되면 일부 라벨은 비어 있을 수 있다. `truncated.text`, `truncated.interactive`, `truncated.nodes`, `truncated.shadowRoots`, `truncated.depth`는 각 상한 때문에 관찰이 잘렸는지 표시한다. 관찰용 순회와 출력의 제한이므로 페이지 자체 DOM 크기나 Chromium 메모리를 제한하지 않는다.
 
 참조는 읽기 세대와 네이티브 탐색 세대에 연결된다. 새로운 read, 페이지 이동, 방문 기록 복원, 제어권 넘김, 렌더러 종료 이후에는 새 참조가 필요하다. 조작 시 탐색 세대와 제어권을 확인하고, 대상 요소와 shadow host·slot 경로의 제거, 숨김, inert, 비활성화 여부를 검사한다. 화면이나 DOM 레이아웃의 모든 변화를 감지하는 것은 아니다.
 
-DOM 클릭과 값 입력은 열린 Shadow DOM에서도 합성 경로를 사용한다. Enter는 후속 소스에서 대상 포커스를 준비한 뒤 Chromium의 keyDown과 keyUp을 직접 요청하도록 변경했다. 수동 form.requestSubmit은 제거하며 엔진 응답을 실제 제출 성공으로 해석하지 않는다. 포커스 경합과 응답 계약은 [키 입력 설계](keyboard-input.md)에 기록한다. 접근 가능한 iframe의 DOM 입력과 엔진 Enter의 실제 Naru CEF 통합 검증은 남아 있다. 교차 출처 iframe 내용, 내부 스크롤과 픽셀 좌표 변환, 닫힌 Shadow DOM, 캔버스, 복합 단축키는 현재 범위에 없다. 후속 입력 계층에서는 대상 요소 확인, 좌표 변환, CEF 입력 전달, 결과 재관찰을 함께 검증해야 한다.
+후속 소스의 클릭은 대상과 부모 iframe을 스크롤하고 화면 좌표를 검사한 뒤 Chromium 포인터 입력을 요청한다. 포인터 이동 뒤 원래 참조의 같은 좌표를 다시 확인하며 지원하지 않는 프레임 변환은 거절한다. 키 입력은 원 요청과 준비 응답의 키를 대조한 뒤 keyDown 또는 rawKeyDown, keyUp을 요청하며 수동 form.requestSubmit은 실행하지 않는다. 기본 키 14개와 Shift 조합 10개에 macOS 편집 조합 18개를 더해 총 42개 형식을 지원한다. read는 반환 참조 범위에서 관찰한 focusedRef에 같은 탐색 세대 접두사를 붙이며 확인 불가이면 null로 둔다. 엔진 응답을 페이지 동작의 성공이나 물리 입력의 증거로 해석하지 않는다. [포인터 입력 설계](pointer-input.md)와 [키 입력 설계](keyboard-input.md)에 지원 범위와 경합을 기록한다. 텍스트 fill은 Chromium 입력과 값 확인으로 연결하며, contenteditable도 Chromium 입력과 렌더된 텍스트 확인을 사용하며, 다른 입력 유형과 select, check는 기존 DOM 동작을 유지한다. 실제 Naru CEF 통합과 배경 선택 보존은 미검증이며 지원 밖 프레임 좌표 변환, 닫힌 Shadow DOM, 캔버스 내부와 명시 목록 밖의 조합키는 미지원이다. 교차 출처 문서의 입력 7개는 아래 read-frame 참조 경로를 사용한다.
 
 `fill`은 포커스 전과 실제 값 쓰기 직전에 동일한 지원 요소·입력 종류 규칙을 검사한다. 포커스 처리 중 체크박스, 파일 등 지원하지 않는 종류로 바뀌면 `ELEMENT_UNAVAILABLE`로 거절하고 fill의 값 쓰기와 input/change 이벤트를 실행하지 않는다. 계속 지원하는 text와 password 사이의 전환은 허용한다. 페이지의 포커스 처리 자체가 만든 변경을 되돌리는 기능은 아니다. 2026-10-15 보완의 상태 단위·모의 DOM 검사와 실제 CEF 미검증 범위는 작업 기록을 따른다.
 
-후속 일반 input과 textarea 경로는 포커스 뒤 입력 종류를 고정하고 setter, input, change 사이에 대상과 편집 조건을 다시 확인한다. 마지막에 원문서 프로토타입의 value getter로 요청 문자열과 비교한다. 값 미도달과 대상 변경에 따른 미확정을 구분하고, 기존 fill의 boolean 오류 상세만 전달한다. 브라우저의 값 정규화와 페이지의 되돌림을 무조건 성공으로 표시하지 않는다. [일반 입력칸 계약](native-fill-control.md)에 동기 확인과 비동기 결과의 경계를 기록한다.
+후속 text, search, tel, url, password와 textarea는 포커스 뒤 입력 종류와 전체 선택 범위를 확인하고 Input.insertText 한 번으로 입력한다. Rust는 요청 문자열과 원 Browser, 문서, 소유권, isolated context를 요청 수명 동안 유지하며 준비, 입력, 사후 확인 사이에 같은 pending을 연결한다. 엔진 ACK만으로 완료하지 않고 원 context와 ref의 네이티브 value를 요청 문자열과 비교한다. 다른 지원 유형은 기존 setter와 합성 input, change 경로를 유지한다. 값 미도달과 대상 변경에 따른 미확정을 구분하며 입력 뒤 DOM fallback이나 자동 재시도는 없다. [일반 입력칸 계약](native-fill-control.md)에 동기 확인과 비동기 결과의 경계를 기록한다.
 
-명시적 HTML `contenteditable` 영역의 fill은 별도 DOM 경로로 전체 자식 내용을 텍스트로 바꾼다. 현재 ref와 지원 상태를 포커스와 beforeinput 뒤에 재검사하고, 취소된 beforeinput에는 교체하지 않는다. 교체 뒤 input을 전달하고 같은 삽입 텍스트와 대상이 유지되는지 확인한다. 오류의 attempted와 trusted는 원래 요청 종류와 응답 action이 fill로 일치할 때만 boolean으로 전달한다. 기존 체크박스 상세의 필드 제한과 취소 후 outcomeUnknown 경로를 유지한다. [contenteditable 계약](contenteditable-control.md)에 지원 경계와 합성 입력의 한계를 기록했다.
+명시적 HTML `contenteditable` 영역의 fill도 전체 Range 선택과 Chromium Input.insertText를 사용한다. 준비에서 전체 선택과 원래 포커스를 검사하고, 엔진 응답 뒤 구조와 텍스트 예산을 확인한 후 네이티브 innerText를 요청 문자열과 비교한다. 합성 beforeinput과 직접 자식 교체는 제거했다. [contenteditable 계약](contenteditable-control.md)에 지원 범위와 편집기 호환성, 실제 앱 미검증 범위를 기록한다.
+
+`insert`는 기존 FillTarget과 입력 배치를 재사용하되 포커스 전후 원래 값과 선택을 비교하고 선택 영역을 직접 바꾸지 않는다. Input.insertText 뒤 입력칸은 예상 값, contenteditable은 원래 host의 일치하는 input 이벤트를 확인한다. 원 Browser, 문서, 작업 제어권과 isolated context에 결합한 임시 관찰 token을 준비와 사후 확인에서 대조한다. DOM fallback이나 자동 재시도는 없으며 [삽입 계약](insert-text.md)에 상태 확인과 이벤트 관찰의 차이를 기록한다.
+
+키 입력은 두 엔진 응답 뒤 같은 isolated context에서 짧게 유지한 keydown 대상 관찰을 소비한다. 다른 대상이 관찰되면 KEY_TARGET_MISMATCH이고, 탐색 등으로 관찰을 얻지 못하면 unconfirmed를 명시한다. PressTarget은 요청 키, 참조와 관찰 token을 묶고 pending 잠금은 사후 확인까지 이어진다. 페이지 관찰자는 최대 하나이며 새 동작이나 읽기, 소비, 단발 만료에서 정리한다. 사용자 이벤트를 막지 않으며 지연 포커스 변경 자체를 예방하는 장치는 아니다.
+
+명령 전송과 raw 응답은 [DevTools 연결 경로](devtools-routing.md)에서 관리한다. 예약한 ID를 그대로 전송하고, 완료 처리 전에 원래 탭의 Browser와 정확한 session을 확인한다. `frames TAB`은 현재 탭의 iframe 후손만 지연 연결하고 각 renderer의 로컬 FrameTree를 수집한다. 수집 중에는 탐색·문서 세대, 소유권과 프레임 변화를 검사하며 단계 사이의 native getter 재진입에서도 수집 상태를 유지한다. 메타데이터 관찰은 원자적 snapshot이 아니다.
+
+2026-10-18 소스는 `read-frame TAB FRAME`을 이 수집 경로에 연결한다. 요청마다 현재 프레임을 다시 찾고 원래 Browser·session·문서·작업 소유권을 유지한 채 해당 문서 하나의 본문과 요소 설명을 읽는다. 고정 이름 `LightBrowserFrameControl`의 isolated world를 재사용하며, `Runtime.disable` ACK 뒤 `Runtime.enable`로 생성 이벤트를 받는다. `ContextTracker`는 정확한 frame ID·world 이름·isolated 유형·isDefault=false에 해당하는 context 하나만 보관하고, `createIsolatedWorld`의 숫자 ID를 대조한 뒤 같은 session의 `Runtime.evaluate`에 `uniqueContextId`만 전달한다. context 교체·파괴·초기화나 프레임·제어권 변경은 이전 읽기를 무효화한다.
+
+정상 읽기는 `Runtime.disable` ACK 뒤 결과를 반환한다. 실패·취소는 root Runtime이 활성화됐다면 그 해제와 root autoAttach 해제를 별도 ACK로 추적하고, 정리 대기나 실패가 남으면 새 프레임 수집을 막는다. `Runtime.disable`은 이벤트 보고를 끄는 정리이며 이미 시작한 JavaScript 실행 취소나 isolated world 해제를 보장하지 않는다. 정상 읽기 후 제한된 child session은 재사용할 수 있다.
+
+후속 구현은 `readFrameActions`의 약한 DOM 참조에 native frame 접두사를 붙여 반환한다. 탭마다 최신 묶음 하나에 최대 16개 문서의 Browser·탐색 및 문서 epoch·소유권·frame/session·unique context·문서 ID·읽기 세대와 전체 최대 120개 ref를 묶는다. `supportedActions`는 click·hover·fill·insert·press·check·select이며 `pointerActionsSupported:true`로 반환한다. 접수되어 시작한 새 read-frame·read-page는 이전 묶음을 먼저 무효화하며 오래된 참조로 새 문서를 자동 재시도하지 않는다.
+
+프레임 입력 전에 현재 tree를 다시 수집하고 최대 32단계의 부모를 확인한다. 각 부모의 별도 고정 world에서 frame owner를 resolve하고 같은 unique context의 함수 인자로 전달해 원문서 소속·연결·숨김·비활성을 검사한다. 임시 원격 객체는 objectGroup으로 추적하고 release ACK 후 다음 부모로 넘어간다. root 취소 정리는 객체 group·Runtime·autoAttach ACK를 각각 추적하며 child는 session detach로 정리한다. 대상 world는 원래 unique context와 일치해야 하며 `frameAct`는 DOM 바인딩을 먼저 확인한다. Chromium 입력 배치와 사후 확인까지 같은 snapshot/session/context와 요청 잠금을 유지한다. 입력 성공도 Runtime disable ACK 후 전송한다.
+
+후속 포인터 경로는 로컬 요소와 부모별 content box·viewport를 교차해 clip을 구한 뒤 최대 9개 후보를 부모의 hit-test로 거른다. leaf의 특정 위치와 루트 전송 위치를 분리하며 mouseMoved 뒤 원 local point, 모든 부모와 같은 root point를 다시 확인한 다음 hover를 끝내거나 click 두 이벤트를 보낸다. 후보를 찾지 못하면 leaf scrollIntoView 한 번 후 전체 기하를 다시 측정하며 이동 후 스크롤·후보 재선택·입력 재시도는 없다. 각 부모의 객체를 순차 해제하고 원 target으로 돌아올 때 Runtime replay로 unique context를 재확인한다. `src/frame_pointer.rs`는 유한 수치·공유 clip·후보 부분집합을 검증한다. 이 순차 검사는 레이아웃과 입력을 원자적으로 묶지 않으며 지연 focus 경합도 예방하지 않는다. 회전·skew·perspective·pinch는 미지원이다. 단일 문서 상한과 read-page 공통 예산을 구분하며 약한 refs의 world별 메타데이터는 world 수명까지 남을 수 있다. [입력 계약](frame-input.md)과 [고정 엔진 조사](../artifacts/frame-input-v1-sources.json)에 범위를 기록한다. 실제 Naru CEF·외부 사이트·E2E는 실행하지 않았으며 최신 빌드 근거는 [체크리스트](ego-parity-e2e.md)를 따른다.
 
 접근 가능한 iframe은 최대 16개 문서 슬롯과 중첩 8단계에서 contentDocument 조회 전에 제한한다. 기존 노드, 텍스트, 참조와 옵션 예산은 전체 문서가 공유한다. ref에는 원래 소속 문서와 부모 iframe 연결을 묶고 focus, keydown 뒤에도 문서 identity와 가용성을 확인한다. document별 isolated realm과 자원 경계, 미검증 범위는 [iframe 관찰과 입력](iframe-control.md)에 기록한다.
+
+## 임시 페이지 포커스와 입력 수명
+
+키와 Chromium 텍스트 입력은 정확한 Browser·session의 임시 focus emulation을 사용한다. enable ACK 뒤 원 ref의 준비를 새로 실행하고 기존 입력 배치 한 번, disable ACK, 읽기 전용 결과 확인 순서로 진행한다. legacy DOM fill은 읽기 전용 사전 분류 뒤 이 설정 없이 실행하며 분류한 유형과 경로를 고정한다. 별도 네이티브 창 포커스·공간 선택 호출을 추가하지 않는다.
+
+취소가 일반 pending을 제거해도 임시 설정 해제 책임은 별도 상태에 남는다. 해제 미확정 상태에서는 같은 탭의 새 페이지 조작을 거절하고 원 Browser·session·ID의 늦은 응답을 구분한다. 입력을 자동 재전송하지 않는다. 일반 입력칸의 fill 관찰은 insert와 단일 임시 receipt를 공유하며 beforeinput·input의 다른 대상 증거와 최종 값을 구분한다. 자세한 상한·정리와 비원자적 입력의 한계는 [포커스 준비](focus-input.md)와 [입력칸 계약](native-fill-control.md)을 따른다.
+
+## 여러 문서 통합 읽기
+
+`read-page`는 `start_frame_inventory`에서 프레임 연결을 수집한 뒤 루트부터 너비 우선으로 최대 16개 문서를 읽는다. 각 문서는 재귀 없는 `readFrameActions(remaining)`을 사용하며 `src/page_read.rs`가 본문 UTF-16 길이, 반환 요소·옵션·메타데이터 개수와 보고된 순회 사용량을 검증하고 차감한다. 본문 읽기 전에 확인한 PAGE_LOADING만 사용량 0인 개별 누락으로 처리한다. 다른 오류나 context 변경은 전체 요청을 실패시킨다.
+
+완료한 문서의 context tracker도 전체 읽기가 끝날 때까지 유지한다. 마지막 Runtime disable ACK와 현재성, 전체 응답 2MiB 검사를 통과한 뒤에만 참조 묶음을 게시한다. 응답 본문은 전송 뒤 native snapshot에 보관하지 않는다. 약한 DOM Map과 isolated world를 즉시 지우는 기능은 아니며 실제 누적 메모리는 E2E에서 확인한다. [통합 읽기 계약](page-read.md)에 상한과 비원자적 관찰의 한계를 기록한다.
 
 ## UI와 AI의 후속 설계
 
@@ -197,6 +231,8 @@ CEF의 페이지 우클릭 메뉴는 `itemSelected:`로 기본 명령을 실행�
 
 ## 검증과 배포 순서
 
+현재 개발은 남은 기능을 먼저 구현하고 통합 빌드 후 [14개 E2E 사용 여정](ego-parity-e2e.md)으로 확인한다. 아래 스크립트는 각 여정의 실행 수단이며 기능마다 전체 회귀 묶음을 반복하는 절차가 아니다.
+
 1. `tests/tasks_smoke.py`로 소유권, revision, handoff·resume, 종료 보존을 확인하고 브라우저 안의 작업 중지 버튼이 같은 경로를 사용하는지 검사한다. 기존 탐색·자원 제한 테스트도 유지한다.
 2. `tests/shadow_smoke.py`로 열린 Shadow DOM의 관찰·입력·참조·순회 상한을 검사한다. 렌더러 종료의 요청 취소와 명시적 복구는 별도 상태 전환으로 확인한다. 이후 관찰 범위나 실제 입력 이벤트를 확장할 때도 제어권 변경 중 취소를 검사한다.
 3. `tests/single_window_smoke.py`로 명시 공간 전환 후 선택 메타데이터, 배경 관찰과 캡처를 확인한다. `tests/spaces_smoke.py`로 작업 생성과 open의 선택 보존, 공간별 선택 복원, 빈 공간, adopt와 release의 복귀, 완료 결과 보존을 확인한다. 네이티브 창 수, 카드와 미리보기, 사이드바 접기, 실제 포커스, 팝업과 입력 handoff는 별도로 검사한다.
@@ -205,7 +241,7 @@ CEF의 페이지 우클릭 메뉴는 `itemSelected:`로 기본 명령을 실행�
 
 단위 테스트는 상태 전환과 파서의 근거다. 로컬 CEF 통합 테스트는 해당 명령으로 관찰한 CEF 탭, DOM, 소켓 동작의 근거다. 단일 창 테스트의 CLI 메타데이터 검증을 네이티브 창 수나 UI 버튼 클릭 검증으로 해석하지 않는다. 둘 다 외부 사이트의 전체 호환성이나 배포 완료를 뜻하지 않는다. 작업 공간, Shadow DOM과 단일 창 테스트는 로컬 HTTP fixture와 직접 만든 탭만 사용하며 기존 탭과 프로필을 삭제하지 않는다. 위 절차는 검증 범위를 설명하며 실행 결과는 별도 기록한다.
 
-이미 실행 중인 앱과 같은 데이터 디렉터리를 지정해 새 회귀 테스트를 실행한다. 기존 탭 1~5개와 추가 생성·캡처가 진행 중이지 않은 상태가 필요하며, 다른 CLI 테스트와 동시에 실행하지 않는다. PNG는 새 파일로 남기고 JSON은 표준 출력으로 반환한다.
+선택한 E2E 스크립트는 이미 실행 중인 최종 앱과 같은 데이터 디렉터리를 지정해 실행한다. 기존 탭 1~5개와 추가 생성·캡처가 진행 중이지 않은 상태가 필요하며, 다른 CLI 테스트와 동시에 실행하지 않는다. PNG는 새 파일로 남기고 JSON은 표준 출력으로 반환한다.
 
 ```bash
 python3 tests/single_window_smoke.py --data-dir "$LIGHT_BROWSER_DATA_DIR" \

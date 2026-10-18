@@ -57,7 +57,6 @@ pub struct ShellTab {
 pub enum ShellAction {
     Back(i32),
     Forward(i32),
-    Reload(i32),
     Navigate(i32, String),
     NewTab,
     CloseTab(i32),
@@ -607,6 +606,37 @@ struct TabOrderMenu {
     target: crate::browser::TabOrderTarget,
 }
 
+#[derive(Clone)]
+struct NavigationControlMenu {
+    item: Retained<NSMenuItem>,
+    target: crate::browser::NavigationControlTarget,
+}
+
+struct NavigationControlCall {
+    target: crate::browser::NavigationControlTarget,
+    url: String,
+    window: Retained<NSWindow>,
+    address: Retained<NSTextField>,
+    reload: Retained<NSButton>,
+    preserve_address: bool,
+}
+
+struct NavigationControlCleanup(Rc<NavigationControlCall>);
+
+impl Drop for NavigationControlCleanup {
+    fn drop(&mut self) {
+        let removed = NAVIGATION_CONTROL_CALL.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.as_ref().is_some_and(|call| Rc::ptr_eq(call, &self.0)) {
+                slot.take()
+            } else {
+                None
+            }
+        });
+        drop(removed);
+    }
+}
+
 fn tab_rows_signature(
     space: &str,
     active: Option<i32>,
@@ -1099,6 +1129,10 @@ thread_local! {
     static TAB_AUDIO_MENU: RefCell<Option<TabAudioMenu>> = const { RefCell::new(None) };
     static TAB_ORDER_MENU: RefCell<[Option<TabOrderMenu>; 2]> = const { RefCell::new([None, None]) };
     static TAB_ORDER_QUERYING: Cell<bool> = const { Cell::new(false) };
+    static NAVIGATION_CONTROL_MENU: RefCell<Option<NavigationControlMenu>> = const { RefCell::new(None) };
+    static NAVIGATION_CONTROL_QUERYING: Cell<bool> = const { Cell::new(false) };
+    // At most one synchronous call may defer its own address rendering.
+    static NAVIGATION_CONTROL_CALL: RefCell<Option<Rc<NavigationControlCall>>> = const { RefCell::new(None) };
     // Rc clones share one order snapshot; pointer motion never clones its Vec.
     static TAB_DRAG: RefCell<Option<Rc<TabDragSession>>> = const { RefCell::new(None) };
     static TAB_DRAG_QUERYING: Cell<bool> = const { Cell::new(false) };
@@ -1660,6 +1694,9 @@ define_class!(
                     } else if let Some(forward) = tab_order_menu_direction(&item) {
                         prepare_tab_order_menu(item.clone(), forward);
                         item.setEnabled(validate_tab_order_menu(&item, forward));
+                    } else if item.action() == Some(sel!(reloadTab:)) {
+                        prepare_navigation_control_menu(item.clone());
+                        item.setEnabled(validate_navigation_control_menu(&item));
                     }
                 }
             }
@@ -1701,6 +1738,8 @@ define_class!(
                 validate_tab_audio_menu(item)
             } else if let Some(forward) = tab_order_menu_direction(item) {
                 validate_tab_order_menu(item, forward)
+            } else if item.action() == Some(sel!(reloadTab:)) {
+                validate_navigation_control_menu(item)
             } else if item.action() == Some(sel!(reopenClosedTab:)) {
                 can_reopen_closed_tab_ui()
             } else if item.action() == Some(sel!(openCurrentPageInUserTab:)) {
@@ -1893,8 +1932,8 @@ define_class!(
             run_action(active_tab().map(ShellAction::Forward));
         }
         #[unsafe(method(reloadTab:))]
-        fn reload_tab(&self, _sender: Option<&AnyObject>) {
-            run_action(active_tab().map(ShellAction::Reload));
+        fn reload_tab(&self, sender: Option<&AnyObject>) {
+            navigation_control_action(sender);
         }
         #[unsafe(method(focusAddress:))]
         fn focus_address(&self, _sender: Option<&AnyObject>) {
@@ -3612,7 +3651,7 @@ impl Shell {
             .setEnabled(browsing && tab.is_some_and(|tab| tab.can_go_back));
         self.forward
             .setEnabled(browsing && tab.is_some_and(|tab| tab.can_go_forward));
-        self.reload.setEnabled(browsing);
+        self.reload.setEnabled(browsing && !self.overlay_is_open());
         let loading = tab.is_some_and(|tab| tab.loading);
         set_symbol(
             &self.reload,
@@ -3629,22 +3668,39 @@ impl Shell {
         self.address.setEnabled(browsing);
         // Background state updates must not replace an address being typed.
         let editor: *mut AnyObject = unsafe { msg_send![&*self.address, currentEditor] };
-        if tab.is_some_and(|tab| {
-            self.address_draft.as_ref().is_some_and(|draft| {
-                draft.superseded(tab.id, &tab.url, tab.navigation_epoch, !editor.is_null())
+        let hold_address = NAVIGATION_CONTROL_CALL.with(|slot| {
+            slot.borrow().as_ref().is_some_and(|call| {
+                call.preserve_address
+                    && std::ptr::eq(&*call.address, &*self.address)
+                    && navigation_control_page_matches(
+                        &call.target,
+                        &call.url,
+                        tab,
+                        &self.active_space,
+                        self.active,
+                        self.overview,
+                    )
             })
-        }) {
+        });
+        if !hold_address
+            && tab.is_some_and(|tab| {
+                self.address_draft.as_ref().is_some_and(|draft| {
+                    draft.superseded(tab.id, &tab.url, tab.navigation_epoch, !editor.is_null())
+                })
+            })
+        {
             // Once editing ends, a later page navigation owns the address again.
             self.address_draft = None;
             self.notice = None;
         }
-        if self.overview
-            || self.displayed_address != self.active
-            || (editor.is_null()
-                && !self
-                    .address_draft
-                    .as_ref()
-                    .is_some_and(|draft| Some(draft.tab) == self.active))
+        if !hold_address
+            && (self.overview
+                || self.displayed_address != self.active
+                || (editor.is_null()
+                    && !self
+                        .address_draft
+                        .as_ref()
+                        .is_some_and(|draft| Some(draft.tab) == self.active)))
         {
             self.address
                 .setStringValue(&NSString::from_str(if self.overview {
@@ -4637,7 +4693,9 @@ fn reveal_download_source(sender: &NSButton, permission: bool) {
             return;
         }
     };
-    let selected = crate::browser::shell_snapshot();
+    let Some(selected) = crate::browser::shell_snapshot() else {
+        return;
+    };
     let Some(space) = download_reveal_selection(&selected, tab).map(str::to_owned) else {
         return;
     };
@@ -4658,7 +4716,9 @@ fn reveal_download_source(sender: &NSButton, permission: bool) {
         })
     });
     if !can_close
-        || download_reveal_selection(&crate::browser::shell_snapshot(), tab) != Some(space.as_str())
+        || !crate::browser::shell_snapshot().is_some_and(|snapshot| {
+            download_reveal_selection(&snapshot, tab) == Some(space.as_str())
+        })
     {
         return;
     }
@@ -4680,7 +4740,9 @@ fn reveal_download_source(sender: &NSButton, permission: bool) {
         })
     });
     if can_focus
-        && download_reveal_selection(&crate::browser::shell_snapshot(), tab) == Some(space.as_str())
+        && crate::browser::shell_snapshot().is_some_and(|snapshot| {
+            download_reveal_selection(&snapshot, tab) == Some(space.as_str())
+        })
     {
         crate::browser::focus_tab(tab);
     }
@@ -4782,6 +4844,7 @@ fn download_site_snapshot_ui() -> DownloadSiteQuery {
     if DOWNLOAD_SITE_QUERYING.with(|querying| querying.replace(true)) {
         return DownloadSiteQuery::Skipped;
     }
+    let mut snapshot_invalid = false;
     let value = (|| {
         let window = SHELL.with(|slot| {
             let slot = slot.try_borrow().ok()?;
@@ -4795,7 +4858,10 @@ fn download_site_snapshot_ui() -> DownloadSiteQuery {
         }
         // The shell may still show the previous selection until this sync's
         // render. Resolve the read-only query from fresh browser state instead.
-        let current = crate::browser::shell_snapshot();
+        let Some(current) = crate::browser::shell_snapshot() else {
+            snapshot_invalid = true;
+            return None;
+        };
         let page = download_site_page_target(
             &current.tabs,
             &current.active_space,
@@ -4810,7 +4876,11 @@ fn download_site_snapshot_ui() -> DownloadSiteQuery {
             .then_some((page, snapshot))
     })();
     DOWNLOAD_SITE_QUERYING.with(|querying| querying.set(false));
-    DownloadSiteQuery::Ready(value)
+    if snapshot_invalid {
+        DownloadSiteQuery::Skipped
+    } else {
+        DownloadSiteQuery::Ready(value)
+    }
 }
 
 fn download_site_is_current(page: &crate::browser::CurrentPageTarget, origin: &str) -> bool {
@@ -6676,11 +6746,8 @@ pub fn show() {
 
 pub fn refresh() {
     let marker = MainThreadMarker::new().expect("Browser shell requires the main thread");
-    let visible = SHELL.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .is_some_and(|shell| shell.window.isVisible() && !shell.window.isMiniaturized())
-    });
+    let window = SHELL.with(|slot| slot.borrow().as_ref().map(|shell| shell.window.clone()));
+    let visible = window.is_some_and(|window| window.isVisible() && !window.isMiniaturized());
     if visible && !NSApp(marker).isHidden() {
         sync();
     }
@@ -6690,7 +6757,9 @@ pub fn sync() {
     // Read a fresh browser snapshot after CEF setting queries, which may reenter
     // and change selection/navigation while the download panel is open.
     let site = download_site_snapshot_ui();
-    let snapshot = crate::browser::shell_snapshot();
+    let Some(snapshot) = crate::browser::shell_snapshot() else {
+        return;
+    };
     let end_start_editor = SHELL.with(|slot| {
         let slot = slot.borrow();
         let shell = slot.as_ref()?;
@@ -7028,7 +7097,9 @@ fn start_page_action(sender: &AnyObject, bookmarks: bool) {
         }
     } else {
         refresh();
-        let selected = crate::browser::shell_snapshot();
+        let Some(selected) = crate::browser::shell_snapshot() else {
+            return;
+        };
         let focus_page = selected.active_tab == Some(target.tab)
             && selected.active_space == target.space
             && !selected.overview
@@ -7877,6 +7948,342 @@ fn update_tab_drag(sender: &TabDragRecognizer, ended: bool) {
     }
 }
 
+fn navigation_control_target(
+    tabs: &[ShellTab],
+    space: &str,
+    active: Option<i32>,
+    overview: bool,
+    overlay: bool,
+) -> Option<crate::browser::NavigationControlTarget> {
+    if overview || overlay {
+        return None;
+    }
+    let tab = tabs
+        .iter()
+        .find(|tab| Some(tab.id) == active && tab.space == space)?;
+    Some(crate::browser::NavigationControlTarget {
+        tab: tab.id,
+        space: tab.space.clone(),
+        navigation_epoch: tab.navigation_epoch,
+        stop: tab.loading,
+    })
+}
+
+fn navigation_control_page_matches(
+    target: &crate::browser::NavigationControlTarget,
+    url: &str,
+    tab: Option<&ShellTab>,
+    space: &str,
+    active: Option<i32>,
+    overview: bool,
+) -> bool {
+    !overview
+        && active == Some(target.tab)
+        && space == target.space
+        && tab
+            .is_some_and(|tab| tab.id == target.tab && tab.space == target.space && tab.url == url)
+}
+
+fn rebase_navigation_address(
+    draft: &mut AddressDraft,
+    target: &crate::browser::NavigationControlTarget,
+    url: &str,
+    tab: &ShellTab,
+    outcome: &crate::browser::NavigationControlOutcome,
+    receipt_current: bool,
+) -> bool {
+    if !receipt_current
+        || !outcome.preserve_address
+        || draft.tab != target.tab
+        || draft.url != url
+        || draft.navigation_epoch != target.navigation_epoch
+        || tab.id != target.tab
+        || tab.space != target.space
+        || tab.url != url
+        || tab.navigation_epoch < target.navigation_epoch
+        || tab.navigation_epoch > outcome.navigation_epoch
+    {
+        return false;
+    }
+    // A snapshot can be skipped after a loading-only callback. The live receipt
+    // proves the document/owner even when the displayed epoch is still older.
+    draft.navigation_epoch = outcome.navigation_epoch;
+    true
+}
+
+fn navigation_address_outcome(
+    result: &Result<
+        crate::browser::NavigationControlOutcome,
+        crate::browser::NavigationControlError,
+    >,
+) -> Option<&crate::browser::NavigationControlOutcome> {
+    match result {
+        Ok(outcome) => Some(outcome),
+        Err(error) => error.preserved_address.as_ref(),
+    }
+}
+
+fn navigation_control_call_has_page(shell: &Shell, call: &NavigationControlCall) -> bool {
+    std::ptr::eq(&*shell.window, &*call.window)
+        && std::ptr::eq(&*shell.address, &*call.address)
+        && std::ptr::eq(&*shell.reload, &*call.reload)
+        && navigation_control_page_matches(
+            &call.target,
+            &call.url,
+            shell.tabs.iter().find(|tab| Some(tab.id) == shell.active),
+            &shell.active_space,
+            shell.active,
+            shell.overview,
+        )
+}
+
+fn navigation_control_address_is_current(call: &Rc<NavigationControlCall>) -> bool {
+    // Losing focus or opening an overlay blocks the command, but does not by
+    // itself replace this address. Keep the exact call and control identities.
+    NAVIGATION_CONTROL_CALL.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|current| Rc::ptr_eq(current, call))
+    }) && SHELL.with(|slot| {
+        slot.try_borrow().ok().is_some_and(|slot| {
+            slot.as_ref()
+                .is_some_and(|shell| navigation_control_call_has_page(shell, call))
+        })
+    })
+}
+
+fn navigation_control_native_ready(call: &NavigationControlCall) -> bool {
+    // Getters can dispatch nested callbacks. The runtime samples CEF loading
+    // after this preflight and uses only the pure predicate after that sample.
+    call.window.isKeyWindow()
+        && call.window.isVisible()
+        && !call.window.isMiniaturized()
+        && call.reload.window().as_deref() == Some(&*call.window)
+        && !call.reload.isHiddenOrHasHiddenAncestor()
+        && call.reload.isEnabled()
+        && call.address.window().as_deref() == Some(&*call.window)
+        && !page_find_has_marked_text()
+}
+
+fn navigation_control_call_is_current(call: &NavigationControlCall, exact: bool) -> bool {
+    // No native/CEF getters after the runtime's final loading observation.
+    SHELL.with(|slot| {
+        let Ok(slot) = slot.try_borrow() else {
+            return false;
+        };
+        let Some(shell) = slot.as_ref() else {
+            return false;
+        };
+        let tab = shell.tabs.iter().find(|tab| Some(tab.id) == shell.active);
+        navigation_control_call_has_page(shell, call)
+            && !shell.overlay_is_open()
+            && (!exact
+                || tab.is_some_and(|tab| {
+                    tab.navigation_epoch == call.target.navigation_epoch
+                        && tab.loading == call.target.stop
+                }))
+    })
+}
+
+fn capture_navigation_control() -> Option<NavigationControlCall> {
+    if NAVIGATION_CONTROL_CALL.with(|slot| slot.borrow().is_some()) {
+        return None;
+    }
+    let call = SHELL.with(|slot| {
+        let slot = slot.try_borrow().ok()?;
+        let shell = slot.as_ref()?;
+        let target = navigation_control_target(
+            &shell.tabs,
+            &shell.active_space,
+            shell.active,
+            shell.overview,
+            shell.overlay_is_open(),
+        )?;
+        let tab = shell.tabs.iter().find(|tab| tab.id == target.tab)?;
+        let preserve_address = shell.address_draft.as_ref().is_none_or(|draft| {
+            draft.tab == target.tab
+                && draft.url == tab.url
+                && draft.navigation_epoch == target.navigation_epoch
+        });
+        Some(NavigationControlCall {
+            target,
+            url: tab.url.clone(),
+            window: shell.window.clone(),
+            address: shell.address.clone(),
+            reload: shell.reload.clone(),
+            preserve_address,
+        })
+    })?;
+    (navigation_control_native_ready(&call) && navigation_control_call_is_current(&call, true))
+        .then_some(call)
+}
+
+fn prepare_navigation_control_menu(item: Retained<NSMenuItem>) {
+    if NAVIGATION_CONTROL_QUERYING.with(|busy| busy.replace(true)) {
+        return;
+    }
+    let previous = NAVIGATION_CONTROL_MENU.with(|slot| slot.borrow_mut().take());
+    drop(previous);
+    let value = capture_navigation_control().map(|call| NavigationControlMenu {
+        item: item.clone(),
+        target: call.target,
+    });
+    item.setTitle(&NSString::from_str(
+        if value.as_ref().is_some_and(|value| value.target.stop) {
+            "로딩 중지"
+        } else {
+            "새로 고침"
+        },
+    ));
+    NAVIGATION_CONTROL_MENU.with(|slot| *slot.borrow_mut() = value);
+    NAVIGATION_CONTROL_QUERYING.with(|busy| busy.set(false));
+}
+
+fn validate_navigation_control_menu(item: &NSMenuItem) -> bool {
+    if NAVIGATION_CONTROL_QUERYING.with(|busy| busy.replace(true)) {
+        return false;
+    }
+    let target = NAVIGATION_CONTROL_MENU.with(|slot| {
+        slot.try_borrow()
+            .ok()?
+            .as_ref()
+            .filter(|value| std::ptr::eq(item, &*value.item))
+            .map(|value| value.target.clone())
+    });
+    let valid = target.is_some_and(|target| {
+        capture_navigation_control().is_some_and(|call| call.target == target)
+    });
+    NAVIGATION_CONTROL_QUERYING.with(|busy| busy.set(false));
+    valid
+}
+
+fn navigation_control_action(sender: Option<&AnyObject>) {
+    let Some(call) = capture_navigation_control() else {
+        return;
+    };
+    if let Some(sender) = sender {
+        if let Some(button) = sender.downcast_ref::<NSButton>() {
+            if !std::ptr::eq(button, &*call.reload) {
+                return;
+            }
+        } else if let Some(item) = sender.downcast_ref::<NSMenuItem>() {
+            let target = NAVIGATION_CONTROL_MENU.with(|slot| {
+                slot.try_borrow()
+                    .ok()?
+                    .as_ref()
+                    .filter(|value| std::ptr::eq(item, &*value.item))
+                    .map(|value| value.target.clone())
+            });
+            // An open menu never replaces its displayed intent with a new one.
+            if target.as_ref() != Some(&call.target) || !item.isEnabled() {
+                return;
+            }
+        } else {
+            return;
+        }
+    }
+    if !navigation_control_native_ready(&call) || !navigation_control_call_is_current(&call, true) {
+        return;
+    }
+    let call = Rc::new(call);
+    let installed = NAVIGATION_CONTROL_CALL.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_some() {
+            return false;
+        }
+        *slot = Some(call.clone());
+        true
+    });
+    if !installed {
+        return;
+    }
+    let cleanup = NavigationControlCleanup(call.clone());
+    SHELL.with(|slot| {
+        if let Some(shell) = slot.borrow_mut().as_mut() {
+            // A button click can end editing before validation. Preserve that
+            // field's context on an early failure, without copying its text.
+            if shell.address_draft.is_none() {
+                shell.address_draft = Some(AddressDraft {
+                    tab: call.target.tab,
+                    url: call.url.clone(),
+                    navigation_epoch: call.target.navigation_epoch,
+                });
+            }
+        }
+    });
+    let result = crate::browser::control_navigation(
+        &call.target,
+        || navigation_control_native_ready(&call),
+        || {
+            navigation_control_call_is_current(&call, false)
+                && NAVIGATION_CONTROL_CALL.with(|slot| {
+                    slot.borrow()
+                        .as_ref()
+                        .is_some_and(|current| Rc::ptr_eq(current, &call))
+                })
+        },
+    );
+    let address_receipt = navigation_address_outcome(&result).and_then(|outcome| {
+        crate::browser::capture_navigation_address_receipt(&call.target, &call.url, outcome)
+    });
+    // Keep the local hold across native snapshot queries. A rejected snapshot
+    // must not discard a draft when the same document still matches below.
+    sync();
+    let receipt_current = address_receipt
+        .as_ref()
+        .is_some_and(crate::browser::navigation_address_receipt_current);
+    let command_current = navigation_control_call_is_current(&call, false);
+    if navigation_control_address_is_current(&call) {
+        SHELL.with(|slot| {
+            if let Some(shell) = slot.borrow_mut().as_mut() {
+                let tab = shell.tabs.iter().find(|tab| Some(tab.id) == shell.active);
+                let mut rebased = false;
+                if call.preserve_address {
+                    if let (Some(outcome), Some(draft), Some(tab)) = (
+                        navigation_address_outcome(&result),
+                        &mut shell.address_draft,
+                        tab,
+                    ) {
+                        rebased = rebase_navigation_address(
+                            draft,
+                            &call.target,
+                            &call.url,
+                            tab,
+                            outcome,
+                            receipt_current,
+                        );
+                    }
+                }
+                match (&result, tab) {
+                    (Ok(outcome), Some(tab)) => {
+                        if command_current
+                            && tab.navigation_epoch == outcome.navigation_epoch
+                            && outcome.navigation_epoch != call.target.navigation_epoch
+                        {
+                            shell.notice = None;
+                        }
+                    }
+                    (Err(error), Some(tab))
+                        if command_current
+                            && receipt_current
+                            && (tab.navigation_epoch == call.target.navigation_epoch
+                                || rebased) =>
+                    {
+                        // A rejected old target cannot attach its error to a
+                        // new page. Same-page busy/send errors remain visible.
+                        shell.notice = Some(format!("처리하지 못했습니다: {}", error.message));
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+    // Drop this exact call before rendering. No hold survives a return/error,
+    // and a reentrant newer call can never be cleared by this cleanup.
+    drop(cleanup);
+    refresh();
+}
+
 fn run_action(action: Option<ShellAction>) {
     let Some(action) = action else {
         return;
@@ -8491,6 +8898,10 @@ fn shortcut_key(event: &NSEvent) -> Option<String> {
 
 pub fn shutdown() {
     cancel_tab_drag();
+    let navigation_menu = NAVIGATION_CONTROL_MENU.with(|slot| slot.borrow_mut().take());
+    drop(navigation_menu);
+    let navigation_call = NAVIGATION_CONTROL_CALL.with(|slot| slot.borrow_mut().take());
+    drop(navigation_call);
     let audio_menu = TAB_AUDIO_MENU.with(|slot| slot.borrow_mut().take());
     drop(audio_menu);
     let order_menu =
@@ -8811,6 +9222,14 @@ pub fn handle_shortcut(event: &NSEvent) -> bool {
     }
     let command = modifiers.contains(NSEventModifierFlags::Command)
         && !modifiers.intersects(NSEventModifierFlags::Control | NSEventModifierFlags::Option);
+    // Consume before overlay dismissal or page-input handoff. Hidden-page and
+    // composing-text cases remain unchanged, including repeated key events.
+    if command && key == "r" {
+        if !event.isARepeat() {
+            navigation_control_action(None);
+        }
+        return true;
+    }
     if command && key == "f" && !modifiers.contains(NSEventModifierFlags::Shift) {
         if !event.isARepeat() {
             open_page_find(false);
@@ -8873,7 +9292,7 @@ pub fn handle_shortcut(event: &NSEvent) -> bool {
             return true;
         }
         if command
-            && (matches!(key.as_str(), "l" | "t" | "w" | "r" | "[" | "]")
+            && (matches!(key.as_str(), "l" | "t" | "w" | "[" | "]")
                 || is_menu_only_shortcut(&key, modifiers))
         {
             close_downloads(false);
@@ -8926,7 +9345,7 @@ pub fn handle_shortcut(event: &NSEvent) -> bool {
             }
         }
         if command
-            && (matches!(key.as_str(), "l" | "t" | "w" | "r" | "[" | "]")
+            && (matches!(key.as_str(), "l" | "t" | "w" | "[" | "]")
                 || is_menu_only_shortcut(&key, modifiers))
         {
             close_bookmarks(false);
@@ -8985,13 +9404,13 @@ pub fn handle_shortcut(event: &NSEvent) -> bool {
             }
         }
         if command
-            && (matches!(key.as_str(), "l" | "t" | "w" | "r" | "[" | "]")
+            && (matches!(key.as_str(), "l" | "t" | "w" | "[" | "]")
                 || is_menu_only_shortcut(&key, modifiers))
         {
             close_tab_search(false);
         }
     }
-    if !command || !matches!(key.as_str(), "l" | "t" | "w" | "r" | "[" | "]") {
+    if !command || !matches!(key.as_str(), "l" | "t" | "w" | "[" | "]") {
         return false;
     }
     if event.isARepeat() {
@@ -9001,7 +9420,6 @@ pub fn handle_shortcut(event: &NSEvent) -> bool {
         "l" => focus_address(),
         "t" => run_action(Some(ShellAction::NewTab)),
         "w" => run_action(active_tab().map(ShellAction::CloseTab)),
-        "r" => run_action(active_tab().map(ShellAction::Reload)),
         "[" => run_action(active_tab().map(ShellAction::Back)),
         "]" => run_action(active_tab().map(ShellAction::Forward)),
         _ => unreachable!(),
@@ -10078,6 +10496,317 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn navigation_controls_capture_visible_intent_and_reject_hidden_pages() {
+        let mut tabs = vec![
+            numbered_tab_fixture(7, "task-a"),
+            numbered_tab_fixture(8, "user"),
+        ];
+        tabs[0].loading = true;
+        let stop = navigation_control_target(&tabs, "task-a", Some(7), false, false).unwrap();
+        assert!(stop.stop);
+        assert_eq!(stop.tab, 7);
+        assert_eq!(stop.navigation_epoch, tabs[0].navigation_epoch);
+        tabs[0].loading = false;
+        let reload = navigation_control_target(&tabs, "task-a", Some(7), false, false).unwrap();
+        assert!(!reload.stop);
+        assert_ne!(stop, reload); // A displayed stop intent cannot become reload.
+        tabs[0].navigation_epoch += 1;
+        assert_ne!(
+            navigation_control_target(&tabs, "task-a", Some(7), false, false),
+            Some(reload),
+        );
+        for (overview, overlay) in [(true, false), (false, true), (true, true)] {
+            assert!(
+                navigation_control_target(&tabs, "task-a", Some(7), overview, overlay).is_none()
+            );
+        }
+        assert!(navigation_control_target(&tabs, "user", Some(7), false, false).is_none());
+        assert!(navigation_control_target(&tabs, "task-a", None, false, false).is_none());
+    }
+
+    #[test]
+    fn stop_address_hold_follows_only_its_current_page() {
+        let mut tab = numbered_tab_fixture(7, "task-a");
+        tab.loading = true;
+        let target =
+            navigation_control_target(std::slice::from_ref(&tab), "task-a", Some(7), false, false)
+                .unwrap();
+        let url = tab.url.clone();
+        // The synchronous hold admits ownership/stop epochs; only the runtime
+        // outcome below may make that protection survive the call.
+        tab.navigation_epoch += 2;
+        assert!(navigation_control_page_matches(
+            &target,
+            &url,
+            Some(&tab),
+            "task-a",
+            Some(7),
+            false
+        ));
+        assert!(!navigation_control_page_matches(
+            &target,
+            &url,
+            Some(&tab),
+            "user",
+            Some(7),
+            false
+        ));
+        assert!(!navigation_control_page_matches(
+            &target,
+            &url,
+            Some(&tab),
+            "task-a",
+            Some(8),
+            false
+        ));
+        assert!(!navigation_control_page_matches(
+            &target,
+            &url,
+            Some(&tab),
+            "task-a",
+            Some(7),
+            true
+        ));
+        tab.url = "https://example.invalid/new".into();
+        assert!(!navigation_control_page_matches(
+            &target,
+            &url,
+            Some(&tab),
+            "task-a",
+            Some(7),
+            false
+        ));
+    }
+
+    #[test]
+    fn navigation_address_rebase_needs_live_receipt_when_snapshot_is_skipped() {
+        let mut tab = numbered_tab_fixture(7, "task-a");
+        tab.loading = true;
+        let mut target =
+            navigation_control_target(std::slice::from_ref(&tab), "task-a", Some(7), false, false)
+                .unwrap();
+        let url = tab.url.clone();
+        let original = || AddressDraft {
+            tab: 7,
+            url: url.clone(),
+            navigation_epoch: 1,
+        };
+        let mut outcome = crate::browser::NavigationControlOutcome {
+            navigation_epoch: 3,
+            preserve_address: true,
+        };
+        // A loading-only callback can reject the native snapshot, leaving E
+        // or handoff's E+1 displayed. The same receipt also handles a fresh E+2.
+        for displayed_epoch in [1, 2, 3] {
+            tab.navigation_epoch = displayed_epoch;
+            let mut draft = original();
+            assert!(navigation_control_page_matches(
+                &target,
+                &url,
+                Some(&tab),
+                "task-a",
+                Some(7),
+                false
+            ));
+            assert!(!rebase_navigation_address(
+                &mut draft, &target, &url, &tab, &outcome, false
+            ));
+            assert_eq!(draft.navigation_epoch, 1);
+            assert!(rebase_navigation_address(
+                &mut draft, &target, &url, &tab, &outcome, true
+            ));
+            assert_eq!(tab.navigation_epoch, displayed_epoch);
+            assert!(!draft.superseded(7, &url, 3, false));
+            assert!(!rebase_navigation_address(
+                &mut draft, &target, &url, &tab, &outcome, true
+            ));
+            assert!(draft.superseded(7, &url, 4, false));
+        }
+        outcome.preserve_address = false;
+        let mut rejected = original();
+        assert!(!rebase_navigation_address(
+            &mut rejected,
+            &target,
+            &url,
+            &tab,
+            &outcome,
+            true
+        ));
+        assert_eq!(rejected.navigation_epoch, 1);
+        outcome.preserve_address = true;
+        outcome.navigation_epoch = 2;
+        assert!(!rebase_navigation_address(
+            &mut original(),
+            &target,
+            &url,
+            &tab,
+            &outcome,
+            true
+        ));
+        outcome.navigation_epoch = 3;
+        tab.url.push_str("/changed");
+        assert!(!rebase_navigation_address(
+            &mut original(),
+            &target,
+            &url,
+            &tab,
+            &outcome,
+            true
+        ));
+        tab.url = url.clone();
+        target.stop = false;
+        outcome.preserve_address = false; // A successful reload never supplies a receipt.
+        assert!(!rebase_navigation_address(
+            &mut original(),
+            &target,
+            &url,
+            &tab,
+            &outcome,
+            true
+        ));
+        // An actual reload navigation still expires the old address context.
+        assert!(!original().superseded(7, &url, 1, false));
+        assert!(original().superseded(7, &url, 2, false));
+    }
+
+    #[test]
+    fn handoff_failure_keeps_address_only_with_exact_runtime_evidence() {
+        let mut tab = numbered_tab_fixture(7, "task-a");
+        tab.loading = true;
+        let target =
+            navigation_control_target(std::slice::from_ref(&tab), "task-a", Some(7), false, false)
+                .unwrap();
+        let url = tab.url.clone();
+        let original = || AddressDraft {
+            tab: 7,
+            url: url.clone(),
+            navigation_epoch: target.navigation_epoch,
+        };
+        let failed = Err(crate::browser::NavigationControlError {
+            message: "창 포커스가 바뀌었습니다.".into(),
+            preserved_address: Some(crate::browser::NavigationControlOutcome {
+                navigation_epoch: target.navigation_epoch + 1,
+                preserve_address: true,
+            }),
+        });
+        let outcome = navigation_address_outcome(&failed).unwrap();
+        let mut draft = original();
+        // A missing or changed runtime receipt rejects the old displayed page.
+        assert!(!rebase_navigation_address(
+            &mut draft, &target, &url, &tab, outcome, false
+        ));
+        // A valid receipt preserves the draft even when sync skipped rendering
+        // after an unrelated loading callback and the handoff epoch is uncached.
+        assert!(rebase_navigation_address(
+            &mut draft, &target, &url, &tab, outcome, true
+        ));
+        assert!(!draft.superseded(7, &url, outcome.navigation_epoch, false));
+        tab.navigation_epoch = outcome.navigation_epoch;
+
+        let changed = Err(crate::browser::NavigationControlError {
+            message: "문서나 제어권이 바뀌었습니다.".into(),
+            preserved_address: None,
+        });
+        assert!(navigation_address_outcome(&changed).is_none());
+        assert!(original().superseded(7, &url, tab.navigation_epoch, false));
+        let reload_target = crate::browser::NavigationControlTarget {
+            stop: false,
+            ..target.clone()
+        };
+        let mut reload_draft = original();
+        assert!(rebase_navigation_address(
+            &mut reload_draft,
+            &reload_target,
+            &url,
+            &tab,
+            outcome,
+            true,
+        ));
+        assert!(!reload_draft.superseded(7, &url, tab.navigation_epoch, false));
+        // New edit metadata and a later same-URL page cannot be revived using
+        // the old call's failure evidence.
+        assert!(!rebase_navigation_address(
+            &mut draft, &target, &url, &tab, outcome, true
+        ));
+        tab.navigation_epoch += 1;
+        assert!(!rebase_navigation_address(
+            &mut original(),
+            &target,
+            &url,
+            &tab,
+            outcome,
+            true
+        ));
+    }
+
+    #[test]
+    fn opening_overlay_blocks_navigation_but_preserves_same_address_identity() {
+        let mut tab = numbered_tab_fixture(7, "task-a");
+        tab.loading = true;
+        let target =
+            navigation_control_target(std::slice::from_ref(&tab), "task-a", Some(7), false, false)
+                .unwrap();
+        let url = tab.url.clone();
+        assert!(
+            navigation_control_target(std::slice::from_ref(&tab), "task-a", Some(7), false, true)
+                .is_none()
+        );
+        assert!(navigation_control_page_matches(
+            &target,
+            &url,
+            Some(&tab),
+            "task-a",
+            Some(7),
+            false
+        ));
+        let failed = Err(crate::browser::NavigationControlError {
+            message: "패널이 열렸습니다.".into(),
+            preserved_address: Some(crate::browser::NavigationControlOutcome {
+                navigation_epoch: target.navigation_epoch + 1,
+                preserve_address: true,
+            }),
+        });
+        let mut draft = AddressDraft {
+            tab: 7,
+            url: url.clone(),
+            navigation_epoch: target.navigation_epoch,
+        };
+        tab.navigation_epoch += 1;
+        assert!(rebase_navigation_address(
+            &mut draft,
+            &target,
+            &url,
+            &tab,
+            navigation_address_outcome(&failed).unwrap(),
+            true
+        ));
+        assert!(!navigation_control_page_matches(
+            &target,
+            &url,
+            Some(&tab),
+            "user",
+            Some(7),
+            false
+        ));
+        assert!(!navigation_control_page_matches(
+            &target,
+            &url,
+            Some(&tab),
+            "task-a",
+            Some(8),
+            false
+        ));
+        assert!(!navigation_control_page_matches(
+            &target,
+            &url,
+            Some(&tab),
+            "task-a",
+            Some(7),
+            true
+        ));
     }
 
     #[test]

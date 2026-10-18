@@ -1,5 +1,6 @@
 use crate::capture::{MAX_CAPTURE_RESULT_BYTES, save_png_base64};
 use crate::control_panel::{ShellAction, ShellSnapshot, ShellTab};
+use crate::keyboard::{KeyPress, UNSUPPORTED_KEY_MESSAGE};
 use crate::page_find::{Request as FindRequest, State as FindState, Target as FindTarget};
 use crate::page_recovery::{PageFailure, PageRecoveryTarget};
 use crate::protocol::{self, Command, Request, Response, TaskScope, WaitUntil};
@@ -28,6 +29,8 @@ use std::{
 const DOM_BRIDGE: &str = include_str!("dom_bridge.js");
 const ACTION_TIMEOUT: Duration = Duration::from_secs(45);
 const MAX_CONNECTIONS: usize = 16;
+const MAX_FOCUS_LEASES: usize = 16;
+const FOCUS_ACK_TIMEOUT_MS: i64 = 5000;
 
 struct CommandPermit {
     outstanding: Arc<AtomicUsize>,
@@ -66,9 +69,24 @@ struct Reply {
     active: Arc<AtomicBool>,
     sender: Sender<Response>,
     scope: Option<TaskScope>,
+    focus_completion: Option<i32>,
+    frame_completion: Option<i32>,
 }
 impl Reply {
     fn send(&self, response: Response) {
+        if self.focus_completion.is_some() && defer_focus_reply(self, response.clone()) {
+            return;
+        }
+        self.send_after_focus(response);
+    }
+    fn send_after_focus(&self, response: Response) {
+        if let Some(tab) = self.frame_completion {
+            finish_frame_action_reply(tab, self, response);
+            return;
+        }
+        self.send_final(response);
+    }
+    fn send_final(&self, response: Response) {
         if self.active.swap(false, Ordering::AcqRel) {
             let _ = self.sender.send(response);
         }
@@ -237,6 +255,8 @@ struct Navigation {
     epoch: u64,
     // Main-document identity excludes provisional requests that become downloads.
     document_epoch: u64,
+    // A loading callback can change native chrome flags without navigating.
+    loading_event_revision: u64,
     // Explicit navigation/control changes invalidate a file's source link;
     // provisional attachment requests must not hide earlier source links.
     download_source_generation: u64,
@@ -525,8 +545,8 @@ impl Tab {
 #[derive(Clone)]
 enum ActionEvidence {
     Check,
-    Fill,
-    Press,
+    Fill(Shared<FillTarget>),
+    Press(Shared<PressTarget>),
     Click(Shared<ClickTarget>),
 }
 
@@ -534,14 +554,35 @@ impl ActionEvidence {
     fn for_command(command: &Command) -> Option<Self> {
         match command {
             Command::Check { .. } => Some(Self::Check),
-            Command::Fill { .. } => Some(Self::Fill),
-            Command::Press { .. } => Some(Self::Press),
-            Command::Click { reference, .. } => Some(Self::Click(Shared::new(ClickTarget {
+            Command::Fill {
+                reference, text, ..
+            }
+            | Command::Insert {
+                reference, text, ..
+            } => Some(Self::Fill(Shared::new(FillTarget {
                 reference: reference.clone(),
+                text: text.clone(),
+                insert: matches!(command, Command::Insert { .. }),
+                classification: RefCell::new(None),
+                observation: RefCell::new(None),
                 context: Cell::new(None),
-                point: Cell::new(None),
+                kind: Cell::new(None),
                 attempted: Cell::new(false),
+                native: Cell::new(matches!(command, Command::Insert { .. })),
+                binding: RefCell::new(None),
             }))),
+            Command::Press { reference, key, .. } => KeyPress::parse(key)
+                .map(|key| Self::Press(Shared::new(PressTarget::new(reference.clone(), key)))),
+            Command::Click { reference, .. } | Command::Hover { reference, .. } => {
+                Some(Self::Click(Shared::new(ClickTarget {
+                    reference: reference.clone(),
+                    hover: matches!(command, Command::Hover { .. }),
+                    context: Cell::new(None),
+                    point: Cell::new(None),
+                    local_point: Cell::new(None),
+                    attempted: Cell::new(false),
+                })))
+            }
             _ => None,
         }
     }
@@ -551,8 +592,8 @@ impl ActionEvidence {
             Self::Check if value["action"] == "check" => {
                 &["attempted", "trusted", "checked", "indeterminate"]
             }
-            Self::Fill if value["action"] == "fill" => &["attempted", "trusted"],
-            Self::Press if value["action"] == "press" => &["attempted"],
+            Self::Fill(target) if value["action"] == target.action() => &["attempted", "trusted"],
+            Self::Press(_) if value["action"] == "press" => &["attempted"],
             _ => &[],
         }
     }
@@ -566,14 +607,23 @@ enum Evaluation {
     },
     ReadyState {
         token: u64,
+        started: Instant,
     },
 }
 #[derive(Clone)]
 enum Step {
+    FrameInventory {
+        inventory: Shared<FrameInventory>,
+        session: Option<String>,
+        phase: FramePhase,
+    },
     Frame(String),
     World(String),
     Evaluate,
+    FillPreflight,
     ClickVerify,
+    FillVerify,
+    PressVerify,
     Screenshot(String),
     Input {
         batch: Shared<InputBatch>,
@@ -584,27 +634,59 @@ enum Step {
 struct Pending {
     tab: i32,
     epoch: u64,
+    frame: Option<Shared<FrameSnapshot>>,
     evaluation: Evaluation,
     reply: Reply,
     step: Step,
 }
 impl Pending {
+    fn session(&self) -> Option<&str> {
+        if matches!(&self.step, Step::Input { batch, .. } if batch.kind.is_pointer()) {
+            return None;
+        }
+        if let Some(frame) = &self.frame {
+            return frame.session_id();
+        }
+        match &self.step {
+            Step::FrameInventory { session, .. } => session.as_deref(),
+            _ => None,
+        }
+    }
+
     fn mutation_dispatched(&self) -> bool {
+        if let Step::FrameInventory { inventory, .. } = &self.step {
+            if (inventory.action.is_some() && inventory.response.borrow().is_some())
+                || inventory
+                    .pointer
+                    .as_ref()
+                    .is_some_and(|pointer| pointer.target.attempted.get())
+            {
+                return true;
+            }
+        }
         matches!(
             self.step,
-            Step::Evaluate | Step::ClickVerify | Step::Input { .. }
+            Step::Evaluate
+                | Step::ClickVerify
+                | Step::FillVerify
+                | Step::PressVerify
+                | Step::Input { .. }
         ) && matches!(self.evaluation, Evaluation::Page { mutation: true, .. })
     }
 
     fn input_preparation(&self) -> bool {
-        matches!(self.step, Step::Evaluate | Step::ClickVerify)
-            && matches!(
-                self.evaluation,
-                Evaluation::Page {
-                    evidence: Some(ActionEvidence::Press | ActionEvidence::Click(_)),
-                    ..
-                }
-            )
+        matches!(
+            self.step,
+            Step::Evaluate | Step::ClickVerify | Step::FillVerify | Step::PressVerify
+        ) && matches!(
+            self.evaluation,
+            Evaluation::Page {
+                evidence: Some(
+                    ActionEvidence::Press(_) | ActionEvidence::Click(_) | ActionEvidence::Fill(_)
+                ),
+                ..
+            }
+        )
     }
 
     fn outcome_details(&self) -> Json {
@@ -616,13 +698,44 @@ impl Pending {
             );
         } else if let Some(target) = self.click_target() {
             details["attempted"] = json!(target.attempted.get());
+        } else if let Some(target) = self.fill_target() {
+            // Before the bridge identifies its route, a legacy DOM setter may
+            // already have run. Preserve its previous unknown-outcome contract.
+            if target.native.get() {
+                details["attempted"] = json!(target.attempted.get());
+            }
+        } else if let Some(target) = self.press_target() {
+            details["attempted"] = json!(target.attempted.get());
         } else if self.input_preparation() {
             details["attempted"] = json!(false);
         }
         details
     }
 
+    fn fill_target(&self) -> Option<&Shared<FillTarget>> {
+        match &self.evaluation {
+            Evaluation::Page {
+                evidence: Some(ActionEvidence::Fill(target)),
+                ..
+            } => Some(target),
+            _ => None,
+        }
+    }
+
+    fn press_target(&self) -> Option<&Shared<PressTarget>> {
+        match &self.evaluation {
+            Evaluation::Page {
+                evidence: Some(ActionEvidence::Press(target)),
+                ..
+            } => Some(target),
+            _ => None,
+        }
+    }
+
     fn click_target(&self) -> Option<&Shared<ClickTarget>> {
+        if let Step::FrameInventory { inventory, .. } = &self.step {
+            return inventory.pointer.as_ref().map(|pointer| &pointer.target);
+        }
         match &self.evaluation {
             Evaluation::Page {
                 evidence: Some(ActionEvidence::Click(target)),
@@ -631,6 +744,171 @@ impl Pending {
             _ => None,
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FramePhase {
+    Enable,
+    Attach,
+    Tree,
+    RuntimeReset,
+    RuntimeEnable,
+    World,
+    Read,
+    RuntimeDisable,
+    ParentReset,
+    ParentEnable,
+    ParentWorld,
+    ParentOwner,
+    ParentResolve,
+    ParentInspect,
+    ParentRelease,
+    ParentDisable,
+    Action,
+    Pointer,
+}
+
+struct FrameRead {
+    frame: crate::frame_sessions::FrameRecord,
+    context: crate::frame_sessions::ContextTracker,
+    page: Option<Json>,
+    unavailable: Option<&'static str>,
+    parents: Vec<FrameParent>,
+    parent_index: usize,
+}
+
+struct CollectedFrame {
+    snapshot: Shared<FrameSnapshot>,
+    context: crate::frame_sessions::ContextTracker,
+}
+
+#[derive(Default)]
+struct PageRead {
+    remaining: crate::page_read::Budget,
+    queue: Vec<crate::frame_sessions::FrameRecord>,
+    next: usize,
+    documents: Vec<Json>,
+    unread: Vec<Json>,
+    collected: Vec<CollectedFrame>,
+    document_bytes: usize,
+    truncated: bool,
+}
+
+struct FrameParent {
+    child: String,
+    frame: crate::frame_sessions::FrameRecord,
+    context: crate::frame_sessions::ContextTracker,
+    backend_node: Option<u64>,
+    object: Option<String>,
+    object_group: Option<String>,
+    geometry: Option<crate::frame_pointer::Geometry>,
+}
+
+struct FrameSnapshot {
+    browser: Browser,
+    epoch: u64,
+    document_epoch: u64,
+    owner: Option<(TaskScope, Status)>,
+    frame: crate::frame_sessions::FrameRecord,
+    unique_context: String,
+    prefix: String,
+    document_id: String,
+    generation: u64,
+    references: BTreeSet<String>,
+    invalidated: Cell<bool>,
+}
+
+impl FrameSnapshot {
+    fn session_id(&self) -> Option<&str> {
+        self.frame.session_id.as_deref()
+    }
+    fn unique_context_id(&self) -> &str {
+        &self.unique_context
+    }
+    fn ref_prefix(&self) -> &str {
+        &self.prefix
+    }
+    fn binding(&self) -> Json {
+        json!({"documentId":self.document_id,"generation":self.generation})
+    }
+}
+
+struct FrameAction {
+    command: Command,
+    snapshot: Shared<FrameSnapshot>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FramePointerStage {
+    Geometry,
+    ParentGeometry,
+    Candidates,
+    ParentPoints,
+    Move,
+    ParentVerify,
+    Finish,
+}
+
+struct FramePointer {
+    target: Shared<ClickTarget>,
+    stage: Cell<FramePointerStage>,
+    scrolled: Cell<bool>,
+    rect: Cell<Option<crate::frame_pointer::Rect>>,
+    viewport: Cell<Option<crate::frame_pointer::Rect>>,
+    clip: Cell<Option<crate::frame_pointer::Rect>>,
+    candidates: RefCell<Vec<crate::frame_pointer::Candidate>>,
+    local_candidates: RefCell<Vec<crate::frame_pointer::Candidate>>,
+}
+
+impl FramePointer {
+    fn new(command: &Command) -> Option<Self> {
+        let ActionEvidence::Click(target) = ActionEvidence::for_command(command)? else {
+            return None;
+        };
+        Some(Self {
+            target,
+            stage: Cell::new(FramePointerStage::Geometry),
+            scrolled: Cell::new(false),
+            rect: Cell::new(None),
+            viewport: Cell::new(None),
+            clip: Cell::new(None),
+            candidates: RefCell::new(Vec::new()),
+            local_candidates: RefCell::new(Vec::new()),
+        })
+    }
+}
+
+struct FrameInventory {
+    browser: Browser,
+    document_epoch: u64,
+    owner: Option<(TaskScope, Status)>,
+    requested_frame: Option<String>,
+    page_read: Option<RefCell<PageRead>>,
+    action: Option<FrameAction>,
+    pointer: Option<FramePointer>,
+    response: RefCell<Option<Response>>,
+    read: RefCell<Option<FrameRead>>,
+    current: RefCell<(Option<String>, FramePhase)>,
+    invalidated: Cell<bool>,
+    visited: RefCell<BTreeSet<Option<String>>>,
+    frames: RefCell<Vec<crate::frame_sessions::FrameRecord>>,
+    truncated: Cell<bool>,
+}
+
+#[derive(Default)]
+struct FrameControl {
+    enabled: bool,
+    root_ready: bool,
+    active_token: Option<u64>,
+    active_inventory: Option<Shared<FrameInventory>>,
+    sessions: crate::frame_sessions::Registry,
+    cleanup: Option<i32>,
+    runtime_cleanup: Option<i32>,
+    object_cleanup: Option<i32>,
+    deferred_object_group: Option<String>,
+    root_runtime_enabled: bool,
+    cleanup_failed: bool,
+    snapshots: Vec<Shared<FrameSnapshot>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -654,20 +932,90 @@ impl ClickPoint {
 
 struct ClickTarget {
     reference: String,
+    hover: bool,
     context: Cell<Option<i64>>,
     point: Cell<Option<ClickPoint>>,
+    local_point: Cell<Option<ClickPoint>>,
     attempted: Cell<bool>,
 }
 
+impl ClickTarget {
+    fn action(&self) -> &'static str {
+        if self.hover { "hover" } else { "click" }
+    }
+}
+
+struct FillBinding {
+    browser: Browser,
+    document_epoch: u64,
+    owner: Option<(TaskScope, Status)>,
+}
+
+struct FillTarget {
+    reference: String,
+    text: String,
+    insert: bool,
+    classification: RefCell<Option<(String, String)>>,
+    observation: RefCell<Option<String>>,
+    context: Cell<Option<i64>>,
+    kind: Cell<Option<&'static str>>,
+    attempted: Cell<bool>,
+    native: Cell<bool>,
+    binding: RefCell<Option<FillBinding>>,
+}
+
+impl FillTarget {
+    fn action(&self) -> &'static str {
+        if self.insert { "insert" } else { "fill" }
+    }
+}
+
+struct PressTarget {
+    reference: String,
+    key: KeyPress,
+    context: Cell<Option<i64>>,
+    observation: RefCell<Option<String>>,
+    attempted: Cell<bool>,
+}
+
+impl PressTarget {
+    fn new(reference: String, key: KeyPress) -> Self {
+        Self {
+            reference,
+            key,
+            context: Cell::new(None),
+            observation: RefCell::new(None),
+            attempted: Cell::new(false),
+        }
+    }
+}
+
+fn native_fill_kind(value: &Json) -> Option<&'static str> {
+    match value.as_str()? {
+        "text" => Some("text"),
+        "search" => Some("search"),
+        "tel" => Some("tel"),
+        "url" => Some("url"),
+        "password" => Some("password"),
+        "textarea" => Some("textarea"),
+        "contenteditable" => Some("contenteditable"),
+        _ => None,
+    }
+}
+
 enum NativeInput {
-    Enter,
+    Key(Shared<PressTarget>),
+    Fill(Shared<FillTarget>),
     MouseMove(Shared<ClickTarget>),
     Click(ClickPoint),
 }
 
 impl NativeInput {
+    fn is_pointer(&self) -> bool {
+        matches!(self, Self::MouseMove(_) | Self::Click(_))
+    }
     fn count(&self) -> usize {
-        if matches!(self, Self::MouseMove(_)) {
+        if matches!(self, Self::MouseMove(_) | Self::Fill(_)) {
             1
         } else {
             2
@@ -675,22 +1023,43 @@ impl NativeInput {
     }
     fn prior_attempted(&self) -> bool {
         matches!(self, Self::Click(_))
+            || matches!(self, Self::Fill(target) if target.attempted.get())
+    }
+    fn verifies_after_input(&self) -> bool {
+        matches!(self, Self::MouseMove(_) | Self::Fill(_) | Self::Key(_))
+    }
+    fn allows_navigation(&self) -> bool {
+        matches!(self, Self::Key(_) | Self::Click(_))
     }
     fn method(&self) -> &'static str {
-        if matches!(self, Self::Enter) {
-            "Input.dispatchKeyEvent"
-        } else {
-            "Input.dispatchMouseEvent"
+        match self {
+            Self::Key(_) => "Input.dispatchKeyEvent",
+            Self::Fill(_) => "Input.insertText",
+            _ => "Input.dispatchMouseEvent",
         }
     }
     fn params(&self, part: usize) -> Json {
         match self {
-            Self::Enter => {
-                let mut params = json!({"type":if part == 0 {"keyDown"} else {"keyUp"},"key":"Enter","code":"Enter",
-                    "windowsVirtualKeyCode":13,"nativeVirtualKeyCode":0});
-                if part == 0 {
-                    params["text"] = json!("\r");
-                    params["unmodifiedText"] = json!("\r");
+            Self::Fill(target) => json!({"text":target.text}),
+            Self::Key(target) => {
+                let key = target.key;
+                let text = key.text();
+                let down = if text.is_some() {
+                    "keyDown"
+                } else {
+                    "rawKeyDown"
+                };
+                let mut params = json!({"type":if part == 0 {down} else {"keyUp"},
+                    "key":key.dom_key(),"code":key.code(),"windowsVirtualKeyCode":key.windows_virtual_key_code(),
+                    "nativeVirtualKeyCode":0,"modifiers":key.modifiers(),"autoRepeat":false,"isKeypad":false});
+                if part == 0
+                    && let Some(text) = text
+                {
+                    params["text"] = json!(text);
+                    params["unmodifiedText"] = json!(text);
+                }
+                if part == 0 && !key.editing_commands().is_empty() {
+                    params["commands"] = json!(key.editing_commands());
                 }
                 params
             }
@@ -709,14 +1078,16 @@ impl NativeInput {
     }
     fn success_page(&self) -> Json {
         match self {
-            Self::Enter => json!({"ok":true,"action":"press","key":"Enter","input":"chromium",
-                "attempted":true,"dispatchAcknowledged":true,
-                "detail":"Chromium acknowledged Enter keyDown and keyUp; read again to verify effects."}),
+            Self::Key(target) => {
+                json!({"ok":true,"action":"press","key":target.key.canonical(),"input":"chromium",
+                "attempted":true,"dispatchAcknowledged":true,"keydownTarget":"unconfirmed",
+                "detail":"Chromium acknowledged the keys, but the target observation is unavailable. Read again to verify effects; do not automatically repeat the action."})
+            }
             Self::Click(_) => json!({"ok":true,"action":"click","input":"chromium",
                 "attempted":true,"dispatchAcknowledged":true,
                 "detail":"Chromium acknowledged mousePressed and mouseReleased; read again to verify effects."}),
-            Self::MouseMove(_) => {
-                unreachable!("a pointer move must be verified before completing a click")
+            Self::MouseMove(_) | Self::Fill(_) => {
+                unreachable!("intermediate input must be verified before completing the action")
             }
         }
     }
@@ -741,12 +1112,100 @@ struct InputBatch {
     kind: NativeInput,
     tab: i32,
     epoch: u64,
+    frame: Option<Shared<FrameSnapshot>>,
     // Retain the original browser until both parts finish; raw identity cannot
     // be recycled while a late callback is being checked.
     browser: Browser,
     reply: Reply,
     progress: RefCell<InputProgress>,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FocusPhase {
+    Enabling,
+    Active,
+    Disabling,
+    Failed,
+}
+
+struct FocusMessage {
+    id: i32,
+    started: bool,
+    sending: bool,
+    accepted: Option<bool>,
+    acknowledged: Option<bool>,
+}
+
+impl FocusMessage {
+    fn new(id: i32) -> Self {
+        Self {
+            id,
+            started: false,
+            sending: true,
+            accepted: None,
+            acknowledged: None,
+        }
+    }
+    fn finished(&self) -> Option<bool> {
+        if self.sending {
+            return None;
+        }
+        if self.accepted == Some(false) {
+            return Some(false);
+        }
+        (self.accepted == Some(true))
+            .then_some(self.acknowledged)
+            .flatten()
+    }
+}
+
+enum FocusContinuation {
+    Dispatch {
+        method: String,
+        params: Json,
+        pending: Pending,
+    },
+    Verify(Shared<InputBatch>),
+    Respond {
+        reply: Reply,
+        response: Response,
+    },
+}
+
+struct FocusLease {
+    browser: Browser,
+    session: Option<String>,
+    token: u64,
+    reply: Reply,
+    evidence: Option<ActionEvidence>,
+    attempted: bool,
+    phase: FocusPhase,
+    enable: FocusMessage,
+    disable: Option<FocusMessage>,
+    disable_after_enable: bool,
+    initial: Option<FocusContinuation>,
+    after: Option<FocusContinuation>,
+    stop_frames: bool,
+    started: Instant,
+}
+
+impl FocusLease {
+    fn attempted(&self) -> bool {
+        self.attempted
+            || match &self.evidence {
+                Some(ActionEvidence::Press(target)) => target.attempted.get(),
+                Some(ActionEvidence::Fill(target)) => target.attempted.get(),
+                _ => false,
+            }
+    }
+    fn failure(&self, code: &str, message: &str, cleanup: &str) -> Response {
+        Response::error(&self.reply.id, code, message).with_details(json!({
+            "attempted":self.attempted(),"outcomeUnknown":self.attempted(),
+            "focusCleanup":cleanup
+        }))
+    }
+}
+#[derive(Clone)]
 struct Waiter {
     tab: i32,
     until: WaitUntil,
@@ -780,9 +1239,8 @@ fn reserve_preview(
     {
         return None;
     }
+    let id = state.next_control_message()?;
     state.preview_attempted.insert(key.clone());
-    state.next_message += 1;
-    let id = state.next_message;
     state.captures.insert(id, key.1);
     state.previews.insert(
         id,
@@ -872,17 +1330,8 @@ pub fn request_space_previews() {
             .min(1.0);
         let params = json!({"format":"png","captureBeyondViewport":false,
             "clip":{"x":0,"y":0,"width":bounds.width,"height":bounds.height,"scale":scale}});
-        let mut dictionary = parse_json(
-            Some(&CefString::from(params.to_string().as_str())),
-            JsonParserOptions::default(),
-        )
-        .and_then(|value| value.dictionary());
         let accepted = browser.host().is_some_and(|host| {
-            host.execute_dev_tools_method(
-                id,
-                Some(&CefString::from("Page.captureScreenshot")),
-                dictionary.as_mut(),
-            ) != 0
+            send_root_command(&host, id, "Page.captureScreenshot", &params) == id
         });
         if !accepted {
             complete_preview(id, false, b"{}");
@@ -998,6 +1447,12 @@ fn link_is_current(state: &State, link: &LinkCreation) -> bool {
 
 #[derive(Default)]
 struct State {
+    // A lease survives removal of Pending/Reply ownership. At most one per tab;
+    // failed cleanup remains bounded and blocks further page actions until an
+    // exact late disable ACK or destruction of the control connection.
+    focus_leases: BTreeMap<i32, FocusLease>,
+    focus_watchdog_queued: bool,
+    frame_controls: BTreeMap<i32, FrameControl>,
     closed_pages: crate::closed_pages::ClosedPages,
     page_find: FindState,
     previews: BTreeMap<i32, PreviewRequest>,
@@ -1013,6 +1468,13 @@ struct State {
     creations: ResourceBudget,
     waits: BTreeMap<u64, Waiter>,
     next_message: i32,
+}
+impl State {
+    fn next_control_message(&mut self) -> Option<i32> {
+        let id = self.next_message.checked_add(1)?;
+        self.next_message = id;
+        Some(id)
+    }
 }
 thread_local! { static STATE: RefCell<State> = RefCell::new(State::default()); }
 
@@ -1342,67 +1804,213 @@ pub(crate) fn download_host(tab: i32, scope: Option<&TaskScope>) -> Result<Brows
         .ok_or_else(|| "다운로드를 요청한 탭을 사용할 수 없습니다.".into())
 }
 
-pub fn shell_snapshot() -> ShellSnapshot {
-    STATE.with(|state| {
-        let state = state.borrow();
-        let spaces = state.spaces.views();
-        ShellSnapshot {
-            active_space: state.spaces.active_space().to_owned(),
-            active_tab: state.spaces.active_tab(),
-            overview: state.spaces.overview(),
-            tabs: spaces
-                .iter()
-                .flat_map(|space| space.tabs.iter())
-                .filter_map(|id| state.tabs.get(id).map(|tab| (id, tab)))
-                .filter(|(_, tab)| !tab.rejected_creation)
-                .map(|(id, tab)| {
-                    let task = state
-                        .tasks
-                        .owner(*id)
-                        .and_then(|(task, _)| state.tasks.info(&task).ok());
-                    let task_status = task
-                        .as_ref()
-                        .map(|task| {
-                            format!(
-                                "{}, {}",
-                                task.name,
-                                match task.status {
-                                    Status::Active => "AI 제어 중",
-                                    Status::Paused => "중지됨, 직접 사용 가능",
-                                    Status::Finishing => "작업 마무리 중",
-                                    Status::Finished => "직접 사용 중",
-                                }
-                            )
-                        })
-                        .unwrap_or_else(|| "직접 사용 중".into());
-                    let stop_scope =
-                        task.filter(|task| task.status == Status::Active)
-                            .map(|task| TaskScope {
-                                task: task.id,
-                                revision: task.revision,
-                            });
-                    let loading = tab.browser.is_loading() != 0;
-                    ShellTab {
-                        id: *id,
-                        navigation_epoch: tab.navigation.epoch,
-                        space: state.spaces.tab_space(*id).unwrap_or(USER_SPACE).to_owned(),
-                        title: tab.title.chars().take(120).collect(),
-                        url: tab.navigation.requested_url.clone(),
-                        can_go_back: tab.browser.can_go_back() != 0,
-                        can_go_forward: tab.browser.can_go_forward() != 0,
-                        loading,
-                        crashed: tab.navigation.renderer_exit.is_some(),
-                        audio_muted: tab.audio_muted,
-                        failure: tab.navigation.page_failure(loading),
-                        start_page: tab.start_page_ready(loading),
-                        task_status,
-                        stop_scope,
-                    }
-                })
-                .collect(),
-            spaces,
-        }
+thread_local! { static SHELL_SNAPSHOT_READING: Cell<bool> = const { Cell::new(false) }; }
+
+struct ShellSnapshotRead;
+impl ShellSnapshotRead {
+    fn acquire() -> Option<Self> {
+        SHELL_SNAPSHOT_READING.with(|reading| {
+            if reading.replace(true) {
+                None
+            } else {
+                Some(Self)
+            }
+        })
+    }
+}
+impl Drop for ShellSnapshotRead {
+    fn drop(&mut self) {
+        SHELL_SNAPSHOT_READING.with(|reading| reading.set(false));
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ShellProbe {
+    Loading,
+    Back,
+    Forward,
+}
+
+struct ShellObservation {
+    tab: i32,
+    browser: Browser,
+    epoch: u64,
+    document_epoch: u64,
+    loading_revision: u64,
+    loading: bool,
+    back: bool,
+    forward: bool,
+}
+
+fn shell_observation_matches(state: &State, sample: &ShellObservation) -> bool {
+    state.tabs.get(&sample.tab).is_some_and(|tab| {
+        !tab.rejected_creation
+            && tab.browser.get_raw() == sample.browser.get_raw()
+            && tab.navigation.epoch == sample.epoch
+            && tab.navigation.document_epoch == sample.document_epoch
+            && tab.navigation.loading_event_revision == sample.loading_revision
     })
+}
+
+fn shell_observation_current(sample: &ShellObservation) -> bool {
+    STATE.with(|slot| {
+        slot.try_borrow()
+            .is_ok_and(|state| shell_observation_matches(&state, sample))
+    })
+}
+
+fn shell_snapshot_with(
+    mut probe: impl FnMut(&Browser, ShellProbe) -> bool,
+) -> Option<ShellSnapshot> {
+    let mut read = || -> Option<ShellSnapshot> {
+        let _reading = ShellSnapshotRead::acquire()?;
+        let mut samples = STATE.with(|slot| {
+            let state = slot.try_borrow().ok()?;
+            Some(
+                state
+                    .tabs
+                    .iter()
+                    .filter(|(_, tab)| !tab.rejected_creation)
+                    .map(|(id, tab)| {
+                        (
+                            *id,
+                            ShellObservation {
+                                tab: *id,
+                                browser: tab.browser.clone(),
+                                epoch: tab.navigation.epoch,
+                                document_epoch: tab.navigation.document_epoch,
+                                loading_revision: tab.navigation.loading_event_revision,
+                                loading: false,
+                                back: false,
+                                forward: false,
+                            },
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>(),
+            )
+        })?;
+        for sample in samples.values_mut() {
+            for kind in [ShellProbe::Loading, ShellProbe::Back, ShellProbe::Forward] {
+                if !shell_observation_current(sample) {
+                    return None;
+                }
+                // Even read-only CEF getters can reenter. No STATE borrow is
+                // retained, and an invalidated sample never reaches the next getter.
+                let value = probe(&sample.browser, kind);
+                if !shell_observation_current(sample) {
+                    return None;
+                }
+                match kind {
+                    ShellProbe::Loading => sample.loading = value,
+                    ShellProbe::Back => sample.back = value,
+                    ShellProbe::Forward => sample.forward = value,
+                }
+            }
+        }
+        STATE.with(|slot| {
+            let state = slot.try_borrow().ok()?;
+            // A later tab's getter can invalidate an earlier observation or
+            // create a tab. Never publish a partial or mixed-generation list.
+            if state
+                .tabs
+                .values()
+                .filter(|tab| !tab.rejected_creation)
+                .count()
+                != samples.len()
+                || samples
+                    .values()
+                    .any(|sample| !shell_observation_matches(&state, sample))
+            {
+                return None;
+            }
+            let spaces = state.spaces.views();
+            Some(ShellSnapshot {
+                active_space: state.spaces.active_space().to_owned(),
+                active_tab: state.spaces.active_tab(),
+                overview: state.spaces.overview(),
+                tabs: spaces
+                    .iter()
+                    .flat_map(|space| space.tabs.iter())
+                    .filter_map(|id| state.tabs.get(id).map(|tab| (id, tab)))
+                    .filter(|(_, tab)| !tab.rejected_creation)
+                    .map(|(id, tab)| {
+                        let sample = &samples[id];
+                        let task = state
+                            .tasks
+                            .owner(*id)
+                            .and_then(|(task, _)| state.tasks.info(&task).ok());
+                        let task_status = task
+                            .as_ref()
+                            .map(|task| {
+                                format!(
+                                    "{}, {}",
+                                    task.name,
+                                    match task.status {
+                                        Status::Active => "AI 제어 중",
+                                        Status::Paused => "중지됨, 직접 사용 가능",
+                                        Status::Finishing => "작업 마무리 중",
+                                        Status::Finished => "직접 사용 중",
+                                    }
+                                )
+                            })
+                            .unwrap_or_else(|| "직접 사용 중".into());
+                        let stop_scope =
+                            task.filter(|task| task.status == Status::Active)
+                                .map(|task| TaskScope {
+                                    task: task.id,
+                                    revision: task.revision,
+                                });
+                        let loading = sample.loading
+                            || tab.navigation.provisional
+                            || tab.navigation.intent_pending;
+                        ShellTab {
+                            id: *id,
+                            navigation_epoch: tab.navigation.epoch,
+                            space: state.spaces.tab_space(*id).unwrap_or(USER_SPACE).to_owned(),
+                            title: tab.title.chars().take(120).collect(),
+                            url: tab.navigation.requested_url.clone(),
+                            can_go_back: sample.back,
+                            can_go_forward: sample.forward,
+                            loading,
+                            crashed: tab.navigation.renderer_exit.is_some(),
+                            audio_muted: tab.audio_muted,
+                            failure: tab.navigation.page_failure(loading),
+                            start_page: tab.start_page_ready(loading),
+                            task_status,
+                            stop_scope,
+                        }
+                    })
+                    .collect(),
+                spaces,
+            })
+        })
+    };
+    let snapshot = read();
+    if snapshot.is_none() {
+        notify_panel();
+    }
+    snapshot
+}
+
+pub fn shell_snapshot() -> Option<ShellSnapshot> {
+    shell_snapshot_with(|browser, kind| match kind {
+        ShellProbe::Loading => browser.is_loading() != 0,
+        ShellProbe::Back => browser.can_go_back() != 0,
+        ShellProbe::Forward => browser.can_go_forward() != 0,
+    })
+}
+
+fn observe_loading_state(tab: i32, loading: bool) {
+    STATE.with(|slot| {
+        if let Some(tab) = slot.borrow_mut().tabs.get_mut(&tab) {
+            tab.navigation.loading_event_revision =
+                tab.navigation.loading_event_revision.wrapping_add(1);
+            if !loading {
+                tab.navigation.finish_loading();
+                tab.navigation.history.attempt = None;
+            }
+        }
+    });
 }
 
 fn native_reply() -> (Reply, mpsc::Receiver<Response>) {
@@ -1414,6 +2022,8 @@ fn native_reply() -> (Reply, mpsc::Receiver<Response>) {
             active: Arc::new(AtomicBool::new(true)),
             sender,
             scope: None,
+            focus_completion: None,
+            frame_completion: None,
         },
         receiver,
     )
@@ -2746,14 +3356,357 @@ pub(crate) fn validate_failed_page_target(target: &PageRecoveryTarget) -> Result
 
 pub(crate) fn retry_failed_page(target: &PageRecoveryTarget) -> Result<(), String> {
     validate_failed_page_target(target)?;
-    // Address correction remains available for a terminated renderer whose
-    // loading flag lags. Retry must not enter Reload's loading-stop toggle.
-    if recovery_loading(target.tab)? {
-        return Err("페이지가 아직 로딩 중입니다. 잠시 후 다시 시도해 주세요.".into());
+    control_navigation(
+        &NavigationControlTarget {
+            tab: target.tab,
+            space: target.space.clone(),
+            navigation_epoch: target.navigation_epoch,
+            stop: false,
+        },
+        || true,
+        || true,
+    )
+    .map(|_| ())
+    .map_err(|error| error.message)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NavigationControlTarget {
+    pub tab: i32,
+    pub space: String,
+    pub navigation_epoch: u64,
+    pub stop: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NavigationControlOutcome {
+    pub navigation_epoch: u64,
+    pub preserve_address: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NavigationControlError {
+    pub message: String,
+    pub preserved_address: Option<NavigationControlOutcome>,
+}
+
+struct NavigationControlGuard {
+    tab: i32,
+    browser: Browser,
+    epoch: u64,
+    document_epoch: u64,
+    owner: Option<(TaskScope, Status)>,
+    // CLI stop can target a background tab; native controls must stay selected.
+    space: Option<String>,
+}
+
+const NAVIGATION_CONTROL_CHANGED: &str = "페이지 상태가 바뀌었습니다. 현재 페이지를 확인해 주세요.";
+
+fn navigation_control_guard(
+    state: &State,
+    tab: i32,
+    target: Option<&NavigationControlTarget>,
+) -> Result<NavigationControlGuard, String> {
+    let page = state
+        .tabs
+        .get(&tab)
+        .filter(|page| !page.rejected_creation)
+        .ok_or_else(|| NAVIGATION_CONTROL_CHANGED.to_owned())?;
+    let guard = NavigationControlGuard {
+        tab,
+        browser: page.browser.clone(),
+        epoch: target.map_or(page.navigation.epoch, |target| target.navigation_epoch),
+        document_epoch: page.navigation.document_epoch,
+        owner: link_owner(&state.tasks, tab),
+        space: target.map(|target| target.space.clone()),
+    };
+    if navigation_control_matches(state, &guard) {
+        Ok(guard)
+    } else {
+        Err(NAVIGATION_CONTROL_CHANGED.into())
     }
-    // The native Reload path hands off only this tab's current AI owner and
-    // preserves browser-level renderer recovery without requiring a live frame.
-    shell_action(ShellAction::Reload(target.tab))
+}
+
+fn navigation_control_matches(state: &State, guard: &NavigationControlGuard) -> bool {
+    (guard.space.is_none() || !state.spaces.overview()) && navigation_address_matches(state, guard)
+}
+
+// Losing chrome focus or opening an overlay blocks a command, but does not
+// change the document to which an existing address draft belongs.
+fn navigation_address_matches(state: &State, guard: &NavigationControlGuard) -> bool {
+    guard.space.as_ref().is_none_or(|space| {
+        state.spaces.active_tab() == Some(guard.tab)
+            && state.spaces.active_space() == space
+            && state.spaces.tab_space(guard.tab) == Some(space.as_str())
+    }) && link_owner(&state.tasks, guard.tab) == guard.owner
+        && state.tabs.get(&guard.tab).is_some_and(|page| {
+            !page.rejected_creation
+                && page.browser.get_raw() == guard.browser.get_raw()
+                && page.navigation.epoch == guard.epoch
+                && page.navigation.document_epoch == guard.document_epoch
+        })
+}
+
+// Short-lived proof spanning the shell's optional snapshot refresh. Keep this
+// opaque so UI code cannot manufacture a new document/owner identity.
+pub(crate) struct NavigationAddressReceipt {
+    guard: NavigationControlGuard,
+    url: String,
+}
+
+pub(crate) fn capture_navigation_address_receipt(
+    target: &NavigationControlTarget,
+    url: &str,
+    outcome: &NavigationControlOutcome,
+) -> Option<NavigationAddressReceipt> {
+    if !outcome.preserve_address {
+        return None;
+    }
+    STATE.with(|slot| {
+        let state = slot.try_borrow().ok()?;
+        let mut guard = navigation_control_guard(&state, target.tab, None).ok()?;
+        guard.space = Some(target.space.clone());
+        guard.epoch = outcome.navigation_epoch;
+        if !navigation_address_matches(&state, &guard)
+            || state.tabs[&target.tab].navigation.requested_url != url
+        {
+            return None;
+        }
+        Some(NavigationAddressReceipt {
+            guard,
+            url: url.to_owned(),
+        })
+    })
+}
+
+pub(crate) fn navigation_address_receipt_current(receipt: &NavigationAddressReceipt) -> bool {
+    STATE.with(|slot| {
+        slot.try_borrow().is_ok_and(|state| {
+            navigation_address_matches(&state, &receipt.guard)
+                && state.tabs[&receipt.guard.tab].navigation.requested_url == receipt.url
+        })
+    })
+}
+
+fn navigation_control_current(
+    guard: &NavigationControlGuard,
+    still_current: &impl Fn() -> bool,
+) -> Result<(), String> {
+    // This predicate is pure UI state. Native window/IME getters run only in
+    // native_ready, before the final CEF loading sample.
+    if still_current() && STATE.with(|slot| navigation_control_matches(&slot.borrow(), guard)) {
+        Ok(())
+    } else {
+        Err(NAVIGATION_CONTROL_CHANGED.into())
+    }
+}
+
+fn navigation_control_needed(
+    guard: &NavigationControlGuard,
+    stop: bool,
+    loading: bool,
+) -> Result<bool, String> {
+    STATE.with(|slot| {
+        let state = slot.borrow();
+        if !navigation_control_matches(&state, guard) {
+            return Err(NAVIGATION_CONTROL_CHANGED.into());
+        }
+        let nav = &state.tabs[&guard.tab].navigation;
+        let busy = loading || nav.provisional || nav.intent_pending;
+        if stop {
+            // `stopped` can outlive this load. A later live resource load must
+            // still be stoppable; only an outstanding stop is idempotent.
+            Ok(busy && !nav.stop_pending)
+        } else if busy || nav.stop_pending || nav.recovering {
+            Err("페이지가 아직 로딩 중입니다. 중지하거나 로딩이 끝난 뒤 다시 시도해 주세요.".into())
+        } else {
+            Ok(true)
+        }
+    })
+}
+
+fn navigation_control_inspect(
+    guard: &NavigationControlGuard,
+    native_ready: &impl Fn() -> bool,
+    still_current: &impl Fn() -> bool,
+    inspect: &mut impl FnMut(&Browser) -> (bool, bool),
+) -> Result<bool, String> {
+    navigation_control_current(guard, still_current)?;
+    if !native_ready() {
+        return Err(NAVIGATION_CONTROL_CHANGED.into());
+    }
+    navigation_control_current(guard, still_current)?;
+    let (valid, loading) = inspect(&guard.browser);
+    navigation_control_current(guard, still_current)?;
+    if !valid {
+        return Err(NAVIGATION_CONTROL_CHANGED.into());
+    }
+    Ok(loading)
+}
+
+fn clear_navigation_controls(
+    guard: &NavigationControlGuard,
+    still_current: &impl Fn() -> bool,
+) -> Result<(), String> {
+    navigation_control_current(guard, still_current)?;
+    abort_focus_lease(
+        guard.tab,
+        "PAGE_CHANGED",
+        "Navigation control changed during input; inspect before retrying.",
+        true,
+    );
+    navigation_control_current(guard, still_current)?;
+    revoke_download_permission_provenance(guard.tab);
+    crate::download_permission_runtime::cancel_tab(guard.tab);
+    navigation_control_current(guard, still_current)?;
+    invalidate_page_find(guard.tab);
+    navigation_control_current(guard, still_current)
+}
+
+// Inspection, cleanup and dispatch are injected only at the native boundary so
+// state/ownership transitions can be exercised without starting Chromium.
+fn execute_navigation_control(
+    mut guard: NavigationControlGuard,
+    stop: bool,
+    native_ready: impl Fn() -> bool,
+    still_current: impl Fn() -> bool,
+    mut inspect: impl FnMut(&Browser) -> (bool, bool),
+    mut cleanup: impl FnMut(&NavigationControlGuard) -> Result<(), String>,
+    send: impl FnOnce(&Browser, bool),
+) -> Result<NavigationControlOutcome, NavigationControlError> {
+    let operation = (|| -> Result<NavigationControlOutcome, String> {
+        let loading =
+            navigation_control_inspect(&guard, &native_ready, &still_current, &mut inspect)?;
+        if !navigation_control_needed(&guard, stop, loading)? {
+            return Ok(NavigationControlOutcome {
+                navigation_epoch: guard.epoch,
+                preserve_address: stop,
+            });
+        }
+        if let Some((scope, Status::Active)) = guard.owner.clone() {
+            let epoch = guard
+                .epoch
+                .checked_add(1)
+                .ok_or(NAVIGATION_CONTROL_CHANGED)?;
+            let revision = scope
+                .revision
+                .checked_add(1)
+                .ok_or(NAVIGATION_CONTROL_CHANGED)?;
+            handoff_native(scope.clone())?;
+            guard.epoch = epoch;
+            guard.owner = Some((TaskScope { revision, ..scope }, Status::Paused));
+            navigation_control_current(&guard, &still_current)?;
+        }
+        // Handoff and native cleanup can synchronously finish, replace or navigate
+        // a page. Re-read loading and validate the original identity after each.
+        let loading =
+            navigation_control_inspect(&guard, &native_ready, &still_current, &mut inspect)?;
+        if !navigation_control_needed(&guard, stop, loading)? {
+            return Ok(NavigationControlOutcome {
+                navigation_epoch: guard.epoch,
+                preserve_address: stop,
+            });
+        }
+        cleanup(&guard)?;
+        let loading =
+            navigation_control_inspect(&guard, &native_ready, &still_current, &mut inspect)?;
+        if !navigation_control_needed(&guard, stop, loading)? {
+            return Ok(NavigationControlOutcome {
+                navigation_epoch: guard.epoch,
+                preserve_address: stop,
+            });
+        }
+        let next_epoch = guard
+            .epoch
+            .checked_add(1)
+            .ok_or(NAVIGATION_CONTROL_CHANGED)?;
+        let history_generation = crate::history_runtime::generation();
+        STATE.with(|slot| {
+            let mut state = slot.borrow_mut();
+            if !navigation_control_matches(&state, &guard) {
+                return Err(NAVIGATION_CONTROL_CHANGED.to_owned());
+            }
+            let history_generation =
+                history_generation.filter(|_| is_unowned_user_tab(&state, guard.tab));
+            let nav = &mut state.tabs.get_mut(&guard.tab).unwrap().navigation;
+            if stop {
+                nav.epoch = next_epoch;
+                nav.automatic_retry_error = None;
+                nav.history.revoke();
+                nav.stopped = true;
+                nav.stop_pending = true;
+            } else {
+                nav.begin(None);
+                nav.history.begin(history_generation, true);
+            }
+            Ok(())
+        })?;
+        guard.epoch = next_epoch;
+        // No native getter or UI callback between reservation and transmission.
+        send(&guard.browser, stop);
+        // The request was sent even if its synchronous callback navigated or closed
+        // the page. Such a callback must not authorize rebasing an old address draft.
+        Ok(NavigationControlOutcome {
+            navigation_epoch: guard.epoch,
+            preserve_address: false,
+        })
+    })();
+    // Only the exact original page and our own expected epochs authorize a
+    // draft rebase. This is separate from whether chrome still permits input.
+    let preserve_address = (stop || operation.is_err())
+        && STATE.with(|slot| navigation_address_matches(&slot.borrow(), &guard));
+    match operation {
+        Ok(mut outcome) => {
+            outcome.preserve_address = preserve_address;
+            Ok(outcome)
+        }
+        Err(message) => Err(NavigationControlError {
+            message,
+            preserved_address: preserve_address.then_some(NavigationControlOutcome {
+                navigation_epoch: guard.epoch,
+                preserve_address: true,
+            }),
+        }),
+    }
+}
+
+fn native_navigation_control(
+    guard: NavigationControlGuard,
+    stop: bool,
+    native_ready: impl Fn() -> bool,
+    still_current: impl Fn() -> bool,
+) -> Result<NavigationControlOutcome, NavigationControlError> {
+    execute_navigation_control(
+        guard,
+        stop,
+        native_ready,
+        &still_current,
+        |browser| (browser.is_valid() != 0, browser.is_loading() != 0),
+        |guard| clear_navigation_controls(guard, &still_current),
+        |browser, stop| {
+            if stop {
+                browser.stop_load()
+            } else {
+                browser.reload()
+            }
+        },
+    )
+}
+
+pub(crate) fn control_navigation(
+    target: &NavigationControlTarget,
+    native_ready: impl Fn() -> bool,
+    still_current: impl Fn() -> bool,
+) -> Result<NavigationControlOutcome, NavigationControlError> {
+    let guard = STATE
+        .with(|slot| navigation_control_guard(&slot.borrow(), target.tab, Some(target)))
+        .map_err(|message| NavigationControlError {
+            message,
+            preserved_address: None,
+        })?;
+    let result = native_navigation_control(guard, target.stop, native_ready, still_current);
+    notify_panel();
+    result
 }
 
 fn validate_start_page_state(
@@ -2874,7 +3827,6 @@ pub fn shell_action(action: ShellAction) -> Result<(), String> {
     let command = match action {
         ShellAction::Back(tab) => Command::Back { tab },
         ShellAction::Forward(tab) => Command::Forward { tab },
-        ShellAction::Reload(tab) => Command::Reload { tab },
         ShellAction::Navigate(tab, url) => Command::Navigate { tab, url },
         ShellAction::CloseTab(tab) => Command::Close { tab },
         _ => unreachable!(),
@@ -2901,11 +3853,6 @@ pub fn shell_action(action: ShellAction) -> Result<(), String> {
                 .map(|tab| tab.browser.clone())
         })
         .ok_or("The tab has closed.")?;
-    if matches!(command, Command::Reload { .. }) && browser.is_loading() != 0 {
-        stop_loading(&browser);
-        notify_panel();
-        return Ok(());
-    }
     // These are explicit human actions in trusted native chrome. A paused task
     // must not prevent its user from browsing. CLI authorization stays in handle.
     if matches!(command, Command::Close { .. }) {
@@ -2916,7 +3863,7 @@ pub fn shell_action(action: ShellAction) -> Result<(), String> {
         return Ok(());
     }
     let (reply, receiver) = native_reply();
-    navigate(&browser, &command, reply);
+    navigate(&browser, &command, reply, ObservationAccess::Native);
     notify_panel();
     native_result(receiver)
 }
@@ -2981,11 +3928,162 @@ pub fn focus_tab(id: i32) {
     }
 }
 
-fn tab_info(tab: &Tab) -> Json {
-    json!({"tab":tab.browser.identifier(),"title":tab.title,
-    "url":tab.browser.main_frame().map(|f| CefString::from(&f.url()).to_string()).unwrap_or_default(),
-    "loading":tab.browser.is_loading()!=0,
-    "canGoBack":tab.browser.can_go_back()!=0,"canGoForward":tab.browser.can_go_forward()!=0,
+#[derive(Clone, Copy)]
+enum ObservationAccess {
+    Tab,
+    List,
+    Native,
+}
+
+struct TabObservation {
+    sample: ShellObservation,
+    owner: Option<(TaskScope, Status)>,
+    access: ObservationAccess,
+    native_space: Option<String>,
+    frame: Option<Frame>,
+    url: String,
+}
+
+const OBSERVATION_CHANGED: TaskError = TaskError {
+    code: "PAGE_CHANGED",
+    message: "The page changed while its state was being read. Inspect again.",
+};
+
+fn observation_access(
+    state: &State,
+    reply: &Reply,
+    tab: i32,
+    access: ObservationAccess,
+) -> Result<(), TaskError> {
+    if !reply.active.load(Ordering::Acquire) {
+        return Err(TaskError {
+            code: "COMMAND_CANCELED",
+            message: "The request is no longer active.",
+        });
+    }
+    match access {
+        ObservationAccess::Native => Ok(()),
+        ObservationAccess::List if reply.scope.is_none() => Ok(()),
+        _ => state.tasks.check_tab(reply.scope.as_ref(), tab),
+    }
+}
+
+fn observation_matches(
+    state: &State,
+    reply: &Reply,
+    observation: &TabObservation,
+) -> Result<(), TaskError> {
+    observation_access(state, reply, observation.sample.tab, observation.access)?;
+    if !shell_observation_matches(state, &observation.sample)
+        || link_owner(&state.tasks, observation.sample.tab) != observation.owner
+        || observation.native_space.as_ref().is_some_and(|space| {
+            state.spaces.overview()
+                || state.spaces.active_tab() != Some(observation.sample.tab)
+                || state.spaces.active_space() != space
+                || state.spaces.tab_space(observation.sample.tab) != Some(space.as_str())
+        })
+    {
+        return Err(OBSERVATION_CHANGED);
+    }
+    Ok(())
+}
+
+fn observation_current(reply: &Reply, observation: &TabObservation) -> Result<(), TaskError> {
+    STATE.with(|slot| observation_matches(&slot.borrow(), reply, observation))
+}
+
+fn observe_tab_with(
+    tab: i32,
+    reply: &Reply,
+    access: ObservationAccess,
+    mut frame: impl FnMut(&Browser) -> Option<Frame>,
+    mut url: impl FnMut(&Frame) -> String,
+    mut flag: impl FnMut(&Browser, ShellProbe) -> bool,
+) -> Result<TabObservation, TaskError> {
+    let mut observation = STATE.with(|slot| {
+        let state = slot.borrow();
+        observation_access(&state, reply, tab, access)?;
+        let page = state
+            .tabs
+            .get(&tab)
+            .filter(|page| !page.rejected_creation)
+            .ok_or(TaskError {
+                code: "TAB_NOT_FOUND",
+                message: "No available browser tab has that ID.",
+            })?;
+        let native_space = if matches!(access, ObservationAccess::Native) {
+            if state.spaces.overview() || state.spaces.active_tab() != Some(tab) {
+                return Err(OBSERVATION_CHANGED);
+            }
+            let space = state.spaces.tab_space(tab).ok_or(OBSERVATION_CHANGED)?;
+            if state.spaces.active_space() != space {
+                return Err(OBSERVATION_CHANGED);
+            }
+            Some(space.to_owned())
+        } else {
+            None
+        };
+        Ok(TabObservation {
+            sample: ShellObservation {
+                tab,
+                browser: page.browser.clone(),
+                epoch: page.navigation.epoch,
+                document_epoch: page.navigation.document_epoch,
+                loading_revision: page.navigation.loading_event_revision,
+                loading: false,
+                back: false,
+                forward: false,
+            },
+            owner: link_owner(&state.tasks, tab),
+            access,
+            native_space,
+            frame: None,
+            url: String::new(),
+        })
+    })?;
+    observation_current(reply, &observation)?;
+    observation.frame = frame(&observation.sample.browser);
+    observation_current(reply, &observation)?;
+    if let Some(frame) = &observation.frame {
+        observation.url = url(frame);
+        observation_current(reply, &observation)?;
+    }
+    for kind in [ShellProbe::Loading, ShellProbe::Back, ShellProbe::Forward] {
+        observation_current(reply, &observation)?;
+        let value = flag(&observation.sample.browser, kind);
+        observation_current(reply, &observation)?;
+        match kind {
+            ShellProbe::Loading => observation.sample.loading = value,
+            ShellProbe::Back => observation.sample.back = value,
+            ShellProbe::Forward => observation.sample.forward = value,
+        }
+    }
+    Ok(observation)
+}
+
+fn observe_tab(
+    tab: i32,
+    reply: &Reply,
+    access: ObservationAccess,
+) -> Result<TabObservation, TaskError> {
+    observe_tab_with(
+        tab,
+        reply,
+        access,
+        |browser| browser.main_frame(),
+        |frame| CefString::from(&frame.url()).to_string(),
+        |browser, kind| match kind {
+            ShellProbe::Loading => browser.is_loading() != 0,
+            ShellProbe::Back => browser.can_go_back() != 0,
+            ShellProbe::Forward => browser.can_go_forward() != 0,
+        },
+    )
+}
+
+fn tab_info(id: i32, tab: &Tab, observed: &TabObservation) -> Json {
+    json!({"tab":id,"title":tab.title,
+    "url":observed.url,"loading":observed.sample.loading,
+    "canGoBack":observed.sample.back,"canGoForward":observed.sample.forward,
     "renderer":{"status":tab.navigation.renderer_status(),"error":tab.navigation.renderer_exit},
     "navigation": {
         "epoch":tab.navigation.epoch,"requestedUrl":tab.navigation.requested_url,
@@ -2994,6 +4092,121 @@ fn tab_info(tab: &Tab) -> Json {
         "mainLoadComplete":tab.navigation.main_load_complete,"error":tab.navigation.error,
         "stopped":tab.navigation.stopped,"incomplete":tab.navigation.incomplete
     }})
+}
+
+fn observed_tab_info(reply: &Reply, observation: &TabObservation) -> Result<Json, TaskError> {
+    STATE.with(|slot| {
+        let state = slot.borrow();
+        observation_matches(&state, reply, observation)?;
+        Ok(tab_info(
+            observation.sample.tab,
+            &state.tabs[&observation.sample.tab],
+            observation,
+        ))
+    })
+}
+
+fn list_tab_ids(state: &State, reply: &Reply) -> Result<Vec<i32>, TaskError> {
+    if !reply.active.load(Ordering::Acquire) {
+        return Err(OBSERVATION_CHANGED);
+    }
+    if let Some(scope) = &reply.scope {
+        state.tasks.check(scope)?;
+    }
+    Ok(state
+        .tabs
+        .iter()
+        .filter(|(id, tab)| {
+            !tab.rejected_creation
+                && reply.scope.as_ref().is_none_or(|scope| {
+                    state
+                        .tasks
+                        .owner(**id)
+                        .is_some_and(|(owner, _)| owner == scope.task)
+                })
+        })
+        .map(|(id, _)| *id)
+        .collect())
+}
+
+fn tabs_info_with(
+    reply: &Reply,
+    mut observe: impl FnMut(i32, &Reply, ObservationAccess) -> Result<TabObservation, TaskError>,
+) -> Result<Json, TaskError> {
+    let ids = STATE.with(|slot| list_tab_ids(&slot.borrow(), reply))?;
+    let observations = ids
+        .iter()
+        .map(|id| observe(*id, reply, ObservationAccess::List))
+        .collect::<Result<Vec<_>, _>>()?;
+    STATE.with(|slot| {
+        let state = slot.borrow();
+        if list_tab_ids(&state, reply)? != ids {
+            return Err(OBSERVATION_CHANGED);
+        }
+        let mut tabs = Vec::with_capacity(observations.len());
+        for observation in &observations {
+            observation_matches(&state, reply, observation)?;
+            let id = observation.sample.tab;
+            let mut info = tab_info(id, &state.tabs[&id], observation);
+            info["active"] = json!(state.spaces.active_tab() == Some(id));
+            info["space"] = json!(state.spaces.tab_space(id).unwrap_or(USER_SPACE));
+            info["task"] = state
+                .tasks
+                .owner(id)
+                .map(|(id, origin)| json!({"id":id,"origin":origin}))
+                .unwrap_or(Json::Null);
+            tabs.push(info);
+        }
+        Ok(json!({"tabs":tabs}))
+    })
+}
+
+fn diagnostic_tab_info(
+    tab: i32,
+    browser: &Browser,
+    reply: &Reply,
+    unavailable: impl Fn(&Tab) -> bool,
+) -> Result<Option<Json>, TaskError> {
+    let needed = STATE.with(|slot| slot.borrow().tabs.get(&tab).is_some_and(&unavailable));
+    if !needed {
+        return Ok(None);
+    }
+    let observed = observe_tab(tab, reply, ObservationAccess::Tab)?;
+    if observed.sample.browser.get_raw() != browser.get_raw() {
+        return Err(OBSERVATION_CHANGED);
+    }
+    STATE.with(|slot| {
+        let state = slot.borrow();
+        observation_matches(&state, reply, &observed)?;
+        let page = &state.tabs[&tab];
+        Ok(unavailable(page).then(|| tab_info(tab, page, &observed)))
+    })
+}
+
+fn reply_created_tab_with(
+    tab: i32,
+    browser: &Browser,
+    reply: &Reply,
+    mut observe: impl FnMut(i32, &Reply, ObservationAccess) -> Result<TabObservation, TaskError>,
+) {
+    let info = observe(tab, reply, ObservationAccess::Tab).and_then(|observed| {
+        if observed.sample.browser.get_raw() != browser.get_raw() {
+            return Err(OBSERVATION_CHANGED);
+        }
+        observed_tab_info(reply, &observed)
+    });
+    match info {
+        Ok(info) => reply.ok(info),
+        Err(error) => reply.error_details(
+            error.code,
+            error.message,
+            json!({"tab":tab,"tabCreated":true,"stateUnavailable":true,"outcomeUnknown":false}),
+        ),
+    }
+}
+
+fn observation_error(reply: &Reply, error: TaskError) {
+    reply.error_details(error.code, error.message, json!({"outcomeUnknown":false}));
 }
 
 pub fn start_server(listener: UnixListener, stopped: Arc<AtomicBool>) -> thread::JoinHandle<()> {
@@ -3070,6 +4283,8 @@ fn serve_connection(
             active: active.clone(),
             sender,
             scope: None,
+            focus_completion: None,
+            frame_completion: None,
         },
         _permit: permit,
     }))));
@@ -3148,8 +4363,12 @@ wrap_task! {
     }
 }
 wrap_task! {
-    struct WaitTask { token: u64 }
-    impl Task { fn execute(&self) { poll_wait(self.token); } }
+    struct WaitTask { token: u64, tab: i32, started: Instant, active: Arc<AtomicBool> }
+    impl Task {
+        fn execute(&self) {
+            if wait_tick_current(self.token, self.tab, self.started, &self.active) { poll_wait(self.token); }
+        }
+    }
 }
 
 wrap_task! {
@@ -3172,87 +4391,240 @@ wrap_task! {
 }
 
 fn remove_wait(token: u64) -> Option<Waiter> {
-    let waiter = STATE.with(|state| {
+    let (waiter, frame_tabs) = STATE.with(|state| {
         let mut state = state.borrow_mut();
+        let frame_tabs = state
+            .frame_controls
+            .iter()
+            .filter_map(|(tab, control)| (control.active_token == Some(token)).then_some(*tab))
+            .collect::<Vec<_>>();
         state
             .pending
             .retain(|_, pending| pending.reply.token != token);
-        state.waits.remove(&token)
+        (state.waits.remove(&token), frame_tabs)
     });
+    let focus_tabs = STATE.with(|slot| {
+        slot.borrow()
+            .focus_leases
+            .iter()
+            .filter_map(|(tab, lease)| (lease.token == token).then_some(*tab))
+            .collect::<Vec<_>>()
+    });
+    for tab in focus_tabs {
+        abort_focus_lease(
+            tab,
+            "TIMEOUT",
+            "The input request was canceled or timed out; do not repeat it automatically.",
+            true,
+        );
+    }
+    for tab in frame_tabs {
+        stop_frame_tracking(tab, Some(token));
+    }
     if waiter.is_some() {
         notify_panel();
     }
     waiter
 }
 
-fn poll_wait(token: u64) {
-    let probe = STATE.with(|state| {
-        let mut state = state.borrow_mut();
+fn wait_tick_current(token: u64, tab: i32, started: Instant, active: &Arc<AtomicBool>) -> bool {
+    STATE.with(|slot| {
+        slot.borrow().waits.get(&token).is_some_and(|waiter| {
+            waiter.tab == tab
+                && waiter.started == started
+                && Arc::ptr_eq(&waiter.reply.active, active)
+        })
+    })
+}
+
+fn same_waiter(current: &Waiter, captured: &Waiter) -> bool {
+    current.tab == captured.tab
+        && current.started == captured.started
+        && Arc::ptr_eq(&current.reply.active, &captured.reply.active)
+}
+
+fn poll_wait_with(
+    token: u64,
+    mut observe: impl FnMut(i32, &Reply, ObservationAccess) -> Result<TabObservation, TaskError>,
+) -> Option<(Browser, Pending)> {
+    let captured = STATE.with(|slot| slot.borrow().waits.get(&token).cloned())?;
+    if !captured.reply.active.load(Ordering::Acquire) {
+        return None;
+    }
+    let access = STATE.with(|slot| {
+        slot.borrow()
+            .tasks
+            .check_tab(captured.reply.scope.as_ref(), captured.tab)
+    });
+    if let Err(error) = access {
+        captured.reply.error(error.code, error.message);
+        return None;
+    }
+    let observed = observe(captured.tab, &captured.reply, ObservationAccess::Tab);
+    STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
         let waiter = state.waits.get(&token)?;
-        if let Err(error) = state.tasks.check_tab(waiter.reply.scope.as_ref(), waiter.tab) {
+        if !same_waiter(waiter, &captured) || !waiter.reply.active.load(Ordering::Acquire) {
+            return None;
+        }
+        if let Err(error) = state
+            .tasks
+            .check_tab(waiter.reply.scope.as_ref(), waiter.tab)
+        {
             waiter.reply.error(error.code, error.message);
             return None;
         }
-        let Some(tab) = state.tabs.get(&waiter.tab) else {
-            waiter.reply.error("TAB_NOT_FOUND", "No browser tab has that ID.");
+        let Some(tab) = state
+            .tabs
+            .get(&waiter.tab)
+            .filter(|tab| !tab.rejected_creation)
+        else {
+            waiter
+                .reply
+                .error("TAB_NOT_FOUND", "No browser tab has that ID.");
             return None;
         };
-        let info = tab_info(tab);
+        let stable = observed
+            .as_ref()
+            .ok()
+            .filter(|observation| observation_matches(&state, &waiter.reply, observation).is_ok());
+        let info = stable.map(|observation| tab_info(waiter.tab, tab, observation));
+        let mut details = json!({"tab":waiter.tab,"state":info});
+        if stable.is_none() {
+            details["stateUnavailable"] = json!(true);
+        }
         if tab.navigation.renderer_exit.is_some() && !tab.navigation.recovering {
-            waiter.reply.error_details("RENDERER_TERMINATED", "The renderer stopped. Reload the tab to recover.",
-                json!({"tab":waiter.tab,"state":info,"outcomeUnknown":false}));
+            details["outcomeUnknown"] = json!(false);
+            waiter.reply.error_details(
+                "RENDERER_TERMINATED",
+                "The renderer stopped. Reload the tab to recover.",
+                details,
+            );
             return None;
         }
         if tab.navigation.stopped || tab.navigation.incomplete {
-            let code = if tab.navigation.stopped { "NAVIGATION_STOPPED" } else { "NAVIGATION_INCOMPLETE" };
-            waiter.reply.error_details(code, "Navigation ended without reaching the requested page readiness.",
-                json!({"tab":waiter.tab,"state":info}));
+            let code = if tab.navigation.stopped {
+                "NAVIGATION_STOPPED"
+            } else {
+                "NAVIGATION_INCOMPLETE"
+            };
+            waiter.reply.error_details(
+                code,
+                "Navigation ended without reaching the requested page readiness.",
+                details,
+            );
             return None;
         }
         if tab.navigation.error.is_some() {
-            waiter.reply.error_details("NAVIGATION_FAILED", "The main-frame navigation failed.",
-                json!({"tab":waiter.tab,"state":info}));
+            waiter.reply.error_details(
+                "NAVIGATION_FAILED",
+                "The main-frame navigation failed.",
+                details,
+            );
             return None;
         }
         if waiter.started.elapsed() >= Duration::from_millis(waiter.timeout_ms) {
-            waiter.reply.error_details("WAIT_TIMEOUT", "The requested page readiness was not reached.",
-                json!({"tab":waiter.tab,"until":waiter.until,"timeoutMs":waiter.timeout_ms,
-                    "elapsedMs":waiter.started.elapsed().as_millis(),"state":info,"navigationContinues":true}));
+            details["until"] = json!(waiter.until);
+            details["timeoutMs"] = json!(waiter.timeout_ms);
+            details["elapsedMs"] = json!(waiter.started.elapsed().as_millis());
+            details["navigationContinues"] = json!(true);
+            waiter.reply.error_details(
+                "WAIT_TIMEOUT",
+                "The requested page readiness was not reached.",
+                details,
+            );
             return None;
         }
-        let usable = tab.navigation.committed && tab.navigation.document_available && !tab.navigation.provisional;
-        if usable && waiter.until == WaitUntil::Load && tab.browser.is_loading() == 0 {
-            waiter.reply.ok(info);
+        let observation = stable?;
+        let usable = tab.navigation.committed
+            && tab.navigation.document_available
+            && !tab.navigation.provisional;
+        if usable && waiter.until == WaitUntil::Load && !observation.sample.loading {
+            waiter.reply.ok(info.unwrap());
             return None;
         }
         if usable && waiter.until == WaitUntil::Dom && !waiter.probe_in_flight {
-            let browser = tab.browser.clone();
-            let pending = Pending { tab:waiter.tab, epoch:tab.navigation.epoch,
-                evaluation:Evaluation::ReadyState {token}, reply:waiter.reply.clone(),
-                step:Step::Frame("document.readyState".into()) };
+            let browser = observation.sample.browser.clone();
+            let pending = Pending {
+                frame: None,
+                tab: waiter.tab,
+                epoch: tab.navigation.epoch,
+                evaluation: Evaluation::ReadyState {
+                    token,
+                    started: waiter.started,
+                },
+                reply: waiter.reply.clone(),
+                step: Step::Frame("document.readyState".into()),
+            };
             state.waits.get_mut(&token).unwrap().probe_in_flight = true;
             Some((browser, pending))
-        } else { None }
-    });
-    let active = STATE.with(|state| {
-        state
-            .borrow()
+        } else {
+            None
+        }
+    })
+}
+
+fn remove_matching_wait(token: u64, captured: &Waiter) -> Option<Waiter> {
+    let removed = STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        if !state
             .waits
             .get(&token)
-            .is_some_and(|waiter| waiter.reply.active.load(Ordering::Acquire))
+            .is_some_and(|waiter| same_waiter(waiter, captured))
+        {
+            return None;
+        }
+        state
+            .pending
+            .retain(|_, pending| !pending_matches_waiter(pending, captured));
+        state.waits.remove(&token)
     });
-    if !active {
-        remove_wait(token);
+    if removed.is_some() {
+        notify_panel();
+    }
+    removed
+}
+
+fn wait_continues(token: u64, captured: &Waiter) -> bool {
+    let current = STATE.with(|slot| {
+        slot.borrow()
+            .waits
+            .get(&token)
+            .is_some_and(|waiter| same_waiter(waiter, captured))
+    });
+    if !current {
+        return false;
+    }
+    if captured.reply.active.load(Ordering::Acquire) {
+        return true;
+    }
+    remove_matching_wait(token, captured);
+    false
+}
+
+fn poll_wait_cycle_with(
+    token: u64,
+    observe: impl FnMut(i32, &Reply, ObservationAccess) -> Result<TabObservation, TaskError>,
+    dispatch_probe: impl FnOnce(&Browser, Pending),
+    schedule: impl FnOnce(&Waiter) -> bool,
+) {
+    let Some(captured) = STATE.with(|slot| slot.borrow().waits.get(&token).cloned()) else {
+        return;
+    };
+    let probe = poll_wait_with(token, observe);
+    if !wait_continues(token, &captured) {
         return;
     }
     if let Some((browser, pending)) = probe {
-        dispatch(&browser, "Page.getFrameTree", json!({}), pending);
+        dispatch_probe(&browser, pending);
     }
-    // A separate deadline tick can finish even if the renderer never answers.
-    // At most one CDP probe is in flight for each wait.
-    let mut task = WaitTask::new(token);
-    if post_delayed_task(ThreadId::UI, Some(&mut task), 50) == 0 {
-        if let Some(waiter) = remove_wait(token) {
+    if !wait_continues(token, &captured) {
+        return;
+    }
+    // A separate deadline tick can finish even if Chromium never answers.
+    // Never schedule or remove a replacement waiter from this old callback.
+    if !schedule(&captured) {
+        if let Some(waiter) = remove_matching_wait(token, &captured) {
             waiter
                 .reply
                 .error("APP_STOPPING", "The browser cannot continue waiting.");
@@ -3260,10 +4632,108 @@ fn poll_wait(token: u64) {
     }
 }
 
+fn poll_wait(token: u64) {
+    poll_wait_cycle_with(
+        token,
+        observe_tab,
+        |browser, pending| dispatch(browser, "Page.getFrameTree", json!({}), pending),
+        |waiter| {
+            let mut task = WaitTask::new(
+                token,
+                waiter.tab,
+                waiter.started,
+                waiter.reply.active.clone(),
+            );
+            post_delayed_task(ThreadId::UI, Some(&mut task), 50) != 0
+        },
+    );
+}
+
+fn pending_matches_waiter(pending: &Pending, waiter: &Waiter) -> bool {
+    matches!(pending.evaluation, Evaluation::ReadyState { token, started }
+        if token == waiter.reply.token && started == waiter.started)
+        && pending.tab == waiter.tab
+        && Arc::ptr_eq(&pending.reply.active, &waiter.reply.active)
+}
+
+fn finish_dom_wait_with(
+    browser: &Browser,
+    pending: &Pending,
+    token: u64,
+    ready: &Json,
+    mut observe: impl FnMut(i32, &Reply, ObservationAccess) -> Result<TabObservation, TaskError>,
+) {
+    let captured = STATE.with(|slot| slot.borrow().waits.get(&token).cloned());
+    let Some(captured) = captured.filter(|waiter| pending_matches_waiter(pending, waiter)) else {
+        return;
+    };
+    let original_browser = STATE.with(|slot| {
+        slot.borrow()
+            .tabs
+            .get(&captured.tab)
+            .is_some_and(|tab| !tab.rejected_creation && tab.browser.get_raw() == browser.get_raw())
+    });
+    if !original_browser {
+        pending_error(
+            pending,
+            "PAGE_CHANGED",
+            "The wait callback belongs to an older browser.",
+        );
+        return;
+    }
+    let observed = observe(captured.tab, &captured.reply, ObservationAccess::Tab);
+    let completed = STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        let waiter = state.waits.get(&token)?;
+        if !same_waiter(waiter, &captured) || !waiter.reply.active.load(Ordering::Acquire) {
+            return None;
+        }
+        let valid = observed.as_ref().ok().filter(|observation| {
+            observation.sample.browser.get_raw() == browser.get_raw()
+                && observation.sample.epoch == pending.epoch
+                && observation_matches(&state, &waiter.reply, observation).is_ok()
+                && waiter.started.elapsed() < Duration::from_millis(waiter.timeout_ms)
+                && state.tabs.get(&waiter.tab).is_some_and(|tab| {
+                    tab.navigation.error.is_none()
+                        && !tab.navigation.stopped
+                        && !tab.navigation.incomplete
+                        && !tab.navigation.provisional
+                        && tab.navigation.renderer_exit.is_none()
+                        && tab.navigation.document_available
+                })
+        });
+        let Some(observation) = valid else {
+            // The absolute-deadline tick still owns this waiter. Release only
+            // the completed probe; do not lose it on an unstable observation.
+            state.waits.get_mut(&token).unwrap().probe_in_flight = false;
+            return None;
+        };
+        let mut info = tab_info(waiter.tab, &state.tabs[&waiter.tab], observation);
+        info["readyState"] = ready.clone();
+        let waiter = state.waits.remove(&token).unwrap();
+        state
+            .pending
+            .retain(|_, pending| !pending_matches_waiter(pending, &waiter));
+        Some((waiter.reply, info))
+    });
+    if let Some((reply, info)) = completed {
+        reply.ok(info);
+        notify_panel();
+    }
+}
+
 fn pending_error(pending: &Pending, code: &str, message: &str) {
-    if let Evaluation::ReadyState { token } = pending.evaluation {
+    if matches!(pending.step, Step::FrameInventory { .. }) {
+        stop_frame_tracking(pending.tab, Some(pending.reply.token));
+    }
+    if let Evaluation::ReadyState { token, .. } = pending.evaluation {
         STATE.with(|state| {
-            if let Some(waiter) = state.borrow_mut().waits.get_mut(&token) {
+            if let Some(waiter) = state
+                .borrow_mut()
+                .waits
+                .get_mut(&token)
+                .filter(|waiter| pending_matches_waiter(pending, waiter))
+            {
                 waiter.probe_in_flight = false;
             }
         });
@@ -3279,8 +4749,10 @@ fn pending_error(pending: &Pending, code: &str, message: &str) {
 }
 
 fn control_detached(tab: i32) {
-    let pending = STATE.with(|state| {
+    let (pending, focus) = STATE.with(|state| {
         let mut state = state.borrow_mut();
+        state.frame_controls.remove(&tab);
+        let focus = state.focus_leases.remove(&tab);
         state.captures.retain(|_, capture_tab| *capture_tab != tab);
         state.previews.retain(|_, request| request.tab != tab);
         let ids = state
@@ -3288,10 +4760,19 @@ fn control_detached(tab: i32) {
             .iter()
             .filter_map(|(id, request)| (request.tab == tab).then_some(*id))
             .collect::<Vec<_>>();
-        ids.into_iter()
+        let pending = ids
+            .into_iter()
             .filter_map(|id| state.pending.remove(&id))
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        (pending, focus)
     });
+    if let Some(lease) = focus {
+        lease.reply.send_final(lease.failure(
+            "CONTROL_DISCONNECTED",
+            "The input control session disconnected; inspect before retrying.",
+            "session-destroyed",
+        ));
+    }
     for request in pending {
         if request.mutation_dispatched() {
             let mut details = request.outcome_details();
@@ -3315,6 +4796,13 @@ fn control_detached(tab: i32) {
 
 fn renderer_terminated(tab: i32, reason: Json) {
     crate::download_permission_runtime::cancel_tab(tab);
+    abort_focus_lease(
+        tab,
+        "RENDERER_TERMINATED",
+        "The renderer stopped during input; inspect before retrying.",
+        true,
+    );
+    stop_frame_tracking(tab, None);
     let (pending, waits) = STATE.with(|state| {
         let mut state = state.borrow_mut();
         state.page_find.invalidate(tab);
@@ -3379,6 +4867,21 @@ fn revoke_task_requests(task: &str, only_tab: Option<i32>) {
         reply.scope.as_ref().is_some_and(|scope| scope.task == task)
             && only_tab.is_none_or(|id| id == tab)
     };
+    let focus_tabs = STATE.with(|slot| {
+        slot.borrow()
+            .focus_leases
+            .iter()
+            .filter_map(|(tab, lease)| matches(&lease.reply, *tab).then_some(*tab))
+            .collect::<Vec<_>>()
+    });
+    for tab in focus_tabs {
+        abort_focus_lease(
+            tab,
+            "TASK_CONTROL_LOST",
+            "Task control changed during input; inspect before continuing.",
+            true,
+        );
+    }
     let (pending, waits) = STATE.with(|state| {
         let mut state = state.borrow_mut();
         let pending_ids = state
@@ -3402,6 +4905,9 @@ fn revoke_task_requests(task: &str, only_tab: Option<i32>) {
         (pending, waits)
     });
     for request in pending {
+        if matches!(request.step, Step::FrameInventory { .. }) {
+            stop_frame_tracking(request.tab, Some(request.reply.token));
+        }
         let mut details = request.outcome_details();
         details["task"] = json!(task);
         details["tab"] = json!(request.tab);
@@ -3422,6 +4928,9 @@ fn revoke_task_requests(task: &str, only_tab: Option<i32>) {
 
 fn expire_tab_refs(tabs: impl IntoIterator<Item = i32>) {
     let tabs = tabs.into_iter().collect::<Vec<_>>();
+    for &tab in &tabs {
+        stop_frame_tracking(tab, None);
+    }
     let stopped = STATE.with(|state| {
         let mut state = state.borrow_mut();
         let mut stopped = None;
@@ -3622,7 +5131,7 @@ fn status_json() -> Json {
         let state = state.borrow();
         json!({"app":"Light Browser","engine":"CEF/Chromium","cef":String::from_utf8_lossy(&sys::CEF_VERSION[..sys::CEF_VERSION.len()-1]),"cefApi":sys::CEF_API_VERSION_LAST,"version":env!("CARGO_PKG_VERSION"),"tabs":state.tabs.len(),"pendingWaits":state.waits.len(),"sandbox":true,"externalDebugPort":false,"controlPanel":"embedded","windowMode":"single","activeTab":state.spaces.active_tab(),"activeSpace":state.spaces.active_space(),"overview":state.spaces.overview(),
             "downloads":{"active":active_downloads,"awaitingSave":awaiting_save,"awaitingPermission":awaiting_permission},
-            "resources":{"automationTabLimit":MAX_AUTOMATION_TABS,"taskTabLimit":crate::tasks::MAX_TASK_TABS,"pendingTabCreations":state.creations.len(),"captureLimit":1,"capturesInFlight":state.captures.len()}})
+            "resources":{"automationTabLimit":MAX_AUTOMATION_TABS,"taskTabLimit":crate::tasks::MAX_TASK_TABS,"pendingTabCreations":state.creations.len(),"captureLimit":1,"capturesInFlight":state.captures.len(),"focusLeases":state.focus_leases.len(),"focusCleanupFailed":state.focus_leases.values().filter(|lease| lease.phase == FocusPhase::Failed).count()}})
     })
 }
 
@@ -3631,12 +5140,23 @@ fn handle(command: &Command, reply: Reply) {
         Command::TaskRun { command, .. } => command.as_ref(),
         other => other,
     };
+    // Reject raw protocol requests as early as CLI input, before native getters
+    // or page preparation. Task-run uses the same bounded key grammar.
+    if let Command::Press { key, .. } = observed
+        && KeyPress::parse(key).is_none()
+    {
+        reply.error("UNSUPPORTED_KEY", UNSUPPORTED_KEY_MESSAGE);
+        return;
+    }
     let _refresh = PanelRefresh(!matches!(
         observed,
         Command::Status
             | Command::Spaces
             | Command::Tabs
             | Command::Read { .. }
+            | Command::Frames { .. }
+            | Command::ReadFrame { .. }
+            | Command::ReadPage { .. }
             | Command::TaskList
             | Command::TaskInfo { .. }
     ));
@@ -3708,39 +5228,10 @@ fn handle(command: &Command, reply: Reply) {
             reply.ok(json!({"panel":"embedded","shown":true,"windowMode":"single"}));
         }
         Command::Status => reply.ok(status_json()),
-        Command::Tabs => reply.ok(STATE.with(|state| {
-            let state = state.borrow();
-            let tabs =
-                state
-                    .tabs
-                    .values()
-                    .filter_map(|tab| {
-                        if tab.rejected_creation {
-                            return None;
-                        }
-                        let owner = state.tasks.owner(tab.browser.identifier());
-                        if reply.scope.as_ref().is_some_and(|scope| {
-                            owner.as_ref().is_none_or(|(id, _)| *id != scope.task)
-                        }) {
-                            return None;
-                        }
-                        let mut info = tab_info(tab);
-                        info["active"] =
-                            json!(state.spaces.active_tab() == Some(tab.browser.identifier()));
-                        info["space"] = json!(
-                            state
-                                .spaces
-                                .tab_space(tab.browser.identifier())
-                                .unwrap_or(USER_SPACE)
-                        );
-                        info["task"] = owner
-                            .map(|(id, origin)| json!({"id":id,"origin":origin}))
-                            .unwrap_or(Json::Null);
-                        Some(info)
-                    })
-                    .collect::<Vec<_>>();
-            json!({"tabs":tabs})
-        })),
+        Command::Tabs => match tabs_info_with(&reply, observe_tab) {
+            Ok(info) => reply.ok(info),
+            Err(error) => observation_error(&reply, error),
+        },
         Command::Open { url } => {
             if !valid_url(url) {
                 reply.error(
@@ -3757,19 +5248,8 @@ fn handle(command: &Command, reply: Reply) {
                 }
             };
             if let Some(browser) = create_browser(url, reply.scope.clone(), Some(reservation)) {
-                let info = STATE.with(|state| {
-                    state
-                        .borrow()
-                        .tabs
-                        .get(&browser.identifier())
-                        .filter(|tab| !tab.rejected_creation)
-                        .map(tab_info)
-                });
-                if let Some(info) = info {
-                    reply.ok(info);
-                } else {
-                    reply.error("OPEN_FAILED", "The created tab is unavailable.");
-                }
+                let tab = browser.identifier();
+                reply_created_tab_with(tab, &browser, &reply, observe_tab);
             } else {
                 STATE.with(|state| {
                     state.borrow_mut().creations.release(reservation);
@@ -3780,9 +5260,14 @@ fn handle(command: &Command, reply: Reply) {
         other => {
             let tab_id = match other {
                 Command::Read { tab }
+                | Command::Frames { tab }
+                | Command::ReadFrame { tab, .. }
+                | Command::ReadPage { tab }
                 | Command::Click { tab, .. }
+                | Command::Hover { tab, .. }
                 | Command::Check { tab, .. }
                 | Command::Fill { tab, .. }
+                | Command::Insert { tab, .. }
                 | Command::Select { tab, .. }
                 | Command::Press { tab, .. }
                 | Command::Close { tab }
@@ -3807,6 +5292,15 @@ fn handle(command: &Command, reply: Reply) {
                 reply.error("TAB_NOT_FOUND", "No browser tab has that ID.");
                 return;
             };
+            let focus_pending = STATE.with(|slot| slot.borrow().focus_leases.contains_key(&tab_id));
+            if !matches!(
+                other,
+                Command::Close { .. } | Command::Stop { .. } | Command::Wait { .. }
+            ) && focus_pending
+            {
+                reply.error("TAB_BUSY", "Temporary input focus is active or awaiting acknowledged cleanup. Inspect its result before continuing.");
+                return;
+            }
             if !matches!(
                 other,
                 Command::Navigate { .. }
@@ -3817,11 +5311,15 @@ fn handle(command: &Command, reply: Reply) {
                     | Command::Stop { .. }
                     | Command::Wait { .. }
             ) {
-                let unavailable = STATE.with(|state| {
-                    let state = state.borrow();
-                    let tab = &state.tabs[&tab_id];
-                    tab.navigation.renderer_exit.as_ref().map(|_| tab_info(tab))
-                });
+                let unavailable = match diagnostic_tab_info(tab_id, &browser, &reply, |tab| {
+                    tab.navigation.renderer_exit.is_some()
+                }) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        observation_error(&reply, error);
+                        return;
+                    }
+                };
                 if let Some(info) = unavailable {
                     reply.error_details(
                         "RENDERER_TERMINATED",
@@ -3831,14 +5329,29 @@ fn handle(command: &Command, reply: Reply) {
                     return;
                 }
             }
-            if reply.scope.is_some()
+            let collecting_frames = STATE.with(|slot| {
+                slot.borrow()
+                    .frame_controls
+                    .get(&tab_id)
+                    .is_some_and(|control| control.active_token.is_some())
+            });
+            if (reply.scope.is_some()
+                || matches!(
+                    other,
+                    Command::Frames { .. } | Command::ReadFrame { .. } | Command::ReadPage { .. }
+                )
+                || command_reference(other)
+                    .is_some_and(|reference| reference.starts_with("frame/"))
+                || collecting_frames)
                 && !matches!(other, Command::Wait { .. } | Command::Screenshot { .. })
+                && !(focus_pending && matches!(other, Command::Close { .. } | Command::Stop { .. }))
             {
                 let busy = STATE.with(|state| {
-                    state.borrow().pending.values().any(|pending| {
-                        pending.tab == tab_id
-                            && matches!(pending.evaluation, Evaluation::Page { .. })
-                    })
+                    collecting_frames
+                        || state.borrow().pending.values().any(|pending| {
+                            pending.tab == tab_id
+                                && matches!(pending.evaluation, Evaluation::Page { .. })
+                        })
                 });
                 if busy {
                     reply.error("TAB_BUSY", "A page operation is still in flight. Inspect its result before continuing.");
@@ -3846,15 +5359,33 @@ fn handle(command: &Command, reply: Reply) {
                 }
             }
             match other {
+                Command::Frames { .. } => {
+                    start_frame_inventory(&browser, tab_id, None, None, false, reply);
+                }
+                Command::ReadPage { .. } => {
+                    start_frame_inventory(&browser, tab_id, None, None, true, reply);
+                }
+                Command::ReadFrame { frame, .. } => {
+                    start_frame_inventory(
+                        &browser,
+                        tab_id,
+                        Some(frame.clone()),
+                        None,
+                        false,
+                        reply,
+                    );
+                }
                 Command::Navigate { .. }
                 | Command::Back { .. }
                 | Command::Forward { .. }
                 | Command::Reload { .. } => {
-                    navigate(&browser, other, reply);
+                    navigate(&browser, other, reply, ObservationAccess::Tab);
                 }
                 Command::Stop { .. } => {
-                    stop_loading(&browser);
-                    reply.ok(json!({"tab":tab_id,"stopRequested":true}));
+                    match stop_loading(&browser, tab_id, || reply.active.load(Ordering::Acquire)) {
+                        Ok(()) => reply.ok(json!({"tab":tab_id,"stopRequested":true})),
+                        Err(error) => reply.error("PAGE_CHANGED", &error),
+                    }
                 }
                 Command::Wait {
                     until, timeout_ms, ..
@@ -3898,6 +5429,7 @@ fn handle(command: &Command, reply: Reply) {
                         "Page.captureScreenshot",
                         json!({"format":"png","captureBeyondViewport":false}),
                         Pending {
+                            frame: None,
                             tab: tab_id,
                             epoch: 0,
                             evaluation: Evaluation::Page {
@@ -3910,30 +5442,48 @@ fn handle(command: &Command, reply: Reply) {
                     );
                 }
                 _ => {
-                    let epoch = STATE.with(|state| {
-                        let state = state.borrow();
-                        let tab = state.tabs.get(&tab_id)?;
-                        if tab.navigation.provisional
+                    if command_reference(other)
+                        .is_some_and(|reference| reference.starts_with("frame/"))
+                    {
+                        start_frame_action(&browser, tab_id, other, reply);
+                        return;
+                    }
+                    match diagnostic_tab_info(tab_id, &browser, &reply, |tab| {
+                        tab.navigation.provisional
                             || !tab.navigation.committed
                             || !tab.navigation.document_available
-                        {
+                    }) {
+                        Ok(Some(info)) => {
                             reply.error_details(
                                 "PAGE_LOADING",
                                 "The current main document is not available yet.",
-                                json!({"tab":tab_id,"state":tab_info(tab)}),
+                                json!({"tab":tab_id,"state":info}),
                             );
-                            None
-                        } else {
-                            Some(tab.navigation.epoch)
+                            return;
                         }
+                        Err(error) => {
+                            observation_error(&reply, error);
+                            return;
+                        }
+                        Ok(None) => {}
+                    }
+                    let epoch = STATE.with(|slot| {
+                        let state = slot.borrow();
+                        let tab = state.tabs.get(&tab_id)?;
+                        (tab.browser.get_raw() == browser.get_raw() && !tab.rejected_creation)
+                            .then_some(tab.navigation.epoch)
                     });
                     let Some(epoch) = epoch else {
+                        observation_error(&reply, OBSERVATION_CHANGED);
                         return;
                     };
                     let invocation = match other {
                         Command::Read { .. } => "window.__lightBrowserBridge.read()".to_owned(),
                         Command::Click { reference, .. } => {
                             action_expression("click", reference, None, epoch, &reply)
+                        }
+                        Command::Hover { reference, .. } => {
+                            action_expression("hover", reference, None, epoch, &reply)
                         }
                         Command::Check {
                             reference, checked, ..
@@ -3953,6 +5503,15 @@ fn handle(command: &Command, reply: Reply) {
                             epoch,
                             &reply,
                         ),
+                        Command::Insert {
+                            reference, text, ..
+                        } => action_expression(
+                            "insert",
+                            reference,
+                            Some(("text", ActionValue::String(text))),
+                            epoch,
+                            &reply,
+                        ),
                         Command::Select {
                             reference, value, ..
                         } => action_expression(
@@ -3962,22 +5521,13 @@ fn handle(command: &Command, reply: Reply) {
                             epoch,
                             &reply,
                         ),
-                        Command::Press { reference, key, .. } => {
-                            if key != "Enter" {
-                                reply.error(
-                                    "UNSUPPORTED_KEY",
-                                    "The first version supports Enter only.",
-                                );
-                                return;
-                            }
-                            action_expression(
-                                "press",
-                                reference,
-                                Some(("key", ActionValue::String(key))),
-                                epoch,
-                                &reply,
-                            )
-                        }
+                        Command::Press { reference, key, .. } => action_expression(
+                            "press",
+                            reference,
+                            Some(("key", ActionValue::String(key))),
+                            epoch,
+                            &reply,
+                        ),
                         Command::Scroll { x, y, .. } => {
                             if !(-10000..=10000).contains(x) || !(-10000..=10000).contains(y) {
                                 reply.error(
@@ -4002,6 +5552,7 @@ fn handle(command: &Command, reply: Reply) {
                         "Page.getFrameTree",
                         json!({}),
                         Pending {
+                            frame: None,
                             tab: tab_id,
                             epoch,
                             evaluation: Evaluation::Page {
@@ -4018,103 +5569,211 @@ fn handle(command: &Command, reply: Reply) {
     }
 }
 
-fn stop_loading(browser: &Browser) {
-    revoke_download_permission_provenance(browser.identifier());
-    crate::download_permission_runtime::cancel_tab(browser.identifier());
-    invalidate_page_find(browser.identifier());
-    STATE.with(|state| {
-        if let Some(tab) = state.borrow_mut().tabs.get_mut(&browser.identifier()) {
-            tab.navigation.automatic_retry_error = None;
-            tab.navigation.history.revoke();
-            if tab.navigation.provisional || browser.is_loading() != 0 {
-                tab.navigation.epoch += 1;
-                tab.navigation.stopped = true;
-                tab.navigation.stop_pending = true;
-            }
+fn execute_cli_stop(
+    mut guard: NavigationControlGuard,
+    still_current: impl Fn() -> bool,
+    mut inspect: impl FnMut(&Browser) -> (bool, bool),
+    mut cleanup: impl FnMut(&NavigationControlGuard) -> Result<(), String>,
+    send: impl FnOnce(&Browser),
+) -> Result<(), String> {
+    navigation_control_inspect(&guard, &|| true, &still_current, &mut inspect)?;
+    cleanup(&guard)?;
+    let loading = navigation_control_inspect(&guard, &|| true, &still_current, &mut inspect)?;
+    STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        if !navigation_control_matches(&state, &guard) {
+            return Err(NAVIGATION_CONTROL_CHANGED.to_owned());
         }
-    });
-    browser.stop_load();
+        let nav = &mut state.tabs.get_mut(&guard.tab).unwrap().navigation;
+        if loading || nav.provisional || nav.intent_pending {
+            guard.epoch = guard
+                .epoch
+                .checked_add(1)
+                .ok_or(NAVIGATION_CONTROL_CHANGED)?;
+            nav.epoch = guard.epoch;
+            nav.stopped = true;
+            nav.stop_pending = true;
+        }
+        nav.automatic_retry_error = None;
+        nav.history.revoke();
+        Ok(())
+    })?;
+    // CLI stop retains its accepted-request contract, including cleanup and
+    // stop_load on an idle page. It does not use native chrome's no-op policy.
+    send(&guard.browser);
+    Ok(())
 }
 
-fn navigate(browser: &Browser, command: &Command, reply: Reply) {
-    let tab_id = browser.identifier();
-    let (action, url) = match command {
-        Command::Navigate { url, .. } => {
-            if !valid_url(url) {
-                reply.error(
-                    "INVALID_URL",
-                    "Only an absolute HTTP(S) URL without control characters is accepted.",
-                );
-                return;
-            }
-            ("navigate", Some(url.as_str()))
-        }
-        Command::Back { .. } => {
-            if browser.can_go_back() == 0 {
-                reply.error("NO_HISTORY", "No previous history entry.");
-                return;
-            }
-            ("back", None)
-        }
-        Command::Forward { .. } => {
-            if browser.can_go_forward() == 0 {
-                reply.error("NO_HISTORY", "No next history entry.");
-                return;
-            }
-            ("forward", None)
-        }
-        Command::Reload { .. } => ("reload", None),
+fn stop_loading(
+    browser: &Browser,
+    tab: i32,
+    still_current: impl Fn() -> bool,
+) -> Result<(), String> {
+    let guard = STATE.with(|slot| navigation_control_guard(&slot.borrow(), tab, None))?;
+    if guard.browser.get_raw() != browser.get_raw() {
+        return Err(NAVIGATION_CONTROL_CHANGED.into());
+    }
+    execute_cli_stop(
+        guard,
+        &still_current,
+        |browser| (browser.is_valid() != 0, browser.is_loading() != 0),
+        |guard| clear_navigation_controls(guard, &still_current),
+        |browser| browser.stop_load(),
+    )
+}
+
+fn navigation_request(command: &Command) -> Result<(&'static str, Option<&str>), TaskError> {
+    match command {
+        Command::Navigate { url, .. } if !valid_url(url) => Err(TaskError {
+            code: "INVALID_URL",
+            message: "Only an absolute HTTP(S) URL without control characters is accepted.",
+        }),
+        Command::Navigate { url, .. } => Ok(("navigate", Some(url.as_str()))),
+        Command::Back { .. } => Ok(("back", None)),
+        Command::Forward { .. } => Ok(("forward", None)),
+        Command::Reload { .. } => Ok(("reload", None)),
         _ => unreachable!(),
+    }
+}
+
+fn navigation_available(reply: &Reply, command: &Command, observed: &TabObservation) -> bool {
+    let failure = match command {
+        Command::Back { .. } if !observed.sample.back => {
+            Some(("NO_HISTORY", "No previous history entry."))
+        }
+        Command::Forward { .. } if !observed.sample.forward => {
+            Some(("NO_HISTORY", "No next history entry."))
+        }
+        Command::Navigate { .. } if observed.frame.is_none() => {
+            Some(("FRAME_UNAVAILABLE", "Main frame is unavailable."))
+        }
+        _ => None,
     };
-    // History/reload are browser-level recovery operations and must remain
-    // available while a terminated renderer has no usable main frame.
-    let frame = browser.main_frame();
-    if url.is_some() && frame.is_none() {
-        reply.error("FRAME_UNAVAILABLE", "Main frame is unavailable.");
+    if let Some((code, message)) = failure {
+        reply.error(code, message);
+        return false;
+    }
+    STATE.with(|slot| {
+        let state = slot.borrow();
+        if let Err(error) = observation_matches(&state, reply, observed) {
+            observation_error(reply, error); return false;
+        }
+        let tab = &state.tabs[&observed.sample.tab];
+        // History/reload remain recovery operations without a live main frame.
+        let recovering = tab.navigation.renderer_exit.is_some() && !tab.navigation.recovering;
+        if !recovering && (tab.navigation.provisional || tab.navigation.intent_pending || observed.sample.loading) {
+            reply.error_details("NAVIGATION_BUSY",
+                "The tab is still loading. Stop it or wait for load before navigating.",
+                json!({"tab":observed.sample.tab,"state":tab_info(observed.sample.tab, tab, observed)}));
+            return false;
+        }
+        true
+    })
+}
+
+fn navigate_with(
+    browser: &Browser,
+    command: &Command,
+    reply: &Reply,
+    access: ObservationAccess,
+    mut observe: impl FnMut(i32, &Reply, ObservationAccess) -> Result<TabObservation, TaskError>,
+    cleanup: impl FnOnce(&TabObservation) -> Result<(), TaskError>,
+    send: impl FnOnce(&TabObservation, &Command),
+) {
+    let (action, url) = match navigation_request(command) {
+        Ok(request) => request,
+        Err(error) => {
+            observation_error(reply, error);
+            return;
+        }
+    };
+    let tab_id = command.tab_id().expect("navigation command has a tab");
+    let first = match observe(tab_id, reply, access) {
+        Ok(observed) if observed.sample.browser.get_raw() == browser.get_raw() => observed,
+        Ok(_) => {
+            observation_error(reply, OBSERVATION_CHANGED);
+            return;
+        }
+        Err(error) => {
+            observation_error(reply, error);
+            return;
+        }
+    };
+    if !navigation_available(reply, command, &first) {
+        return;
+    }
+    if let Err(error) = cleanup(&first).and_then(|()| observation_current(reply, &first)) {
+        observation_error(reply, error);
+        return;
+    }
+    let observed = match observe(tab_id, reply, access) {
+        Ok(observed) => observed,
+        Err(error) => {
+            observation_error(reply, error);
+            return;
+        }
+    };
+    // A native getter or cleanup can reenter. Never reserve an intent for the
+    // replacement page/owner, nor redirect native navigation to another tab.
+    if let Err(error) = observation_current(reply, &first) {
+        observation_error(reply, error);
+        return;
+    }
+    if !navigation_available(reply, command, &observed) {
         return;
     }
     let history_generation = crate::history_runtime::generation();
-    let started = STATE.with(|state| {
-        let mut state = state.borrow_mut();
-        let history_generation = history_generation.filter(|_| is_unowned_user_tab(&state, tab_id));
-        let Some(tab) = state.tabs.get_mut(&tab_id) else {
-            return false;
-        };
-        // A single navigation intent avoids attributing a superseded request's
-        // late ERR_ABORTED callback to the next request. Stop and wait first.
-        let recovering = tab.navigation.renderer_exit.is_some() && !tab.navigation.recovering;
-        if !recovering && (tab.navigation.provisional || browser.is_loading() != 0) {
-            reply.error_details(
-                "NAVIGATION_BUSY",
-                "The tab is still loading. Stop it or wait for load before navigating.",
-                json!({"tab":tab_id,"state":tab_info(tab)}),
-            );
-            return false;
-        }
-        // Set the barrier before CEF can queue any asynchronous callbacks.
+    let reserved = STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        observation_matches(&state, reply, &first)?;
+        observation_matches(&state, reply, &observed)?;
+        let generation = history_generation.filter(|_| is_unowned_user_tab(&state, tab_id));
+        let tab = state.tabs.get_mut(&tab_id).ok_or(OBSERVATION_CHANGED)?;
         if let Some(url) = url {
             tab.observe_start_page_url(url);
         }
         tab.navigation.begin(url);
-        tab.navigation.history.begin(history_generation, true);
-        true
+        tab.navigation.history.begin(generation, true);
+        Ok::<_, TaskError>(())
     });
-    if !started {
+    if let Err(error) = reserved {
+        observation_error(reply, error);
         return;
     }
-    revoke_download_permission_provenance(tab_id);
-    crate::download_permission_runtime::cancel_tab(tab_id);
-    invalidate_page_find(tab_id);
-    match command {
-        Command::Navigate { url, .. } => frame
-            .unwrap()
-            .load_url(Some(&CefString::from(url.as_str()))),
-        Command::Back { .. } => browser.go_back(),
-        Command::Forward { .. } => browser.go_forward(),
-        Command::Reload { .. } => browser.reload(),
-        _ => unreachable!(),
-    }
+    // No native getters or UI callbacks between reservation and this send.
+    send(&observed, command);
     reply.ok(json!({"tab":tab_id,"action":action,"navigationRequested":true}));
+}
+
+fn navigate(browser: &Browser, command: &Command, reply: Reply, access: ObservationAccess) {
+    // Native browsing of a paused task remains available; only CLI requests
+    // require a task scope. Both paths retain the captured owner during reads.
+    navigate_with(
+        browser,
+        command,
+        &reply,
+        access,
+        observe_tab,
+        |observed| {
+            observation_current(&reply, observed)?;
+            revoke_download_permission_provenance(observed.sample.tab);
+            crate::download_permission_runtime::cancel_tab(observed.sample.tab);
+            observation_current(&reply, observed)?;
+            invalidate_page_find(observed.sample.tab);
+            observation_current(&reply, observed)
+        },
+        |observed, command| match command {
+            Command::Navigate { url, .. } => observed
+                .frame
+                .as_ref()
+                .unwrap()
+                .load_url(Some(&CefString::from(url.as_str()))),
+            Command::Back { .. } => browser.go_back(),
+            Command::Forward { .. } => browser.go_forward(),
+            Command::Reload { .. } => browser.reload(),
+            _ => unreachable!(),
+        },
+    );
 }
 
 enum ActionValue<'a> {
@@ -4357,6 +6016,112 @@ fn input_target_failure(
     None
 }
 
+fn fill_binding_failure(
+    state: &State,
+    browser: &Browser,
+    tab: i32,
+    target: &FillTarget,
+) -> Option<InputFailure> {
+    let binding = target.binding.borrow();
+    let current = binding.as_ref().is_some_and(|binding| {
+        binding.browser.get_raw() == browser.get_raw()
+            && state
+                .tabs
+                .get(&tab)
+                .is_some_and(|tab| tab.navigation.document_epoch == binding.document_epoch)
+            && link_owner(&state.tasks, tab) == binding.owner
+    });
+    (!current).then_some(InputFailure { code: "PAGE_CHANGED", message: "The original fill target changed. Read again; do not repeat the input automatically." })
+}
+
+fn pending_input_failure(
+    state: &State,
+    browser: &Browser,
+    pending: &Pending,
+) -> Option<InputFailure> {
+    pending
+        .frame
+        .as_ref()
+        .and_then(|frame| {
+            frame_snapshot_failure(
+                state,
+                browser,
+                pending.tab,
+                pending.epoch,
+                &pending.reply,
+                frame,
+            )
+        })
+        .or_else(|| {
+            input_target_failure(
+                state,
+                browser,
+                pending.tab,
+                pending.epoch,
+                &pending.reply,
+                false,
+            )
+        })
+        .or_else(|| {
+            pending
+                .fill_target()
+                .and_then(|target| fill_binding_failure(state, browser, pending.tab, target))
+        })
+}
+
+fn bind_fill_target(browser: &Browser, pending: &Pending) -> Option<InputFailure> {
+    let target = pending.fill_target()?;
+    STATE.with(|slot| {
+        let state = slot.borrow();
+        if let Some(failure) = input_target_failure(
+            &state,
+            browser,
+            pending.tab,
+            pending.epoch,
+            &pending.reply,
+            false,
+        ) {
+            return Some(failure);
+        }
+        if target.binding.borrow().is_none() {
+            *target.binding.borrow_mut() = Some(FillBinding {
+                browser: browser.clone(),
+                document_epoch: state.tabs[&pending.tab].navigation.document_epoch,
+                owner: link_owner(&state.tasks, pending.tab),
+            });
+        }
+        fill_binding_failure(&state, browser, pending.tab, target)
+    })
+}
+
+fn batch_input_failure(
+    state: &State,
+    browser: &Browser,
+    batch: &InputBatch,
+    allow_navigation: bool,
+) -> Option<InputFailure> {
+    batch
+        .frame
+        .as_ref()
+        .and_then(|frame| {
+            frame_snapshot_failure(state, browser, batch.tab, batch.epoch, &batch.reply, frame)
+        })
+        .or_else(|| {
+            input_target_failure(
+                state,
+                browser,
+                batch.tab,
+                batch.epoch,
+                &batch.reply,
+                allow_navigation,
+            )
+        })
+        .or_else(|| match &batch.kind {
+            NativeInput::Fill(target) => fill_binding_failure(state, browser, batch.tab, target),
+            _ => None,
+        })
+}
+
 fn input_registered(state: &State, batch: &Shared<InputBatch>) -> bool {
     batch.ids.iter().take(batch.kind.count()).all(|id| state.pending.get(id).is_some_and(|pending| {
         matches!(&pending.step, Step::Input { batch: current, .. } if Shared::ptr_eq(current, batch))
@@ -4376,7 +6141,7 @@ fn remove_input_batch(batch: &Shared<InputBatch>) {
     });
 }
 
-// True advances a completed pointer move to DOM verification. Keep its pending
+// True advances intermediate input to DOM verification. Keep its pending
 // entry until that continuation replaces it, so callers cannot observe a gap.
 fn finish_input_batch(batch: &Shared<InputBatch>) -> bool {
     let (enqueuing, failure, acknowledged, attempted) = {
@@ -4399,13 +6164,11 @@ fn finish_input_batch(batch: &Shared<InputBatch>) -> bool {
     let current = STATE.with(|state| {
         let state = state.borrow();
         input_registered(&state, batch).then(|| {
-            input_target_failure(
+            batch_input_failure(
                 &state,
                 &batch.browser,
-                batch.tab,
-                batch.epoch,
-                &batch.reply,
-                !matches!(batch.kind, NativeInput::MouseMove(_)),
+                batch,
+                batch.kind.allows_navigation(),
             )
         })
     });
@@ -4416,8 +6179,21 @@ fn finish_input_batch(batch: &Shared<InputBatch>) -> bool {
     if failure.is_none() && !acknowledged {
         return false;
     }
-    if failure.is_none() && matches!(batch.kind, NativeInput::MouseMove(_)) {
-        return true;
+    if failure.is_none() && batch.kind.verifies_after_input() {
+        // Enter may have navigated successfully. Its old document observation
+        // is then unavailable, not proof that the original target received it.
+        let can_observe = !matches!(batch.kind, NativeInput::Key(_))
+            || STATE.with(|slot| {
+                slot.borrow().tabs.get(&batch.tab).is_some_and(|tab| {
+                    tab.navigation.epoch == batch.epoch
+                        && !tab.navigation.provisional
+                        && tab.navigation.committed
+                        && tab.navigation.document_available
+                })
+            });
+        if can_observe {
+            return true;
+        }
     }
     remove_input_batch(batch);
     if let Some(failure) = failure {
@@ -4453,16 +6229,12 @@ fn enqueue_input_batch(
         // Native getters can re-enter cancellation, handoff, navigation or close.
         let checked = STATE.with(|state| {
             let state = state.borrow();
-            input_registered(&state, batch).then(|| {
-                input_target_failure(
-                    &state,
-                    &batch.browser,
-                    batch.tab,
-                    batch.epoch,
-                    &batch.reply,
-                    false,
-                )
-            })
+            input_registered(&state, batch)
+                .then(|| batch_input_failure(&state, &batch.browser, batch, false).or_else(|| {
+                    (!focus_input_active(&state, &batch.browser, batch.tab, &batch.reply,
+                        batch.frame.as_ref().and_then(|frame| frame.session_id())))
+                        .then_some(InputFailure { code:"FOCUS_PREPARATION_FAILED", message:"Temporary input focus is no longer active; no remaining input is dispatched." })
+                }))
         });
         let Some(failure) = checked else {
             return false;
@@ -4481,8 +6253,11 @@ fn enqueue_input_batch(
             break;
         }
         batch.progress.borrow_mut().attempted[part] = true;
-        if let NativeInput::MouseMove(target) = &batch.kind {
-            target.attempted.set(true);
+        match &batch.kind {
+            NativeInput::MouseMove(target) => target.attempted.set(true),
+            NativeInput::Fill(target) => target.attempted.set(true),
+            NativeInput::Key(target) => target.attempted.set(true),
+            _ => {}
         }
         let receipt = submit(part, batch.ids[part]);
         if !STATE.with(|state| input_registered(&state.borrow(), batch)) {
@@ -4520,14 +6295,7 @@ fn input_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) -> bool
             && serde_json::from_slice::<Json>(bytes).is_ok_and(|value| value.is_object()));
     let current = STATE.with(|state| {
         let state = state.borrow();
-        input_target_failure(
-            &state,
-            browser,
-            batch.tab,
-            batch.epoch,
-            &batch.reply,
-            !matches!(batch.kind, NativeInput::MouseMove(_)),
-        )
+        batch_input_failure(&state, browser, &batch, batch.kind.allows_navigation())
     });
     {
         let mut progress = batch.progress.borrow_mut();
@@ -4550,7 +6318,7 @@ fn input_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) -> bool
         progress.acknowledged[part] = true;
     }
     if finish_input_batch(&batch) {
-        dispatch_click_verification(&batch);
+        dispatch_input_verification(&batch);
     }
     true
 }
@@ -4563,18 +6331,13 @@ fn reserve_input_batch(
 ) -> Result<Shared<InputBatch>, InputFailure> {
     STATE.with(|state| {
         let mut state = state.borrow_mut();
-        if let Some(failure) = input_target_failure(
-            &state,
-            browser,
-            pending.tab,
-            pending.epoch,
-            &pending.reply,
-            false,
-        ) {
+        if let Some(failure) = pending_input_failure(&state, browser, pending) {
             return Err(failure);
         }
         if !state.pending.get(&id).is_some_and(|current| {
-            current.reply.token == pending.reply.token && current.input_preparation()
+            current.reply.token == pending.reply.token
+                && Arc::ptr_eq(&current.reply.active, &pending.reply.active)
+                && current.input_preparation()
         }) {
             return Err(InputFailure {
                 code: "COMMAND_CANCELED",
@@ -4597,6 +6360,7 @@ fn reserve_input_batch(
             kind,
             tab: pending.tab,
             epoch: pending.epoch,
+            frame: pending.frame.clone(),
             browser: browser.clone(),
             reply: pending.reply.clone(),
             progress: RefCell::new(InputProgress {
@@ -4625,23 +6389,741 @@ fn reserve_input_batch(
     })
 }
 
+// Focus emulation is a temporary renderer/session setting, not native window
+// activation and not an atomic binding between a DOM ref and an Input command.
+// Its owner is deliberately separate from Pending: cancellation must still
+// disable the original session after the action's pending entries disappear.
+fn focus_preparation(pending: &Pending) -> bool {
+    let initial = matches!(pending.step, Step::Frame(_))
+        || (pending.frame.is_some() && matches!(pending.step, Step::Evaluate));
+    match &pending.evaluation {
+        Evaluation::Page {
+            evidence: Some(ActionEvidence::Press(_)),
+            ..
+        } => initial,
+        Evaluation::Page {
+            evidence: Some(ActionEvidence::Fill(target)),
+            ..
+        } => {
+            if target.insert {
+                initial
+            } else {
+                matches!(pending.step, Step::Evaluate)
+                    && target
+                        .classification
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|(input, _)| input == "chromium")
+            }
+        }
+        _ => false,
+    }
+}
+
+fn fill_dispatch_params(pending: &Pending, inspect: bool) -> Option<Json> {
+    let target = pending.fill_target()?;
+    let root_prefix = format!("{}/", pending.epoch);
+    let prefix = pending
+        .frame
+        .as_ref()
+        .map_or(root_prefix.as_str(), |frame| frame.ref_prefix());
+    let reference = target
+        .reference
+        .strip_prefix(prefix)
+        .filter(|reference| !reference.is_empty())?;
+    let mut request = json!({"action":"fill","ref":reference,"text":target.text});
+    if inspect {
+        request["inspectOnly"] = json!(true);
+    } else {
+        let classification = target.classification.borrow();
+        let (input, kind) = classification.as_ref()?;
+        request["expectedInput"] = json!(input);
+        request["expectedKind"] = json!(kind);
+    }
+    if let Some(frame) = &pending.frame {
+        Some(
+            json!({"expression":format!("window.__lightBrowserBridge.frameAct({request},{})", frame.binding()),
+            "uniqueContextId":frame.unique_context_id(),"returnByValue":true,"awaitPromise":false,"timeout":5000}),
+        )
+    } else {
+        Some(
+            json!({"expression":format!("(()=>{{{DOM_BRIDGE}\nreturn window.__lightBrowserBridge.act({request});}})()"),
+            "contextId":target.context.get()?,"returnByValue":true,"awaitPromise":false,"timeout":5000}),
+        )
+    }
+}
+
+fn start_focus_lease(browser: &Browser, method: &str, params: Json, mut pending: Pending) {
+    let tab = pending.tab;
+    let token = pending.reply.token;
+    pending.reply.focus_completion = Some(tab);
+    let session = pending.session().map(str::to_owned);
+    let reserved = STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        if state.focus_leases.contains_key(&tab) || state.focus_leases.len() >= MAX_FOCUS_LEASES {
+            return Err((
+                "TAB_BUSY",
+                "Temporary input focus is still in use or awaiting cleanup.",
+            ));
+        }
+        if let Some(failure) = pending_input_failure(&state, browser, &pending) {
+            return Err((failure.code, failure.message));
+        }
+        let id = state.next_control_message().ok_or((
+            "CONTROL_UNAVAILABLE",
+            "The control message identifiers are exhausted.",
+        ))?;
+        let evidence = match &pending.evaluation {
+            Evaluation::Page { evidence, .. } => evidence.clone(),
+            _ => None,
+        };
+        state.focus_leases.insert(
+            tab,
+            FocusLease {
+                browser: browser.clone(),
+                session,
+                token,
+                reply: pending.reply.clone(),
+                evidence,
+                attempted: false,
+                phase: FocusPhase::Enabling,
+                enable: FocusMessage::new(id),
+                disable: None,
+                disable_after_enable: false,
+                initial: Some(FocusContinuation::Dispatch {
+                    method: method.to_owned(),
+                    params,
+                    pending: pending.clone(),
+                }),
+                after: None,
+                stop_frames: false,
+                started: Instant::now(),
+            },
+        );
+        Ok(())
+    });
+    if let Err((code, message)) = reserved {
+        pending
+            .reply
+            .send_after_focus(Response::error(&pending.reply.id, code, message));
+        return;
+    }
+    send_focus_message(tab, token, true);
+    schedule_focus_watchdog();
+}
+
+fn focus_input_active(
+    state: &State,
+    browser: &Browser,
+    tab: i32,
+    reply: &Reply,
+    session: Option<&str>,
+) -> bool {
+    reply.focus_completion.is_none()
+        || state.focus_leases.get(&tab).is_some_and(|lease| {
+            lease.token == reply.token
+                && lease.phase == FocusPhase::Active
+                && lease.browser.get_raw() == browser.get_raw()
+                && lease.session.as_deref() == session
+        })
+}
+
+fn schedule_focus_watchdog() {
+    let schedule = STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        if state.focus_watchdog_queued
+            || !state
+                .focus_leases
+                .values()
+                .any(|lease| lease.phase != FocusPhase::Failed)
+        {
+            return false;
+        }
+        state.focus_watchdog_queued = true;
+        true
+    });
+    if !schedule {
+        return;
+    }
+    let mut task = FocusWatchdogTask::new();
+    if post_delayed_task(ThreadId::UI, Some(&mut task), 1000) == 0 {
+        let tabs = STATE.with(|slot| {
+            let mut state = slot.borrow_mut();
+            state.focus_watchdog_queued = false;
+            state.focus_leases.keys().copied().collect::<Vec<_>>()
+        });
+        for tab in tabs {
+            abort_focus_lease(
+                tab,
+                "CONTROL_UNAVAILABLE",
+                "Input cleanup monitoring is unavailable; no input is retried.",
+                true,
+            );
+        }
+    }
+}
+
+wrap_task! {
+    struct FocusWatchdogTask;
+    impl Task {
+        fn execute(&self) {
+            let tabs = STATE.with(|slot| {
+                let mut state = slot.borrow_mut();
+                state.focus_watchdog_queued = false;
+                state.focus_leases.iter().filter_map(|(tab, lease)|
+                    (lease.phase != FocusPhase::Failed && lease.started.elapsed() >= ACTION_TIMEOUT).then_some(*tab)).collect::<Vec<_>>()
+            });
+            for tab in tabs { abort_focus_lease(tab, "TIMEOUT", "The input operation exceeded its lifetime; do not repeat it automatically.", true); }
+            schedule_focus_watchdog();
+        }
+    }
+}
+
+fn focus_navigation_changed(tab: i32) {
+    let preserve_key_ack = STATE.with(|slot| {
+        let state = slot.borrow();
+        state.focus_leases.get(&tab).is_some_and(|lease| lease.phase == FocusPhase::Active
+            && lease.session.is_none() && matches!(&lease.evidence, Some(ActionEvidence::Press(target)) if target.attempted.get()))
+    });
+    // Root keys can navigate as their intended effect. Their existing ACK path
+    // still finishes the lease, or cancellation/watchdog does so if no ACK comes.
+    if !preserve_key_ack {
+        abort_focus_lease(
+            tab,
+            "PAGE_CHANGED",
+            "The document changed during input; inspect before retrying.",
+            true,
+        );
+    }
+}
+
+fn focus_message_current(
+    state: &State,
+    tab: i32,
+    token: u64,
+    id: i32,
+    enabled: bool,
+    browser: &Browser,
+) -> bool {
+    state
+        .tabs
+        .get(&tab)
+        .is_some_and(|page| page.browser.get_raw() == browser.get_raw())
+        && state.focus_leases.get(&tab).is_some_and(|lease| {
+            lease.token == token
+                && lease.browser.get_raw() == browser.get_raw()
+                && if enabled {
+                    lease.phase == FocusPhase::Enabling && lease.enable.id == id
+                } else {
+                    lease.phase == FocusPhase::Disabling
+                        && lease
+                            .disable
+                            .as_ref()
+                            .is_some_and(|message| message.id == id)
+                }
+        })
+}
+
+fn send_focus_message(tab: i32, token: u64, enabled: bool) {
+    let captured = STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        let lease = state
+            .focus_leases
+            .get_mut(&tab)
+            .filter(|lease| lease.token == token)?;
+        if enabled && lease.phase != FocusPhase::Enabling {
+            return None;
+        }
+        if !enabled
+            && (lease.phase != FocusPhase::Disabling
+                || (lease.enable.started && lease.enable.sending))
+        {
+            return None;
+        }
+        if !enabled {
+            lease.disable_after_enable = !lease.enable.started || lease.enable.finished().is_some();
+        }
+        let message = if enabled {
+            &mut lease.enable
+        } else {
+            lease.disable.as_mut()?
+        };
+        if message.started {
+            return None;
+        }
+        message.started = true;
+        let id = message.id;
+        Some((lease.browser.clone(), lease.session.clone(), id))
+    });
+    let Some((browser, session, id)) = captured else {
+        return;
+    };
+    let host = browser.host();
+    // No epoch/task/active-Reply guard here: disable must also reach a surviving
+    // session after navigation, cancellation or a task handoff.
+    let current =
+        STATE.with(|slot| focus_message_current(&slot.borrow(), tab, token, id, enabled, &browser));
+    let accepted = current
+        && host.is_some_and(|host| {
+            send_session_command(
+                &host,
+                id,
+                "Emulation.setFocusEmulationEnabled",
+                &json!({"enabled":enabled}),
+                session.as_deref(),
+            ) == id
+        });
+    STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        if let Some(lease) = state
+            .focus_leases
+            .get_mut(&tab)
+            .filter(|lease| lease.token == token)
+        {
+            let message = if enabled {
+                Some(&mut lease.enable)
+            } else {
+                lease.disable.as_mut()
+            };
+            if let Some(message) = message.filter(|message| message.id == id) {
+                message.sending = false;
+                message.accepted = Some(accepted);
+            }
+        }
+    });
+    advance_focus_lease(tab, token);
+    // Cancellation while enable's native sender was on the stack defers the
+    // disable send until the enable call has returned. Otherwise a synchronous
+    // disable ACK could release a lease before the earlier enable was accepted.
+    if enabled {
+        send_focus_message(tab, token, false);
+    }
+    let waiting = STATE.with(|slot| {
+        let state = slot.borrow();
+        state.focus_leases.get(&tab).is_some_and(|lease| {
+            lease.token == token
+                && if enabled {
+                    lease.phase == FocusPhase::Enabling
+                } else {
+                    lease.phase == FocusPhase::Disabling
+                }
+        })
+    });
+    if waiting {
+        let mut task = FocusTimeoutTask::new(tab, token, id, enabled);
+        if post_delayed_task(ThreadId::UI, Some(&mut task), FOCUS_ACK_TIMEOUT_MS) == 0 {
+            focus_timeout(tab, token, id, enabled);
+        }
+    }
+}
+
+fn begin_focus_cleanup(
+    tab: i32,
+    token: u64,
+    after: Option<FocusContinuation>,
+    stop_frames: bool,
+) -> bool {
+    let mut retired = Vec::with_capacity(2);
+    let reserved = STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        let Some(lease) = state
+            .focus_leases
+            .get(&tab)
+            .filter(|lease| lease.token == token)
+        else {
+            return None;
+        };
+        let allocate = !matches!(lease.phase, FocusPhase::Disabling | FocusPhase::Failed);
+        let id = allocate.then(|| state.next_control_message()).flatten();
+        let lease = state.focus_leases.get_mut(&tab).unwrap();
+        lease.stop_frames |= stop_frames;
+        if let Some(initial) = lease.initial.take() {
+            retired.push(initial);
+        }
+        if !matches!(lease.phase, FocusPhase::Failed) {
+            if let Some(after) = after {
+                let error =
+                    matches!(&after, FocusContinuation::Respond { response, .. } if !response.ok);
+                if lease.after.is_none() || error {
+                    if let Some(previous) = lease.after.replace(after) {
+                        retired.push(previous);
+                    }
+                } else {
+                    retired.push(after);
+                }
+            }
+        } else if let Some(after) = after {
+            retired.push(after);
+        }
+        if !allocate {
+            return Some(None);
+        }
+        lease.phase = FocusPhase::Disabling;
+        lease.disable = id.map(FocusMessage::new);
+        Some(Some(id))
+    });
+    drop(retired);
+    match reserved {
+        None => false,
+        Some(None) => true,
+        Some(Some(Some(_))) => {
+            send_focus_message(tab, token, false);
+            true
+        }
+        Some(Some(None)) => {
+            fail_focus_cleanup(tab, token);
+            true
+        }
+    }
+}
+
+fn defer_focus_reply(reply: &Reply, response: Response) -> bool {
+    let Some(tab) = reply.focus_completion else {
+        return false;
+    };
+    begin_focus_cleanup(
+        tab,
+        reply.token,
+        Some(FocusContinuation::Respond {
+            reply: reply.clone(),
+            response,
+        }),
+        false,
+    )
+}
+
+fn defer_focus_verification(batch: &Shared<InputBatch>) -> bool {
+    let Some(tab) = batch.reply.focus_completion else {
+        return false;
+    };
+    begin_focus_cleanup(
+        tab,
+        batch.reply.token,
+        Some(FocusContinuation::Verify(batch.clone())),
+        false,
+    )
+}
+
+fn abort_focus_lease(tab: i32, code: &str, message: &str, stop_frames: bool) {
+    let captured = STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        let lease = state.focus_leases.get(&tab)?;
+        let token = lease.token;
+        let after = FocusContinuation::Respond {
+            reply: lease.reply.clone(),
+            response: lease.failure(code, message, "pending"),
+        };
+        let ids = state
+            .pending
+            .iter()
+            .filter_map(|(id, pending)| (pending.reply.token == token).then_some(*id))
+            .collect::<Vec<_>>();
+        let retired = ids
+            .into_iter()
+            .filter_map(|id| state.pending.remove(&id))
+            .collect::<Vec<_>>();
+        Some((token, after, retired))
+    });
+    if let Some((token, after, retired)) = captured {
+        drop(retired);
+        begin_focus_cleanup(tab, token, Some(after), stop_frames);
+    }
+}
+
+fn fail_focus_cleanup(tab: i32, token: u64) {
+    let failure = STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        let lease = state.focus_leases.get_mut(&tab).filter(|lease| lease.token == token)?;
+        if lease.phase == FocusPhase::Failed { return None; }
+        lease.phase = FocusPhase::Failed;
+        lease.attempted = lease.attempted();
+        let evidence = lease.evidence.take();
+        let initial = lease.initial.take();
+        let after = lease.after.take();
+        lease.stop_frames = true;
+        let result = (lease.reply.clone(), lease.failure("FOCUS_CLEANUP_FAILED",
+            "Temporary input focus cleanup was not acknowledged. Do not repeat input; close this tab to reset its control session.", "failed"));
+        let ids = state.pending.iter().filter_map(|(id, pending)| (pending.reply.token == token).then_some(*id)).collect::<Vec<_>>();
+        let retired = ids.into_iter().filter_map(|id| state.pending.remove(&id)).collect::<Vec<_>>();
+        let frame_payload = state.frame_controls.get_mut(&tab)
+            .filter(|control| control.active_token == Some(token))
+            .map(|control| {
+                let inventory = control.active_inventory.take();
+                if let Some(inventory) = &inventory {
+                    inventory.invalidated.set(true);
+                    // Retain only the remote cleanup obligation, not the
+                    // FrameAction's input text while this tab is quarantined.
+                    let read = inventory.read.borrow();
+                    if let Some(parent) = read.as_ref().and_then(|read| read.parents.get(read.parent_index)) {
+                        if parent.frame.session_id.is_none() {
+                            control.deferred_object_group = parent.object_group.clone();
+                        }
+                    }
+                }
+                let snapshots = std::mem::take(&mut control.snapshots);
+                for snapshot in &snapshots { snapshot.invalidated.set(true); }
+                (inventory, snapshots)
+            });
+        Some((result, evidence, initial, after, retired, frame_payload))
+    });
+    if let Some(((reply, response), evidence, initial, after, retired, frame_payload)) = failure {
+        drop((evidence, initial, after, retired, frame_payload));
+        // Frame detachment is intentionally held while the session's setting is
+        // uncertain. A late successful disable ACK can release this quarantine.
+        reply.send_final(response);
+        notify_panel();
+    }
+}
+
+fn focus_session_detached(browser: &Browser, tab: i32, removed: &[String]) {
+    let retired = STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        let lease = state.focus_leases.get(&tab)?;
+        if lease.browser.get_raw() != browser.get_raw()
+            || !lease
+                .session
+                .as_ref()
+                .is_some_and(|session| removed.contains(session))
+        {
+            return None;
+        }
+        let lease = state.focus_leases.remove(&tab).unwrap();
+        let ids = state
+            .pending
+            .iter()
+            .filter_map(|(id, pending)| (pending.reply.token == lease.token).then_some(*id))
+            .collect::<Vec<_>>();
+        let pending = ids
+            .into_iter()
+            .filter_map(|id| state.pending.remove(&id))
+            .collect::<Vec<_>>();
+        Some((lease, pending))
+    });
+    if let Some((lease, pending)) = retired {
+        let response = lease.failure(
+            "FRAME_CHANGED",
+            "The controlled frame session ended during input. Inspect before retrying.",
+            "session-destroyed",
+        );
+        let reply = lease.reply.clone();
+        drop((lease, pending));
+        // Exact parent/child detachment transfers cleanup to engine disposal.
+        // This is an error, not a disable ACK or proof of renderer reset timing.
+        reply.send_final(response);
+    }
+}
+
+fn run_focus_continuation(continuation: FocusContinuation) {
+    match continuation {
+        FocusContinuation::Dispatch {
+            method,
+            params,
+            pending,
+        } => {
+            let browser = STATE.with(|slot| {
+                slot.borrow()
+                    .focus_leases
+                    .get(&pending.tab)
+                    .filter(|lease| {
+                        lease.token == pending.reply.token && lease.phase == FocusPhase::Active
+                    })
+                    .map(|lease| lease.browser.clone())
+            });
+            if let Some(browser) = browser {
+                dispatch(&browser, &method, params, pending);
+            }
+        }
+        FocusContinuation::Verify(batch) => dispatch_input_verification(&batch),
+        FocusContinuation::Respond { reply, response } => reply.send_after_focus(response),
+    }
+}
+
+fn advance_focus_lease(tab: i32, token: u64) {
+    enum Next {
+        Resume(FocusContinuation),
+        Reject,
+        Cleaned(FocusLease),
+        DisableAgain,
+        Fail,
+    }
+    let next = STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        let lease = state
+            .focus_leases
+            .get_mut(&tab)
+            .filter(|lease| lease.token == token)?;
+        match lease.phase {
+            FocusPhase::Enabling => match lease.enable.finished()? {
+                true if lease.reply.active.load(Ordering::Acquire) => {
+                    lease.phase = FocusPhase::Active;
+                    lease.initial.take().map(Next::Resume)
+                }
+                _ => Some(Next::Reject),
+            },
+            FocusPhase::Disabling | FocusPhase::Failed => {
+                if lease.enable.started && lease.enable.sending {
+                    return None;
+                }
+                let succeeded = lease.disable.as_ref()?.finished()?;
+                if !succeeded {
+                    return (lease.phase != FocusPhase::Failed).then_some(Next::Fail);
+                }
+                if lease.enable.started && lease.enable.finished().is_none() {
+                    return None;
+                }
+                if !lease.disable_after_enable {
+                    // An early cancellation can send disable before enable's
+                    // ACK. Once enable settles, one final disable establishes
+                    // ordering instead of assuming cross-domain reply order.
+                    let id = state.next_control_message();
+                    let lease = state.focus_leases.get_mut(&tab).unwrap();
+                    lease.phase = FocusPhase::Disabling;
+                    lease.disable = id.map(FocusMessage::new);
+                    return Some(if id.is_some() {
+                        Next::DisableAgain
+                    } else {
+                        Next::Fail
+                    });
+                }
+                let lease = state.focus_leases.remove(&tab).unwrap();
+                Some(Next::Cleaned(lease))
+            }
+            FocusPhase::Active => None,
+        }
+    });
+    match next {
+        Some(Next::Resume(continuation)) => run_focus_continuation(continuation),
+        Some(Next::Reject) => abort_focus_lease(
+            tab,
+            "FOCUS_PREPARATION_FAILED",
+            "Chromium did not acknowledge temporary input focus preparation. No input is retried.",
+            false,
+        ),
+        Some(Next::Fail) => fail_focus_cleanup(tab, token),
+        Some(Next::DisableAgain) => send_focus_message(tab, token, false),
+        Some(Next::Cleaned(mut lease)) => {
+            if lease.stop_frames {
+                stop_frame_tracking(tab, Some(token));
+            }
+            if let Some(after) = lease.after.take() {
+                run_focus_continuation(after);
+            }
+            notify_panel();
+        }
+        None => {}
+    }
+}
+
+fn complete_focus_message(browser: &Browser, id: i32, success: bool, bytes: &[u8]) -> bool {
+    let completed = STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        let (tab, lease) = state.focus_leases.iter_mut().find(|(_, lease)| {
+            lease.browser.get_raw() == browser.get_raw()
+                && (lease.enable.id == id
+                    || lease
+                        .disable
+                        .as_ref()
+                        .is_some_and(|message| message.id == id))
+        })?;
+        let message = if lease.enable.id == id {
+            &mut lease.enable
+        } else {
+            lease.disable.as_mut().unwrap()
+        };
+        if message.acknowledged.is_none() {
+            message.acknowledged = Some(
+                success
+                    && bytes.len() <= 4096
+                    && serde_json::from_slice::<Json>(bytes).is_ok_and(|value| value.is_object()),
+            );
+        }
+        Some((*tab, lease.token))
+    });
+    let Some((tab, token)) = completed else {
+        return false;
+    };
+    advance_focus_lease(tab, token);
+    true
+}
+
+fn focus_timeout(tab: i32, token: u64, id: i32, enabled: bool) {
+    let current = STATE.with(|slot| {
+        slot.borrow().focus_leases.get(&tab).is_some_and(|lease| {
+            lease.token == token
+                && if enabled {
+                    lease.phase == FocusPhase::Enabling && lease.enable.id == id
+                } else {
+                    lease.phase == FocusPhase::Disabling
+                        && lease
+                            .disable
+                            .as_ref()
+                            .is_some_and(|message| message.id == id)
+                }
+        })
+    });
+    if !current {
+        return;
+    }
+    if enabled {
+        abort_focus_lease(
+            tab,
+            "FOCUS_PREPARATION_TIMEOUT",
+            "Temporary input focus preparation timed out; no input is retried.",
+            false,
+        );
+    } else {
+        fail_focus_cleanup(tab, token);
+    }
+}
+
+wrap_task! {
+    struct FocusTimeoutTask { tab: i32, token: u64, id: i32, enabled: bool }
+    impl Task {
+        fn execute(&self) { focus_timeout(self.tab, self.token, self.id, self.enabled); }
+    }
+}
+
 fn dispatch_input(browser: &Browser, id: i32, pending: &Pending, kind: NativeInput) {
     let host = browser.host();
     let count = kind.count();
-    let mut dictionaries: [Option<DictionaryValue>; 2] = std::array::from_fn(|part| {
-        if part >= count {
-            return None;
-        }
-        parse_json(
-            Some(&CefString::from(kind.params(part).to_string().as_str())),
-            JsonParserOptions::default(),
-        )
-        .and_then(|value| value.dictionary())
-    });
-    // Enter's native code zero prevents native browser key fallback. Pointer
-    // input also avoids set_focus, frontmost-window and current-space changes.
+    let params: [Option<Json>; 2] =
+        std::array::from_fn(|part| (part < count).then(|| kind.params(part)));
+    // Native code zero prevents native browser key fallback. This dispatch code
+    // does not call native focus or selected-space methods.
     let available = browser.is_valid() != 0 && browser.has_document() != 0;
-    if host.is_none() || dictionaries[..count].iter().any(Option::is_none) || !available {
+    if !STATE.with(|slot| {
+        focus_input_active(
+            &slot.borrow(),
+            browser,
+            pending.tab,
+            &pending.reply,
+            pending.session(),
+        )
+    }) {
+        finish_input_preparation(
+            id,
+            pending,
+            "FOCUS_PREPARATION_FAILED",
+            "Temporary input focus is no longer active; no input was dispatched.",
+        );
+        return;
+    }
+    if let Some(failure) = STATE.with(|slot| {
+        pending.frame.as_ref().and_then(|frame| {
+            frame_snapshot_failure(
+                &slot.borrow(),
+                browser,
+                pending.tab,
+                pending.epoch,
+                &pending.reply,
+                frame,
+            )
+        })
+    }) {
+        finish_input_preparation(id, pending, failure.code, failure.message);
+        return;
+    }
+    if host.is_none() || !available {
         finish_input_preparation(
             id,
             pending,
@@ -4658,37 +7140,82 @@ fn dispatch_input(browser: &Browser, id: i32, pending: &Pending, kind: NativeInp
         }
     };
     let host = host.unwrap();
-    let method = CefString::from(batch.kind.method());
     if enqueue_input_batch(
         &batch,
         || browser.is_valid() != 0 && browser.has_document() != 0,
         |part, message| {
-            host.execute_dev_tools_method(message, Some(&method), dictionaries[part].as_mut())
+            send_session_command(
+                &host,
+                message,
+                batch.kind.method(),
+                params[part].as_ref().unwrap(),
+                if batch.kind.is_pointer() {
+                    None
+                } else {
+                    batch.frame.as_ref().and_then(|frame| frame.session_id())
+                },
+            )
         },
     ) {
-        dispatch_click_verification(&batch);
+        dispatch_input_verification(&batch);
     }
 }
 
-fn click_verification_params(batch: &InputBatch) -> Option<Json> {
-    let NativeInput::MouseMove(target) = &batch.kind else {
-        return None;
+fn input_verification_params(batch: &InputBatch) -> Option<Json> {
+    let (reference, context, mut request) = match &batch.kind {
+        NativeInput::MouseMove(target) => {
+            let point = if batch.frame.is_some() {
+                target.local_point.get()?
+            } else {
+                target.point.get()?
+            };
+            (
+                &target.reference,
+                target.context.get(),
+                json!({"action":target.action(),"point":{"x":point.x,"y":point.y},"verifyOnly":true}),
+            )
+        }
+        NativeInput::Fill(target) => {
+            let mut request = json!({"action":target.action(),"text":target.text,
+                "kind":target.kind.get()?,"verifyOnly":true});
+            if target.insert || target.kind.get() != Some("contenteditable") {
+                request["observation"] = json!(target.observation.borrow().as_ref()?);
+            }
+            (&target.reference, target.context.get(), request)
+        }
+        NativeInput::Key(target) => (
+            &target.reference,
+            target.context.get(),
+            json!({"action":"press","key":target.key.canonical(),
+                "observation":target.observation.borrow().as_ref()?,"verifyOnly":true}),
+        ),
+        _ => return None,
     };
-    let point = target.point.get()?;
-    let context = target.context.get()?;
-    let prefix = format!("{}/", batch.epoch);
-    let reference = target
-        .reference
-        .strip_prefix(&prefix)
-        .filter(|value| !value.is_empty())?;
-    let request = json!({"action":"click","ref":reference,"point":{"x":point.x,"y":point.y},"verifyOnly":true});
-    Some(
-        json!({"expression":format!("window.__lightBrowserBridge.act({request})"),"contextId":context,
-        "returnByValue":true,"awaitPromise":false,"timeout":5000}),
-    )
+    let root_prefix = format!("{}/", batch.epoch);
+    let prefix = batch
+        .frame
+        .as_ref()
+        .map_or(root_prefix.as_str(), |frame| frame.ref_prefix());
+    request["ref"] = json!(
+        reference
+            .strip_prefix(prefix)
+            .filter(|value| !value.is_empty())?
+    );
+    if let Some(frame) = &batch.frame {
+        let binding = frame.binding();
+        Some(
+            json!({"expression":format!("window.__lightBrowserBridge.frameAct({request},{binding})"),
+            "uniqueContextId":frame.unique_context_id(),"returnByValue":true,"awaitPromise":false,"timeout":5000}),
+        )
+    } else {
+        Some(
+            json!({"expression":format!("window.__lightBrowserBridge.act({request})"),"contextId":context?,
+            "returnByValue":true,"awaitPromise":false,"timeout":5000}),
+        )
+    }
 }
 
-fn reserve_click_verification(
+fn reserve_input_verification(
     batch: &Shared<InputBatch>,
 ) -> Result<Option<(i32, Pending)>, InputFailure> {
     STATE.with(|state| {
@@ -4696,14 +7223,7 @@ fn reserve_click_verification(
         if !input_registered(&state, batch) {
             return Ok(None);
         }
-        if let Some(failure) = input_target_failure(
-            &state,
-            &batch.browser,
-            batch.tab,
-            batch.epoch,
-            &batch.reply,
-            false,
-        ) {
+        if let Some(failure) = batch_input_failure(&state, &batch.browser, batch, false) {
             return Err(failure);
         }
         let Some(id) = state.next_message.checked_add(1) else {
@@ -4713,7 +7233,12 @@ fn reserve_click_verification(
             });
         };
         let pending = Pending {
-            step: Step::ClickVerify,
+            step: match &batch.kind {
+                NativeInput::Fill(_) => Step::FillVerify,
+                NativeInput::Key(_) => Step::PressVerify,
+                NativeInput::MouseMove(_) => Step::ClickVerify,
+                _ => unreachable!("terminal input has no verification"),
+            },
             ..state.pending[&batch.ids[0]].clone()
         };
         state.next_message = id;
@@ -4725,77 +7250,475 @@ fn reserve_click_verification(
     })
 }
 
-fn dispatch_click_verification(batch: &Shared<InputBatch>) {
-    let params = click_verification_params(batch);
+fn dispatch_input_verification(batch: &Shared<InputBatch>) {
+    if defer_focus_verification(batch) {
+        return;
+    }
+    let params = input_verification_params(batch);
     let host = batch.browser.host();
-    let mut dictionary = params.and_then(|params| {
-        parse_json(
-            Some(&CefString::from(params.to_string().as_str())),
-            JsonParserOptions::default(),
-        )
-        .and_then(|value| value.dictionary())
-    });
     let available = batch.browser.is_valid() != 0 && batch.browser.has_document() != 0;
-    if host.is_none() || dictionary.is_none() || !available {
+    if let Some(failure) = STATE.with(|slot| {
+        batch.frame.as_ref().and_then(|frame| {
+            frame_snapshot_failure(
+                &slot.borrow(),
+                &batch.browser,
+                batch.tab,
+                batch.epoch,
+                &batch.reply,
+                frame,
+            )
+        })
+    }) {
+        batch.progress.borrow_mut().failure = Some(failure);
+        finish_input_batch(batch);
+        return;
+    }
+    if batch.frame.is_none()
+        && matches!(batch.kind, NativeInput::Key(_))
+        && STATE.with(|slot| {
+            let state = slot.borrow();
+            batch_input_failure(&state, &batch.browser, batch, true).is_none()
+                && batch_input_failure(&state, &batch.browser, batch, false).is_some()
+        })
+    {
+        finish_input_batch(batch);
+        return;
+    }
+    if host.is_none() || params.is_none() || !available {
         batch.progress.borrow_mut().failure = Some(InputFailure {
             code: "CONTROL_UNAVAILABLE",
-            message: "Chromium is unavailable for click verification. Inspect before retrying.",
+            message: "Chromium is unavailable for input verification. Inspect before retrying.",
         });
         finish_input_batch(batch);
         return;
     }
-    // Native getters above can re-enter. Keep the pointer-move pending until
-    // this checked replacement; no fresh read, ref or document context is used.
-    let (id, _) = match reserve_click_verification(batch) {
+    // Native getters above can re-enter. Keep the input pending until this
+    // checked replacement; no fresh read, ref or document context is used.
+    let (id, _) = match reserve_input_verification(batch) {
         Ok(Some(reserved)) => reserved,
         Ok(None) => return,
         Err(failure) => {
+            if batch.frame.is_none()
+                && matches!(batch.kind, NativeInput::Key(_))
+                && failure.code == "PAGE_CHANGED"
+            {
+                finish_input_batch(batch);
+                return;
+            }
             batch.progress.borrow_mut().failure = Some(failure);
             finish_input_batch(batch);
             return;
         }
     };
-    if host.unwrap().execute_dev_tools_method(
+    if send_session_command(
+        &host.unwrap(),
         id,
-        Some(&CefString::from("Runtime.evaluate")),
-        dictionary.as_mut(),
-    ) == 0
+        "Runtime.evaluate",
+        &params.unwrap(),
+        batch.frame.as_ref().and_then(|frame| frame.session_id()),
+    ) != id
     {
         if let Some(pending) = complete_control_request(id) {
             pending_error(
                 &pending,
                 "CONTROL_UNAVAILABLE",
-                "Chromium rejected click verification. Inspect before retrying.",
+                "Chromium rejected input verification. Inspect before retrying.",
             );
         }
     }
 }
 
-fn finish_input_preparation(id: i32, pending: &Pending, code: &str, message: &str) {
-    let removed = STATE.with(|state| {
+fn take_input_preparation(id: i32, pending: &Pending) -> bool {
+    STATE.with(|state| {
         let mut state = state.borrow_mut();
         if state.pending.get(&id).is_some_and(|current| {
-            current.reply.token == pending.reply.token && current.input_preparation()
+            current.reply.token == pending.reply.token
+                && Arc::ptr_eq(&current.reply.active, &pending.reply.active)
+                && current.input_preparation()
         }) {
             state.pending.remove(&id);
             true
         } else {
             false
         }
-    });
-    if !removed {
+    })
+}
+
+fn finish_input_preparation(id: i32, pending: &Pending, code: &str, message: &str) {
+    if !take_input_preparation(id, pending) {
         return;
     }
-    // Preparation may focus or scroll. Click verification also follows a real
-    // pointer move; its engine-attempted evidence must survive a DOM rejection.
+    // Preparation may focus, select or scroll. Evidence from an engine input
+    // survives rejection of its later DOM verification.
     pending
         .reply
         .error_details(code, message, pending.outcome_details());
 }
 
+fn fill_error(value: &Json) -> (&'static str, &'static str) {
+    // Do not forward exception text, input values or arbitrary page-provided
+    // messages from either native verification or the legacy DOM path.
+    match value["error"].as_str() {
+        Some("STALE_REF") => (
+            "STALE_REF",
+            "Read the page again to get a current element ref.",
+        ),
+        Some("ELEMENT_UNAVAILABLE") => (
+            "ELEMENT_UNAVAILABLE",
+            "The fill target changed or became unavailable; read again.",
+        ),
+        Some("READ_ONLY") => ("READ_ONLY", "The fill target is read-only."),
+        Some("INVALID_TEXT") => ("INVALID_TEXT", "Text must be a string."),
+        Some("UNSUPPORTED_ELEMENT") => {
+            ("UNSUPPORTED_ELEMENT", "This element does not support fill.")
+        }
+        Some("FOCUS_NOT_REACHED") => (
+            "FOCUS_NOT_REACHED",
+            "The target did not retain focus; no text was inserted.",
+        ),
+        Some("SELECTION_NOT_REACHED") => (
+            "SELECTION_NOT_REACHED",
+            "The target did not retain the full selection; no text was inserted.",
+        ),
+        Some("INPUT_CANCELED") => (
+            "INPUT_CANCELED",
+            "The page canceled input; inspect the page before retrying.",
+        ),
+        Some("FILL_STATE_UNCONFIRMED") => (
+            "FILL_STATE_UNCONFIRMED",
+            "Input was attempted, but the original target could not be verified. Read again before retrying.",
+        ),
+        Some("FILL_STATE_NOT_REACHED") => (
+            "FILL_STATE_NOT_REACHED",
+            "Input was attempted, but the final value differs from the requested text. Read again before retrying.",
+        ),
+        Some("INSERT_STATE_UNCONFIRMED") => (
+            "INSERT_STATE_UNCONFIRMED",
+            "Text insertion was attempted, but its original target or input observation could not be confirmed. Read again before retrying.",
+        ),
+        Some("INSERT_STATE_NOT_REACHED") => (
+            "INSERT_STATE_NOT_REACHED",
+            "Text insertion was attempted, but the original control does not contain the expected result. Read again before retrying.",
+        ),
+        Some("INPUT_TARGET_MISMATCH") => (
+            "INPUT_TARGET_MISMATCH",
+            "A matching text input reached a different target. Inspect the page; do not automatically repeat the input.",
+        ),
+        _ => (
+            "ACTION_FAILED",
+            "The fill action did not complete; read again before retrying.",
+        ),
+    }
+}
+
+fn finish_legacy_fill(id: i32, pending: &Pending, value: &Json) {
+    if !take_input_preparation(id, pending) {
+        return;
+    }
+    if value["ok"] == false {
+        let (code, message) = fill_error(value);
+        let mut details = serde_json::Map::new();
+        if let Evaluation::Page {
+            evidence: Some(evidence),
+            ..
+        } = &pending.evaluation
+        {
+            for &key in evidence.fields(value) {
+                if let Some(value) = value[key].as_bool() {
+                    details.insert(key.into(), Json::Bool(value));
+                }
+            }
+        }
+        if details.is_empty() {
+            pending.reply.error(code, message);
+        } else {
+            pending
+                .reply
+                .error_details(code, message, Json::Object(details));
+        }
+    } else {
+        let mut page = json!({"ok":true,"action":"fill","trusted":false,
+            "detail":"Value set and input/change events dispatched; the native value matched the requested text at the final synchronous check."});
+        if let Some(changed) = value["changed"].as_bool() {
+            page["changed"] = json!(changed);
+            page["detail"] = json!(if changed {
+                "Plain text replaced the editing host contents and synthetic beforeinput/input were dispatched. Formatting and native editor undo are not preserved."
+            } else {
+                "The editing host already contains the requested plain text; no input events were dispatched."
+            });
+        }
+        pending.reply.ok(json!({"tab":pending.tab,"page":page}));
+    }
+}
+
+fn fill_preparation_result(
+    browser: &Browser,
+    id: i32,
+    pending: &Pending,
+    success: bool,
+    bytes: &[u8],
+) {
+    let failure = STATE.with(|slot| pending_input_failure(&slot.borrow(), browser, pending));
+    if let Some(failure) = failure {
+        finish_input_preparation(id, pending, failure.code, failure.message);
+        return;
+    }
+    let parsed = (bytes.len() <= 64 * 1024)
+        .then(|| serde_json::from_slice::<Json>(bytes).ok())
+        .flatten();
+    let Some(result) = parsed else {
+        finish_input_preparation(
+            id,
+            pending,
+            "INVALID_RESULT",
+            "Chromium returned an invalid text input result.",
+        );
+        return;
+    };
+    if !success || result.get("exceptionDetails").is_some() {
+        finish_input_preparation(
+            id,
+            pending,
+            "PAGE_SCRIPT_ERROR",
+            "Text input preparation or verification failed. Read again before retrying.",
+        );
+        return;
+    }
+    let value = &result["result"]["value"];
+    let target = pending
+        .fill_target()
+        .expect("fill handler has a fill target");
+    let verify = matches!(pending.step, Step::FillVerify);
+    if verify {
+        let native = value["action"] == target.action()
+            && value["input"] == "chromium"
+            && value["attempted"] == true
+            && value.get("prepared").is_none()
+            && value.get("trusted").is_none()
+            && target.attempted.get()
+            && (pending.frame.is_some() || target.context.get().is_some())
+            && target.kind.get().is_some();
+        if target.insert {
+            let observed = value["observation"].as_str() == target.observation.borrow().as_deref()
+                && target.observation.borrow().is_some();
+            let verification = if target.kind.get() == Some("contenteditable") {
+                "input-event"
+            } else {
+                "value"
+            };
+            if native
+                && observed
+                && value["ok"] == true
+                && value["verification"] == verification
+                && value.get("verified").is_none()
+            {
+                if take_input_preparation(id, pending) {
+                    let detail = if verification == "value" {
+                        "Chromium acknowledged insertion and the original control matched the expected value. Read again to verify later effects."
+                    } else {
+                        "Chromium acknowledged insertion and a matching trusted input event was observed on the original editing host. This does not verify the complete document, formatting or editor model; read again."
+                    };
+                    pending.reply.ok(json!({"tab":pending.tab,"page":{
+                        "ok":true,"action":"insert","input":"chromium","attempted":true,
+                        "dispatchAcknowledged":true,"verification":verification,"detail":detail
+                    }}));
+                }
+            } else if native && observed && value["ok"] == false {
+                let (code, message) = fill_error(value);
+                finish_input_preparation(id, pending, code, message);
+            } else {
+                finish_input_preparation(
+                    id,
+                    pending,
+                    "INVALID_PAGE_RESULT",
+                    "The page did not confirm the original insertion result. Read again.",
+                );
+            }
+            return;
+        }
+        let observed_fill = target.kind.get() == Some("contenteditable")
+            || (target.observation.borrow().is_some()
+                && matches!(
+                    value["inputTarget"].as_str(),
+                    Some("matched" | "unconfirmed")
+                ));
+        if native && observed_fill && value["ok"] == true && value["verified"] == true {
+            if take_input_preparation(id, pending) {
+                let mut page = json!({"ok":true,"action":"fill","input":"chromium",
+                    "attempted":true,"dispatchAcknowledged":true,"verified":true,
+                    "detail":"Chromium acknowledged text insertion and the original target matched the requested text; read again to verify later effects."});
+                if target.kind.get() != Some("contenteditable") {
+                    page["inputTarget"] = value["inputTarget"].clone();
+                }
+                pending.reply.ok(json!({"tab":pending.tab,"page":page}));
+            }
+        } else if native && value["ok"] == false && value.get("verified").is_none() {
+            let (code, message) = fill_error(value);
+            finish_input_preparation(id, pending, code, message);
+        } else {
+            finish_input_preparation(
+                id,
+                pending,
+                "INVALID_PAGE_RESULT",
+                "The page did not confirm the original fill result. Read again.",
+            );
+        }
+        return;
+    }
+    if value.get("prepared").is_some() {
+        if let Some(kind) = prepared_input_kind(pending, value) {
+            dispatch_input(browser, id, pending, kind);
+        } else {
+            finish_input_preparation(
+                id,
+                pending,
+                "INVALID_PAGE_RESULT",
+                "The page did not confirm text input preparation. Read again.",
+            );
+        }
+        return;
+    }
+    if value["input"] == "chromium"
+        && value["ok"] == false
+        && value["action"] == target.action()
+        && value["attempted"] == false
+        && value.get("trusted").is_none()
+        && value.get("verified").is_none()
+    {
+        target.native.set(true);
+        let (code, message) = fill_error(value);
+        finish_input_preparation(id, pending, code, message);
+    } else if !target.insert
+        && value.get("input").is_none()
+        && value.get("verified").is_none()
+        && value["action"] == "fill"
+        && (value["ok"] == false || (value["ok"] == true && value["trusted"] == false))
+    {
+        finish_legacy_fill(id, pending, value);
+    } else {
+        finish_input_preparation(
+            id,
+            pending,
+            "INVALID_PAGE_RESULT",
+            "The page did not return a supported fill result. Read again.",
+        );
+    }
+}
+
+fn press_verification_result(
+    browser: &Browser,
+    id: i32,
+    pending: &Pending,
+    success: bool,
+    bytes: &[u8],
+) {
+    // The engine already acknowledged both events. Navigation can invalidate
+    // this observation, but never relax cancellation, ownership or Browser checks.
+    let failure = STATE.with(|slot| {
+        let state = slot.borrow();
+        if let Some(failure) = pending.frame.as_ref().and_then(|frame| {
+            frame_snapshot_failure(
+                &state,
+                browser,
+                pending.tab,
+                pending.epoch,
+                &pending.reply,
+                frame,
+            )
+        }) {
+            return Some(failure);
+        }
+        input_target_failure(
+            &state,
+            browser,
+            pending.tab,
+            pending.epoch,
+            &pending.reply,
+            true,
+        )
+    });
+    if let Some(failure) = failure {
+        finish_input_preparation(id, pending, failure.code, failure.message);
+        return;
+    }
+    let current_failure =
+        STATE.with(|slot| pending_input_failure(&slot.borrow(), browser, pending));
+    if let Some(failure) = current_failure {
+        if pending.frame.is_some() {
+            finish_input_preparation(id, pending, failure.code, failure.message);
+            return;
+        }
+        if take_input_preparation(id, pending) {
+            let target = pending
+                .press_target()
+                .expect("key verification retains its target");
+            pending.reply.ok(
+                json!({"tab":pending.tab,"page":NativeInput::Key(target.clone()).success_page()}),
+            );
+        }
+        return;
+    }
+    let parsed = (bytes.len() <= 64 * 1024)
+        .then(|| serde_json::from_slice::<Json>(bytes).ok())
+        .flatten();
+    let Some(result) = parsed else {
+        finish_input_preparation(
+            id,
+            pending,
+            "INVALID_RESULT",
+            "The key target observation was invalid. Inspect before retrying.",
+        );
+        return;
+    };
+    let target = pending
+        .press_target()
+        .expect("key verification retains its target");
+    let value = &result["result"]["value"];
+    let valid = success
+        && result.get("exceptionDetails").is_none()
+        && value["ok"] == true
+        && value["action"] == "press"
+        && value["input"] == "chromium"
+        && value["attempted"] == true
+        && value["key"] == target.key.canonical()
+        && target.attempted.get()
+        && value["observation"].as_str() == target.observation.borrow().as_deref()
+        && matches!(
+            value["keydownTarget"].as_str(),
+            Some("matched" | "mismatched" | "unconfirmed")
+        );
+    if !valid {
+        finish_input_preparation(
+            id,
+            pending,
+            "INVALID_PAGE_RESULT",
+            "The original key target observation could not be verified. Inspect before retrying.",
+        );
+        return;
+    }
+    if value["keydownTarget"] == "mismatched" {
+        if take_input_preparation(id, pending) {
+            pending.reply.error_details("KEY_TARGET_MISMATCH",
+                "A matching keydown reached a different element. The input may already have changed the page; inspect it and do not automatically retry.",
+                json!({"tab":pending.tab,"attempted":true,"outcomeUnknown":true,
+                    "dispatchAcknowledged":true,"keydownTarget":"mismatched"}));
+        }
+        return;
+    }
+    if take_input_preparation(id, pending) {
+        pending.reply.ok(json!({"tab":pending.tab,"page":{
+            "ok":true,"action":"press","key":target.key.canonical(),"input":"chromium",
+            "attempted":true,"dispatchAcknowledged":true,"keydownTarget":value["keydownTarget"],
+            "detail":"The first matching trusted keydown target was observed when available. This cannot distinguish simultaneous human input or guarantee subsequent page effects. Read again before the next action."
+        }}));
+    }
+}
+
 fn prepared_input_kind(pending: &Pending, value: &Json) -> Option<NativeInput> {
-    let action = if pending.click_target().is_some() {
-        "click"
+    let action = if let Some(target) = pending.fill_target() {
+        target.action()
+    } else if let Some(target) = pending.click_target() {
+        target.action()
     } else {
         "press"
     };
@@ -4806,12 +7729,40 @@ fn prepared_input_kind(pending: &Pending, value: &Json) -> Option<NativeInput> {
     {
         return None;
     }
+    if let Some(target) = pending.fill_target() {
+        let kind = native_fill_kind(&value["kind"])?;
+        if !matches!(pending.step, Step::Evaluate)
+            || value["input"] != "chromium"
+            || value.get("trusted").is_some()
+            || value.get("verified").is_some()
+            || (pending.frame.is_none() && target.context.get().is_none())
+            || target.kind.get().is_some()
+            || target.attempted.get()
+        {
+            return None;
+        }
+        if target.insert || kind != "contenteditable" {
+            let observation = value["observation"].as_str()?;
+            if observation.len() != 32
+                || !observation.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || target.observation.borrow().is_some()
+            {
+                return None;
+            }
+            *target.observation.borrow_mut() = Some(observation.to_owned());
+        }
+        target.kind.set(Some(kind));
+        target.native.set(true);
+        return Some(NativeInput::Fill(target.clone()));
+    }
     if let Some(target) = pending.click_target() {
         let point = ClickPoint::from_json(&value["point"])?;
         if matches!(pending.step, Step::ClickVerify) {
-            (target.attempted.get() && target.point.get() == Some(point))
+            (!target.hover && target.attempted.get() && target.point.get() == Some(point))
                 .then_some(NativeInput::Click(point))
-        } else if target.context.get().is_some()
+        } else if matches!(pending.step, Step::Evaluate)
+            && !target.attempted.get()
+            && (pending.frame.is_some() || target.context.get().is_some())
             && target.point.get().is_none_or(|existing| existing == point)
         {
             target.point.set(Some(point));
@@ -4819,9 +7770,39 @@ fn prepared_input_kind(pending: &Pending, value: &Json) -> Option<NativeInput> {
         } else {
             None
         }
+    } else if let Some(target) = pending.press_target() {
+        let observation = value["observation"].as_str()?;
+        if !matches!(pending.step, Step::Evaluate)
+            || value["key"] != target.key.canonical()
+            || value.get("trusted").is_some()
+            || (pending.frame.is_none() && target.context.get().is_none())
+            || observation.len() != 32
+            || !observation.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || target.observation.borrow().is_some()
+            || target.attempted.get()
+        {
+            return None;
+        }
+        *target.observation.borrow_mut() = Some(observation.to_owned());
+        Some(NativeInput::Key(target.clone()))
     } else {
-        (value["key"] == "Enter").then_some(NativeInput::Enter)
+        None
     }
+}
+
+fn hover_verified(pending: &Pending, value: &Json) -> bool {
+    pending.click_target().is_some_and(|target| {
+        target.hover
+            && matches!(pending.step, Step::ClickVerify)
+            && target.attempted.get()
+            && (pending.frame.is_some() || target.context.get().is_some())
+            && target.point.get().is_some()
+            && ClickPoint::from_json(&value["point"]) == target.point.get()
+            && value["ok"] == true
+            && value["action"] == target.action()
+            && value["prepared"] == true
+            && value["attempted"] == false
+    })
 }
 
 fn input_preparation_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) -> bool {
@@ -4836,21 +7817,20 @@ fn input_preparation_result(browser: &Browser, id: i32, success: bool, bytes: &[
     let Some(pending) = pending else {
         return false;
     };
-    let action = if pending.click_target().is_some() {
-        "click"
+    if pending.fill_target().is_some() {
+        fill_preparation_result(browser, id, &pending, success, bytes);
+        return true;
+    }
+    if matches!(pending.step, Step::PressVerify) {
+        press_verification_result(browser, id, &pending, success, bytes);
+        return true;
+    }
+    let action = if let Some(target) = pending.click_target() {
+        target.action()
     } else {
         "press"
     };
-    let failure = STATE.with(|state| {
-        input_target_failure(
-            &state.borrow(),
-            browser,
-            pending.tab,
-            pending.epoch,
-            &pending.reply,
-            false,
-        )
-    });
+    let failure = STATE.with(|state| pending_input_failure(&state.borrow(), browser, &pending));
     if let Some(failure) = failure {
         finish_input_preparation(id, &pending, failure.code, failure.message);
         return true;
@@ -4884,6 +7864,18 @@ fn input_preparation_result(browser: &Browser, id: i32, success: bool, bytes: &[
                 .as_str()
                 .unwrap_or("Input preparation did not complete."),
         );
+    } else if pending.frame.is_some() && pending.click_target().is_some() {
+        frame_pointer_input_ready(browser, id, &pending, value);
+    } else if hover_verified(&pending, value) {
+        // Hover is terminal after one mouseMoved and its original-point check.
+        // Never advance it to the click press/release pair.
+        if take_input_preparation(id, &pending) {
+            pending.reply.ok(json!({"tab":pending.tab,"page":{
+                "ok":true,"action":"hover","input":"chromium","attempted":true,
+                "dispatchAcknowledged":true,"pointVerified":true,
+                "detail":"Chromium acknowledged mouseMoved and the original point still reached the reference. Read again to verify hover effects."
+            }}));
+        }
     } else if let Some(kind) = prepared_input_kind(&pending, value) {
         dispatch_input(browser, id, &pending, kind);
     } else {
@@ -4897,8 +7889,2541 @@ fn input_preparation_result(browser: &Browser, id: i32, success: bool, bytes: &[
     true
 }
 
-fn dispatch(browser: &Browser, method: &str, params: Json, pending: Pending) {
+struct ReadinessDispatchGuard {
+    waiter: Waiter,
+    browser: Browser,
+    epoch: u64,
+    document_epoch: u64,
+    owner: Option<(TaskScope, Status)>,
+}
+
+fn readiness_dispatch_current(
+    state: &State,
+    pending: &Pending,
+    guard: &ReadinessDispatchGuard,
+) -> bool {
+    let token = guard.waiter.reply.token;
+    pending_matches_waiter(pending, &guard.waiter)
+        && state.waits.get(&token).is_some_and(|waiter| {
+            same_waiter(waiter, &guard.waiter)
+                && waiter.probe_in_flight
+                && waiter.started.elapsed() < Duration::from_millis(waiter.timeout_ms)
+        })
+        && pending.reply.active.load(Ordering::Acquire)
+        && guard.waiter.started.elapsed() < Duration::from_millis(guard.waiter.timeout_ms)
+        && state
+            .tasks
+            .check_tab(pending.reply.scope.as_ref(), pending.tab)
+            .is_ok()
+        && link_owner(&state.tasks, pending.tab) == guard.owner
+        && state.tabs.get(&pending.tab).is_some_and(|tab| {
+            !tab.rejected_creation
+                && tab.browser.get_raw() == guard.browser.get_raw()
+                && tab.navigation.epoch == pending.epoch
+                && tab.navigation.epoch == guard.epoch
+                && tab.navigation.document_epoch == guard.document_epoch
+                && !tab.navigation.provisional
+                && tab.navigation.document_available
+                && tab.navigation.renderer_exit.is_none()
+                && tab.navigation.error.is_none()
+                && !tab.navigation.stopped
+                && !tab.navigation.incomplete
+        })
+}
+
+fn dispatch_readiness_with<H, P>(
+    browser: &Browser,
+    pending: Pending,
+    host: impl FnOnce() -> Option<H>,
+    params: impl FnOnce() -> Option<P>,
+    send: impl FnOnce(H, P, i32) -> i32,
+) {
+    let guard = STATE.with(|slot| {
+        let state = slot.borrow();
+        let Evaluation::ReadyState { token, .. } = pending.evaluation else {
+            return None;
+        };
+        let waiter = state.waits.get(&token)?.clone();
+        let tab = state.tabs.get(&pending.tab)?;
+        let guard = ReadinessDispatchGuard {
+            waiter,
+            browser: browser.clone(),
+            epoch: pending.epoch,
+            document_epoch: tab.navigation.document_epoch,
+            owner: link_owner(&state.tasks, pending.tab),
+        };
+        readiness_dispatch_current(&state, &pending, &guard).then_some(guard)
+    });
+    let Some(guard) = guard else {
+        pending_error(
+            &pending,
+            "PAGE_CHANGED",
+            "The wait probe is no longer current.",
+        );
+        return;
+    };
+    let host = host();
+    if !STATE.with(|slot| readiness_dispatch_current(&slot.borrow(), &pending, &guard)) {
+        pending_error(
+            &pending,
+            "PAGE_CHANGED",
+            "The page changed while preparing the wait probe.",
+        );
+        return;
+    }
+    let Some(host) = host else {
+        pending_error(&pending, "TAB_CLOSED", "Browser host is unavailable.");
+        return;
+    };
+    let params = params();
+    let reserved = STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        if params.is_none() || !readiness_dispatch_current(&state, &pending, &guard) {
+            return Err((
+                "PAGE_CHANGED",
+                "The page changed while preparing the wait probe.",
+            ));
+        }
+        let id = state.next_control_message().ok_or((
+            "CONTROL_UNAVAILABLE",
+            "The control message identifiers are exhausted.",
+        ))?;
+        state.pending.insert(id, pending.clone());
+        Ok(id)
+    });
+    let id = match reserved {
+        Ok(id) => id,
+        Err((code, message)) => {
+            pending_error(&pending, code, message);
+            return;
+        }
+    };
+    // All CEF getters and parameter preparation are complete. A stale probe
+    // releases only its own waiter; the existing deadline tick remains active.
+    if send(host, params.unwrap(), id) != id {
+        if let Some(pending) = complete_control_request(id) {
+            pending_error(
+                &pending,
+                "CONTROL_UNAVAILABLE",
+                "Chromium rejected the wait probe.",
+            );
+        }
+    }
+}
+
+fn command_reference(command: &Command) -> Option<&str> {
+    match command {
+        Command::Click { reference, .. }
+        | Command::Hover { reference, .. }
+        | Command::Check { reference, .. }
+        | Command::Fill { reference, .. }
+        | Command::Insert { reference, .. }
+        | Command::Select { reference, .. }
+        | Command::Press { reference, .. } => Some(reference),
+        _ => None,
+    }
+}
+
+fn frame_action_arguments(command: &Command, snapshot: &FrameSnapshot) -> Option<Json> {
+    let reference = command_reference(command)?;
+    if !snapshot.references.contains(reference) {
+        return None;
+    }
+    let reference = reference.strip_prefix(snapshot.ref_prefix())?;
+    Some(match command {
+        Command::Click { .. } => json!({"action":"click","ref":reference}),
+        Command::Hover { .. } => json!({"action":"hover","ref":reference}),
+        Command::Fill { text, .. } => json!({"action":"fill","ref":reference,"text":text}),
+        Command::Insert { text, .. } => json!({"action":"insert","ref":reference,"text":text}),
+        Command::Press { key, .. } => json!({"action":"press","ref":reference,"key":key}),
+        Command::Check { checked, .. } => {
+            json!({"action":"check","ref":reference,"checked":checked})
+        }
+        Command::Select { value, .. } => json!({"action":"select","ref":reference,"value":value}),
+        _ => return None,
+    })
+}
+
+fn start_frame_action(browser: &Browser, tab: i32, command: &Command, reply: Reply) {
+    let snapshot = STATE.with(|slot| {
+        slot.borrow().frame_controls.get(&tab).and_then(|control| {
+            control
+                .snapshots
+                .iter()
+                .find(|snapshot| {
+                    command_reference(command)
+                        .is_some_and(|reference| snapshot.references.contains(reference))
+                })
+                .cloned()
+        })
+    });
+    let Some(snapshot) = snapshot.filter(|snapshot| {
+        !snapshot.invalidated.get()
+            && snapshot.browser.get_raw() == browser.get_raw()
+            && command_reference(command)
+                .is_some_and(|reference| snapshot.references.contains(reference))
+    }) else {
+        reply.error(
+            "STALE_FRAME_SNAPSHOT",
+            "Read the frame again to obtain a current reference.",
+        );
+        return;
+    };
+    start_frame_inventory(
+        browser,
+        tab,
+        Some(snapshot.frame.frame_id.clone()),
+        Some(FrameAction {
+            command: command.clone(),
+            snapshot,
+        }),
+        false,
+        reply,
+    );
+}
+
+fn frame_snapshot_failure(
+    state: &State,
+    browser: &Browser,
+    tab: i32,
+    epoch: u64,
+    reply: &Reply,
+    snapshot: &Shared<FrameSnapshot>,
+) -> Option<InputFailure> {
+    let current = !snapshot.invalidated.get()
+        && snapshot.browser.get_raw() == browser.get_raw()
+        && snapshot.epoch == epoch
+        && snapshot.owner == link_owner(&state.tasks, tab)
+        && state.tasks.check_tab(reply.scope.as_ref(), tab).is_ok()
+        && reply.active.load(Ordering::Acquire)
+        && state.tabs.get(&tab).is_some_and(|page| {
+            !page.rejected_creation
+                && page.browser.get_raw() == browser.get_raw()
+                && page.navigation.epoch == epoch
+                && page.navigation.document_epoch == snapshot.document_epoch
+                && page.navigation.document_available
+                && !page.navigation.provisional
+                && page.navigation.renderer_exit.is_none()
+        })
+        && state.frame_controls.get(&tab).is_some_and(|control| {
+            control.enabled
+                && !control.cleanup_failed
+                && control.cleanup.is_none()
+                && control.runtime_cleanup.is_none()
+                && control.object_cleanup.is_none()
+                && control.active_token == Some(reply.token)
+                && control
+                    .snapshots
+                    .iter()
+                    .any(|stored| Shared::ptr_eq(stored, snapshot))
+                && snapshot
+                    .session_id()
+                    .is_none_or(|session| control.sessions.contains(session))
+                && control.active_inventory.as_ref().is_some_and(|inventory| {
+                    !inventory.invalidated.get()
+                        && inventory
+                            .action
+                            .as_ref()
+                            .is_some_and(|action| Shared::ptr_eq(&action.snapshot, snapshot))
+                        && inventory.read.borrow().as_ref().is_some_and(|read| {
+                            read.frame.frame_id == snapshot.frame.frame_id
+                                && read.frame.session_id == snapshot.frame.session_id
+                                && read
+                                    .parents
+                                    .iter()
+                                    .all(|parent| !parent.context.invalidated())
+                                && read.context.context().is_some_and(|context| {
+                                    context.unique_id == snapshot.unique_context
+                                })
+                        })
+                })
+        });
+    (!current).then_some(InputFailure { code:"FRAME_CHANGED", message:"The original frame, document, context or control ownership changed. Read again; do not repeat input automatically." })
+}
+
+fn finish_frame_action_reply(tab: i32, reply: &Reply, response: Response) {
+    if !reply.active.load(Ordering::Acquire) {
+        return;
+    }
+    let inventory = STATE.with(|slot| {
+        let state = slot.borrow();
+        state
+            .frame_controls
+            .get(&tab)
+            .filter(|control| control.active_token == Some(reply.token))
+            .and_then(|control| control.active_inventory.clone())
+    });
+    let Some(inventory) = inventory else {
+        // Cancellation/disconnection already revoked the route. Preserve an
+        // actual error, but never turn a late successful action into success.
+        reply.send_final(if response.ok {
+            Response::error(
+                &reply.id,
+                "FRAME_CHANGED",
+                "The frame changed before action completion.",
+            )
+            .with_details(json!({"outcomeUnknown":true}))
+        } else {
+            response
+        });
+        return;
+    };
+    if !response.ok {
+        stop_frame_tracking(tab, Some(reply.token));
+        reply.send_final(response);
+        return;
+    }
+    let Some(action) = inventory.action.as_ref() else {
+        reply.send_final(Response::error(
+            &reply.id,
+            "INVALID_RESULT",
+            "The frame action is unavailable.",
+        ));
+        return;
+    };
+    let failure = STATE.with(|slot| {
+        frame_snapshot_failure(
+            &slot.borrow(),
+            &inventory.browser,
+            tab,
+            action.snapshot.epoch,
+            reply,
+            &action.snapshot,
+        )
+    });
+    if let Some(failure) = failure {
+        stop_frame_tracking(tab, Some(reply.token));
+        reply.send_final(
+            Response::error(&reply.id, failure.code, failure.message)
+                .with_details(json!({"outcomeUnknown":true})),
+        );
+        return;
+    }
+    if inventory.response.borrow().is_some() {
+        return;
+    }
+    *inventory.response.borrow_mut() = Some(response);
+    dispatch_frame_phase(Pending {
+        tab,
+        epoch: action.snapshot.epoch,
+        evaluation: Evaluation::Page {
+            mutation: true,
+            evidence: None,
+        },
+        reply: Reply {
+            frame_completion: None,
+            ..reply.clone()
+        },
+        frame: None,
+        step: Step::FrameInventory {
+            inventory: inventory.clone(),
+            session: action.snapshot.frame.session_id.clone(),
+            phase: FramePhase::RuntimeDisable,
+        },
+    });
+}
+
+fn frame_inventory_current(state: &State, browser: &Browser, pending: &Pending) -> bool {
+    let Step::FrameInventory {
+        inventory, session, ..
+    } = &pending.step
+    else {
+        return true;
+    };
+    pending.reply.active.load(Ordering::Acquire)
+        && !inventory.invalidated.get()
+        && inventory.page_read.as_ref().is_none_or(|page_read| {
+            page_read.borrow().collected.iter().all(|collected| {
+                !collected.context.invalidated() && !collected.snapshot.invalidated.get()
+            })
+        })
+        && inventory.read.borrow().as_ref().is_none_or(|read| {
+            !read.context.invalidated()
+                && read
+                    .parents
+                    .iter()
+                    .all(|parent| !parent.context.invalidated())
+        })
+        && inventory.browser.get_raw() == browser.get_raw()
+        && inventory.owner == link_owner(&state.tasks, pending.tab)
+        && state
+            .tasks
+            .check_tab(pending.reply.scope.as_ref(), pending.tab)
+            .is_ok()
+        && state.tabs.get(&pending.tab).is_some_and(|tab| {
+            tab.browser.get_raw() == browser.get_raw()
+                && !tab.rejected_creation
+                && tab.navigation.epoch == pending.epoch
+                && tab.navigation.document_epoch == inventory.document_epoch
+                && !tab.navigation.provisional
+                && tab.navigation.document_available
+                && tab.navigation.renderer_exit.is_none()
+        })
+        && state
+            .frame_controls
+            .get(&pending.tab)
+            .is_some_and(|control| {
+                control.enabled
+                    && control.active_token == Some(pending.reply.token)
+                    && control.cleanup.is_none()
+                    && control.runtime_cleanup.is_none()
+                    && control.object_cleanup.is_none()
+                    && !control.cleanup_failed
+                    && session
+                        .as_deref()
+                        .is_none_or(|session| control.sessions.contains(session))
+            })
+}
+
+fn start_frame_inventory(
+    browser: &Browser,
+    tab: i32,
+    requested_frame: Option<String>,
+    action: Option<FrameAction>,
+    read_page: bool,
+    reply: Reply,
+) {
+    match diagnostic_tab_info(tab, browser, &reply, |tab| {
+        tab.navigation.provisional
+            || !tab.navigation.committed
+            || !tab.navigation.document_available
+    }) {
+        Ok(Some(info)) => {
+            reply.error_details(
+                "PAGE_LOADING",
+                "The current document is not available yet.",
+                json!({"tab":tab,"state":info}),
+            );
+            return;
+        }
+        Err(error) => {
+            observation_error(&reply, error);
+            return;
+        }
+        Ok(None) => {}
+    }
+    let prepared = STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        let page = state.tabs.get(&tab).filter(|page| {
+            !page.rejected_creation && page.browser.get_raw() == browser.get_raw()
+        })?;
+        let epoch = page.navigation.epoch;
+        let inventory = Shared::new(FrameInventory {
+            browser: browser.clone(),
+            document_epoch: page.navigation.document_epoch,
+            owner: link_owner(&state.tasks, tab),
+            requested_frame,
+            page_read: read_page.then(|| RefCell::new(PageRead::default())),
+            pointer: action
+                .as_ref()
+                .and_then(|action| FramePointer::new(&action.command)),
+            action,
+            response: RefCell::new(None),
+            read: RefCell::new(None),
+            current: RefCell::new((None, FramePhase::Enable)),
+            invalidated: Cell::new(false),
+            visited: RefCell::new(BTreeSet::new()),
+            frames: RefCell::new(Vec::new()),
+            truncated: Cell::new(false),
+        });
+        let control = state.frame_controls.entry(tab).or_default();
+        if control.cleanup.is_some()
+            || control.runtime_cleanup.is_some()
+            || control.object_cleanup.is_some()
+            || control.cleanup_failed
+            || control.active_token.is_some()
+        {
+            return None;
+        }
+        if (inventory.requested_frame.is_some() || read_page) && inventory.action.is_none() {
+            for snapshot in control.snapshots.drain(..) {
+                snapshot.invalidated.set(true);
+            }
+        }
+        control.enabled = true;
+        control.active_token = Some(reply.token);
+        control.active_inventory = Some(inventory.clone());
+        let phase = if control.root_ready {
+            FramePhase::Tree
+        } else {
+            FramePhase::Enable
+        };
+        Some(Pending {
+            frame: None,
+            tab,
+            epoch,
+            reply: reply.clone(),
+            evaluation: Evaluation::Page {
+                mutation: false,
+                evidence: None,
+            },
+            step: Step::FrameInventory {
+                inventory,
+                session: None,
+                phase,
+            },
+        })
+    });
+    let Some(pending) = prepared else {
+        reply.error("FRAME_CONTROL_UNAVAILABLE", "Frame discovery is busy, disconnecting, or unavailable. Inspect the tab before retrying.");
+        return;
+    };
+    dispatch_frame_phase(pending);
+}
+
+fn dispatch_frame_phase(pending: Pending) {
+    let Step::FrameInventory {
+        inventory,
+        phase,
+        session,
+    } = &pending.step
+    else {
+        return;
+    };
+    let browser = inventory.browser.clone();
+    *inventory.current.borrow_mut() = (session.clone(), *phase);
+    if matches!(phase, FramePhase::RuntimeEnable | FramePhase::ParentEnable) && session.is_none() {
+        STATE.with(|slot| {
+            if let Some(control) = slot
+                .borrow_mut()
+                .frame_controls
+                .get_mut(&pending.tab)
+                .filter(|control| control.active_token == Some(pending.reply.token))
+            {
+                // A failed/late enable still needs explicit root-domain cleanup.
+                control.root_runtime_enabled = true;
+            }
+        });
+    }
+    let (method, params) = match phase {
+        FramePhase::Enable => ("Page.enable", json!({})),
+        FramePhase::Attach => (
+            "Target.setAutoAttach",
+            json!({"autoAttach":true,"waitForDebuggerOnStart":false,"flatten":true,"filter":[{"type":"iframe"},{"exclude":true}]}),
+        ),
+        FramePhase::Tree => ("Page.getFrameTree", json!({})),
+        FramePhase::RuntimeReset
+        | FramePhase::RuntimeDisable
+        | FramePhase::ParentReset
+        | FramePhase::ParentDisable => ("Runtime.disable", json!({})),
+        FramePhase::ParentEnable => ("Runtime.enable", json!({})),
+        FramePhase::ParentWorld
+        | FramePhase::ParentOwner
+        | FramePhase::ParentResolve
+        | FramePhase::ParentInspect
+        | FramePhase::ParentRelease => {
+            let prepared = frame_parent_command(inventory, *phase, pending.reply.token);
+            let Some(command) = prepared else {
+                pending_error(
+                    &pending,
+                    "FRAME_OWNER_UNAVAILABLE",
+                    "The frame parent inspection target is unavailable.",
+                );
+                return;
+            };
+            command
+        }
+        FramePhase::Action => {
+            dispatch_frame_action(&pending);
+            return;
+        }
+        FramePhase::Pointer => {
+            dispatch_frame_pointer_dom(&pending);
+            return;
+        }
+        FramePhase::RuntimeEnable => ("Runtime.enable", json!({})),
+        FramePhase::World => {
+            let target = inventory.read.borrow().as_ref().map(|read| {
+                (
+                    read.context.frame_id().to_owned(),
+                    read.context.world_name().to_owned(),
+                )
+            });
+            let Some((frame, world)) = target else {
+                pending_error(
+                    &pending,
+                    "FRAME_UNAVAILABLE",
+                    "The selected frame is unavailable.",
+                );
+                return;
+            };
+            (
+                "Page.createIsolatedWorld",
+                json!({"frameId":frame,"worldName":world,"grantUniveralAccess":false}),
+            )
+        }
+        FramePhase::Read => {
+            let context = inventory
+                .read
+                .borrow()
+                .as_ref()
+                .and_then(|read| read.context.context())
+                .map(|context| context.unique_id.clone());
+            let Some(context) = context else {
+                pending_error(
+                    &pending,
+                    "CONTEXT_UNAVAILABLE",
+                    "The original frame context is unavailable.",
+                );
+                return;
+            };
+            let limits = inventory
+                .page_read
+                .as_ref()
+                .map_or_else(String::new, |page_read| {
+                    page_read.borrow().remaining.to_json().to_string()
+                });
+            let expression = format!(
+                "(()=>{{if(!document.body||!['interactive','complete'].includes(document.readyState))return {{ok:false,error:'PAGE_LOADING'}};{DOM_BRIDGE}\nreturn window.__lightBrowserBridge.readFrameActions({limits});}})()"
+            );
+            (
+                "Runtime.evaluate",
+                json!({"expression":expression,"uniqueContextId":context,"returnByValue":true,"awaitPromise":false,"timeout":5000}),
+            )
+        }
+    };
+    dispatch(&browser, method, params, pending);
+}
+
+/// Disable the root auto-attacher, which owns all descendant attachments.
+/// Keep the cleanup ID until the ACK; send acceptance alone is not detachment.
+fn stop_frame_tracking(tab: i32, token: Option<u64>) {
+    let focus = STATE.with(|slot| {
+        slot.borrow()
+            .focus_leases
+            .get(&tab)
+            .filter(|lease| token.is_none_or(|token| token == lease.token))
+            .map(|lease| lease.token)
+    });
+    if let Some(focus_token) = focus {
+        // The original child session must survive until its focus-disable ACK.
+        // Revoke the frame route now, while retaining its transport for cleanup.
+        STATE.with(|slot| {
+            if let Some(control) = slot.borrow_mut().frame_controls.get_mut(&tab) {
+                if let Some(inventory) = &control.active_inventory {
+                    inventory.invalidated.set(true);
+                }
+                for snapshot in &control.snapshots {
+                    snapshot.invalidated.set(true);
+                }
+            }
+        });
+        abort_focus_lease(
+            tab,
+            "FRAME_CHANGED",
+            "The frame action was revoked during input; inspect before retrying.",
+            true,
+        );
+        // A reentrant ACK may already have removed the lease and completed the
+        // deferred stop. Never detach its session a second time here.
+        let _ = focus_token;
+        return;
+    }
+    let reservation = STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        let browser = state.tabs.get(&tab)?.browser.clone();
+        let control = state.frame_controls.get_mut(&tab)?;
+        if token.is_some_and(|token| control.active_token != Some(token)) || !control.enabled {
+            return None;
+        }
+        let object = control.deferred_object_group.take().or_else(|| {
+            control.active_inventory.as_ref().and_then(|inventory| {
+                let read = inventory.read.borrow();
+                let read = read.as_ref()?;
+                let parent = read.parents.get(read.parent_index)?;
+                parent
+                    .frame
+                    .session_id
+                    .is_none()
+                    .then(|| parent.object_group.clone())
+                    .flatten()
+            })
+        });
+        let runtime_enabled = control.root_runtime_enabled;
+        for snapshot in control.snapshots.drain(..) {
+            snapshot.invalidated.set(true);
+        }
+        control.enabled = false;
+        control.root_ready = false;
+        control.active_token = None;
+        control.active_inventory = None;
+        control.sessions.clear();
+        let object_id = object.as_ref().and_then(|_| state.next_control_message());
+        let runtime_id = runtime_enabled
+            .then(|| state.next_control_message())
+            .flatten();
+        let detach_id = state.next_control_message();
+        let control = state.frame_controls.get_mut(&tab).unwrap();
+        control.object_cleanup = object_id;
+        control.runtime_cleanup = runtime_id;
+        control.cleanup = detach_id;
+        control.cleanup_failed = detach_id.is_none()
+            || (runtime_enabled && runtime_id.is_none())
+            || (object.is_some() && object_id.is_none());
+        Some((browser, runtime_id, detach_id, object_id, object))
+    });
+    let Some((browser, runtime_id, detach_id, object_id, object)) = reservation else {
+        return;
+    };
+    // Disposing child sessions disables their Runtime domain. Root Runtime
+    // remains on the Browser connection and needs its own acknowledged reset.
+    for (id, method, params) in [
+        (
+            object_id,
+            "Runtime.releaseObjectGroup",
+            json!({"objectGroup":object}),
+        ),
+        (runtime_id, "Runtime.disable", json!({})),
+        (
+            detach_id,
+            "Target.setAutoAttach",
+            json!({"autoAttach":false,"waitForDebuggerOnStart":false,"flatten":true}),
+        ),
+    ] {
+        let Some(id) = id else {
+            continue;
+        };
+        let host = browser.host();
+        let current = STATE.with(|slot| {
+            let state = slot.borrow();
+            state
+                .tabs
+                .get(&tab)
+                .is_some_and(|page| page.browser.get_raw() == browser.get_raw())
+                && state.frame_controls.get(&tab).is_some_and(|control| {
+                    control.cleanup == Some(id)
+                        || control.runtime_cleanup == Some(id)
+                        || control.object_cleanup == Some(id)
+                })
+        });
+        if !current {
+            continue;
+        }
+        let accepted = host.is_some_and(|host| send_root_command(&host, id, method, &params) == id);
+        if !accepted {
+            complete_frame_cleanup(&browser, id, false);
+        }
+    }
+}
+
+fn complete_frame_cleanup(browser: &Browser, id: i32, success: bool) -> bool {
+    STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        let Some(tab) = state.frame_controls.iter().find_map(|(tab, control)| {
+            ((control.cleanup == Some(id)
+                || control.runtime_cleanup == Some(id)
+                || control.object_cleanup == Some(id))
+                && state
+                    .tabs
+                    .get(tab)
+                    .is_some_and(|page| page.browser.get_raw() == browser.get_raw()))
+            .then_some(*tab)
+        }) else {
+            return false;
+        };
+        let control = state.frame_controls.get_mut(&tab).unwrap();
+        if control.object_cleanup == Some(id) {
+            control.object_cleanup = None;
+        } else if control.runtime_cleanup == Some(id) {
+            control.runtime_cleanup = None;
+            if success {
+                control.root_runtime_enabled = false;
+            }
+        } else {
+            control.cleanup = None;
+        }
+        control.cleanup_failed |= !success;
+        true
+    })
+}
+
+fn fail_frame_inventory(tab: i32, code: &str, message: &str) {
+    let requests = STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        let ids = state
+            .pending
+            .iter()
+            .filter_map(|(id, request)| {
+                (request.tab == tab
+                    && (matches!(request.step, Step::FrameInventory { .. })
+                        || request.frame.is_some()))
+                .then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        ids.into_iter()
+            .filter_map(|id| state.pending.remove(&id))
+            .collect::<Vec<_>>()
+    });
+    for request in requests {
+        pending_error(&request, code, message);
+    }
+}
+
+fn frame_inventory_result(browser: &Browser, pending: &Pending, success: bool, bytes: &[u8]) {
+    let Step::FrameInventory {
+        inventory,
+        session,
+        phase,
+    } = &pending.step
+    else {
+        return;
+    };
+    if !STATE.with(|slot| frame_inventory_current(&slot.borrow(), browser, pending)) {
+        pending_error(
+            pending,
+            "FRAME_CHANGED",
+            "The document, frame connection, or task changed during discovery.",
+        );
+        return;
+    }
+    let result_limit = if *phase == FramePhase::Read {
+        2 * 1024 * 1024
+    } else {
+        256 * 1024
+    };
+    if !success || bytes.len() > result_limit {
+        pending_error(
+            pending,
+            "FRAME_CONTROL_UNAVAILABLE",
+            "Frame discovery failed or exceeded its response limit.",
+        );
+        return;
+    }
+    let Ok(result) = serde_json::from_slice::<Json>(bytes) else {
+        pending_error(
+            pending,
+            "INVALID_RESULT",
+            "Chromium returned an invalid frame result.",
+        );
+        return;
+    };
+    if *phase == FramePhase::Pointer {
+        frame_pointer_result(pending, &result);
+        return;
+    }
+    if matches!(
+        phase,
+        FramePhase::ParentReset
+            | FramePhase::ParentEnable
+            | FramePhase::ParentWorld
+            | FramePhase::ParentOwner
+            | FramePhase::ParentResolve
+            | FramePhase::ParentInspect
+            | FramePhase::ParentRelease
+            | FramePhase::ParentDisable
+    ) {
+        frame_parent_result(pending, &result);
+        return;
+    }
+    if matches!(
+        phase,
+        FramePhase::RuntimeReset
+            | FramePhase::RuntimeEnable
+            | FramePhase::World
+            | FramePhase::Read
+            | FramePhase::RuntimeDisable
+    ) {
+        frame_read_result(pending, &result);
+        return;
+    }
+    let next_phase = match phase {
+        FramePhase::Enable => Some(FramePhase::Attach),
+        FramePhase::Attach => {
+            STATE.with(|slot| {
+                if let Some(control) = slot.borrow_mut().frame_controls.get_mut(&pending.tab) {
+                    if let Some(session) = session {
+                        control.sessions.mark_ready(session);
+                    } else {
+                        control.root_ready = true;
+                    }
+                }
+            });
+            Some(FramePhase::Tree)
+        }
+        FramePhase::Tree => None,
+        _ => unreachable!("frame read phases handled above"),
+    };
+    if let Some(phase) = next_phase {
+        dispatch_frame_phase(Pending {
+            step: Step::FrameInventory {
+                inventory: inventory.clone(),
+                session: session.clone(),
+                phase,
+            },
+            ..pending.clone()
+        });
+        return;
+    }
+    let tree = match crate::frame_sessions::normalize_frame_tree(&result, session.as_deref()) {
+        Ok(tree) => tree,
+        Err(message) => {
+            pending_error(pending, "INVALID_RESULT", message);
+            return;
+        }
+    };
+    inventory
+        .truncated
+        .set(inventory.truncated.get() || tree.truncated);
+    {
+        let mut frames = inventory.frames.borrow_mut();
+        for frame in tree.frames {
+            if frames
+                .iter()
+                .any(|previous| previous.frame_id == frame.frame_id)
+            {
+                drop(frames);
+                pending_error(
+                    pending,
+                    "FRAME_CHANGED",
+                    "A frame appeared in more than one observed tree. Inspect again after navigation settles.",
+                );
+                return;
+            }
+            if frames.len() >= crate::frame_sessions::MAX_FRAMES {
+                inventory.truncated.set(true);
+                break;
+            }
+            frames.push(frame);
+        }
+    }
+    inventory.visited.borrow_mut().insert(session.clone());
+    let next = STATE.with(|slot| {
+        let state = slot.borrow();
+        let control = state.frame_controls.get(&pending.tab)?;
+        control
+            .sessions
+            .ids()
+            .into_iter()
+            .find(|id| !inventory.visited.borrow().contains(&Some(id.clone())))
+            .map(|id| {
+                let ready = control.sessions.get(&id).is_some_and(|entry| entry.ready);
+                (id, ready)
+            })
+    });
+    if let Some((session, ready)) = next {
+        if inventory.visited.borrow().len() > crate::frame_sessions::MAX_CHILD_SESSIONS {
+            pending_error(
+                pending,
+                "FRAME_LIMIT",
+                "The frame discovery session budget was exhausted.",
+            );
+            return;
+        }
+        dispatch_frame_phase(Pending {
+            step: Step::FrameInventory {
+                inventory: inventory.clone(),
+                session: Some(session),
+                phase: if ready {
+                    FramePhase::Tree
+                } else {
+                    FramePhase::Enable
+                },
+            },
+            ..pending.clone()
+        });
+    } else {
+        if inventory.page_read.is_some() {
+            start_page_read(pending);
+            return;
+        }
+        if let Some(requested) = &inventory.requested_frame {
+            let frame = inventory
+                .frames
+                .borrow()
+                .iter()
+                .find(|frame| &frame.frame_id == requested)
+                .cloned();
+            let Some(frame) = frame else {
+                pending_error(
+                    pending,
+                    if inventory.truncated.get() {
+                        "FRAME_LIMIT"
+                    } else {
+                        "FRAME_NOT_FOUND"
+                    },
+                    "The requested frame was not found in this bounded current-tab inventory.",
+                );
+                return;
+            };
+            let Some(context) = crate::frame_sessions::ContextTracker::new(
+                &frame.frame_id,
+                "LightBrowserFrameControl",
+            ) else {
+                pending_error(
+                    pending,
+                    "CONTEXT_UNAVAILABLE",
+                    "The frame cannot be assigned an inspection context.",
+                );
+                return;
+            };
+            let parents = if let Some(action) = &inventory.action {
+                if action.snapshot.invalidated.get()
+                    || frame.frame_id != action.snapshot.frame.frame_id
+                    || frame.session_id != action.snapshot.frame.session_id
+                {
+                    pending_error(
+                        pending,
+                        "FRAME_CHANGED",
+                        "The frame's original connection changed.",
+                    );
+                    return;
+                }
+                match frame_parent_chain(&frame, &inventory.frames.borrow()) {
+                    Some(parents) => parents,
+                    None => {
+                        pending_error(
+                            pending,
+                            "FRAME_LIMIT",
+                            "The complete parent frame chain is unavailable.",
+                        );
+                        return;
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            let (session, phase) = match parents.first() {
+                Some(parent) if inventory.pointer.is_none() => {
+                    (parent.frame.session_id.clone(), FramePhase::ParentReset)
+                }
+                _ => (frame.session_id.clone(), FramePhase::RuntimeReset),
+            };
+            *inventory.read.borrow_mut() = Some(FrameRead {
+                frame,
+                context,
+                page: None,
+                unavailable: None,
+                parents,
+                parent_index: 0,
+            });
+            dispatch_frame_phase(Pending {
+                step: Step::FrameInventory {
+                    inventory: inventory.clone(),
+                    session,
+                    phase,
+                },
+                ..pending.clone()
+            });
+            return;
+        }
+        STATE.with(|slot| {
+            if let Some(control) = slot.borrow_mut().frame_controls.get_mut(&pending.tab) {
+                inventory
+                    .truncated
+                    .set(inventory.truncated.get() || control.sessions.truncated());
+                control.active_token = None;
+                control.active_inventory = None;
+            }
+        });
+        pending.reply.ok(json!({"tab":pending.tab,"epoch":pending.epoch,"documentEpoch":inventory.document_epoch,
+            "frames":*inventory.frames.borrow(),"truncated":inventory.truncated.get(),"atomic":false,"contentIncluded":false}));
+    }
+}
+
+fn start_page_read(pending: &Pending) {
+    let Step::FrameInventory { inventory, .. } = &pending.step else {
+        return;
+    };
+    let Some(page_read) = &inventory.page_read else {
+        return;
+    };
+    let frames = inventory.frames.borrow();
+    let roots = frames
+        .iter()
+        .filter(|frame| frame.parent_id.is_none())
+        .collect::<Vec<_>>();
+    if roots.len() != 1 || roots[0].session_id.is_some() {
+        drop(frames);
+        pending_error(
+            pending,
+            "FRAME_CHANGED",
+            "The page inventory has no unique top document.",
+        );
+        return;
+    }
+    // Visit parents before children. Child sessions may have been discovered
+    // after their same-process siblings; this is not a unified DOM order.
+    let mut queue = vec![roots[0].clone()];
+    let mut index = 0;
+    while index < queue.len() && queue.len() <= crate::frame_sessions::MAX_FRAMES {
+        let parent = queue[index].frame_id.clone();
+        for frame in frames
+            .iter()
+            .filter(|frame| frame.parent_id.as_deref() == Some(&parent))
+        {
+            if queue.iter().any(|queued| queued.frame_id == frame.frame_id) {
+                drop(frames);
+                pending_error(
+                    pending,
+                    "FRAME_CHANGED",
+                    "The page inventory contains a cyclic frame relation.",
+                );
+                return;
+            }
+            queue.push(frame.clone());
+        }
+        index += 1;
+    }
+    if queue.len() != frames.len() || queue.len() > crate::frame_sessions::MAX_FRAMES {
+        drop(frames);
+        pending_error(
+            pending,
+            "FRAME_LIMIT",
+            "The complete parent relation is unavailable for page reading.",
+        );
+        return;
+    }
+    drop(frames);
+    page_read.borrow_mut().queue = queue;
+    STATE.with(|slot| {
+        if let Some(control) = slot.borrow().frame_controls.get(&pending.tab) {
+            inventory
+                .truncated
+                .set(inventory.truncated.get() || control.sessions.truncated());
+        }
+    });
+    next_page_document(pending);
+}
+
+fn next_page_document(pending: &Pending) {
+    let Step::FrameInventory { inventory, .. } = &pending.step else {
+        return;
+    };
+    let Some(page_read) = &inventory.page_read else {
+        return;
+    };
+    let frame = {
+        let mut batch = page_read.borrow_mut();
+        let reason = if batch.next >= 16 {
+            Some("DOCUMENT_LIMIT")
+        } else if batch.remaining.nodes == 0
+            || (batch.remaining.text == 0
+                && batch.remaining.elements == 0
+                && batch.remaining.frames == 0)
+        {
+            Some("READ_BUDGET")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            while batch.next < batch.queue.len() {
+                let frame = batch.queue[batch.next].clone();
+                batch.unread.push(json!({"frame":frame,"reason":reason}));
+                batch.next += 1;
+                batch.truncated = true;
+            }
+            None
+        } else {
+            let frame = batch.queue.get(batch.next).cloned();
+            if frame.is_some() {
+                batch.next += 1;
+            }
+            frame
+        }
+    };
+    let Some(frame) = frame else {
+        finish_page_read(pending);
+        return;
+    };
+    let Some(context) =
+        crate::frame_sessions::ContextTracker::new(&frame.frame_id, "LightBrowserFrameControl")
+    else {
+        pending_error(
+            pending,
+            "CONTEXT_UNAVAILABLE",
+            "The frame cannot be assigned an inspection context.",
+        );
+        return;
+    };
+    let session = frame.session_id.clone();
+    *inventory.read.borrow_mut() = Some(FrameRead {
+        frame,
+        context,
+        page: None,
+        unavailable: None,
+        parents: Vec::new(),
+        parent_index: 0,
+    });
+    dispatch_frame_phase(Pending {
+        step: Step::FrameInventory {
+            inventory: inventory.clone(),
+            session,
+            phase: FramePhase::RuntimeReset,
+        },
+        ..pending.clone()
+    });
+}
+
+fn finish_page_read(pending: &Pending) {
+    let Step::FrameInventory { inventory, .. } = &pending.step else {
+        return;
+    };
+    let Some(page_read) = &inventory.page_read else {
+        return;
+    };
+    if !STATE.with(|slot| frame_inventory_current(&slot.borrow(), &inventory.browser, pending)) {
+        pending_error(
+            pending,
+            "FRAME_CHANGED",
+            "A collected document changed before the page read completed.",
+        );
+        return;
+    }
+    let (documents, unread, remaining, truncated) = {
+        let mut batch = page_read.borrow_mut();
+        (
+            std::mem::take(&mut batch.documents),
+            std::mem::take(&mut batch.unread),
+            batch.remaining,
+            batch.truncated,
+        )
+    };
+    let limit = crate::page_read::Budget::default().to_json();
+    let remaining = remaining.to_json();
+    let mut used = json!({});
+    for key in ["text", "elements", "nodes", "roots", "options", "frames"] {
+        used[key] = json!(limit[key].as_u64().unwrap() - remaining[key].as_u64().unwrap());
+    }
+    let response = Response::success(
+        &pending.reply.id,
+        json!({
+            "tab":pending.tab,"epoch":pending.epoch,"documentEpoch":inventory.document_epoch,
+            "documents":documents,"unread":unread,"frames":*inventory.frames.borrow(),
+            "budget":{"limit":limit,"used":used,"remaining":remaining},
+            "truncated":truncated || inventory.truncated.get(),"atomic":false,
+            "supportedActions":["click","hover","fill","insert","press","check","select"],
+            "pointerActionsSupported":true
+        }),
+    );
+    if crate::page_read::serialized_size(&response).is_none() {
+        pending_error(
+            pending,
+            "RESULT_LIMIT",
+            "The combined page response exceeded its byte limit.",
+        );
+        return;
+    }
+    STATE.with(|slot| {
+        if let Some(control) = slot.borrow_mut().frame_controls.get_mut(&pending.tab) {
+            control.snapshots = page_read
+                .borrow()
+                .collected
+                .iter()
+                .map(|collected| collected.snapshot.clone())
+                .collect();
+        }
+    });
+    finish_frame_inventory_state(pending.tab, pending.reply.token);
+    pending.reply.send_final(response);
+}
+
+fn frame_parent_chain(
+    frame: &crate::frame_sessions::FrameRecord,
+    frames: &[crate::frame_sessions::FrameRecord],
+) -> Option<Vec<FrameParent>> {
+    let mut parents = Vec::new();
+    let mut child = frame;
+    let mut visited = BTreeSet::new();
+    visited.insert(frame.frame_id.as_str());
+    while let Some(parent_id) = &child.parent_id {
+        if parents.len() >= crate::frame_sessions::MAX_FRAME_DEPTH
+            || !visited.insert(parent_id.as_str())
+        {
+            return None;
+        }
+        let parent = frames
+            .iter()
+            .find(|candidate| &candidate.frame_id == parent_id)?;
+        parents.push(FrameParent {
+            child: child.frame_id.clone(),
+            frame: parent.clone(),
+            context: crate::frame_sessions::ContextTracker::new(
+                parent_id,
+                "LightBrowserFrameAncestors",
+            )?,
+            backend_node: None,
+            object: None,
+            object_group: None,
+            geometry: None,
+        });
+        child = parent;
+    }
+    Some(parents)
+}
+
+fn frame_parent_command(
+    inventory: &FrameInventory,
+    phase: FramePhase,
+    token: u64,
+) -> Option<(&'static str, Json)> {
+    let mut read = inventory.read.borrow_mut();
+    let read = read.as_mut()?;
+    let parent = read.parents.get_mut(read.parent_index)?;
+    Some(match phase {
+        FramePhase::ParentWorld => (
+            "Page.createIsolatedWorld",
+            json!({"frameId":parent.frame.frame_id,
+            "worldName":parent.context.world_name(),"grantUniveralAccess":false}),
+        ),
+        FramePhase::ParentOwner => ("DOM.getFrameOwner", json!({"frameId":parent.child})),
+        FramePhase::ParentResolve => {
+            let group = format!("NaruFrameParent:{token}:{}", read.parent_index);
+            parent.object_group = Some(group.clone());
+            (
+                "DOM.resolveNode",
+                json!({"backendNodeId":parent.backend_node?,
+                "executionContextId":parent.context.context()?.id,"objectGroup":group}),
+            )
+        }
+        FramePhase::ParentInspect => {
+            let request = inventory.pointer.as_ref().map(|pointer| match pointer.stage.get() {
+                FramePointerStage::ParentGeometry => Some(json!({"action":pointer.target.action(),"phase":"geometry"})),
+                FramePointerStage::ParentPoints | FramePointerStage::ParentVerify => Some(json!({
+                    "action":pointer.target.action(),"phase":"points",
+                    "points":pointer.candidates.borrow().iter().map(|point| point.to_json()).collect::<Vec<_>>()
+                })),
+                _ => None,
+            });
+            let (expression, arguments) = if let Some(request) = request {
+                let request = request?;
+                (
+                    format!(
+                        "function(owner,request){{{DOM_BRIDGE}\nreturn window.__lightBrowserBridge.inspectFramePointer(owner,request);}}"
+                    ),
+                    json!([{"objectId":parent.object.as_ref()?},{"value":request}]),
+                )
+            } else {
+                (
+                    format!(
+                        "function(owner){{{DOM_BRIDGE}\nreturn window.__lightBrowserBridge.inspectFrameOwner(owner);}}"
+                    ),
+                    json!([{"objectId":parent.object.as_ref()?}]),
+                )
+            };
+            (
+                "Runtime.callFunctionOn",
+                json!({"functionDeclaration":expression,
+                "uniqueContextId":parent.context.context()?.unique_id,
+                "arguments":arguments,
+                "objectGroup":parent.object_group.as_ref()?,
+                "returnByValue":true,"awaitPromise":false}),
+            )
+        }
+        FramePhase::ParentRelease => (
+            "Runtime.releaseObjectGroup",
+            json!({"objectGroup":parent.object_group.as_ref()?}),
+        ),
+        _ => return None,
+    })
+}
+
+fn frame_parent_result(pending: &Pending, result: &Json) {
+    let Step::FrameInventory {
+        inventory,
+        session,
+        phase,
+    } = &pending.step
+    else {
+        return;
+    };
+    let next = (|| {
+        let mut slot = inventory.read.borrow_mut();
+        let read = slot.as_mut()?;
+        let parent = read.parents.get_mut(read.parent_index)?;
+        let next = match phase {
+            FramePhase::ParentReset => FramePhase::ParentEnable,
+            FramePhase::ParentEnable => FramePhase::ParentWorld,
+            FramePhase::ParentWorld => {
+                let id = result["executionContextId"]
+                    .as_i64()
+                    .and_then(|id| i32::try_from(id).ok())?;
+                parent.context.confirm(id)?;
+                FramePhase::ParentOwner
+            }
+            FramePhase::ParentOwner => {
+                let backend_node = Some(
+                    result["backendNodeId"]
+                        .as_u64()
+                        .filter(|id| *id > 0 && *id <= i32::MAX as u64)?,
+                );
+                if inventory.pointer.is_some()
+                    && parent.backend_node.is_some()
+                    && parent.backend_node != backend_node
+                {
+                    return None;
+                }
+                parent.backend_node = backend_node;
+                FramePhase::ParentResolve
+            }
+            FramePhase::ParentResolve => {
+                if result["object"]["type"] != "object" || result["object"]["subtype"] != "node" {
+                    return None;
+                }
+                parent.object = Some(
+                    result["object"]["objectId"]
+                        .as_str()
+                        .filter(|id| {
+                            !id.is_empty()
+                                && id.len() <= 512
+                                && id.is_ascii()
+                                && !id.bytes().any(|b| b.is_ascii_control())
+                        })?
+                        .to_owned(),
+                );
+                FramePhase::ParentInspect
+            }
+            FramePhase::ParentInspect => {
+                let value = &result["result"]["value"];
+                if result.get("exceptionDetails").is_some() || value["ok"] != true {
+                    return None;
+                }
+                if let Some(pointer) = &inventory.pointer {
+                    if value["action"] != pointer.target.action()
+                        || value["prepared"] != true
+                        || value["attempted"] != false
+                    {
+                        return None;
+                    }
+                    let geometry = crate::frame_pointer::Geometry::from_json(&value["geometry"])?;
+                    match pointer.stage.get() {
+                        FramePointerStage::ParentGeometry => parent.geometry = Some(geometry),
+                        FramePointerStage::ParentPoints | FramePointerStage::ParentVerify => {
+                            let filtered = crate::frame_pointer::candidate_filter(
+                                &value["candidates"],
+                                &pointer.candidates.borrow(),
+                                &geometry,
+                            )?;
+                            *pointer.candidates.borrow_mut() = filtered;
+                        }
+                        _ => return None,
+                    }
+                } else if value["visible"] != true || value["disabled"] != false {
+                    return None;
+                }
+                FramePhase::ParentRelease
+            }
+            FramePhase::ParentRelease => {
+                parent.object = None;
+                parent.object_group = None;
+                FramePhase::ParentDisable
+            }
+            FramePhase::ParentDisable => {
+                if session.is_none() {
+                    STATE.with(|slot| {
+                        if let Some(control) =
+                            slot.borrow_mut().frame_controls.get_mut(&pending.tab)
+                        {
+                            control.root_runtime_enabled = false;
+                        }
+                    });
+                }
+                read.parent_index += 1;
+                if inventory.pointer.as_ref().is_some_and(|pointer| {
+                    matches!(
+                        pointer.stage.get(),
+                        FramePointerStage::ParentPoints | FramePointerStage::ParentVerify
+                    ) && pointer.candidates.borrow().is_empty()
+                }) {
+                    read.parent_index = read.parents.len();
+                }
+                return Some(match read.parents.get(read.parent_index) {
+                    Some(parent) => (parent.frame.session_id.clone(), FramePhase::ParentReset),
+                    None if inventory.pointer.is_some() => {
+                        (read.frame.session_id.clone(), FramePhase::Pointer)
+                    }
+                    None => (read.frame.session_id.clone(), FramePhase::RuntimeReset),
+                });
+            }
+            _ => return None,
+        };
+        Some((session.clone(), next))
+    })();
+    let Some((session, phase)) = next else {
+        pending_error(
+            pending,
+            "FRAME_OWNER_UNAVAILABLE",
+            "The embedding frame is hidden, disabled, changed or unavailable. Inspect before retrying.",
+        );
+        return;
+    };
+    if phase == FramePhase::Pointer && inventory.pointer.is_some() {
+        frame_pointer_parents_done(pending, inventory);
+        return;
+    }
+    dispatch_frame_phase(Pending {
+        step: Step::FrameInventory {
+            inventory: inventory.clone(),
+            session,
+            phase,
+        },
+        ..pending.clone()
+    });
+}
+
+fn dispatch_frame_action(pending: &Pending) {
+    let Step::FrameInventory { inventory, .. } = &pending.step else {
+        return;
+    };
+    if inventory.pointer.is_some() {
+        let session = inventory
+            .read
+            .borrow()
+            .as_ref()
+            .map(|read| read.frame.session_id.clone());
+        if let Some(session) = session {
+            dispatch_frame_phase(Pending {
+                step: Step::FrameInventory {
+                    inventory: inventory.clone(),
+                    session,
+                    phase: FramePhase::Pointer,
+                },
+                ..pending.clone()
+            });
+        } else {
+            pending_error(
+                pending,
+                "FRAME_CHANGED",
+                "The pointer frame is unavailable.",
+            );
+        }
+        return;
+    }
+    let Some(action) = &inventory.action else {
+        return;
+    };
+    let Some(args) = frame_action_arguments(&action.command, &action.snapshot) else {
+        pending_error(
+            pending,
+            "STALE_FRAME_SNAPSHOT",
+            "The element reference does not belong to the current frame snapshot.",
+        );
+        return;
+    };
+    let expression = format!(
+        "window.__lightBrowserBridge.frameAct({args},{})",
+        action.snapshot.binding()
+    );
+    dispatch(
+        &inventory.browser,
+        "Runtime.evaluate",
+        json!({"expression":expression,"uniqueContextId":action.snapshot.unique_context_id(),
+            "returnByValue":true,"awaitPromise":false,"timeout":5000}),
+        Pending {
+            frame: Some(action.snapshot.clone()),
+            evaluation: Evaluation::Page {
+                mutation: true,
+                evidence: ActionEvidence::for_command(&action.command),
+            },
+            reply: Reply {
+                frame_completion: Some(pending.tab),
+                ..pending.reply.clone()
+            },
+            step: Step::Evaluate,
+            ..pending.clone()
+        },
+    );
+}
+
+fn dispatch_frame_pointer_dom(pending: &Pending) {
+    let Step::FrameInventory { inventory, .. } = &pending.step else {
+        return;
+    };
+    let (Some(pointer), Some(action)) = (&inventory.pointer, &inventory.action) else {
+        return;
+    };
+    let Some(mut args) = frame_action_arguments(&action.command, &action.snapshot) else {
+        pending_error(
+            pending,
+            "STALE_FRAME_SNAPSHOT",
+            "Read the frame again before pointer input.",
+        );
+        return;
+    };
+    let verifying = match pointer.stage.get() {
+        FramePointerStage::Geometry => {
+            args["pointerPhase"] = json!("geometry");
+            args["scroll"] = json!(pointer.scrolled.get());
+            false
+        }
+        FramePointerStage::Candidates => {
+            let Some(clip) = pointer.clip.get() else {
+                pending_error(
+                    pending,
+                    "INVALID_POINT",
+                    "The clipped pointer area is unavailable.",
+                );
+                return;
+            };
+            args["pointerPhase"] = json!("candidates");
+            args["clip"] = clip.to_json();
+            false
+        }
+        FramePointerStage::Move | FramePointerStage::Finish => {
+            let Some(point) = pointer.target.local_point.get() else {
+                pending_error(
+                    pending,
+                    "INVALID_POINT",
+                    "The original frame point is unavailable.",
+                );
+                return;
+            };
+            args["verifyOnly"] = json!(true);
+            args["point"] = json!({"x":point.x,"y":point.y});
+            true
+        }
+        _ => {
+            pending_error(
+                pending,
+                "INVALID_RESULT",
+                "The pointer preparation phase is invalid.",
+            );
+            return;
+        }
+    };
+    let expression = format!(
+        "window.__lightBrowserBridge.frameAct({args},{})",
+        action.snapshot.binding()
+    );
+    let next = if verifying {
+        Pending {
+            frame: Some(action.snapshot.clone()),
+            evaluation: Evaluation::Page {
+                mutation: true,
+                evidence: Some(ActionEvidence::Click(pointer.target.clone())),
+            },
+            reply: Reply {
+                frame_completion: Some(pending.tab),
+                ..pending.reply.clone()
+            },
+            step: Step::Evaluate,
+            ..pending.clone()
+        }
+    } else {
+        pending.clone()
+    };
+    dispatch(
+        &inventory.browser,
+        "Runtime.evaluate",
+        json!({"expression":expression,"uniqueContextId":action.snapshot.unique_context_id(),
+            "returnByValue":true,"awaitPromise":false,"timeout":5000}),
+        next,
+    );
+}
+
+fn frame_pointer_target(pending: &Pending, inventory: &Shared<FrameInventory>) {
+    let session = inventory
+        .read
+        .borrow()
+        .as_ref()
+        .map(|read| read.frame.session_id.clone());
+    if let Some(session) = session {
+        dispatch_frame_phase(Pending {
+            frame: None,
+            evaluation: Evaluation::Page {
+                mutation: false,
+                evidence: None,
+            },
+            step: Step::FrameInventory {
+                inventory: inventory.clone(),
+                session,
+                phase: FramePhase::RuntimeReset,
+            },
+            ..pending.clone()
+        });
+    } else {
+        pending_error(
+            pending,
+            "FRAME_CHANGED",
+            "The pointer frame is unavailable.",
+        );
+    }
+}
+
+fn frame_pointer_parents(pending: &Pending, inventory: &Shared<FrameInventory>) {
+    let first = inventory.read.borrow_mut().as_mut().and_then(|read| {
+        read.parent_index = 0;
+        read.parents
+            .first()
+            .map(|parent| parent.frame.session_id.clone())
+    });
+    if let Some(session) = first {
+        dispatch_frame_phase(Pending {
+            frame: None,
+            evaluation: Evaluation::Page {
+                mutation: false,
+                evidence: None,
+            },
+            step: Step::FrameInventory {
+                inventory: inventory.clone(),
+                session,
+                phase: FramePhase::ParentReset,
+            },
+            ..pending.clone()
+        });
+    } else {
+        frame_pointer_parents_done(pending, inventory);
+    }
+}
+
+fn frame_pointer_retry(pending: &Pending, inventory: &Shared<FrameInventory>) {
+    let Some(pointer) = &inventory.pointer else {
+        return;
+    };
+    if pointer.target.attempted.get() || pointer.scrolled.replace(true) {
+        pending_error(
+            pending,
+            "CLICK_POINT_UNAVAILABLE",
+            "No supported point reached the frame element. Inspect before retrying; no pointer input is repeated.",
+        );
+        return;
+    }
+    pointer.stage.set(FramePointerStage::Geometry);
+    pointer.candidates.borrow_mut().clear();
+    pointer.local_candidates.borrow_mut().clear();
+    pointer.clip.set(None);
+    if let Some(read) = inventory.read.borrow_mut().as_mut() {
+        for parent in &mut read.parents {
+            parent.geometry = None;
+        }
+    }
+    frame_pointer_target(pending, inventory);
+}
+
+fn frame_pointer_parents_done(pending: &Pending, inventory: &Shared<FrameInventory>) {
+    let Some(pointer) = &inventory.pointer else {
+        return;
+    };
+    match pointer.stage.get() {
+        FramePointerStage::ParentGeometry => {
+            let geometry = inventory.read.borrow().as_ref().and_then(|read| {
+                read.parents
+                    .iter()
+                    .map(|parent| parent.geometry)
+                    .collect::<Option<Vec<_>>>()
+            });
+            let clip = geometry.and_then(|geometry| {
+                Some(crate::frame_pointer::local_clip(
+                    pointer.rect.get()?,
+                    pointer.viewport.get()?,
+                    &geometry,
+                ))
+            });
+            match clip {
+                Some(Ok(Some(clip))) => pointer.clip.set(Some(clip)),
+                Some(Ok(None)) => {
+                    frame_pointer_retry(pending, inventory);
+                    return;
+                }
+                _ => {
+                    pending_error(
+                        pending,
+                        "UNSUPPORTED_GEOMETRY",
+                        "The frame clipping geometry is unsupported.",
+                    );
+                    return;
+                }
+            }
+            pointer.stage.set(FramePointerStage::Candidates);
+        }
+        FramePointerStage::ParentPoints => {
+            let candidate = pointer.candidates.borrow().first().copied();
+            let Some(candidate) = candidate else {
+                frame_pointer_retry(pending, inventory);
+                return;
+            };
+            let local = pointer
+                .local_candidates
+                .borrow()
+                .iter()
+                .find(|local| local.index == candidate.index)
+                .copied();
+            let Some(local) = local else {
+                pending_error(
+                    pending,
+                    "INVALID_POINT",
+                    "The frame point lost its original candidate.",
+                );
+                return;
+            };
+            pointer.target.local_point.set(Some(ClickPoint {
+                x: local.x,
+                y: local.y,
+            }));
+            pointer.target.point.set(Some(ClickPoint {
+                x: candidate.x,
+                y: candidate.y,
+            }));
+            pointer.stage.set(FramePointerStage::Move);
+        }
+        FramePointerStage::ParentVerify => {
+            let valid = {
+                let candidates = pointer.candidates.borrow();
+                candidates.len() == 1
+                    && pointer.target.point.get()
+                        == Some(ClickPoint {
+                            x: candidates[0].x,
+                            y: candidates[0].y,
+                        })
+            };
+            if !valid {
+                pending_error(
+                    pending,
+                    "CLICK_POINT_UNAVAILABLE",
+                    "The original pointer position no longer reaches the frame element. Inspect before retrying.",
+                );
+                return;
+            }
+            pointer.stage.set(FramePointerStage::Finish);
+        }
+        _ => {
+            pending_error(
+                pending,
+                "INVALID_RESULT",
+                "The pointer parent phase is invalid.",
+            );
+            return;
+        }
+    }
+    frame_pointer_target(pending, inventory);
+}
+
+fn frame_pointer_result(pending: &Pending, result: &Json) {
+    let Step::FrameInventory { inventory, .. } = &pending.step else {
+        return;
+    };
+    let Some(pointer) = &inventory.pointer else {
+        return;
+    };
+    let value = &result["result"]["value"];
+    if result.get("exceptionDetails").is_some()
+        || value["ok"] != true
+        || value["prepared"] != true
+        || value["attempted"] != false
+        || value["action"] != pointer.target.action()
+    {
+        pending_error(
+            pending,
+            "FRAME_POINTER_UNAVAILABLE",
+            "The frame could not prepare its pointer geometry. Inspect the page before retrying.",
+        );
+        return;
+    }
+    match pointer.stage.get() {
+        FramePointerStage::Geometry => {
+            let rect = crate::frame_pointer::Rect::from_json(&value["rect"]);
+            let viewport = crate::frame_pointer::Rect::from_json(&value["viewport"]);
+            if rect.is_none() || viewport.is_none() {
+                pending_error(
+                    pending,
+                    "INVALID_POINT",
+                    "The frame returned invalid pointer geometry.",
+                );
+                return;
+            }
+            pointer.rect.set(rect);
+            pointer.viewport.set(viewport);
+            pointer.stage.set(FramePointerStage::ParentGeometry);
+        }
+        FramePointerStage::Candidates => {
+            let Some(items) = value["candidates"]
+                .as_array()
+                .filter(|items| items.len() <= 9)
+            else {
+                pending_error(
+                    pending,
+                    "INVALID_POINT",
+                    "The frame returned invalid pointer candidates.",
+                );
+                return;
+            };
+            let candidates: Option<Vec<_>> = items
+                .iter()
+                .map(crate::frame_pointer::Candidate::from_json)
+                .collect();
+            let Some(candidates) = candidates else {
+                pending_error(
+                    pending,
+                    "INVALID_POINT",
+                    "The frame returned an invalid candidate.",
+                );
+                return;
+            };
+            let unique: BTreeSet<_> = candidates.iter().map(|candidate| candidate.index).collect();
+            if unique.len() != candidates.len() {
+                pending_error(
+                    pending,
+                    "INVALID_POINT",
+                    "The frame returned duplicate pointer candidates.",
+                );
+                return;
+            }
+            if candidates.is_empty() {
+                frame_pointer_retry(pending, inventory);
+                return;
+            }
+            *pointer.local_candidates.borrow_mut() = candidates.clone();
+            *pointer.candidates.borrow_mut() = candidates;
+            pointer.stage.set(FramePointerStage::ParentPoints);
+        }
+        _ => {
+            pending_error(
+                pending,
+                "INVALID_RESULT",
+                "The pointer result belongs to another phase.",
+            );
+            return;
+        }
+    }
+    frame_pointer_parents(pending, inventory);
+}
+
+fn frame_pointer_input_ready(browser: &Browser, id: i32, pending: &Pending, value: &Json) {
+    let inventory = STATE.with(|slot| {
+        slot.borrow()
+            .frame_controls
+            .get(&pending.tab)
+            .filter(|control| control.active_token == Some(pending.reply.token))
+            .and_then(|control| control.active_inventory.clone())
+    });
+    let Some(inventory) = inventory else {
+        finish_input_preparation(
+            id,
+            pending,
+            "FRAME_CHANGED",
+            "The original pointer operation is unavailable.",
+        );
+        return;
+    };
+    let Some(pointer) = &inventory.pointer else {
+        finish_input_preparation(
+            id,
+            pending,
+            "INVALID_RESULT",
+            "The frame pointer operation is unavailable.",
+        );
+        return;
+    };
+    if value["ok"] != true
+        || value["prepared"] != true
+        || value["attempted"] != false
+        || value["action"] != pointer.target.action()
+        || pointer.target.local_point.get().is_none()
+        || ClickPoint::from_json(&value["point"]) != pointer.target.local_point.get()
+    {
+        finish_input_preparation(
+            id,
+            pending,
+            "CLICK_POINT_UNAVAILABLE",
+            "The original frame point did not pass its hit test.",
+        );
+        return;
+    }
+    match (
+        pointer.stage.get(),
+        &pending.step,
+        pointer.target.attempted.get(),
+    ) {
+        (FramePointerStage::Move, Step::Evaluate, false) => {
+            dispatch_input(
+                browser,
+                id,
+                pending,
+                NativeInput::MouseMove(pointer.target.clone()),
+            );
+        }
+        (FramePointerStage::Move, Step::ClickVerify, true) => {
+            if !take_input_preparation(id, pending) {
+                return;
+            }
+            let point = pointer.target.local_point.get().unwrap();
+            *pointer.candidates.borrow_mut() = vec![crate::frame_pointer::Candidate {
+                index: 0,
+                x: point.x,
+                y: point.y,
+            }];
+            pointer.stage.set(FramePointerStage::ParentVerify);
+            let next = Pending {
+                frame: None,
+                evaluation: Evaluation::Page {
+                    mutation: false,
+                    evidence: None,
+                },
+                step: Step::FrameInventory {
+                    inventory: inventory.clone(),
+                    session: None,
+                    phase: FramePhase::Pointer,
+                },
+                ..pending.clone()
+            };
+            frame_pointer_parents(&next, &inventory);
+        }
+        (FramePointerStage::Finish, Step::Evaluate, true) => {
+            if pointer.target.hover {
+                if take_input_preparation(id, pending) {
+                    pending.reply.ok(json!({"tab":pending.tab,"page":{
+                        "ok":true,"action":"hover","input":"chromium","attempted":true,
+                        "dispatchAcknowledged":true,"pointVerified":true,
+                        "detail":"Chromium acknowledged mouseMoved; the original frame point and embedding chain passed their subsequent hit tests. Read again to verify hover effects."
+                    }}));
+                }
+            } else if let Some(point) = pointer.target.point.get() {
+                dispatch_input(browser, id, pending, NativeInput::Click(point));
+            } else {
+                finish_input_preparation(
+                    id,
+                    pending,
+                    "INVALID_POINT",
+                    "The original root point is unavailable.",
+                );
+            }
+        }
+        _ => finish_input_preparation(
+            id,
+            pending,
+            "INVALID_RESULT",
+            "The pointer verification belongs to another phase.",
+        ),
+    }
+}
+
+fn finish_frame_inventory_state(tab: i32, token: u64) {
+    STATE.with(|slot| {
+        if let Some(control) = slot
+            .borrow_mut()
+            .frame_controls
+            .get_mut(&tab)
+            .filter(|control| control.active_token == Some(token))
+        {
+            control.active_token = None;
+            control.active_inventory = None;
+        }
+    });
+}
+
+fn make_frame_snapshot(
+    pending: &Pending,
+    inventory: &FrameInventory,
+    read: &FrameRead,
+    page: &mut Json,
+) -> Option<FrameSnapshot> {
+    let document_id = page["documentId"]
+        .as_str()
+        .filter(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))?
+        .to_owned();
+    let generation = page["generation"]
+        .as_u64()
+        .filter(|value| *value > 0 && *value <= 9_007_199_254_740_991)?;
+    let prefix = match &inventory.page_read {
+        Some(page_read) => format!(
+            "frame/{}/{}/{}/",
+            pending.epoch,
+            pending.reply.token,
+            page_read.borrow().next
+        ),
+        None => format!("frame/{}/{}/", pending.epoch, pending.reply.token),
+    };
+    let element_prefix = format!("{document_id}:{generation}:");
+    let focused = page["focusedRef"].as_str().map(str::to_owned);
+    let elements = page["interactive"].as_array_mut()?;
+    if elements.len() > 120 {
+        return None;
+    }
+    let mut references = BTreeSet::new();
+    for item in elements {
+        let reference = item["ref"].as_str()?;
+        let ordinal = reference
+            .strip_prefix(&element_prefix)?
+            .parse::<usize>()
+            .ok()?;
+        if ordinal == 0 || ordinal > 120 || prefix.len() + reference.len() > 256 {
+            return None;
+        }
+        let qualified = format!("{prefix}{reference}");
+        if !references.insert(qualified.clone()) {
+            return None;
+        }
+        item["ref"] = json!(qualified);
+    }
+    page["focusedRef"] = json!(
+        focused
+            .map(|reference| format!("{prefix}{reference}"))
+            .filter(|reference| references.contains(reference))
+    );
+    page["supportedActions"] = json!([
+        "click", "hover", "fill", "insert", "press", "check", "select"
+    ]);
+    page["pointerActionsSupported"] = Json::Bool(true);
+    Some(FrameSnapshot {
+        browser: inventory.browser.clone(),
+        epoch: pending.epoch,
+        document_epoch: inventory.document_epoch,
+        owner: inventory.owner.clone(),
+        frame: read.frame.clone(),
+        unique_context: read.context.context()?.unique_id.clone(),
+        prefix,
+        document_id,
+        generation,
+        references,
+        invalidated: Cell::new(false),
+    })
+}
+
+fn frame_read_result(pending: &Pending, result: &Json) {
+    let Step::FrameInventory {
+        inventory,
+        session,
+        phase,
+    } = &pending.step
+    else {
+        return;
+    };
+    let next_phase = match phase {
+        FramePhase::RuntimeReset => FramePhase::RuntimeEnable,
+        FramePhase::RuntimeEnable => FramePhase::World,
+        FramePhase::World => {
+            let context_id = result["executionContextId"]
+                .as_i64()
+                .and_then(|id| i32::try_from(id).ok());
+            let matched = context_id.is_some_and(|id| {
+                inventory
+                    .read
+                    .borrow_mut()
+                    .as_mut()
+                    .is_some_and(|read| read.context.confirm(id).is_some())
+            });
+            if !matched {
+                pending_error(
+                    pending,
+                    "CONTEXT_UNAVAILABLE",
+                    "The isolated context did not match the frame's creation event.",
+                );
+                return;
+            }
+            if let Some(action) = &inventory.action {
+                let current = inventory.read.borrow().as_ref().is_some_and(|read| {
+                    read.context
+                        .context()
+                        .is_some_and(|context| context.unique_id == action.snapshot.unique_context)
+                });
+                if !current {
+                    pending_error(
+                        pending,
+                        "STALE_FRAME_SNAPSHOT",
+                        "The frame's original execution context no longer exists. Read again.",
+                    );
+                    return;
+                }
+                FramePhase::Action
+            } else {
+                FramePhase::Read
+            }
+        }
+        FramePhase::Read => {
+            let value = &result["result"]["value"];
+            if result.get("exceptionDetails").is_some() || !value.is_object() {
+                pending_error(
+                    pending,
+                    "PAGE_SCRIPT_ERROR",
+                    "The selected frame could not be inspected.",
+                );
+                return;
+            }
+            if value["error"] == "PAGE_LOADING" && value["ok"] == false {
+                if inventory.page_read.is_some() {
+                    if let Some(read) = inventory.read.borrow_mut().as_mut() {
+                        read.unavailable = Some("PAGE_LOADING");
+                    }
+                    dispatch_frame_phase(Pending {
+                        step: Step::FrameInventory {
+                            inventory: inventory.clone(),
+                            session: session.clone(),
+                            phase: FramePhase::RuntimeDisable,
+                        },
+                        ..pending.clone()
+                    });
+                    return;
+                }
+                pending_error(
+                    pending,
+                    "PAGE_LOADING",
+                    "The selected frame document is not ready.",
+                );
+                return;
+            }
+            if value["scope"] != "local-frame"
+                || !value["interactive"].is_array()
+                || !matches!(
+                    value["readyState"].as_str(),
+                    Some("interactive" | "complete")
+                )
+            {
+                pending_error(
+                    pending,
+                    "INVALID_PAGE_RESULT",
+                    "The selected frame did not return a local document snapshot.",
+                );
+                return;
+            }
+            if let Some(read) = inventory.read.borrow_mut().as_mut() {
+                read.page = Some(value.clone());
+            }
+            FramePhase::RuntimeDisable
+        }
+        FramePhase::RuntimeDisable => {
+            if session.is_none() {
+                STATE.with(|slot| {
+                    if let Some(control) = slot.borrow_mut().frame_controls.get_mut(&pending.tab) {
+                        control.root_runtime_enabled = false;
+                    }
+                });
+            }
+            if let Some(response) = inventory.response.borrow_mut().take() {
+                finish_frame_inventory_state(pending.tab, pending.reply.token);
+                pending.reply.send_final(response);
+                return;
+            }
+            let read = inventory.read.borrow_mut().take();
+            let Some(mut read) = read else {
+                pending_error(
+                    pending,
+                    "INVALID_PAGE_RESULT",
+                    "The frame snapshot is unavailable.",
+                );
+                return;
+            };
+            if let Some(reason) = read.unavailable {
+                if let Some(page_read) = &inventory.page_read {
+                    let mut batch = page_read.borrow_mut();
+                    batch
+                        .unread
+                        .push(json!({"frame":read.frame,"reason":reason}));
+                    batch.truncated = true;
+                    drop(batch);
+                    next_page_document(pending);
+                    return;
+                }
+            }
+            let Some(mut page) = read.page.take() else {
+                pending_error(
+                    pending,
+                    "INVALID_PAGE_RESULT",
+                    "The frame snapshot is unavailable.",
+                );
+                return;
+            };
+            let Some(snapshot) = make_frame_snapshot(pending, inventory, &read, &mut page) else {
+                pending_error(
+                    pending,
+                    "INVALID_PAGE_RESULT",
+                    "The frame snapshot references are invalid.",
+                );
+                return;
+            };
+            if let Some(page_read) = &inventory.page_read {
+                let mut batch = page_read.borrow_mut();
+                if batch.remaining.consume(&page).is_none() {
+                    drop(batch);
+                    pending_error(
+                        pending,
+                        "INVALID_PAGE_BUDGET",
+                        "The frame result did not match the remaining shared read budget.",
+                    );
+                    return;
+                }
+                batch.truncated |= page["truncated"]
+                    .as_object()
+                    .is_some_and(|flags| flags.values().any(|flag| flag == &Json::Bool(true)))
+                    || page["interactive"].as_array().is_some_and(|items| {
+                        items.iter().any(|item| item["optionsTruncated"] == true)
+                    });
+                let document = json!({"frame":read.frame,"page":page});
+                let bytes = crate::page_read::serialized_size(&document)
+                    .and_then(|bytes| batch.document_bytes.checked_add(bytes))
+                    .filter(|bytes| *bytes <= crate::page_read::MAX_AGGREGATE_BYTES);
+                let Some(bytes) = bytes else {
+                    drop(batch);
+                    pending_error(
+                        pending,
+                        "RESULT_LIMIT",
+                        "The collected page documents exceeded their byte limit.",
+                    );
+                    return;
+                };
+                batch.document_bytes = bytes;
+                batch.documents.push(document);
+                batch.collected.push(CollectedFrame {
+                    snapshot: Shared::new(snapshot),
+                    context: read.context,
+                });
+                drop(batch);
+                next_page_document(pending);
+                return;
+            }
+            STATE.with(|slot| {
+                if let Some(control) = slot.borrow_mut().frame_controls.get_mut(&pending.tab) {
+                    control.snapshots = vec![Shared::new(snapshot)];
+                }
+            });
+            finish_frame_inventory_state(pending.tab, pending.reply.token);
+            pending.reply.ok(json!({"tab":pending.tab,"epoch":pending.epoch,"documentEpoch":inventory.document_epoch,
+                "frame":read.frame,"page":page,"atomic":false,
+                "supportedActions":["click","hover","fill","insert","press","check","select"],"pointerActionsSupported":true}));
+            return;
+        }
+        _ => return,
+    };
+    dispatch_frame_phase(Pending {
+        step: Step::FrameInventory {
+            inventory: inventory.clone(),
+            session: session.clone(),
+            phase: next_phase,
+        },
+        ..pending.clone()
+    });
+}
+
+fn frame_event(browser: &Browser, session: Option<&str>, method: &str, bytes: &[u8]) {
+    if !matches!(
+        method,
+        "Target.attachedToTarget"
+            | "Target.detachedFromTarget"
+            | "Page.frameAttached"
+            | "Page.frameDetached"
+            | "Page.frameNavigated"
+            | "Runtime.executionContextCreated"
+            | "Runtime.executionContextDestroyed"
+            | "Runtime.executionContextsCleared"
+    ) {
+        return;
+    }
+    let tab = STATE.with(|slot| {
+        let state = slot.borrow();
+        state.tabs.iter().find_map(|(id, tab)| {
+            (!tab.rejected_creation
+                && tab.browser.get_raw() == browser.get_raw()
+                && state.frame_controls.get(id).is_some_and(|control| {
+                    control.enabled
+                        && session.is_none_or(|session| control.sessions.contains(session))
+                }))
+            .then_some(*id)
+        })
+    });
+    let Some(tab) = tab else {
+        return;
+    };
+    if bytes.len() > 32 * 1024 {
+        fail_frame_inventory(
+            tab,
+            "FRAME_LIMIT",
+            "The frame event exceeded its size limit.",
+        );
+        stop_frame_tracking(tab, None);
+        return;
+    }
+    let Ok(params) = serde_json::from_slice::<Json>(bytes) else {
+        fail_frame_inventory(
+            tab,
+            "INVALID_RESULT",
+            "Chromium returned an invalid frame event.",
+        );
+        stop_frame_tracking(tab, None);
+        return;
+    };
+    let (changed, rejected, removed) = STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        let Some(control) = state.frame_controls.get_mut(&tab) else {
+            return (false, false, Vec::new());
+        };
+        // Keep the collection guard between Pending stages too: CEF getters
+        // can deliver events after the preceding request has been removed.
+        let runtime_event = method.starts_with("Runtime.");
+        let mut changed = !runtime_event
+            && control.active_inventory.as_ref().is_some_and(|inventory| {
+                let current = inventory.current.borrow();
+                inventory
+                    .visited
+                    .borrow()
+                    .contains(&session.map(str::to_owned))
+                    || (current.1 == FramePhase::Tree && current.0.as_deref() == session)
+            });
+        let mut rejected = false;
+        let mut removed = Vec::new();
+        match method {
+            "Runtime.executionContextCreated"
+            | "Runtime.executionContextDestroyed"
+            | "Runtime.executionContextsCleared" => {
+                if let Some(inventory) = &control.active_inventory {
+                    if let Some(page_read) = &inventory.page_read {
+                        for collected in &mut page_read.borrow_mut().collected {
+                            if collected.snapshot.session_id() == session {
+                                collected.context.observe(method, &params);
+                                if collected.context.invalidated() {
+                                    collected.snapshot.invalidated.set(true);
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(read) = inventory.read.borrow_mut().as_mut() {
+                        // A parent pass may enable the same session as the
+                        // target or another already-observed ancestor. Keep
+                        // all bound worlds current across those passes.
+                        if read.frame.session_id.as_deref() == session {
+                            read.context.observe(method, &params);
+                            changed |= read.context.invalidated();
+                        }
+                        for parent in &mut read.parents {
+                            if parent.frame.session_id.as_deref() == session {
+                                parent.context.observe(method, &params);
+                                changed |= parent.context.invalidated();
+                            }
+                        }
+                    }
+                }
+            }
+            "Target.attachedToTarget" => match control.sessions.attach(session, &params) {
+                crate::frame_sessions::AttachOutcome::Duplicate => {
+                    changed = false;
+                }
+                crate::frame_sessions::AttachOutcome::Reject { .. } => {
+                    rejected = true;
+                }
+                crate::frame_sessions::AttachOutcome::Added { .. } => {}
+            },
+            "Target.detachedFromTarget" => {
+                removed = params["sessionId"]
+                    .as_str()
+                    .map(|id| control.sessions.detach(session, id))
+                    .unwrap_or_default();
+                changed = !removed.is_empty();
+            }
+            _ => {}
+        }
+        let snapshot_changed = match method {
+            "Page.frameAttached" | "Page.frameDetached" | "Page.frameNavigated" => true,
+            "Target.detachedFromTarget" => changed,
+            _ => false,
+        };
+        if changed || rejected || snapshot_changed {
+            for snapshot in &control.snapshots {
+                snapshot.invalidated.set(true);
+            }
+        }
+        if changed || rejected {
+            if let Some(inventory) = &control.active_inventory {
+                inventory.invalidated.set(true);
+            }
+        }
+        (changed, rejected, removed)
+    });
+    if !removed.is_empty() {
+        focus_session_detached(browser, tab, &removed);
+    }
+    if rejected {
+        fail_frame_inventory(
+            tab,
+            "FRAME_LIMIT",
+            "A child frame attachment was invalid or exceeded the session limits.",
+        );
+        stop_frame_tracking(tab, None);
+    } else if changed {
+        fail_frame_inventory(
+            tab,
+            "FRAME_CHANGED",
+            "Frames changed during discovery. Inspect again after the page settles.",
+        );
+        stop_frame_tracking(tab, None);
+    }
+}
+
+fn dispatch(browser: &Browser, method: &str, mut params: Json, mut pending: Pending) {
+    if matches!(pending.step, Step::Evaluate)
+        && pending.fill_target().is_some_and(|target| !target.insert)
+    {
+        let inspect = pending
+            .fill_target()
+            .unwrap()
+            .classification
+            .borrow()
+            .is_none();
+        let Some(fill_params) = fill_dispatch_params(&pending, inspect) else {
+            pending_error(
+                &pending,
+                "STALE_REF",
+                "The original fill reference or context is unavailable.",
+            );
+            return;
+        };
+        params = fill_params;
+        if inspect {
+            pending.step = Step::FillPreflight;
+        }
+    }
+    if focus_preparation(&pending) && pending.reply.focus_completion.is_none() {
+        start_focus_lease(browser, method, params, pending);
+        return;
+    }
+    let frame_failure = STATE.with(|slot| {
+        pending.frame.as_ref().and_then(|frame| {
+            frame_snapshot_failure(
+                &slot.borrow(),
+                browser,
+                pending.tab,
+                pending.epoch,
+                &pending.reply,
+                frame,
+            )
+        })
+    });
+    if let Some(failure) = frame_failure {
+        pending_error(&pending, failure.code, failure.message);
+        return;
+    }
+    if let Some(failure) = bind_fill_target(browser, &pending) {
+        pending_error(&pending, failure.code, failure.message);
+        return;
+    }
+    if matches!(
+        pending.step,
+        Step::Frame(_) | Step::World(_) | Step::Evaluate
+    ) && !STATE.with(|slot| {
+        focus_input_active(
+            &slot.borrow(),
+            browser,
+            pending.tab,
+            &pending.reply,
+            pending.session(),
+        )
+    }) {
+        pending_error(
+            &pending,
+            "FOCUS_PREPARATION_FAILED",
+            "Temporary input focus is no longer active; no input was dispatched.",
+        );
+        return;
+    }
+    if matches!(pending.evaluation, Evaluation::ReadyState { .. }) {
+        dispatch_readiness_with(
+            browser,
+            pending,
+            || browser.host(),
+            || Some(params),
+            |host, params, id| send_root_command(&host, id, method, &params),
+        );
+        return;
+    }
     if !pending.reply.active.load(Ordering::Acquire) {
+        if pending.reply.focus_completion.is_some() {
+            abort_focus_lease(
+                pending.tab,
+                "TIMEOUT",
+                "The input request is no longer active; do not repeat it automatically.",
+                false,
+            );
+        }
+        if matches!(pending.step, Step::FrameInventory { .. }) {
+            stop_frame_tracking(pending.tab, Some(pending.reply.token));
+        }
         return;
     }
     let access = STATE.with(|state| {
@@ -4908,13 +10433,39 @@ fn dispatch(browser: &Browser, method: &str, params: Json, pending: Pending) {
             .check_tab(pending.reply.scope.as_ref(), pending.tab)
     });
     if let Err(error) = access {
-        pending.reply.error(error.code, error.message);
+        pending_error(&pending, error.code, error.message);
         return;
     }
-    let Some(host) = browser.host() else {
+    let host = browser.host();
+    let frame_failure = STATE.with(|slot| {
+        pending.frame.as_ref().and_then(|frame| {
+            frame_snapshot_failure(
+                &slot.borrow(),
+                browser,
+                pending.tab,
+                pending.epoch,
+                &pending.reply,
+                frame,
+            )
+        })
+    });
+    if let Some(failure) = frame_failure {
+        pending_error(&pending, failure.code, failure.message);
+        return;
+    }
+    let Some(host) = host else {
         pending_error(&pending, "TAB_CLOSED", "Browser host is unavailable.");
         return;
     };
+    if !STATE.with(|slot| frame_inventory_current(&slot.borrow(), browser, &pending)) {
+        pending_error(
+            &pending,
+            "FRAME_CHANGED",
+            "The frame discovery target changed before dispatch.",
+        );
+        return;
+    }
+    let session = pending.session().map(str::to_owned);
     let capture = matches!(pending.step, Step::Screenshot(_));
     if capture && STATE.with(|state| !state.borrow().captures.is_empty()) {
         pending.reply.error(
@@ -4923,30 +10474,17 @@ fn dispatch(browser: &Browser, method: &str, params: Json, pending: Pending) {
         );
         return;
     }
-    let mut dictionary = parse_json(
-        Some(&CefString::from(params.to_string().as_str())),
-        JsonParserOptions::default(),
-    )
-    .and_then(|value| value.dictionary());
     if matches!(
         pending.evaluation,
         Evaluation::Page {
-            evidence: Some(ActionEvidence::Press | ActionEvidence::Click(_)),
+            evidence: Some(
+                ActionEvidence::Press(_) | ActionEvidence::Click(_) | ActionEvidence::Fill(_)
+            ),
             ..
         }
     ) {
-        let available =
-            browser.is_valid() != 0 && browser.has_document() != 0 && dictionary.is_some();
-        let failure = STATE.with(|state| {
-            input_target_failure(
-                &state.borrow(),
-                browser,
-                pending.tab,
-                pending.epoch,
-                &pending.reply,
-                false,
-            )
-        });
+        let available = browser.is_valid() != 0 && browser.has_document() != 0;
+        let failure = STATE.with(|state| pending_input_failure(&state.borrow(), browser, &pending));
         if let Some(failure) = failure {
             pending_error(&pending, failure.code, failure.message);
             return;
@@ -4960,10 +10498,32 @@ fn dispatch(browser: &Browser, method: &str, params: Json, pending: Pending) {
             return;
         }
     }
-    let (id, start_page_revoked) = STATE.with(|state| {
+    // Host/document getters above can re-enter cancellation while the disable
+    // ACK is still pending. Do not start a fresh DOM focus/select preparation.
+    if matches!(
+        pending.step,
+        Step::Frame(_) | Step::World(_) | Step::Evaluate
+    ) && !STATE.with(|slot| {
+        focus_input_active(
+            &slot.borrow(),
+            browser,
+            pending.tab,
+            &pending.reply,
+            pending.session(),
+        )
+    }) {
+        pending_error(
+            &pending,
+            "FOCUS_PREPARATION_FAILED",
+            "Temporary input focus is no longer active; no input was dispatched.",
+        );
+        return;
+    }
+    let reserved = STATE.with(|state| {
         let mut state = state.borrow_mut();
-        state.next_message += 1;
-        let id = state.next_message;
+        let Some(id) = state.next_control_message() else {
+            return Err(pending);
+        };
         if capture {
             state.captures.insert(id, pending.tab);
         }
@@ -4975,10 +10535,21 @@ fn dispatch(browser: &Browser, method: &str, params: Json, pending: Pending) {
                 .get_mut(&pending.tab)
                 .is_some_and(|tab| std::mem::replace(&mut tab.native_start_page, false));
         state.pending.insert(id, pending);
-        (id, start_page_revoked)
+        Ok((id, start_page_revoked))
     });
+    let (id, start_page_revoked) = match reserved {
+        Ok(reserved) => reserved,
+        Err(pending) => {
+            pending_error(
+                &pending,
+                "CONTROL_UNAVAILABLE",
+                "The control message identifiers are exhausted.",
+            );
+            return;
+        }
+    };
     let _refresh = PanelRefresh(start_page_revoked);
-    if host.execute_dev_tools_method(id, Some(&CefString::from(method)), dictionary.as_mut()) == 0 {
+    if send_session_command(&host, id, method, &params, session.as_deref()) != id {
         if let Some(pending) = complete_control_request(id) {
             pending_error(
                 &pending,
@@ -4986,6 +10557,35 @@ fn dispatch(browser: &Browser, method: &str, params: Json, pending: Pending) {
                 "Chromium rejected the control request.",
             );
         }
+    }
+}
+
+/// Keep our identifier in the envelope. The typed CEF sender can allocate an
+/// identifier itself; root and flat child sessions share this raw transport.
+fn send_root_command(host: &BrowserHost, id: i32, method: &str, params: &Json) -> i32 {
+    send_session_command(host, id, method, params, None)
+}
+
+fn send_session_command(
+    host: &BrowserHost,
+    id: i32,
+    method: &str,
+    params: &Json,
+    session: Option<&str>,
+) -> i32 {
+    let bytes = match session {
+        Some(session) => {
+            crate::devtools_wire::serialize_session_request(id, method, params, Some(session))
+        }
+        None => crate::devtools_wire::serialize_request(id, method, params),
+    };
+    let Some(bytes) = bytes else {
+        return 0;
+    };
+    if host.send_dev_tools_message(Some(&bytes)) != 0 {
+        id
+    } else {
+        0
     }
 }
 
@@ -5001,7 +10601,92 @@ fn complete_control_request(id: i32) -> Option<Pending> {
     pending
 }
 
+fn response_matches(state: &State, browser: &Browser, id: i32, session: Option<&str>) -> bool {
+    // No CEF getter or removal while correlating. An unrelated/late response
+    // must not release another tab's capture, preview or pending command.
+    let tab = state
+        .pending
+        .get(&id)
+        .filter(|pending| pending.session() == session)
+        .map(|pending| pending.tab)
+        .or_else(|| {
+            state.focus_leases.iter().find_map(|(tab, lease)| {
+                (lease.browser.get_raw() == browser.get_raw()
+                    && lease.session.as_deref() == session
+                    && (lease.enable.id == id
+                        || lease
+                            .disable
+                            .as_ref()
+                            .is_some_and(|message| message.id == id)))
+                .then_some(*tab)
+            })
+        })
+        .or_else(|| {
+            session
+                .is_none()
+                .then(|| state.previews.get(&id).map(|preview| preview.tab))
+                .flatten()
+        })
+        .or_else(|| {
+            session
+                .is_none()
+                .then(|| state.captures.get(&id).copied())
+                .flatten()
+        })
+        .or_else(|| {
+            session
+                .is_none()
+                .then(|| {
+                    state.frame_controls.iter().find_map(|(tab, control)| {
+                        (control.cleanup == Some(id)
+                            || control.runtime_cleanup == Some(id)
+                            || control.object_cleanup == Some(id))
+                        .then_some(*tab)
+                    })
+                })
+                .flatten()
+        });
+    tab.and_then(|tab| state.tabs.get(&tab))
+        .is_some_and(|tab| !tab.rejected_creation && tab.browser.get_raw() == browser.get_raw())
+}
+
+fn prefix_read_references(page: &mut Json, epoch: u64) {
+    if !page.is_object() {
+        return;
+    }
+    let prefix = format!("{epoch}/");
+    let focused = page["focusedRef"]
+        .as_str()
+        .filter(|reference| {
+            !reference.is_empty()
+                && prefix.len() + reference.len() <= 256
+                && !reference.chars().any(char::is_control)
+                && page["interactive"].as_array().is_some_and(|elements| {
+                    elements
+                        .iter()
+                        .any(|element| element["ref"].as_str() == Some(*reference))
+                })
+        })
+        .map(|reference| format!("{prefix}{reference}"));
+    if let Some(elements) = page["interactive"].as_array_mut() {
+        for element in elements {
+            if let Some(reference) = element["ref"].as_str() {
+                element["ref"] = json!(format!("{prefix}{reference}"));
+            }
+        }
+    }
+    // Focus is useful only as a reference from this exact read. Missing,
+    // unsupported or malformed focus never becomes an actionable arbitrary ref.
+    page["focusedRef"] = json!(focused);
+}
+
 fn devtools_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) {
+    if complete_focus_message(browser, id, success, bytes) {
+        return;
+    }
+    if complete_frame_cleanup(browser, id, success) {
+        return;
+    }
     if complete_preview(id, success, bytes) {
         return;
     }
@@ -5013,6 +10698,26 @@ fn devtools_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) {
     let Some(pending) = complete_control_request(id) else {
         return;
     };
+    if matches!(pending.step, Step::FrameInventory { .. }) {
+        frame_inventory_result(browser, &pending, success, bytes);
+        return;
+    }
+    let frame_failure = STATE.with(|slot| {
+        pending.frame.as_ref().and_then(|snapshot| {
+            frame_snapshot_failure(
+                &slot.borrow(),
+                browser,
+                pending.tab,
+                pending.epoch,
+                &pending.reply,
+                snapshot,
+            )
+        })
+    });
+    if let Some(failure) = frame_failure {
+        pending_error(&pending, failure.code, failure.message);
+        return;
+    }
     if !pending.reply.active.load(Ordering::Acquire) {
         return;
     }
@@ -5025,6 +10730,26 @@ fn devtools_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) {
     if let Err(error) = access {
         pending.reply.error(error.code, error.message);
         return;
+    }
+    if matches!(pending.evaluation, Evaluation::ReadyState { .. }) {
+        let current = STATE.with(|slot| {
+            let state = slot.borrow();
+            state
+                .waits
+                .get(&pending.reply.token)
+                .is_some_and(|waiter| pending_matches_waiter(&pending, waiter))
+                && state.tabs.get(&pending.tab).is_some_and(|tab| {
+                    !tab.rejected_creation && tab.browser.get_raw() == browser.get_raw()
+                })
+        });
+        if !current {
+            pending_error(
+                &pending,
+                "PAGE_CHANGED",
+                "The wait callback belongs to an older browser.",
+            );
+            return;
+        }
     }
     // Check every preparation step. An action's own navigation is allowed
     // after evaluation has been dispatched, and is not retried.
@@ -5051,6 +10776,14 @@ fn devtools_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) {
         );
         return;
     }
+    if matches!(pending.step, Step::FillPreflight) && bytes.len() > 64 * 1024 {
+        pending_error(
+            &pending,
+            "INVALID_RESULT",
+            "The fill classification exceeded its result limit.",
+        );
+        return;
+    }
     let Ok(result) = serde_json::from_slice::<Json>(bytes) else {
         pending_error(
             &pending,
@@ -5070,6 +10803,65 @@ fn devtools_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) {
         return;
     }
     match &pending.step {
+        Step::FrameInventory { .. } => {
+            unreachable!("frame inventory handled before page evaluation")
+        }
+        Step::FillPreflight => {
+            if result.get("exceptionDetails").is_some() {
+                pending_error(
+                    &pending,
+                    "PAGE_SCRIPT_ERROR",
+                    "The fill target could not be classified.",
+                );
+                return;
+            }
+            let value = &result["result"]["value"];
+            if value["ok"] == false {
+                let (code, message) = fill_error(value);
+                pending_error(&pending, code, message);
+                return;
+            }
+            let path = value["input"].as_str();
+            let kind = value["kind"].as_str();
+            let valid = value["ok"] == true
+                && value["action"] == "fill"
+                && match (path, kind) {
+                    (
+                        Some("chromium"),
+                        Some(
+                            "text" | "search" | "tel" | "url" | "password" | "textarea"
+                            | "contenteditable",
+                        ),
+                    ) => true,
+                    (
+                        Some("dom"),
+                        Some(
+                            "email" | "number" | "date" | "datetime-local" | "month" | "week"
+                            | "time" | "range" | "color",
+                        ),
+                    ) => true,
+                    _ => false,
+                };
+            if !valid {
+                pending_error(
+                    &pending,
+                    "INVALID_PAGE_RESULT",
+                    "The fill target returned an unsupported classification.",
+                );
+                return;
+            }
+            *pending.fill_target().unwrap().classification.borrow_mut() =
+                Some((path.unwrap().to_owned(), kind.unwrap().to_owned()));
+            dispatch(
+                browser,
+                "Runtime.evaluate",
+                json!({}),
+                Pending {
+                    step: Step::Evaluate,
+                    ..pending
+                },
+            );
+        }
         Step::Frame(expression) => {
             let Some(frame) = result["frameTree"]["frame"]["id"].as_str() else {
                 pending_error(&pending, "FRAME_UNAVAILABLE", "Main frame is unavailable.");
@@ -5097,6 +10889,33 @@ fn devtools_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) {
             if let Some(target) = pending.click_target() {
                 target.context.set(Some(context));
             }
+            if let Some(target) = pending.press_target() {
+                if context <= 0 {
+                    pending_error(
+                        &pending,
+                        "CONTEXT_UNAVAILABLE",
+                        "The key input context is unavailable.",
+                    );
+                    return;
+                }
+                target.context.set(Some(context));
+            }
+            if let Some(target) = pending.fill_target() {
+                if context <= 0
+                    || target
+                        .context
+                        .get()
+                        .is_some_and(|original| original != context)
+                {
+                    pending_error(
+                        &pending,
+                        "CONTEXT_UNAVAILABLE",
+                        "The original fill context is unavailable.",
+                    );
+                    return;
+                }
+                target.context.set(Some(context));
+            }
             dispatch(
                 browser,
                 "Runtime.evaluate",
@@ -5117,11 +10936,12 @@ fn devtools_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) {
                 return;
             }
             let value = &result["result"]["value"];
-            if let Evaluation::ReadyState { token } = pending.evaluation {
+            if let Evaluation::ReadyState { token, .. } = pending.evaluation {
                 let within_deadline = STATE.with(|state| {
                     let state = state.borrow();
                     state.waits.get(&token).is_some_and(|waiter| {
-                        waiter.started.elapsed() < Duration::from_millis(waiter.timeout_ms)
+                        pending_matches_waiter(&pending, waiter)
+                            && waiter.started.elapsed() < Duration::from_millis(waiter.timeout_ms)
                             && state
                                 .tabs
                                 .get(&waiter.tab)
@@ -5137,14 +10957,7 @@ fn devtools_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) {
                 }
                 let ready = matches!(value.as_str(), Some("interactive" | "complete"));
                 if ready {
-                    if let Some(waiter) = remove_wait(token) {
-                        let info =
-                            STATE.with(|state| state.borrow().tabs.get(&waiter.tab).map(tab_info));
-                        if let Some(mut info) = info {
-                            info["readyState"] = value.clone();
-                            waiter.reply.ok(info);
-                        }
-                    }
+                    finish_dom_wait_with(browser, &pending, token, value, observe_tab);
                 } else {
                     pending_error(&pending, "PAGE_LOADING", "The DOM is still parsing.");
                 }
@@ -5191,13 +11004,7 @@ fn devtools_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) {
                         ..
                     }
                 ) {
-                    if let Some(elements) = page["interactive"].as_array_mut() {
-                        for element in elements {
-                            if let Some(reference) = element["ref"].as_str() {
-                                element["ref"] = json!(format!("{}/{}", pending.epoch, reference));
-                            }
-                        }
-                    }
+                    prefix_read_references(&mut page, pending.epoch);
                 }
                 reply.ok(json!({"tab":pending.tab,"page":page}));
             }
@@ -5217,7 +11024,7 @@ fn devtools_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) {
                 ),
             }
         }
-        Step::Input { .. } | Step::ClickVerify => {
+        Step::Input { .. } | Step::ClickVerify | Step::FillVerify | Step::PressVerify => {
             unreachable!("Native input results are handled before completing a pending request")
         }
     }
@@ -5427,11 +11234,13 @@ wrap_life_span_handler! {
             // The main frame is valid until this callback returns (CEF 156).
             // Read before the STATE borrow; never retain CEF objects as history.
             let url=browser.main_frame().map(|frame| CefString::from(&frame.url()).to_string());
-            let empty=STATE.with(|state| {
+            let (empty, waits, pending, focus)=STATE.with(|state| {
                 let mut state=state.borrow_mut();
                 if let Some(url)=url.as_deref() { remember_closed_page(&mut state,id,url); }
                 state.page_find.invalidate(id);
                 state.tabs.remove(&id);
+                state.frame_controls.remove(&id);
+                let focus=state.focus_leases.remove(&id);
                 state.creations.close_opener(id);
                 state.captures.retain(|_,tab|*tab!=id);
                 state.previews.retain(|_,request|request.tab!=id);
@@ -5439,17 +11248,25 @@ wrap_life_span_handler! {
                 state.spaces.remove(id);
                 let tasks = state.tasks.list();
                 state.spaces.update_tasks(&tasks);
-                state.waits.retain(|_,waiter| {if waiter.tab==id {waiter.reply.error("TAB_CLOSED","The tab closed while waiting.");false}else{true}});
-                state.pending.retain(|_,pending| {if pending.tab==id {
-                    if pending.mutation_dispatched() {
-                        pending.reply.error_details("TAB_CLOSED","The tab closed during the request. Inspect before retrying.",pending.outcome_details());
-                    } else {
-                        pending.reply.error("TAB_CLOSED","The tab closed during the request.");
-                    }
-                    false
-                }else{true}});
-                state.tabs.is_empty()
+                let wait_ids=state.waits.iter().filter_map(|(key,waiter)|(waiter.tab==id).then_some(*key)).collect::<Vec<_>>();
+                let pending_ids=state.pending.iter().filter_map(|(key,pending)|(pending.tab==id).then_some(*key)).collect::<Vec<_>>();
+                let waits=wait_ids.into_iter().filter_map(|key|state.waits.remove(&key)).collect::<Vec<_>>();
+                let pending=pending_ids.into_iter().filter_map(|key|state.pending.remove(&key)).collect::<Vec<_>>();
+                (state.tabs.is_empty(), waits, pending, focus)
             });
+            // Destruction of the browser destroys its sessions. Reply only
+            // outside STATE, and do not enter focus/frame cleanup recursively.
+            if let Some(lease)=focus {
+                lease.reply.send_final(lease.failure("TAB_CLOSED","The tab closed during input. Inspect before retrying.","session-destroyed"));
+            }
+            for waiter in waits {
+                waiter.reply.send_final(Response::error(&waiter.reply.id,"TAB_CLOSED","The tab closed while waiting."));
+            }
+            for pending in pending {
+                let mut response=Response::error(&pending.reply.id,"TAB_CLOSED","The tab closed during the request. Inspect before retrying.");
+                if pending.mutation_dispatched() { response=response.with_details(pending.outcome_details()); }
+                pending.reply.send_final(response);
+            }
             crate::control_panel::remove(id);
             notify_panel();
             if empty {quit_message_loop();}
@@ -5547,7 +11364,7 @@ wrap_display_handler! {
                         nav.incomplete = false;
                     }
                 }
-            }); queue_history_observation(browser.identifier()); notify_panel(); }
+            }); focus_navigation_changed(browser.identifier()); queue_history_observation(browser.identifier()); notify_panel(); }
         }
         fn on_title_change(&self,browser:Option<&mut Browser>,title:Option<&CefString>) {
             if let Some(browser)=browser {STATE.with(|state| {if let Some(tab)=state.borrow_mut().tabs.get_mut(&browser.identifier()) {
@@ -5627,6 +11444,7 @@ wrap_request_handler! {
                             // An aborted request, download or 204 may keep that document.
                         }
                     });
+                    focus_navigation_changed(browser.identifier());
                 }
             }
             0
@@ -5649,13 +11467,12 @@ wrap_load_handler! {
     struct PageLoadHandler;
     impl LoadHandler {
         fn on_loading_state_change(&self,browser:Option<&mut Browser>,is_loading:i32,_can_go_back:i32,_can_go_forward:i32) {
-            if is_loading != 0 { notify_panel(); return; }
-            if let Some(browser)=browser {STATE.with(|state| {
-                if let Some(tab)=state.borrow_mut().tabs.get_mut(&browser.identifier()) {
-                    tab.navigation.finish_loading();
-                    tab.navigation.history.attempt = None;
-                }
-            });queue_history_observation(browser.identifier());notify_panel();}
+            if let Some(browser) = browser {
+                let tab = browser.identifier();
+                observe_loading_state(tab, is_loading != 0);
+                if is_loading == 0 { queue_history_observation(tab); }
+            }
+            notify_panel();
         }
         fn on_load_start(&self,browser:Option<&mut Browser>,frame:Option<&mut Frame>,_transition_type:TransitionType) {
             // Restored documents may commit without OnBeforeBrowse.
@@ -5673,7 +11490,7 @@ wrap_load_handler! {
                     tab.navigation.commit(&url);
                     tab.navigation.history.commit(tab.navigation.document_epoch, &url, generation);
                 }
-            }); notify_panel(); }
+            }); focus_navigation_changed(browser.identifier()); notify_panel(); }
         }
         fn on_load_end(&self,browser:Option<&mut Browser>,frame:Option<&mut Frame>,http_status_code:i32) {
             if frame.is_none_or(|frame| frame.is_main()==0) { return; }
@@ -5706,11 +11523,30 @@ wrap_load_handler! {
 wrap_dev_tools_message_observer! {
     struct ControlObserver;
     impl DevToolsMessageObserver {
-        fn on_dev_tools_agent_detached(&self,browser:Option<&mut Browser>) {
-            if let Some(browser) = browser { control_detached(browser.identifier()); }
+        fn on_dev_tools_message(&self,browser:Option<&mut Browser>,message:Option<&[u8]>) -> i32 {
+            let Some(browser) = browser else { return 1; };
+            let Some(message) = message.and_then(crate::devtools_wire::incoming_message) else { return 1; };
+            match message {
+                crate::devtools_wire::Incoming::Response { id, session, success, payload } => {
+                    if STATE.with(|state| response_matches(&state.borrow(), browser, id, session)) {
+                        devtools_result(browser, id, success, payload);
+                    }
+                }
+                crate::devtools_wire::Incoming::Event { session, method, params } => {
+                    frame_event(browser, session, method, params);
+                }
+            }
+            // Consume every envelope. Typed CEF parsing drops session identity
+            // and assumes field order; the payload above borrows the raw bytes.
+            1
         }
-        fn on_dev_tools_method_result(&self,browser:Option<&mut Browser>,message_id:i32,success:i32,result:Option<&[u8]>) {
-            if let Some(browser)=browser {devtools_result(browser,message_id,success!=0,result.unwrap_or(b"{}"));}
+        fn on_dev_tools_agent_detached(&self,browser:Option<&mut Browser>) {
+            if let Some(browser) = browser {
+                let id = browser.identifier();
+                if STATE.with(|state| state.borrow().tabs.get(&id).is_some_and(|tab| tab.browser.get_raw() == browser.get_raw())) {
+                    control_detached(id);
+                }
+            }
         }
     }
 }
@@ -5770,6 +11606,1479 @@ mod tests {
             state.spaces.show(&scope.task);
             Some(scope)
         })
+    }
+
+    fn inert_frame() -> Frame {
+        let raw = cef::rc::RcImpl::new(unsafe { std::mem::zeroed::<sys::_cef_frame_t>() }, ());
+        cef::rc::ConvertReturnValue::wrap_result(raw.cast::<sys::_cef_frame_t>())
+    }
+
+    fn test_observation(
+        tab: i32,
+        reply: &Reply,
+        access: ObservationAccess,
+    ) -> Result<TabObservation, TaskError> {
+        observe_tab_with(
+            tab,
+            reply,
+            access,
+            |_| None,
+            |_| unreachable!(),
+            |_, _| false,
+        )
+    }
+
+    fn install_wait(reply: Reply, until: WaitUntil) -> Waiter {
+        let waiter = Waiter {
+            tab: 7,
+            until,
+            timeout_ms: 1_000,
+            started: Instant::now(),
+            probe_in_flight: false,
+            reply,
+        };
+        STATE.with(|slot| {
+            slot.borrow_mut()
+                .waits
+                .insert(waiter.reply.token, waiter.clone());
+        });
+        waiter
+    }
+
+    #[test]
+    fn cli_observation_releases_state_and_keeps_actual_url_distinct_from_intent() {
+        context_menu_fixture(false);
+        let (reply, _) = test_reply(17);
+        let calls = Cell::new(0);
+        let observed = observe_tab_with(
+            7,
+            &reply,
+            ObservationAccess::Tab,
+            |_| {
+                STATE.with(|slot| drop(slot.try_borrow_mut().unwrap()));
+                Some(inert_frame())
+            },
+            |_| {
+                STATE.with(|slot| drop(slot.try_borrow_mut().unwrap()));
+                "https://example.test/actual".into()
+            },
+            |_, kind| {
+                calls.set(calls.get() + 1);
+                STATE.with(|slot| {
+                    let mut state = slot.try_borrow_mut().unwrap();
+                    state.tabs.get_mut(&7).unwrap().title = "new title".into();
+                    state.spaces.select_tab(8);
+                });
+                matches!(kind, ShellProbe::Back)
+            },
+        )
+        .unwrap();
+        let info = observed_tab_info(&reply, &observed).unwrap();
+        assert_eq!(calls.get(), 3);
+        assert_eq!(info["url"], "https://example.test/actual");
+        assert_eq!(
+            info["navigation"]["requestedUrl"],
+            "https://example.test/menu"
+        );
+        assert_eq!(info["title"], "new title");
+        assert_eq!(info["canGoBack"], true);
+        assert_eq!(info["loading"], false);
+        clear();
+    }
+
+    #[test]
+    fn cli_observation_stops_after_each_reentrant_native_boundary() {
+        // main_frame, frame.url, loading, back and forward all permit callbacks.
+        for boundary in 1..=5 {
+            for change in 0..6 {
+                context_menu_fixture(false);
+                let (reply, _) = test_reply(17);
+                let calls = Cell::new(0);
+                let touch = || {
+                    calls.set(calls.get() + 1);
+                    STATE.with(|slot| {
+                        let mut state = slot.try_borrow_mut().unwrap();
+                        if calls.get() != boundary {
+                            return;
+                        }
+                        match change {
+                            0 => {
+                                state.tabs.remove(&7);
+                            }
+                            1 => {
+                                state.tabs.get_mut(&7).unwrap().browser =
+                                    native_blank_tab().browser;
+                            }
+                            2 => state.tabs.get_mut(&7).unwrap().navigation.epoch += 1,
+                            3 => state.tabs.get_mut(&7).unwrap().navigation.document_epoch += 1,
+                            4 => {
+                                state
+                                    .tabs
+                                    .get_mut(&7)
+                                    .unwrap()
+                                    .navigation
+                                    .loading_event_revision += 1
+                            }
+                            _ => {
+                                let task = state.tasks.create("changed owner").unwrap();
+                                state
+                                    .tasks
+                                    .attach(
+                                        &TaskScope {
+                                            task: task.id,
+                                            revision: task.revision,
+                                        },
+                                        7,
+                                        Origin::Borrowed,
+                                    )
+                                    .unwrap();
+                            }
+                        }
+                    });
+                };
+                let result = observe_tab_with(
+                    7,
+                    &reply,
+                    ObservationAccess::Tab,
+                    |_| {
+                        touch();
+                        Some(inert_frame())
+                    },
+                    |_| {
+                        touch();
+                        "https://example.test/actual".into()
+                    },
+                    |_, _| {
+                        touch();
+                        false
+                    },
+                );
+                assert!(result.is_err(), "boundary={boundary} change={change}");
+                assert_eq!(calls.get(), boundary);
+            }
+        }
+        clear();
+    }
+
+    #[test]
+    fn cli_tabs_rechecks_scope_full_membership_and_earlier_samples() {
+        let scope = context_menu_fixture(true).unwrap();
+        let (mut scoped, _) = test_reply(17);
+        scoped.scope = Some(scope.clone());
+        let info = tabs_info_with(&scoped, test_observation).unwrap();
+        assert_eq!(info["tabs"].as_array().unwrap().len(), 1);
+        assert_eq!(info["tabs"][0]["tab"], 7);
+        let (unscoped, _) = test_reply(18);
+        assert_eq!(
+            tabs_info_with(&unscoped, test_observation).unwrap()["tabs"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            tabs_info_with(&scoped, |id, reply, access| {
+                let observed = test_observation(id, reply, access)?;
+                STATE.with(|slot| {
+                    slot.borrow_mut().tasks.handoff(&scope).unwrap();
+                });
+                Ok(observed)
+            })
+            .is_err()
+        );
+        for change in 0..3 {
+            context_menu_fixture(false);
+            let (reply, _) = test_reply(19);
+            let result = tabs_info_with(&reply, |id, reply, access| {
+                let observed = test_observation(id, reply, access)?;
+                if id == 8 {
+                    STATE.with(|slot| {
+                        let mut state = slot.borrow_mut();
+                        match change {
+                            0 => state.tabs.get_mut(&7).unwrap().navigation.epoch += 1,
+                            1 => {
+                                state.tabs.insert(9, native_blank_tab());
+                            }
+                            _ => {
+                                state.tabs.remove(&7);
+                            }
+                        }
+                    });
+                }
+                Ok(observed)
+            });
+            assert_eq!(result.err().unwrap().code, "PAGE_CHANGED");
+        }
+        clear();
+    }
+
+    #[test]
+    fn created_tab_observation_failure_reports_creation_without_recreating() {
+        context_menu_fixture(false);
+        let browser = STATE.with(|slot| slot.borrow().tabs[&7].browser.clone());
+        let (reply, receiver) = test_reply(17);
+        reply_created_tab_with(7, &browser, &reply, |id, reply, access| {
+            observe_tab_with(
+                id,
+                reply,
+                access,
+                |_| {
+                    STATE.with(|slot| {
+                        slot.borrow_mut().tabs.get_mut(&7).unwrap().navigation.epoch += 1
+                    });
+                    None
+                },
+                |_| unreachable!(),
+                |_, _| panic!("stale frame lookup must stop observation"),
+            )
+        });
+        let error = receiver.try_recv().unwrap().error.unwrap();
+        assert_eq!(error.code, "PAGE_CHANGED");
+        assert_eq!(
+            error.details.unwrap(),
+            json!({"tab":7,"tabCreated":true,"stateUnavailable":true,"outcomeUnknown":false})
+        );
+        STATE.with(|slot| assert_eq!(slot.borrow().tabs.len(), 2));
+        assert!(receiver.try_recv().is_err());
+        clear();
+    }
+
+    #[test]
+    fn wait_unstable_observation_keeps_deadline_and_terminal_diagnostics() {
+        for terminal in 0..3 {
+            context_menu_fixture(false);
+            let (reply, receiver) = test_reply(17);
+            let captured = install_wait(reply, WaitUntil::Load);
+            assert!(poll_wait_with(17, |_, _, _| Err(OBSERVATION_CHANGED)).is_none());
+            STATE.with(|slot| {
+                let mut state = slot.borrow_mut();
+                assert_eq!(state.waits[&17].started, captured.started);
+                assert!(!state.waits[&17].probe_in_flight);
+                match terminal {
+                    0 => state.waits.get_mut(&17).unwrap().timeout_ms = 0,
+                    1 => {
+                        state.tabs.get_mut(&7).unwrap().navigation.error =
+                            Some(json!({"error":"failed"}))
+                    }
+                    _ => {
+                        state.tabs.get_mut(&7).unwrap().navigation.renderer_exit =
+                            Some(json!({"status":"crashed"}))
+                    }
+                }
+            });
+            assert!(receiver.try_recv().is_err());
+            poll_wait_cycle_with(
+                17,
+                |_, _, _| Err(OBSERVATION_CHANGED),
+                |_, _| panic!("no DOM probe"),
+                |_| panic!("finished wait must not schedule"),
+            );
+            let error = receiver.try_recv().unwrap().error.unwrap();
+            assert_eq!(
+                error.code,
+                ["WAIT_TIMEOUT", "NAVIGATION_FAILED", "RENDERER_TERMINATED"][terminal]
+            );
+            let details = error.details.unwrap();
+            assert!(details["state"].is_null());
+            assert_eq!(details["stateUnavailable"], true);
+            STATE.with(|slot| assert!(!slot.borrow().waits.contains_key(&17)));
+            assert!(receiver.try_recv().is_err());
+        }
+        context_menu_fixture(false);
+        let (reply, receiver) = test_reply(17);
+        install_wait(reply, WaitUntil::Load);
+        poll_wait_cycle_with(
+            17,
+            test_observation,
+            |_, _| panic!("load uses no CDP"),
+            |_| panic!("completed"),
+        );
+        let info = receiver.try_recv().unwrap().result.unwrap();
+        assert_eq!(info["navigation"]["epoch"], 4);
+        assert!(info.get("stateUnavailable").is_none());
+        clear();
+    }
+
+    #[test]
+    fn wait_replacement_is_not_reset_removed_or_scheduled_by_old_cycle() {
+        for boundary in 0..3 {
+            context_menu_fixture(false);
+            let (reply, receiver) = test_reply(17);
+            let old = install_wait(reply, WaitUntil::Dom);
+            let (replacement_reply, _) = test_reply(17);
+            let replacement = Waiter {
+                reply: replacement_reply,
+                probe_in_flight: true,
+                ..old.clone()
+            };
+            let replace = || {
+                STATE.with(|slot| {
+                    slot.borrow_mut().waits.insert(17, replacement.clone());
+                });
+            };
+            let sent = Cell::new(0);
+            let scheduled = Cell::new(0);
+            poll_wait_cycle_with(
+                17,
+                |id, reply, access| {
+                    let observed = test_observation(id, reply, access)?;
+                    if boundary == 0 {
+                        replace();
+                    }
+                    Ok(observed)
+                },
+                |_, pending| {
+                    sent.set(sent.get() + 1);
+                    if boundary == 1 {
+                        replace();
+                    }
+                    pending_error(&pending, "PAGE_CHANGED", "old probe");
+                },
+                |_| {
+                    scheduled.set(scheduled.get() + 1);
+                    assert_eq!(boundary, 2);
+                    replace();
+                    false
+                },
+            );
+            assert_eq!(sent.get(), usize::from(boundary != 0));
+            assert_eq!(scheduled.get(), usize::from(boundary == 2));
+            assert!(!wait_tick_current(
+                17,
+                old.tab,
+                old.started,
+                &old.reply.active
+            ));
+            assert!(remove_matching_wait(17, &old).is_none());
+            STATE.with(|slot| {
+                let state = slot.borrow();
+                assert!(same_waiter(&state.waits[&17], &replacement));
+                assert!(state.waits[&17].probe_in_flight);
+            });
+            assert!(receiver.try_recv().is_err());
+        }
+        clear();
+    }
+
+    #[test]
+    fn dom_wait_completion_preserves_probe_deadline_and_browser_identity() {
+        context_menu_fixture(false);
+        let (reply, receiver) = test_reply(17);
+        let old = install_wait(reply, WaitUntil::Dom);
+        let (browser, pending) = poll_wait_with(17, test_observation).unwrap();
+        assert!(
+            poll_wait_with(17, test_observation).is_none(),
+            "one probe only"
+        );
+        finish_dom_wait_with(&browser, &pending, 17, &json!("complete"), |_, _, _| {
+            Err(OBSERVATION_CHANGED)
+        });
+        STATE.with(|slot| {
+            let state = slot.borrow();
+            assert_eq!(state.waits[&17].started, old.started);
+            assert!(!state.waits[&17].probe_in_flight);
+        });
+        assert!(receiver.try_recv().is_err());
+        let (_, pending) = poll_wait_with(17, test_observation).unwrap();
+        // An old browser callback cannot certify a replacement with the same ID/epoch.
+        STATE.with(|slot| {
+            slot.borrow_mut().tabs.get_mut(&7).unwrap().browser = native_blank_tab().browser
+        });
+        finish_dom_wait_with(&browser, &pending, 17, &json!("complete"), test_observation);
+        assert!(receiver.try_recv().is_err());
+        let (browser, pending) = poll_wait_with(17, test_observation).unwrap();
+        STATE.with(|slot| {
+            slot.borrow_mut().pending.insert(42, pending.clone());
+        });
+        let replaced = native_blank_tab().browser;
+        STATE.with(|slot| slot.borrow_mut().tabs.get_mut(&7).unwrap().browser = replaced.clone());
+        devtools_result(&browser, 42, true, br#"{"result":{"value":"complete"}}"#);
+        assert!(receiver.try_recv().is_err());
+        let (_, pending) = poll_wait_with(17, test_observation).unwrap();
+        STATE.with(|slot| slot.borrow_mut().waits.get_mut(&17).unwrap().timeout_ms = 0);
+        finish_dom_wait_with(
+            &replaced,
+            &pending,
+            17,
+            &json!("complete"),
+            test_observation,
+        );
+        assert!(receiver.try_recv().is_err());
+        STATE.with(|slot| assert!(!slot.borrow().waits[&17].probe_in_flight));
+        clear();
+        context_menu_fixture(false);
+        let (reply, receiver) = test_reply(18);
+        install_wait(reply, WaitUntil::Dom);
+        let (browser, pending) = poll_wait_with(18, test_observation).unwrap();
+        finish_dom_wait_with(
+            &browser,
+            &pending,
+            18,
+            &json!("interactive"),
+            test_observation,
+        );
+        assert_eq!(
+            receiver.try_recv().unwrap().result.unwrap()["readyState"],
+            "interactive"
+        );
+        finish_dom_wait_with(&browser, &pending, 18, &json!("complete"), |_, _, _| {
+            panic!("completed waiter must not observe")
+        });
+        assert!(receiver.try_recv().is_err());
+        clear();
+    }
+
+    #[test]
+    fn readiness_dispatch_revalidates_native_preparation_and_releases_only_its_waiter() {
+        for boundary in 0..2 {
+            for change in 0..6 {
+                context_menu_fixture(false);
+                let (reply, receiver) = test_reply(17);
+                let old = install_wait(reply, WaitUntil::Dom);
+                let (browser, pending) = poll_wait_with(17, test_observation).unwrap();
+                let (replacement_reply, _) = test_reply(17);
+                let replacement = Waiter {
+                    reply: replacement_reply,
+                    probe_in_flight: true,
+                    ..old.clone()
+                };
+                let mutate = || {
+                    STATE.with(|slot| {
+                        let mut state = slot.try_borrow_mut().unwrap();
+                        match change {
+                            0 => {
+                                state.waits.insert(17, replacement.clone());
+                            }
+                            1 => {
+                                state.tabs.get_mut(&7).unwrap().browser = native_blank_tab().browser
+                            }
+                            2 => state.tabs.get_mut(&7).unwrap().navigation.document_epoch += 1,
+                            3 => {
+                                let task = state.tasks.create("new owner").unwrap();
+                                state
+                                    .tasks
+                                    .attach(
+                                        &TaskScope {
+                                            task: task.id,
+                                            revision: task.revision,
+                                        },
+                                        7,
+                                        Origin::Borrowed,
+                                    )
+                                    .unwrap();
+                            }
+                            4 => state.waits.get_mut(&17).unwrap().timeout_ms = 0,
+                            _ => old.reply.active.store(false, Ordering::Release),
+                        }
+                    });
+                };
+                let params = Cell::new(0);
+                dispatch_readiness_with(
+                    &browser,
+                    pending,
+                    || {
+                        if boundary == 0 {
+                            mutate();
+                        }
+                        Some(())
+                    },
+                    || {
+                        params.set(params.get() + 1);
+                        if boundary == 1 {
+                            mutate();
+                        }
+                        Some(())
+                    },
+                    |_, _, _| panic!("stale probe must not reach Chromium"),
+                );
+                assert_eq!(params.get(), boundary);
+                STATE.with(|slot| {
+                    let state = slot.borrow();
+                    assert!(state.pending.is_empty());
+                    assert_eq!(state.waits[&17].probe_in_flight, change == 0);
+                });
+                assert!(receiver.try_recv().is_err());
+            }
+        }
+        for accepted in [false, true] {
+            context_menu_fixture(false);
+            let (reply, receiver) = test_reply(17);
+            install_wait(reply, WaitUntil::Dom);
+            let (browser, pending) = poll_wait_with(17, test_observation).unwrap();
+            let sent = Cell::new(0);
+            dispatch_readiness_with(
+                &browser,
+                pending,
+                || Some(()),
+                || Some(()),
+                |_, _, id| {
+                    STATE.with(|slot| {
+                        assert!(slot.try_borrow_mut().unwrap().pending.contains_key(&id))
+                    });
+                    sent.set(sent.get() + 1);
+                    if accepted { id } else { 0 }
+                },
+            );
+            assert_eq!(sent.get(), 1);
+            STATE.with(|slot| {
+                let state = slot.borrow();
+                assert_eq!(state.pending.len(), usize::from(accepted));
+                assert_eq!(state.waits[&17].probe_in_flight, accepted);
+            });
+            assert!(
+                receiver.try_recv().is_err(),
+                "dispatch ACK is not DOM readiness"
+            );
+        }
+        clear();
+    }
+
+    #[test]
+    fn navigate_native_paused_owner_and_background_cli_keep_distinct_access() {
+        for native in [false, true] {
+            let scope = context_menu_fixture(true).unwrap();
+            STATE.with(|slot| {
+                slot.borrow_mut().tasks.handoff(&scope).unwrap();
+            });
+            let (reply, receiver) = test_reply(17);
+            let browser = STATE.with(|slot| {
+                let mut state = slot.borrow_mut();
+                let tab = state.tabs.get_mut(&7).unwrap();
+                tab.navigation.renderer_exit = Some(json!({"status":"crashed"}));
+                tab.navigation.document_available = false;
+                tab.browser.clone()
+            });
+            let sent = Cell::new(0);
+            let cleaned = Cell::new(0);
+            navigate_with(
+                &browser,
+                &Command::Reload { tab: 7 },
+                &reply,
+                if native {
+                    ObservationAccess::Native
+                } else {
+                    ObservationAccess::Tab
+                },
+                test_observation,
+                |_| {
+                    cleaned.set(cleaned.get() + 1);
+                    Ok(())
+                },
+                |observed, _| {
+                    assert!(
+                        observed.frame.is_none(),
+                        "reload recovery requires no frame"
+                    );
+                    STATE.with(|slot| {
+                        let state = slot.try_borrow_mut().unwrap();
+                        assert_eq!(state.tabs[&7].navigation.epoch, 5);
+                        assert!(state.tabs[&7].navigation.intent_pending);
+                    });
+                    sent.set(sent.get() + 1);
+                },
+            );
+            assert_eq!(sent.get(), usize::from(native));
+            assert_eq!(cleaned.get(), usize::from(native));
+            let response = receiver.try_recv().unwrap();
+            if native {
+                assert_eq!(response.result.unwrap()["navigationRequested"], true);
+            } else {
+                assert_eq!(response.error.unwrap().code, "TASK_REQUIRED");
+            }
+        }
+        context_menu_fixture(false);
+        let (reply, receiver) = test_reply(17);
+        let browser = STATE.with(|slot| slot.borrow().tabs[&7].browser.clone());
+        navigate_with(
+            &browser,
+            &Command::Reload { tab: 7 },
+            &reply,
+            ObservationAccess::Tab,
+            test_observation,
+            |_| {
+                STATE.with(|slot| {
+                    slot.borrow_mut().spaces.select_tab(8);
+                });
+                Ok(())
+            },
+            |_, _| {},
+        );
+        assert!(
+            receiver.try_recv().unwrap().ok,
+            "CLI may navigate a background tab"
+        );
+        clear();
+    }
+
+    #[test]
+    fn navigate_rejects_before_cleanup_and_never_reserves_after_reentrant_change() {
+        for rejected in 0..4 {
+            context_menu_fixture(false);
+            let (reply, receiver) = test_reply(17);
+            let browser = STATE.with(|slot| {
+                let mut state = slot.borrow_mut();
+                if rejected == 0 {
+                    state.tabs.get_mut(&7).unwrap().navigation.intent_pending = true;
+                }
+                state.tabs[&7].browser.clone()
+            });
+            let command = match rejected {
+                0 => Command::Reload { tab: 7 },
+                1 => Command::Back { tab: 7 },
+                2 => Command::Navigate {
+                    tab: 7,
+                    url: "invalid".into(),
+                },
+                _ => Command::Navigate {
+                    tab: 7,
+                    url: "https://example.test/next".into(),
+                },
+            };
+            navigate_with(
+                &browser,
+                &command,
+                &reply,
+                ObservationAccess::Tab,
+                test_observation,
+                |_| panic!("invalid or busy request must not clean up"),
+                |_, _| panic!("must not send"),
+            );
+            assert_eq!(
+                receiver.try_recv().unwrap().error.unwrap().code,
+                [
+                    "NAVIGATION_BUSY",
+                    "NO_HISTORY",
+                    "INVALID_URL",
+                    "FRAME_UNAVAILABLE"
+                ][rejected]
+            );
+            STATE.with(|slot| assert_eq!(slot.borrow().tabs[&7].navigation.epoch, 4));
+        }
+        for change in 0..5 {
+            context_menu_fixture(false);
+            let (reply, receiver) = test_reply(17);
+            let browser = STATE.with(|slot| slot.borrow().tabs[&7].browser.clone());
+            navigate_with(
+                &browser,
+                &Command::Reload { tab: 7 },
+                &reply,
+                ObservationAccess::Native,
+                test_observation,
+                |_| {
+                    STATE.with(|slot| {
+                        let mut state = slot.try_borrow_mut().unwrap();
+                        match change {
+                            0 => state.tabs.get_mut(&7).unwrap().navigation.document_epoch += 1,
+                            1 => {
+                                state.spaces.select_tab(8);
+                            }
+                            2 => {
+                                state.tabs.get_mut(&7).unwrap().browser = native_blank_tab().browser
+                            }
+                            3 => {
+                                let task = state.tasks.create("new owner").unwrap();
+                                state
+                                    .tasks
+                                    .attach(
+                                        &TaskScope {
+                                            task: task.id,
+                                            revision: task.revision,
+                                        },
+                                        7,
+                                        Origin::Borrowed,
+                                    )
+                                    .unwrap();
+                            }
+                            _ => {
+                                state
+                                    .tabs
+                                    .get_mut(&7)
+                                    .unwrap()
+                                    .navigation
+                                    .loading_event_revision += 1
+                            }
+                        }
+                    });
+                    Ok(())
+                },
+                |_, _| panic!("cleanup reentry must prevent transmission"),
+            );
+            assert!(receiver.try_recv().unwrap().error.is_some());
+            STATE.with(|slot| {
+                let state = slot.borrow();
+                assert_eq!(state.tabs[&7].navigation.epoch, 4);
+                assert!(!state.tabs[&7].navigation.intent_pending);
+            });
+        }
+        clear();
+    }
+
+    #[test]
+    fn shell_snapshot_releases_state_for_getters_and_projects_latest_selection_and_task() {
+        context_menu_fixture(false);
+        let calls = Cell::new(0);
+        let snapshot = shell_snapshot_with(|_, kind| {
+            calls.set(calls.get() + 1);
+            STATE.with(|slot| {
+                let mut state = slot
+                    .try_borrow_mut()
+                    .expect("native getter must not overlap STATE borrow");
+                state.tabs.get_mut(&7).unwrap().title = "latest title".into();
+                if calls.get() == 6 {
+                    let task = state.tasks.create("latest owner").unwrap();
+                    let scope = TaskScope {
+                        task: task.id,
+                        revision: task.revision,
+                    };
+                    state.tasks.attach(&scope, 8, Origin::Borrowed).unwrap();
+                    let tasks = state.tasks.list();
+                    state.spaces.update_tasks(&tasks);
+                    state.spaces.adopt(8, &scope.task);
+                    state.spaces.show(&scope.task);
+                }
+            });
+            matches!(kind, ShellProbe::Back)
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 6);
+        assert_eq!(snapshot.active_tab, Some(8));
+        let first = snapshot.tabs.iter().find(|tab| tab.id == 7).unwrap();
+        assert_eq!(first.title, "latest title");
+        assert!(first.can_go_back && !first.can_go_forward && !first.loading);
+        let owned = snapshot.tabs.iter().find(|tab| tab.id == 8).unwrap();
+        assert_eq!(owned.space, snapshot.active_space);
+        assert_eq!(owned.task_status, "latest owner, AI 제어 중");
+        assert!(owned.stop_scope.is_some());
+        let ordered: Vec<_> = snapshot
+            .spaces
+            .iter()
+            .flat_map(|space| space.tabs.iter().copied())
+            .collect();
+        assert_eq!(
+            snapshot.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+            ordered
+        );
+        clear();
+    }
+
+    #[test]
+    fn shell_snapshot_stops_native_reads_at_each_invalidated_getter_boundary() {
+        for boundary in 1..=3 {
+            for change in 0..7 {
+                context_menu_fixture(false);
+                let calls = Cell::new(0);
+                let snapshot = shell_snapshot_with(|_, _| {
+                    calls.set(calls.get() + 1);
+                    if calls.get() == boundary {
+                        if change >= 5 {
+                            // The real loading callback uses this state mutation;
+                            // loading completion deliberately does not change epoch.
+                            observe_loading_state(7, change == 6);
+                        } else {
+                            STATE.with(|slot| {
+                                let mut state = slot.borrow_mut();
+                                match change {
+                                    0 => {
+                                        state.tabs.remove(&7);
+                                    }
+                                    1 => {
+                                        state.tabs.get_mut(&7).unwrap().browser =
+                                            native_blank_tab().browser;
+                                    }
+                                    2 => state.tabs.get_mut(&7).unwrap().navigation.epoch += 1,
+                                    3 => {
+                                        state.tabs.get_mut(&7).unwrap().navigation.document_epoch +=
+                                            1
+                                    }
+                                    4 => state.tabs.get_mut(&7).unwrap().rejected_creation = true,
+                                    _ => unreachable!(),
+                                }
+                            });
+                        }
+                    }
+                    false
+                });
+                assert!(snapshot.is_none());
+                assert_eq!(
+                    calls.get(),
+                    boundary,
+                    "no later getter may run on an invalidated sample"
+                );
+                if change >= 5 {
+                    STATE.with(|slot| {
+                        let state = slot.borrow();
+                        assert_eq!(state.tabs[&7].navigation.epoch, 4);
+                        assert_eq!(state.tabs[&7].navigation.loading_event_revision, 1);
+                    });
+                }
+            }
+        }
+        clear();
+    }
+
+    #[test]
+    fn shell_snapshot_rechecks_earlier_tabs_and_rejects_unsampled_new_tabs() {
+        for new_tab in [false, true] {
+            context_menu_fixture(false);
+            let calls = Cell::new(0);
+            let snapshot = shell_snapshot_with(|_, _| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 6 {
+                    STATE.with(|slot| {
+                        let mut state = slot.borrow_mut();
+                        if new_tab {
+                            state.tabs.insert(9, native_blank_tab());
+                            state.spaces.insert(9, USER_SPACE, false);
+                        } else {
+                            state.tabs.get_mut(&7).unwrap().navigation.epoch += 1;
+                        }
+                    });
+                }
+                false
+            });
+            assert_eq!(calls.get(), 6);
+            assert!(
+                snapshot.is_none(),
+                "final projection cannot combine generations or omit a new live tab"
+            );
+        }
+        clear();
+    }
+
+    #[test]
+    fn nested_shell_snapshot_is_bounded_and_read_guard_is_released() {
+        context_menu_fixture(false);
+        let nested = Cell::new(false);
+        let outer = shell_snapshot_with(|_, _| {
+            if !nested.replace(true) {
+                assert!(
+                    shell_snapshot_with(|_, _| panic!("nested acquisition must not call CEF"))
+                        .is_none()
+                );
+                assert!(
+                    shell_snapshot_with(|_, _| panic!(
+                        "failed nested acquisition must leave the outer guard active"
+                    ))
+                    .is_none()
+                );
+            }
+            false
+        });
+        assert!(outer.is_some());
+        assert!(shell_snapshot_with(|_, _| false).is_some());
+        assert!(
+            shell_snapshot_with(|_, _| {
+                observe_loading_state(7, true);
+                false
+            })
+            .is_none()
+        );
+        assert!(
+            shell_snapshot_with(|_, _| false).is_some(),
+            "invalidated acquisition must release its guard too"
+        );
+        clear();
+    }
+
+    fn navigation_test_guard() -> NavigationControlGuard {
+        STATE.with(|slot| {
+            let state = slot.borrow();
+            let target = NavigationControlTarget {
+                tab: 7,
+                space: state.spaces.active_space().to_owned(),
+                navigation_epoch: state.tabs[&7].navigation.epoch,
+                stop: true,
+            };
+            navigation_control_guard(&state, 7, Some(&target)).unwrap()
+        })
+    }
+
+    #[test]
+    fn finished_or_already_requested_stop_preserves_owner_and_has_no_side_effects() {
+        for pending in [false, true] {
+            let scope = context_menu_fixture(true).unwrap();
+            STATE.with(|slot| {
+                let mut state = slot.borrow_mut();
+                let nav = &mut state.tabs.get_mut(&7).unwrap().navigation;
+                nav.stop_pending = pending;
+                nav.stopped = pending;
+                nav.provisional = pending;
+                nav.intent_pending = pending;
+            });
+            let result = execute_navigation_control(
+                navigation_test_guard(),
+                true,
+                || true,
+                || true,
+                |_| (true, pending),
+                |_| panic!("no-op stop must not revoke permissions/find/history"),
+                |_, _| panic!("no-op stop must never reload or repeat stop"),
+            )
+            .unwrap();
+            assert_eq!(
+                result,
+                NavigationControlOutcome {
+                    navigation_epoch: 4,
+                    preserve_address: true
+                }
+            );
+            STATE.with(|slot| {
+                let state = slot.borrow();
+                assert_eq!(state.tabs[&7].navigation.epoch, 4);
+                let task = state.tasks.info(&scope.task).unwrap();
+                assert_eq!(
+                    (task.status, task.revision),
+                    (Status::Active, scope.revision)
+                );
+            });
+        }
+        clear();
+    }
+
+    #[test]
+    fn pending_intent_and_later_resource_load_dispatch_stop_once() {
+        for intent_only in [true, false] {
+            context_menu_fixture(false);
+            STATE.with(|slot| {
+                let mut state = slot.borrow_mut();
+                let nav = &mut state.tabs.get_mut(&7).unwrap().navigation;
+                nav.intent_pending = intent_only;
+                nav.stopped = !intent_only;
+            });
+            let cleanup_count = Cell::new(0);
+            let sent = Cell::new(0);
+            let result = execute_navigation_control(
+                navigation_test_guard(),
+                true,
+                || true,
+                || true,
+                |_| (true, !intent_only),
+                |_| {
+                    cleanup_count.set(cleanup_count.get() + 1);
+                    Ok(())
+                },
+                |_, stop| {
+                    assert!(stop);
+                    sent.set(sent.get() + 1);
+                },
+            )
+            .unwrap();
+            assert_eq!((cleanup_count.get(), sent.get()), (1, 1));
+            assert_eq!(result.navigation_epoch, 5);
+            assert!(result.preserve_address);
+            execute_navigation_control(
+                navigation_test_guard(),
+                true,
+                || true,
+                || true,
+                |_| (true, true),
+                |_| panic!("second stop has no cleanup"),
+                |_, _| panic!("second stop has no dispatch"),
+            )
+            .unwrap();
+            STATE.with(|slot| assert_eq!(slot.borrow().tabs[&7].navigation.epoch, 5));
+        }
+        clear();
+    }
+
+    #[test]
+    fn native_stop_allows_exact_handoff_but_not_an_extra_document_change() {
+        for changed_document in [false, true] {
+            let scope = context_menu_fixture(true).unwrap();
+            STATE.with(|slot| {
+                slot.borrow_mut()
+                    .tabs
+                    .get_mut(&7)
+                    .unwrap()
+                    .navigation
+                    .intent_pending = true
+            });
+            let reads = Cell::new(0);
+            let sent = Cell::new(0);
+            let result = execute_navigation_control(
+                navigation_test_guard(),
+                true,
+                || true,
+                || true,
+                |_| {
+                    reads.set(reads.get() + 1);
+                    if changed_document && reads.get() == 2 {
+                        STATE.with(|slot| {
+                            slot.borrow_mut()
+                                .tabs
+                                .get_mut(&7)
+                                .unwrap()
+                                .navigation
+                                .document_epoch += 1
+                        });
+                    }
+                    (true, false)
+                },
+                |_| Ok(()),
+                |_, stop| {
+                    assert!(stop);
+                    sent.set(sent.get() + 1);
+                },
+            );
+            STATE.with(|slot| {
+                let state = slot.borrow();
+                let task = state.tasks.info(&scope.task).unwrap();
+                assert_eq!(
+                    (task.status, task.revision),
+                    (Status::Paused, scope.revision + 1)
+                );
+                assert_eq!(
+                    state.tabs[&7].navigation.epoch,
+                    if changed_document { 5 } else { 6 }
+                );
+            });
+            assert_eq!(sent.get(), usize::from(!changed_document));
+            assert_eq!(result.is_ok(), !changed_document);
+        }
+        clear();
+    }
+
+    #[test]
+    fn navigation_failure_after_handoff_preserves_only_the_same_page_address() {
+        // First readiness check succeeds, then the AI handoff expires refs.
+        // A later chrome/IME rejection must preserve E+1 only for that page.
+        for stop in [true, false] {
+            for change in 0..4 {
+                let scope = context_menu_fixture(true).unwrap();
+                let readiness = Cell::new(0);
+                let error = execute_navigation_control(
+                    navigation_test_guard(),
+                    stop,
+                    || {
+                        readiness.set(readiness.get() + 1);
+                        if readiness.get() == 1 {
+                            return true;
+                        }
+                        STATE.with(|slot| {
+                            let mut state = slot.borrow_mut();
+                            match change {
+                                1 => state.tabs.get_mut(&7).unwrap().navigation.document_epoch += 1,
+                                2 => {
+                                    state
+                                        .tasks
+                                        .resume(&TaskScope {
+                                            task: scope.task.clone(),
+                                            revision: scope.revision + 1,
+                                        })
+                                        .unwrap();
+                                }
+                                3 => {
+                                    state.spaces.show(USER_SPACE);
+                                }
+                                _ => {}
+                            }
+                        });
+                        false
+                    },
+                    || true,
+                    |_| (true, stop),
+                    |_| panic!("rejected chrome input must not run cleanup"),
+                    |_, _| panic!("rejected chrome input must not dispatch"),
+                )
+                .unwrap_err();
+                assert_eq!(
+                    error.preserved_address,
+                    (change == 0).then_some(NavigationControlOutcome {
+                        navigation_epoch: 5,
+                        preserve_address: true,
+                    })
+                );
+            }
+        }
+        clear();
+    }
+
+    #[test]
+    fn address_receipt_survives_loading_only_refresh_but_rejects_replaced_context() {
+        for change in 0..7 {
+            context_menu_fixture(false);
+            let target = NavigationControlTarget {
+                tab: 7,
+                space: USER_SPACE.into(),
+                navigation_epoch: 4,
+                stop: true,
+            };
+            let outcome = execute_navigation_control(
+                navigation_test_guard(),
+                true,
+                || true,
+                || true,
+                |_| (true, true),
+                |_| Ok(()),
+                |_, _| {},
+            )
+            .unwrap();
+            let receipt =
+                capture_navigation_address_receipt(&target, "https://example.test/menu", &outcome)
+                    .unwrap();
+            assert!(
+                capture_navigation_address_receipt(&target, "https://example.test/other", &outcome)
+                    .is_none()
+            );
+            let nonpreserving = NavigationControlOutcome {
+                preserve_address: false,
+                ..outcome.clone()
+            };
+            assert!(
+                capture_navigation_address_receipt(
+                    &target,
+                    "https://example.test/menu",
+                    &nonpreserving
+                )
+                .is_none()
+            );
+            let mut invalid_outcome = outcome.clone();
+            invalid_outcome.navigation_epoch += 1;
+            assert!(
+                capture_navigation_address_receipt(
+                    &target,
+                    "https://example.test/menu",
+                    &invalid_outcome
+                )
+                .is_none()
+            );
+            let changed_loading = Cell::new(false);
+            assert!(
+                shell_snapshot_with(|_, _| {
+                    if !changed_loading.replace(true) {
+                        if change == 0 {
+                            STATE.with(|slot| {
+                                let mut state = slot.borrow_mut();
+                                state.tabs.remove(&8);
+                                state.spaces.remove(8);
+                            });
+                        } else {
+                            observe_loading_state(7, false);
+                        }
+                    }
+                    false
+                })
+                .is_none()
+            );
+            assert!(
+                navigation_address_receipt_current(&receipt),
+                "loading-only or unrelated tab invalidation must not lose the active draft"
+            );
+            STATE.with(|slot| {
+                let mut state = slot.borrow_mut();
+                match change {
+                    0 => state.tabs.get_mut(&7).unwrap().navigation.epoch += 1,
+                    1 => state.tabs.get_mut(&7).unwrap().navigation.document_epoch += 1,
+                    2 => state.tabs.get_mut(&7).unwrap().browser = native_blank_tab().browser,
+                    3 => {
+                        state.spaces.select_tab(8);
+                    }
+                    4 => {
+                        let task = state.tasks.create("new receipt owner").unwrap();
+                        state
+                            .tasks
+                            .attach(
+                                &TaskScope {
+                                    task: task.id,
+                                    revision: task.revision,
+                                },
+                                7,
+                                Origin::Borrowed,
+                            )
+                            .unwrap();
+                    }
+                    5 => {
+                        state.tabs.get_mut(&7).unwrap().navigation.requested_url =
+                            "https://example.test/changed".into()
+                    }
+                    6 => {
+                        let task = state.tasks.create("different visible space").unwrap();
+                        let tasks = state.tasks.list();
+                        state.spaces.update_tasks(&tasks);
+                        state.spaces.show(&task.id);
+                    }
+                    _ => unreachable!(),
+                }
+            });
+            assert!(!navigation_address_receipt_current(&receipt));
+        }
+        clear();
+    }
+
+    #[test]
+    fn accepted_stop_keeps_address_when_only_chrome_eligibility_changes() {
+        context_menu_fixture(false);
+        let eligible = Cell::new(true);
+        let outcome = execute_navigation_control(
+            navigation_test_guard(),
+            true,
+            || true,
+            || eligible.get(),
+            |_| (true, true),
+            |_| Ok(()),
+            |_, stop| {
+                assert!(stop);
+                eligible.set(false);
+                STATE.with(|slot| slot.borrow_mut().spaces.set_overview(true));
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            NavigationControlOutcome {
+                navigation_epoch: 5,
+                preserve_address: true
+            }
+        );
+        clear();
+    }
+
+    #[test]
+    fn reload_intent_never_stops_new_loading_or_hands_off_a_busy_owner() {
+        for busy_kind in 0..4 {
+            let scope = context_menu_fixture(true).unwrap();
+            STATE.with(|slot| {
+                let mut state = slot.borrow_mut();
+                let nav = &mut state.tabs.get_mut(&7).unwrap().navigation;
+                nav.provisional = busy_kind == 1;
+                nav.intent_pending = busy_kind == 2;
+                nav.recovering = busy_kind == 3;
+            });
+            let result = execute_navigation_control(
+                navigation_test_guard(),
+                false,
+                || true,
+                || true,
+                |_| (true, busy_kind == 0),
+                |_| panic!("busy reload must not clean up"),
+                |_, _| panic!("busy reload must not dispatch"),
+            );
+            assert!(result.is_err());
+            STATE.with(|slot| {
+                let state = slot.borrow();
+                assert_eq!(state.tabs[&7].navigation.epoch, 4);
+                assert_eq!(
+                    state.tasks.info(&scope.task).unwrap().status,
+                    Status::Active
+                );
+            });
+        }
+        context_menu_fixture(false);
+        let sent = Cell::new(0);
+        let result = execute_navigation_control(
+            navigation_test_guard(),
+            false,
+            || true,
+            || true,
+            |_| (true, false),
+            |_| Ok(()),
+            |_, stop| {
+                assert!(!stop);
+                sent.set(sent.get() + 1);
+            },
+        )
+        .unwrap();
+        assert_eq!(sent.get(), 1);
+        assert_eq!(
+            result,
+            NavigationControlOutcome {
+                navigation_epoch: 5,
+                preserve_address: false
+            }
+        );
+        STATE.with(|slot| {
+            let state = slot.borrow();
+            assert!(state.tabs[&7].navigation.intent_pending);
+            assert!(state.tabs[&7].navigation.provisional);
+        });
+        clear();
+    }
+
+    #[test]
+    fn native_preflight_finishing_load_is_observed_before_handoff() {
+        let scope = context_menu_fixture(true).unwrap();
+        STATE.with(|slot| {
+            slot.borrow_mut()
+                .tabs
+                .get_mut(&7)
+                .unwrap()
+                .navigation
+                .intent_pending = true
+        });
+        let sampled = Cell::new(false);
+        let live_loading = Cell::new(true);
+        let result = execute_navigation_control(
+            navigation_test_guard(),
+            true,
+            || {
+                assert!(
+                    !sampled.get(),
+                    "native UI predicate must precede the loading sample"
+                );
+                STATE.with(|slot| {
+                    slot.borrow_mut()
+                        .tabs
+                        .get_mut(&7)
+                        .unwrap()
+                        .navigation
+                        .finish_loading()
+                });
+                live_loading.set(false);
+                true
+            },
+            || true,
+            |_| {
+                sampled.set(true);
+                (true, live_loading.get())
+            },
+            |_| panic!("completed load must not clear native controls"),
+            |_, _| panic!("completed load must not dispatch"),
+        )
+        .unwrap();
+        assert_eq!(result.navigation_epoch, 4);
+        assert!(result.preserve_address);
+        STATE.with(|slot| {
+            let state = slot.borrow();
+            let task = state.tasks.info(&scope.task).unwrap();
+            assert_eq!(
+                (task.status, task.revision),
+                (Status::Active, scope.revision)
+            );
+        });
+        clear();
+    }
+
+    #[test]
+    fn navigation_getter_reentry_and_cleanup_reject_changed_targets_before_dispatch() {
+        let changes: [fn(&mut State); 6] = [
+            |state| state.tabs.get_mut(&7).unwrap().navigation.epoch += 1,
+            |state| state.tabs.get_mut(&7).unwrap().navigation.document_epoch += 1,
+            |state| {
+                state.tabs.get_mut(&7).unwrap().browser = native_blank_tab().browser;
+            },
+            |state| {
+                state.spaces.select_tab(8);
+            },
+            |state| state.spaces.set_overview(true),
+            |state| {
+                let task = state.tasks.create("reentrant owner").unwrap();
+                state
+                    .tasks
+                    .attach(
+                        &TaskScope {
+                            task: task.id,
+                            revision: task.revision,
+                        },
+                        7,
+                        Origin::Borrowed,
+                    )
+                    .unwrap();
+            },
+        ];
+        for after_cleanup in [false, true] {
+            for change in changes {
+                context_menu_fixture(false);
+                let changed = Cell::new(false);
+                let result = execute_navigation_control(
+                    navigation_test_guard(),
+                    true,
+                    || true,
+                    || true,
+                    |_| {
+                        if !after_cleanup && !changed.replace(true) {
+                            STATE.with(|slot| change(&mut slot.borrow_mut()));
+                        }
+                        (true, true)
+                    },
+                    |_| {
+                        if after_cleanup {
+                            STATE.with(|slot| change(&mut slot.borrow_mut()));
+                        }
+                        Ok(())
+                    },
+                    |_, _| panic!("reentrant change must prevent dispatch"),
+                );
+                assert!(result.is_err());
+            }
+        }
+        clear();
+    }
+
+    #[test]
+    fn accepted_stop_cannot_rebase_address_after_its_callback_navigates() {
+        context_menu_fixture(false);
+        let result = execute_navigation_control(
+            navigation_test_guard(),
+            true,
+            || true,
+            || true,
+            |_| (true, true),
+            |_| Ok(()),
+            |_, stop| {
+                assert!(stop);
+                STATE.with(|slot| {
+                    let mut state = slot.borrow_mut();
+                    let nav = &mut state.tabs.get_mut(&7).unwrap().navigation;
+                    assert_eq!(nav.epoch, 5);
+                    assert!(nav.stop_pending);
+                    nav.commit("https://example.test/reentrant");
+                });
+            },
+        )
+        .unwrap();
+        assert_eq!(result.navigation_epoch, 5);
+        assert!(!result.preserve_address);
+        clear();
+    }
+
+    #[test]
+    fn cli_stop_keeps_idle_dispatch_background_selection_and_checks_cancellation() {
+        context_menu_fixture(false);
+        STATE.with(|slot| {
+            slot.borrow_mut().spaces.select_tab(8);
+        });
+        let guard = STATE
+            .with(|slot| navigation_control_guard(&slot.borrow(), 7, None))
+            .unwrap();
+        let sent = Cell::new(0);
+        let cleaned = Cell::new(0);
+        execute_cli_stop(
+            guard,
+            || true,
+            |_| (true, false),
+            |_| {
+                cleaned.set(cleaned.get() + 1);
+                Ok(())
+            },
+            |_| {
+                sent.set(sent.get() + 1);
+            },
+        )
+        .unwrap();
+        assert_eq!((cleaned.get(), sent.get()), (1, 1));
+        STATE.with(|slot| {
+            let state = slot.borrow();
+            assert_eq!(state.spaces.active_tab(), Some(8));
+            assert_eq!(state.tabs[&7].navigation.epoch, 4);
+        });
+        let guard = STATE
+            .with(|slot| navigation_control_guard(&slot.borrow(), 7, None))
+            .unwrap();
+        let active = Cell::new(true);
+        assert!(
+            execute_cli_stop(
+                guard,
+                || active.get(),
+                |_| {
+                    active.set(false);
+                    (true, true)
+                },
+                |_| panic!("cancelled request must not clean up"),
+                |_| panic!("cancelled request must not dispatch"),
+            )
+            .is_err()
+        );
+        clear();
     }
 
     fn menu_frame_id() -> Option<String> {
@@ -7679,6 +14988,29 @@ mod tests {
     }
 
     #[test]
+    fn wire_response_keeps_capture_until_matching_browser_and_never_reuses_ids() {
+        let mut state = State::default();
+        let original = native_blank_tab();
+        let browser = original.browser.clone();
+        let unrelated = native_blank_tab();
+        state.tabs.insert(7, original);
+        // A timed-out capture has no pending command, but retains its permit.
+        state.captures.insert(42, 7);
+        assert!(!response_matches(&state, &unrelated.browser, 42, None));
+        assert!(!response_matches(&state, &browser, 43, None));
+        assert!(response_matches(&state, &browser, 42, None));
+        assert!(!response_matches(&state, &browser, 42, Some("child")));
+        assert_eq!(state.captures.get(&42), Some(&7));
+        state.tabs.insert(7, unrelated);
+        assert!(!response_matches(&state, &browser, 42, None));
+        state.next_message = i32::MAX - 1;
+        assert_eq!(state.next_control_message(), Some(i32::MAX));
+        assert_eq!(state.next_control_message(), None);
+        assert_eq!(state.next_control_message(), None);
+        assert_eq!(state.next_message, i32::MAX);
+    }
+
+    #[test]
     fn superseded_preview_releases_permit_and_allows_unchanged_card_retry() {
         clear();
         let key = ("task-a".to_owned(), 7, 3);
@@ -7719,6 +15051,8 @@ mod tests {
                 active: Arc::new(AtomicBool::new(true)),
                 sender,
                 scope: None,
+                focus_completion: None,
+                frame_completion: None,
             },
             receiver,
         )
@@ -7899,6 +15233,7 @@ mod tests {
                 state.borrow_mut().pending.insert(
                     id,
                     Pending {
+                        frame: None,
                         tab,
                         epoch: 0,
                         reply,
@@ -8698,7 +16033,7 @@ mod tests {
             forward: false,
         })
         .unwrap();
-        let snapshot = shell_snapshot();
+        let snapshot = shell_snapshot().unwrap();
         assert_eq!(snapshot.active_tab, Some(3));
         assert_eq!(
             snapshot
@@ -9145,6 +16480,7 @@ mod tests {
                 state.borrow_mut().pending.insert(
                     id,
                     Pending {
+                        frame: None,
                         tab: 7,
                         epoch: 0,
                         reply,
@@ -9604,6 +16940,15 @@ mod tests {
         clear();
     }
 
+    fn test_fill_evidence() -> ActionEvidence {
+        ActionEvidence::for_command(&Command::Fill {
+            tab: 7,
+            reference: "4/fill-ref".into(),
+            text: "private test value".into(),
+        })
+        .unwrap()
+    }
+
     #[test]
     fn action_failures_forward_only_boolean_details_for_the_requested_action() {
         for (requested_evidence, action, fields, expected) in [
@@ -9643,25 +16988,25 @@ mod tests {
             ),
             (None, "check", json!({"attempted":true}), None),
             (
-                Some(ActionEvidence::Fill),
+                Some(test_fill_evidence()),
                 "fill",
                 json!({"attempted":true,"trusted":false,"checked":false,"changed":true,"text":"excluded","unknown":{"body":"excluded"}}),
                 Some(json!({"attempted":true,"trusted":false})),
             ),
             (
-                Some(ActionEvidence::Fill),
+                Some(test_fill_evidence()),
                 "fill",
                 json!({"attempted":false,"trusted":false}),
                 Some(json!({"attempted":false,"trusted":false})),
             ),
             (
-                Some(ActionEvidence::Fill),
+                Some(test_fill_evidence()),
                 "fill",
                 json!({"attempted":"true","trusted":1,"text":"excluded"}),
                 None,
             ),
             (
-                Some(ActionEvidence::Fill),
+                Some(test_fill_evidence()),
                 "check",
                 json!({"attempted":true}),
                 None,
@@ -9683,6 +17028,7 @@ mod tests {
                 state.pending.insert(
                     42,
                     Pending {
+                        frame: None,
                         tab: 7,
                         epoch: tab.navigation.epoch,
                         evaluation: Evaluation::Page {
@@ -9695,6 +17041,9 @@ mod tests {
                 );
                 state.tabs.insert(7, tab);
             });
+            let pending = STATE.with(|slot| slot.borrow().pending[&42].clone());
+            let wrong_fill_action = pending.fill_target().is_some() && action != "fill";
+            assert!(bind_fill_target(&browser, &pending).is_none());
             let mut value = fields;
             value["ok"] = json!(false);
             value["action"] = json!(action);
@@ -9709,8 +17058,13 @@ mod tests {
             devtools_result(&browser, 42, true, &bytes);
             let response = receiver.try_recv().unwrap();
             let wire = serde_json::to_value(response).unwrap();
-            assert_eq!(wire["error"]["code"], code);
-            assert_eq!(wire["error"].get("details"), expected.as_ref());
+            if wrong_fill_action {
+                assert_eq!(wire["error"]["code"], "INVALID_PAGE_RESULT");
+                assert_eq!(wire["error"]["details"], json!({"outcomeUnknown":true}));
+            } else {
+                assert_eq!(wire["error"]["code"], code);
+                assert_eq!(wire["error"].get("details"), expected.as_ref());
+            }
             // A repeated native callback cannot send a second action result.
             devtools_result(&browser, 42, true, &bytes);
             assert!(receiver.try_recv().is_err());
@@ -9722,7 +17076,7 @@ mod tests {
     fn canceled_actions_keep_unknown_outcome_and_ignore_late_boolean_details() {
         for (evidence, action) in [
             (ActionEvidence::Check, "check"),
-            (ActionEvidence::Fill, "fill"),
+            (test_fill_evidence(), "fill"),
         ] {
             clear();
             let tab = native_blank_tab();
@@ -9737,6 +17091,7 @@ mod tests {
                 state.pending.insert(
                     42,
                     Pending {
+                        frame: None,
                         tab: 7,
                         epoch: tab.navigation.epoch,
                         evaluation: Evaluation::Page {
@@ -9777,13 +17132,17 @@ mod tests {
     }
 
     fn test_input_preparation() -> (Pending, Browser, mpsc::Receiver<Response>) {
+        test_key_preparation("Enter")
+    }
+
+    fn test_key_preparation(key: &str) -> (Pending, Browser, mpsc::Receiver<Response>) {
         clear();
         let tab = native_blank_tab();
         let browser = tab.browser.clone();
         let (mut reply, receiver) = test_reply(701);
         let scope = STATE.with(|state| {
             let mut state = state.borrow_mut();
-            let task = state.tasks.create("Enter test").unwrap();
+            let task = state.tasks.create("Keyboard test").unwrap();
             let scope = TaskScope {
                 task: task.id,
                 revision: task.revision,
@@ -9799,15 +17158,21 @@ mod tests {
         });
         reply.scope = Some(scope);
         let pending = Pending {
+            frame: None,
             tab: 7,
             epoch: 4,
             reply,
             evaluation: Evaluation::Page {
                 mutation: true,
-                evidence: Some(ActionEvidence::Press),
+                evidence: ActionEvidence::for_command(&Command::Press {
+                    tab: 7,
+                    reference: "4/document:3:8".into(),
+                    key: key.into(),
+                }),
             },
             step: Step::Evaluate,
         };
+        pending.press_target().unwrap().context.set(Some(17));
         STATE.with(|state| {
             let mut state = state.borrow_mut();
             state.next_message = 42;
@@ -9817,49 +17182,156 @@ mod tests {
     }
 
     fn test_press_batch() -> (Shared<InputBatch>, mpsc::Receiver<Response>) {
-        let (pending, browser, receiver) = test_input_preparation();
+        test_key_batch("Enter")
+    }
+
+    fn test_key_batch(key: &str) -> (Shared<InputBatch>, mpsc::Receiver<Response>) {
+        let (pending, browser, receiver) = test_key_preparation(key);
+        let value = test_key_prepared(key);
+        let kind = prepared_input_kind(&pending, &value).unwrap();
         (
-            reserve_input_batch(42, &pending, &browser, NativeInput::Enter).unwrap(),
+            reserve_input_batch(42, &pending, &browser, kind).unwrap(),
             receiver,
         )
     }
 
-    #[test]
-    fn enter_synchronous_acknowledgements_keep_the_lock_until_both_receipts() {
-        let (batch, receiver) = test_press_batch();
-        let mut sent = Vec::new();
-        enqueue_input_batch(
-            &batch,
-            || true,
-            |part, id| {
-                sent.push(part);
-                devtools_result(&batch.browser, id, true, b"{}");
-                assert!(receiver.try_recv().is_err());
-                STATE.with(|state| assert!(input_registered(&state.borrow(), &batch)));
-                // The normal command admission path must still see TAB_BUSY even
-                // when both callbacks arrived before ExecuteDevToolsMethod returned.
-                let (mut reply, blocked) = test_reply(702);
-                reply.scope = batch.reply.scope.clone();
-                handle(&Command::Read { tab: 7 }, reply);
-                assert_eq!(blocked.try_recv().unwrap().error.unwrap().code, "TAB_BUSY");
-                id
-            },
+    fn test_key_prepared(key: &str) -> Json {
+        json!({"ok":true,"action":"press","key":key,"prepared":true,"attempted":false,
+            "observation":"0123456789abcdef0123456789abcdef"})
+    }
+
+    fn finish_test_key_observation(batch: &Shared<InputBatch>, observed: &str) {
+        let NativeInput::Key(target) = &batch.kind else {
+            panic!("key observation helper requires a key batch");
+        };
+        let observation = target.observation.borrow().clone().unwrap();
+        let params = input_verification_params(batch).unwrap();
+        assert_eq!(params["contextId"], 17);
+        assert_eq!(
+            params["expression"],
+            format!(
+                "window.__lightBrowserBridge.act({})",
+                json!({"action":"press","ref":"document:3:8","key":target.key.canonical(),
+                    "observation":observation,"verifyOnly":true})
+            )
         );
-        assert_eq!(sent, [0, 1]);
-        let wire = serde_json::to_value(receiver.try_recv().unwrap()).unwrap();
-        assert_eq!(wire["result"]["page"]["dispatchAcknowledged"], true);
-        assert_eq!(wire["result"]["page"]["input"], "chromium");
-        assert!(wire["result"]["page"].get("trusted").is_none());
-        STATE.with(|state| {
-            let state = state.borrow();
-            assert!(state.pending.is_empty());
-            assert_eq!(state.spaces.active_space(), USER_SPACE);
-            assert_eq!(state.spaces.active_tab(), Some(8));
-        });
-        for id in batch.ids {
-            devtools_result(&batch.browser, id, true, b"{}");
+        let (id, pending) = reserve_input_verification(batch).unwrap().unwrap();
+        assert!(matches!(pending.step, Step::PressVerify));
+        assert_input_busy(batch.reply.scope.clone());
+        let bytes = serde_json::to_vec(&json!({"result":{"value":{
+            "ok":true,"action":"press","key":target.key.canonical(),"input":"chromium",
+            "attempted":true,"observation":observation,"keydownTarget":observed}}}))
+        .unwrap();
+        // Exercise the real pending/callback route without a mock CEF host or a
+        // production bypass for the later Runtime.evaluate transport.
+        devtools_result(&batch.browser, id, true, &bytes);
+    }
+
+    #[test]
+    fn key_synchronous_acknowledgements_keep_the_lock_until_both_receipts() {
+        for (name, code) in [
+            ("Enter", 13),
+            ("Tab", 9),
+            ("Escape", 27),
+            ("ArrowLeft", 37),
+            ("ArrowUp", 38),
+            ("ArrowRight", 39),
+            ("ArrowDown", 40),
+            ("Home", 36),
+            ("End", 35),
+            ("PageUp", 33),
+            ("PageDown", 34),
+            ("Backspace", 8),
+            ("Delete", 46),
+            ("Space", 32),
+            ("Shift+Enter", 13),
+            ("Shift+Tab", 9),
+            ("Shift+ArrowLeft", 37),
+            ("Shift+ArrowUp", 38),
+            ("Shift+ArrowRight", 39),
+            ("Shift+ArrowDown", 40),
+            ("Shift+Home", 36),
+            ("Shift+End", 35),
+            ("Shift+PageUp", 33),
+            ("Shift+PageDown", 34),
+        ] {
+            let (batch, receiver) = test_key_batch(name);
+            let mut sent = Vec::new();
+            let verify = enqueue_input_batch(
+                &batch,
+                || true,
+                |part, id| {
+                    let params = batch.kind.params(part);
+                    let base = name.strip_prefix("Shift+").unwrap_or(name);
+                    let text = match base {
+                        "Enter" => Some("\r"),
+                        "Space" => Some(" "),
+                        _ => None,
+                    };
+                    assert_eq!(
+                        params["type"],
+                        if part == 1 {
+                            "keyUp"
+                        } else if text.is_some() {
+                            "keyDown"
+                        } else {
+                            "rawKeyDown"
+                        }
+                    );
+                    assert_eq!(params["key"], if base == "Space" { " " } else { base });
+                    assert_eq!(params["code"], base);
+                    assert_eq!(params["windowsVirtualKeyCode"], code);
+                    assert_eq!(params["nativeVirtualKeyCode"], 0);
+                    assert_eq!(
+                        params["modifiers"],
+                        if name.starts_with("Shift+") { 8 } else { 0 }
+                    );
+                    assert_eq!(params["autoRepeat"], false);
+                    assert_eq!(params["isKeypad"], false);
+                    assert!(params.get("commands").is_none());
+                    assert_eq!(
+                        params.get("text").and_then(Json::as_str),
+                        if part == 0 { text } else { None }
+                    );
+                    assert_eq!(
+                        params.get("unmodifiedText").and_then(Json::as_str),
+                        if part == 0 { text } else { None }
+                    );
+                    sent.push(part);
+                    devtools_result(&batch.browser, id, true, b"{}");
+                    assert!(receiver.try_recv().is_err());
+                    STATE.with(|state| assert!(input_registered(&state.borrow(), &batch)));
+                    // The normal command admission path must still see TAB_BUSY even
+                    // when both callbacks arrived before ExecuteDevToolsMethod returned.
+                    let (mut reply, blocked) = test_reply(702);
+                    reply.scope = batch.reply.scope.clone();
+                    handle(&Command::Read { tab: 7 }, reply);
+                    assert_eq!(blocked.try_recv().unwrap().error.unwrap().code, "TAB_BUSY");
+                    id
+                },
+            );
+            assert_eq!(sent, [0, 1]);
+            assert!(verify);
+            assert!(receiver.try_recv().is_err());
+            assert_input_busy(batch.reply.scope.clone());
+            finish_test_key_observation(&batch, "matched");
+            let wire = serde_json::to_value(receiver.try_recv().unwrap()).unwrap();
+            assert_eq!(wire["result"]["page"]["dispatchAcknowledged"], true);
+            assert_eq!(wire["result"]["page"]["input"], "chromium");
+            assert_eq!(wire["result"]["page"]["key"], name);
+            assert_eq!(wire["result"]["page"]["keydownTarget"], "matched");
+            assert!(wire["result"]["page"].get("trusted").is_none());
+            STATE.with(|state| {
+                let state = state.borrow();
+                assert!(state.pending.is_empty());
+                assert_eq!(state.spaces.active_space(), USER_SPACE);
+                assert_eq!(state.spaces.active_tab(), Some(8));
+            });
+            for id in batch.ids {
+                devtools_result(&batch.browser, id, true, b"{}");
+            }
+            assert!(receiver.try_recv().is_err());
         }
-        assert!(receiver.try_recv().is_err());
         clear();
     }
 
@@ -9878,7 +17350,9 @@ mod tests {
         assert!(receiver.try_recv().is_err());
         STATE.with(|state| assert_eq!(state.borrow().pending.len(), 2));
         devtools_result(&batch.browser, batch.ids[0], true, b"{}");
-        assert!(receiver.try_recv().unwrap().error.is_none());
+        let wire = serde_json::to_value(receiver.try_recv().unwrap()).unwrap();
+        assert_eq!(wire["result"]["page"]["keydownTarget"], "unconfirmed");
+        assert_eq!(wire["result"]["page"]["dispatchAcknowledged"], true);
         assert!(receiver.try_recv().is_err());
         STATE.with(|state| assert!(state.borrow().pending.is_empty()));
         clear();
@@ -9916,77 +17390,9 @@ mod tests {
     }
 
     #[test]
-    fn enter_navigation_during_keydown_never_sends_keyup_to_the_new_document() {
-        let (batch, receiver) = test_press_batch();
-        let mut sent = Vec::new();
-        enqueue_input_batch(
-            &batch,
-            || true,
-            |part, id| {
-                sent.push(part);
-                devtools_result(&batch.browser, id, true, b"{}");
-                STATE.with(|state| {
-                    state
-                        .borrow_mut()
-                        .tabs
-                        .get_mut(&7)
-                        .unwrap()
-                        .navigation
-                        .epoch += 1
-                });
-                id
-            },
-        );
-        assert_eq!(sent, [0]);
-        let error = receiver.try_recv().unwrap().error.unwrap();
-        assert_eq!(error.code, "PAGE_CHANGED");
-        assert_eq!(error.details.unwrap()["attempted"], true);
-        STATE.with(|state| assert!(state.borrow().pending.is_empty()));
-        clear();
-    }
-
-    #[test]
-    fn enter_rechecks_after_native_getters_and_does_not_revive_canceled_batches() {
-        for cancel in [false, true] {
-            let (batch, receiver) = test_press_batch();
-            let mut sent = 0;
-            enqueue_input_batch(
-                &batch,
-                || {
-                    if cancel {
-                        batch.reply.active.store(false, Ordering::Release);
-                        remove_wait(batch.reply.token);
-                    } else {
-                        STATE.with(|state| state.borrow_mut().tabs.insert(7, native_blank_tab()));
-                    }
-                    true
-                },
-                |_, id| {
-                    sent += 1;
-                    id
-                },
-            );
-            assert_eq!(sent, 0);
-            if cancel {
-                assert!(receiver.try_recv().is_err());
-            } else {
-                let error = receiver.try_recv().unwrap().error.unwrap();
-                assert_eq!(error.code, "TAB_CLOSED");
-                assert_eq!(error.details.unwrap()["attempted"], false);
-            }
-            for id in batch.ids {
-                devtools_result(&batch.browser, id, true, b"{}");
-            }
-            assert!(receiver.try_recv().is_err());
-            STATE.with(|state| assert!(state.borrow().pending.is_empty()));
-        }
-        clear();
-    }
-
-    #[test]
-    fn enter_handoff_detach_and_renderer_exit_terminate_both_parts_once() {
-        for cause in 0..3 {
-            let (batch, receiver) = test_press_batch();
+    fn key_navigation_during_keydown_never_sends_keyup_to_the_new_document() {
+        for key in ["Enter", "Tab", "Shift+ArrowLeft", "Backspace"] {
+            let (batch, receiver) = test_key_batch(key);
             let mut sent = Vec::new();
             enqueue_input_batch(
                 &batch,
@@ -9994,34 +17400,111 @@ mod tests {
                 |part, id| {
                     sent.push(part);
                     devtools_result(&batch.browser, id, true, b"{}");
-                    match cause {
-                        0 => {
-                            revoke_task_requests(&batch.reply.scope.as_ref().unwrap().task, Some(7))
-                        }
-                        1 => control_detached(7),
-                        _ => renderer_terminated(7, json!({"status":"crashed"})),
-                    }
+                    STATE.with(|state| {
+                        state
+                            .borrow_mut()
+                            .tabs
+                            .get_mut(&7)
+                            .unwrap()
+                            .navigation
+                            .epoch += 1
+                    });
                     id
                 },
             );
             assert_eq!(sent, [0]);
             let error = receiver.try_recv().unwrap().error.unwrap();
-            assert_eq!(
-                error.code,
-                [
-                    "TASK_CONTROL_LOST",
-                    "CONTROL_DISCONNECTED",
-                    "RENDERER_TERMINATED"
-                ][cause]
-            );
-            let details = error.details.unwrap();
-            assert_eq!(details["outcomeUnknown"], true);
-            assert_eq!(details["attempted"], true);
-            for id in batch.ids {
-                devtools_result(&batch.browser, id, true, b"{}");
-            }
-            assert!(receiver.try_recv().is_err());
+            assert_eq!(error.code, "PAGE_CHANGED");
+            assert_eq!(error.details.unwrap()["attempted"], true);
             STATE.with(|state| assert!(state.borrow().pending.is_empty()));
+        }
+        clear();
+    }
+
+    #[test]
+    fn key_rechecks_after_native_getters_and_does_not_revive_canceled_batches() {
+        for key in ["Enter", "Tab", "Shift+ArrowLeft", "Backspace"] {
+            for cancel in [false, true] {
+                let (batch, receiver) = test_key_batch(key);
+                let mut sent = 0;
+                enqueue_input_batch(
+                    &batch,
+                    || {
+                        if cancel {
+                            batch.reply.active.store(false, Ordering::Release);
+                            remove_wait(batch.reply.token);
+                        } else {
+                            STATE.with(|state| {
+                                state.borrow_mut().tabs.insert(7, native_blank_tab())
+                            });
+                        }
+                        true
+                    },
+                    |_, id| {
+                        sent += 1;
+                        id
+                    },
+                );
+                assert_eq!(sent, 0);
+                if cancel {
+                    assert!(receiver.try_recv().is_err());
+                } else {
+                    let error = receiver.try_recv().unwrap().error.unwrap();
+                    assert_eq!(error.code, "TAB_CLOSED");
+                    assert_eq!(error.details.unwrap()["attempted"], false);
+                }
+                for id in batch.ids {
+                    devtools_result(&batch.browser, id, true, b"{}");
+                }
+                assert!(receiver.try_recv().is_err());
+                STATE.with(|state| assert!(state.borrow().pending.is_empty()));
+            }
+        }
+        clear();
+    }
+
+    #[test]
+    fn key_handoff_detach_and_renderer_exit_terminate_both_parts_once() {
+        for key in ["Enter", "Tab", "Shift+ArrowLeft", "Backspace"] {
+            for cause in 0..3 {
+                let (batch, receiver) = test_key_batch(key);
+                let mut sent = Vec::new();
+                enqueue_input_batch(
+                    &batch,
+                    || true,
+                    |part, id| {
+                        sent.push(part);
+                        devtools_result(&batch.browser, id, true, b"{}");
+                        match cause {
+                            0 => revoke_task_requests(
+                                &batch.reply.scope.as_ref().unwrap().task,
+                                Some(7),
+                            ),
+                            1 => control_detached(7),
+                            _ => renderer_terminated(7, json!({"status":"crashed"})),
+                        }
+                        id
+                    },
+                );
+                assert_eq!(sent, [0]);
+                let error = receiver.try_recv().unwrap().error.unwrap();
+                assert_eq!(
+                    error.code,
+                    [
+                        "TASK_CONTROL_LOST",
+                        "CONTROL_DISCONNECTED",
+                        "RENDERER_TERMINATED"
+                    ][cause]
+                );
+                let details = error.details.unwrap();
+                assert_eq!(details["outcomeUnknown"], true);
+                assert_eq!(details["attempted"], true);
+                for id in batch.ids {
+                    devtools_result(&batch.browser, id, true, b"{}");
+                }
+                assert!(receiver.try_recv().is_err());
+                STATE.with(|state| assert!(state.borrow().pending.is_empty()));
+            }
         }
         clear();
     }
@@ -10100,6 +17583,586 @@ mod tests {
         clear();
     }
 
+    #[test]
+    fn press_preparation_cannot_replace_the_requested_key_or_accept_mixed_legacy_success() {
+        for (requested, returned, legacy) in [
+            ("Enter", "Escape", false),
+            ("Shift+Tab", "Tab", false),
+            ("Backspace", "Delete", false),
+            ("Space", " ", false),
+            ("ArrowDown", "ArrowDown", true),
+        ] {
+            let (pending, browser, receiver) = test_key_preparation(requested);
+            assert_eq!(pending.press_target().unwrap().key.canonical(), requested);
+            assert!(
+                pending
+                    .press_target()
+                    .unwrap()
+                    .observation
+                    .borrow()
+                    .is_none()
+            );
+            let mut value = test_key_prepared(requested);
+            value["key"] = json!(returned);
+            if legacy {
+                value["trusted"] = json!(false);
+            }
+            devtools_result(
+                &browser,
+                42,
+                true,
+                &serde_json::to_vec(&json!({"result":{"value":value}})).unwrap(),
+            );
+            let error = receiver.try_recv().unwrap().error.unwrap();
+            assert_eq!(error.code, "INVALID_PAGE_RESULT");
+            assert_eq!(
+                error.details.unwrap(),
+                json!({"outcomeUnknown":true,"attempted":false})
+            );
+            STATE.with(|state| {
+                assert_eq!(state.borrow().next_message, 42);
+                assert!(state.borrow().pending.is_empty());
+            });
+        }
+        clear();
+    }
+
+    #[test]
+    fn raw_protocol_unsupported_keys_are_rejected_before_native_or_task_work() {
+        for key in [
+            "",
+            "enter",
+            " ",
+            "Meta+Tab",
+            "Control+Enter",
+            "Shift+Delete",
+            "Shift+Space",
+            "a",
+        ] {
+            for scoped in [false, true] {
+                clear();
+                let mut command = Command::Press {
+                    tab: 7,
+                    reference: "4/doc:2:3".into(),
+                    key: key.into(),
+                };
+                if scoped {
+                    command = Command::TaskRun {
+                        task: "not-created".into(),
+                        revision: 1,
+                        command: Box::new(command),
+                    };
+                }
+                let (reply, receiver) = test_reply(1);
+                handle(&command, reply);
+                assert_eq!(
+                    receiver.try_recv().unwrap().error.unwrap().code,
+                    "UNSUPPORTED_KEY"
+                );
+                STATE.with(|state| {
+                    let state = state.borrow();
+                    assert!(state.pending.is_empty() && state.tabs.is_empty());
+                    assert_eq!(state.next_message, 0);
+                });
+            }
+        }
+        clear();
+    }
+
+    #[test]
+    fn read_focused_ref_is_from_the_same_returned_list_and_reusable_with_its_epoch() {
+        let long = "r".repeat(256);
+        for (focused, returned, usable) in [
+            (json!("doc:2:3"), json!("doc:2:3"), true),
+            (json!("other:2:3"), json!("doc:2:3"), false),
+            (Json::Null, json!("doc:2:3"), false),
+            (json!(7), json!("doc:2:3"), false),
+            (json!(""), json!(""), false),
+            (json!("bad\nref"), json!("bad\nref"), false),
+            (json!(long), json!(long), false),
+        ] {
+            clear();
+            let tab = native_blank_tab();
+            let browser = tab.browser.clone();
+            let epoch = tab.navigation.epoch;
+            let (reply, receiver) = test_reply(1);
+            STATE.with(|state| {
+                let mut state = state.borrow_mut();
+                state.tabs.insert(7, tab);
+                state.pending.insert(
+                    42,
+                    Pending {
+                        frame: None,
+                        tab: 7,
+                        epoch,
+                        reply,
+                        evaluation: Evaluation::Page {
+                            mutation: false,
+                            evidence: None,
+                        },
+                        step: Step::Evaluate,
+                    },
+                );
+            });
+            let bytes = serde_json::to_vec(&json!({"result":{"value":{
+                "focusedRef":focused,"interactive":[{"ref":returned,"role":"textbox"}]}}}))
+            .unwrap();
+            devtools_result(&browser, 42, true, &bytes);
+            let wire = serde_json::to_value(receiver.try_recv().unwrap()).unwrap();
+            if usable {
+                let reference = wire["result"]["page"]["focusedRef"].as_str().unwrap();
+                assert_eq!(
+                    reference,
+                    wire["result"]["page"]["interactive"][0]["ref"]
+                        .as_str()
+                        .unwrap()
+                );
+                assert_eq!(reference, format!("{epoch}/doc:2:3"));
+                let (reply, _) = test_reply(2);
+                let expression = action_expression(
+                    "press",
+                    reference,
+                    Some(("key", ActionValue::String("Tab"))),
+                    epoch,
+                    &reply,
+                );
+                assert_eq!(
+                    expression,
+                    format!(
+                        "window.__lightBrowserBridge.act({})",
+                        json!({"action":"press","ref":"doc:2:3","key":"Tab"})
+                    )
+                );
+            } else {
+                assert!(wire["result"]["page"]["focusedRef"].is_null());
+            }
+        }
+        clear();
+    }
+
+    fn test_fill_preparation(text: &str) -> (Pending, Browser, mpsc::Receiver<Response>) {
+        let (mut pending, browser, receiver) = test_input_preparation();
+        pending.evaluation = Evaluation::Page {
+            mutation: true,
+            evidence: ActionEvidence::for_command(&Command::Fill {
+                tab: 7,
+                reference: "4/document:3:8".into(),
+                text: text.into(),
+            }),
+        };
+        pending.fill_target().unwrap().context.set(Some(17));
+        assert!(bind_fill_target(&browser, &pending).is_none());
+        STATE.with(|state| state.borrow_mut().pending.insert(42, pending.clone()));
+        (pending, browser, receiver)
+    }
+
+    fn fill_prepared(kind: &str) -> Json {
+        json!({"ok":true,"action":"fill","prepared":true,"attempted":false,"input":"chromium","kind":kind})
+    }
+
+    fn test_fill_batch(kind: &str, text: &str) -> (Shared<InputBatch>, mpsc::Receiver<Response>) {
+        let (pending, browser, receiver) = test_fill_preparation(text);
+        let mut value = fill_prepared(kind);
+        // The original CLI text, never text returned by the page, is submitted.
+        value["text"] = json!("page supplied replacement");
+        let input = prepared_input_kind(&pending, &value).unwrap();
+        (
+            reserve_input_batch(42, &pending, &browser, input).unwrap(),
+            receiver,
+        )
+    }
+
+    fn acknowledge_fill(batch: &Shared<InputBatch>) -> bool {
+        enqueue_input_batch(
+            batch,
+            || true,
+            |_, id| {
+                devtools_result(&batch.browser, id, true, b"{}");
+                id
+            },
+        )
+    }
+
+    #[test]
+    fn fill_one_engine_request_keeps_lock_until_original_context_verification() {
+        for (kind, text) in [
+            ("text", ""),
+            ("search", "search value"),
+            ("tel", "+82 123"),
+            ("url", "https://example.test/"),
+            ("password", "private fill sentinel"),
+            ("textarea", "first\nsecond"),
+        ] {
+            let (batch, receiver) = test_fill_batch(kind, text);
+            assert_eq!(batch.kind.method(), "Input.insertText");
+            let mut submissions = Vec::new();
+            assert!(enqueue_input_batch(
+                &batch,
+                || true,
+                |part, id| {
+                    submissions.push(batch.kind.params(part));
+                    devtools_result(&batch.browser, id, true, b"{}");
+                    assert_input_busy(batch.reply.scope.clone());
+                    assert!(receiver.try_recv().is_err());
+                    id
+                }
+            ));
+            assert_eq!(submissions, [json!({"text":text})]);
+            assert_input_busy(batch.reply.scope.clone());
+            assert!(receiver.try_recv().is_err()); // Input ACK is not fill success.
+            let params = input_verification_params(&batch).unwrap();
+            assert_eq!(params["contextId"], 17);
+            assert_eq!(
+                params["expression"],
+                format!(
+                    "window.__lightBrowserBridge.act({})",
+                    json!({"action":"fill","ref":"document:3:8","text":text,"kind":kind,"verifyOnly":true})
+                )
+            );
+            let (id, pending) = reserve_input_verification(&batch).unwrap().unwrap();
+            assert!(matches!(pending.step, Step::FillVerify));
+            assert_input_busy(batch.reply.scope.clone());
+            STATE.with(|state| assert_eq!(state.borrow().pending.len(), 1));
+            devtools_result(&batch.browser, batch.ids[0], true, b"{}");
+            assert!(receiver.try_recv().is_err());
+            let bytes = serde_json::to_vec(&json!({"result":{"value":{
+                "ok":true,"action":"fill","verified":true,"input":"chromium","attempted":true,
+                "text":"private fill sentinel","value":"private fill sentinel"}}}))
+            .unwrap();
+            devtools_result(&batch.browser, id, true, &bytes);
+            let wire = serde_json::to_value(receiver.try_recv().unwrap()).unwrap();
+            assert_eq!(wire["result"]["page"]["verified"], true);
+            assert_eq!(wire["result"]["page"]["dispatchAcknowledged"], true);
+            assert!(wire["result"]["page"].get("trusted").is_none());
+            assert!(!wire.to_string().contains("private fill sentinel"));
+            devtools_result(&batch.browser, id, true, &bytes);
+            assert!(receiver.try_recv().is_err());
+            STATE.with(|state| {
+                let state = state.borrow();
+                assert!(state.pending.is_empty());
+                assert_eq!(state.spaces.active_space(), USER_SPACE);
+                assert_eq!(state.spaces.active_tab(), Some(8));
+            });
+        }
+        clear();
+    }
+
+    #[test]
+    fn fill_malformed_preparation_cannot_fall_back_to_legacy_or_submit_input() {
+        for (key, replacement) in [
+            ("kind", json!("email")),
+            ("kind", json!("number")),
+            ("kind", Json::Null),
+            ("input", json!("dom")),
+            ("prepared", json!(false)),
+            ("attempted", json!(true)),
+            ("trusted", json!(false)),
+            ("verified", json!(false)),
+            ("action", json!("check")),
+        ] {
+            let (pending, browser, receiver) = test_fill_preparation("private fill sentinel");
+            let mut value = fill_prepared("text");
+            value[key] = replacement;
+            devtools_result(
+                &browser,
+                42,
+                true,
+                &serde_json::to_vec(&json!({"result":{"value":value}})).unwrap(),
+            );
+            let error = receiver.try_recv().unwrap().error.unwrap();
+            assert_eq!(error.code, "INVALID_PAGE_RESULT");
+            assert_eq!(pending.fill_target().unwrap().kind.get(), None);
+            assert!(!pending.fill_target().unwrap().attempted.get());
+            STATE.with(|state| {
+                assert_eq!(state.borrow().next_message, 42);
+                assert!(state.borrow().pending.is_empty());
+            });
+        }
+        let (pending, browser, receiver) = test_fill_preparation("text");
+        pending.fill_target().unwrap().context.set(None);
+        devtools_result(
+            &browser,
+            42,
+            true,
+            &serde_json::to_vec(&json!({"result":{"value":fill_prepared("text")}})).unwrap(),
+        );
+        assert_eq!(
+            receiver.try_recv().unwrap().error.unwrap().code,
+            "INVALID_PAGE_RESULT"
+        );
+        clear();
+    }
+
+    #[test]
+    fn fill_legacy_results_preserve_fields_without_echoing_page_values() {
+        for changed in [None, Some(false), Some(true)] {
+            let (_, browser, receiver) = test_fill_preparation("private fill sentinel");
+            let mut value = json!({"ok":true,"action":"fill","trusted":false,
+                "detail":"private fill sentinel","text":"private fill sentinel","value":"private fill sentinel"});
+            if let Some(changed) = changed {
+                value["changed"] = json!(changed);
+            }
+            devtools_result(
+                &browser,
+                42,
+                true,
+                &serde_json::to_vec(&json!({"result":{"value":value}})).unwrap(),
+            );
+            let wire = serde_json::to_value(receiver.try_recv().unwrap()).unwrap();
+            assert_eq!(wire["result"]["page"]["trusted"], false);
+            assert_eq!(
+                wire["result"]["page"]
+                    .get("changed")
+                    .and_then(Json::as_bool),
+                changed
+            );
+            assert!(wire["result"]["page"].get("input").is_none());
+            assert!(!wire.to_string().contains("private fill sentinel"));
+            STATE.with(|state| assert_eq!(state.borrow().next_message, 42));
+        }
+        let (_, browser, receiver) = test_fill_preparation("private fill sentinel");
+        devtools_result(&browser, 42, true, &serde_json::to_vec(&json!({"result":{"value":{
+            "ok":false,"action":"fill","error":"FILL_STATE_NOT_REACHED","attempted":true,"trusted":false,
+            "detail":"private fill sentinel","actualValue":"private fill sentinel"}}})).unwrap());
+        let wire = serde_json::to_value(receiver.try_recv().unwrap()).unwrap();
+        assert_eq!(wire["error"]["code"], "FILL_STATE_NOT_REACHED");
+        assert_eq!(
+            wire["error"]["details"],
+            json!({"attempted":true,"trusted":false})
+        );
+        assert!(!wire.to_string().contains("private fill sentinel"));
+        clear();
+    }
+
+    #[test]
+    fn fill_rejected_receipt_or_engine_error_never_advances_to_verification() {
+        for failure in 0..3 {
+            let (batch, receiver) = test_fill_batch("text", "private fill sentinel");
+            let mut sent = 0;
+            assert!(!enqueue_input_batch(
+                &batch,
+                || true,
+                |_, id| {
+                    sent += 1;
+                    match failure {
+                        0 => devtools_result(&batch.browser, id, true, b"{}"),
+                        1 => devtools_result(
+                            &batch.browser,
+                            id,
+                            false,
+                            br#"{"message":"private fill sentinel"}"#,
+                        ),
+                        _ => devtools_result(&batch.browser, id, true, b"private fill sentinel"),
+                    }
+                    assert!(receiver.try_recv().is_err());
+                    if failure == 0 { 0 } else { id }
+                }
+            ));
+            assert_eq!(sent, 1);
+            let wire = serde_json::to_value(receiver.try_recv().unwrap()).unwrap();
+            assert_eq!(
+                wire["error"]["code"],
+                ["CONTROL_UNAVAILABLE", "CONTROL_ERROR", "INVALID_RESULT"][failure]
+            );
+            assert_eq!(wire["error"]["details"]["attempted"], true);
+            assert!(!wire.to_string().contains("private fill sentinel"));
+            assert!(reserve_input_verification(&batch).unwrap().is_none());
+            devtools_result(&batch.browser, batch.ids[0], true, b"{}");
+            assert!(receiver.try_recv().is_err());
+        }
+        clear();
+    }
+
+    #[test]
+    fn fill_native_getters_recheck_browser_document_owner_and_cancellation_before_send() {
+        for cause in 0..4 {
+            let (batch, receiver) = test_fill_batch("text", "value");
+            let mut sent = 0;
+            assert!(!enqueue_input_batch(
+                &batch,
+                || {
+                    match cause {
+                        0 => {
+                            STATE.with(|state| {
+                                state.borrow_mut().tabs.insert(7, native_blank_tab())
+                            });
+                        }
+                        1 => STATE.with(|state| {
+                            state
+                                .borrow_mut()
+                                .tabs
+                                .get_mut(&7)
+                                .unwrap()
+                                .navigation
+                                .document_epoch += 1
+                        }),
+                        2 => {
+                            STATE.with(|state| {
+                                state
+                                    .borrow_mut()
+                                    .tasks
+                                    .handoff(batch.reply.scope.as_ref().unwrap())
+                                    .unwrap()
+                            });
+                        }
+                        _ => {
+                            batch.reply.active.store(false, Ordering::Release);
+                            remove_wait(batch.reply.token);
+                        }
+                    }
+                    true
+                },
+                |_, id| {
+                    sent += 1;
+                    id
+                }
+            ));
+            assert_eq!(sent, 0);
+            if cause < 3 {
+                let error = receiver.try_recv().unwrap().error.unwrap();
+                assert_eq!(error.details.unwrap()["attempted"], false);
+            }
+            assert!(receiver.try_recv().is_err());
+            devtools_result(&batch.browser, batch.ids[0], true, b"{}");
+            STATE.with(|state| assert!(state.borrow().pending.is_empty()));
+        }
+        clear();
+    }
+
+    #[test]
+    fn fill_does_not_verify_or_succeed_after_navigation_or_foreign_browser_ack() {
+        for cause in 0..3 {
+            let (batch, receiver) = test_fill_batch("text", "value");
+            assert!(!enqueue_input_batch(
+                &batch,
+                || true,
+                |_, id| {
+                    if cause == 0 {
+                        STATE.with(|state| {
+                            state
+                                .borrow_mut()
+                                .tabs
+                                .get_mut(&7)
+                                .unwrap()
+                                .navigation
+                                .epoch += 1
+                        });
+                    } else if cause == 1 {
+                        STATE.with(|state| {
+                            state
+                                .borrow_mut()
+                                .tabs
+                                .get_mut(&7)
+                                .unwrap()
+                                .navigation
+                                .document_epoch += 1
+                        });
+                    }
+                    if cause == 2 {
+                        devtools_result(&native_blank_tab().browser, id, true, b"{}");
+                    } else {
+                        devtools_result(&batch.browser, id, true, b"{}");
+                    }
+                    id
+                }
+            ));
+            let error = receiver.try_recv().unwrap().error.unwrap();
+            assert_eq!(
+                error.code,
+                if cause == 2 {
+                    "TAB_CLOSED"
+                } else {
+                    "PAGE_CHANGED"
+                }
+            );
+            assert_eq!(error.details.unwrap()["attempted"], true);
+            assert!(reserve_input_verification(&batch).unwrap().is_none());
+        }
+        clear();
+    }
+
+    #[test]
+    fn fill_postverification_rejects_wrong_shapes_and_filters_sensitive_error_text() {
+        for cause in 0..5 {
+            let (batch, receiver) = test_fill_batch("password", "private fill sentinel");
+            assert!(acknowledge_fill(&batch));
+            let (id, _) = reserve_input_verification(&batch).unwrap().unwrap();
+            let mut value = json!({"ok":true,"action":"fill","input":"chromium","attempted":true,"verified":true});
+            match cause {
+                0 => value["trusted"] = json!(false),
+                1 => value["verified"] = json!(false),
+                2 => value["input"] = json!("dom"),
+                _ => {
+                    value = json!({"ok":false,"action":"fill","input":"chromium","attempted":true,
+                    "error":if cause == 3 {"FILL_STATE_UNCONFIRMED"} else {"FILL_STATE_NOT_REACHED"},
+                    "detail":"private fill sentinel","value":"private fill sentinel"});
+                }
+            }
+            let bytes = serde_json::to_vec(&json!({"result":{"value":value}})).unwrap();
+            devtools_result(&batch.browser, id, true, &bytes);
+            let wire = serde_json::to_value(receiver.try_recv().unwrap()).unwrap();
+            assert_eq!(
+                wire["error"]["code"],
+                if cause < 3 {
+                    "INVALID_PAGE_RESULT"
+                } else if cause == 3 {
+                    "FILL_STATE_UNCONFIRMED"
+                } else {
+                    "FILL_STATE_NOT_REACHED"
+                }
+            );
+            assert_eq!(
+                wire["error"]["details"],
+                json!({"outcomeUnknown":true,"attempted":true})
+            );
+            assert!(!wire.to_string().contains("private fill sentinel"));
+            devtools_result(&batch.browser, id, true, &bytes);
+            assert!(receiver.try_recv().is_err());
+        }
+        clear();
+    }
+
+    #[test]
+    fn fill_late_verification_cannot_revive_handoff_or_validate_a_changed_document() {
+        for cause in 0..4 {
+            let (batch, receiver) = test_fill_batch("text", "value");
+            assert!(acknowledge_fill(&batch));
+            let (id, _) = reserve_input_verification(&batch).unwrap().unwrap();
+            match cause {
+                0 => revoke_task_requests(&batch.reply.scope.as_ref().unwrap().task, Some(7)),
+                1 => STATE.with(|state| {
+                    state
+                        .borrow_mut()
+                        .tabs
+                        .get_mut(&7)
+                        .unwrap()
+                        .navigation
+                        .document_epoch += 1
+                }),
+                2 => {
+                    STATE.with(|state| state.borrow_mut().tabs.insert(7, native_blank_tab()));
+                }
+                _ => {
+                    STATE.with(|state| {
+                        state
+                            .borrow_mut()
+                            .tasks
+                            .handoff(batch.reply.scope.as_ref().unwrap())
+                            .unwrap()
+                    });
+                }
+            }
+            let bytes = br#"{"result":{"value":{"ok":true,"action":"fill","input":"chromium","attempted":true,"verified":true}}}"#;
+            devtools_result(&batch.browser, id, true, bytes);
+            let error = receiver.try_recv().unwrap().error.unwrap();
+            assert_eq!(error.details.unwrap()["attempted"], true);
+            devtools_result(&batch.browser, id, true, bytes);
+            assert!(receiver.try_recv().is_err());
+            STATE.with(|state| assert!(state.borrow().pending.is_empty()));
+        }
+        clear();
+    }
+
     fn test_click_preparation() -> (Pending, Browser, mpsc::Receiver<Response>) {
         let (mut pending, browser, receiver) = test_input_preparation();
         pending.evaluation = Evaluation::Page {
@@ -10155,7 +18218,7 @@ mod tests {
         assert!(verify);
         assert_input_busy(batch.reply.scope.clone());
         STATE.with(|state| assert_eq!(state.borrow().pending.len(), 1));
-        let params = click_verification_params(&batch).unwrap();
+        let params = input_verification_params(&batch).unwrap();
         assert_eq!(params["contextId"], 17);
         assert_eq!(
             params["expression"],
@@ -10164,7 +18227,7 @@ mod tests {
                 json!({"action":"click","ref":"document:3:8","point":{"x":42.5,"y":90.25},"verifyOnly":true})
             )
         );
-        let (id, pending) = reserve_click_verification(&batch).unwrap().unwrap();
+        let (id, pending) = reserve_input_verification(&batch).unwrap().unwrap();
         assert_input_busy(batch.reply.scope.clone());
         STATE.with(|state| assert_eq!(state.borrow().pending.len(), 1));
         // A duplicate pointer acknowledgement cannot advance the replacement.
@@ -10228,7 +18291,7 @@ mod tests {
             error.details.unwrap(),
             json!({"tab":7,"outcomeUnknown":true,"attempted":true})
         );
-        assert!(reserve_click_verification(&batch).unwrap().is_none());
+        assert!(reserve_input_verification(&batch).unwrap().is_none());
         devtools_result(&batch.browser, batch.ids[0], true, b"{}");
         assert!(receiver.try_recv().is_err());
         STATE.with(|state| assert!(state.borrow().pending.is_empty()));
@@ -10247,7 +18310,7 @@ mod tests {
                     id
                 }
             ));
-            let (id, _) = reserve_click_verification(&batch).unwrap().unwrap();
+            let (id, _) = reserve_input_verification(&batch).unwrap().unwrap();
             let value = if changed_point {
                 click_prepared(json!({"x":43.0,"y":90.25}))
             } else {
@@ -10309,7 +18372,7 @@ mod tests {
                     remove_wait(batch.reply.token);
                 }
             }
-            match reserve_click_verification(&batch) {
+            match reserve_input_verification(&batch) {
                 Err(failure) => {
                     assert_eq!(failure.code, "PAGE_CHANGED");
                     batch.progress.borrow_mut().failure = Some(failure);
@@ -10380,7 +18443,7 @@ mod tests {
                 id
             }
         ));
-        let (id, pending) = reserve_click_verification(&batch).unwrap().unwrap();
+        let (id, pending) = reserve_input_verification(&batch).unwrap().unwrap();
         let kind =
             prepared_input_kind(&pending, &click_prepared(json!({"x":42.5,"y":90.25}))).unwrap();
         let click = reserve_input_batch(id, &pending, &batch.browser, kind).unwrap();
@@ -10418,6 +18481,7 @@ mod tests {
             clear();
             let (reply, receiver) = test_reply(17);
             let active = reply.active.clone();
+            let started = Instant::now() - Duration::from_secs(if expired { 2 } else { 0 });
             let mut tab = native_blank_tab();
             if !expired {
                 tab.navigation.load_failed(
@@ -10432,9 +18496,10 @@ mod tests {
                 state.pending.insert(
                     42,
                     Pending {
+                        frame: None,
                         tab: 7,
                         epoch: tab.navigation.epoch,
-                        evaluation: Evaluation::ReadyState { token: 17 },
+                        evaluation: Evaluation::ReadyState { token: 17, started },
                         reply: reply.clone(),
                         step: Step::Evaluate,
                     },
@@ -10446,7 +18511,7 @@ mod tests {
                         tab: 7,
                         until: WaitUntil::Dom,
                         timeout_ms: 1_000,
-                        started: Instant::now() - Duration::from_secs(if expired { 2 } else { 0 }),
+                        started,
                         probe_in_flight: true,
                         reply,
                     },
@@ -10486,6 +18551,7 @@ mod tests {
                 state.pending.insert(
                     id,
                     Pending {
+                        frame: None,
                         tab: 7,
                         epoch: 0,
                         evaluation: Evaluation::Page {
@@ -10535,6 +18601,7 @@ mod tests {
                 state.pending.insert(
                     id,
                     Pending {
+                        frame: None,
                         tab: 7,
                         epoch: 1,
                         reply,
@@ -10557,13 +18624,15 @@ mod tests {
                     reply: waiting.clone(),
                 },
             );
+            let started = state.waits[&3].started;
             state.pending.insert(
                 3,
                 Pending {
+                    frame: None,
                     tab: 7,
                     epoch: 1,
                     reply: waiting,
-                    evaluation: Evaluation::ReadyState { token: 3 },
+                    evaluation: Evaluation::ReadyState { token: 3, started },
                     step: Step::Evaluate,
                 },
             );
@@ -10637,6 +18706,7 @@ mod tests {
                 state.borrow_mut().pending.insert(
                     id,
                     Pending {
+                        frame: None,
                         tab: 1,
                         epoch: 0,
                         reply,
@@ -10676,19 +18746,22 @@ mod tests {
                     reply: wait_reply.clone(),
                 },
             );
+            let started = state.waits[&1].started;
             state.pending.insert(
                 1,
                 Pending {
+                    frame: None,
                     tab: 7,
                     epoch: 1,
                     reply: wait_reply,
-                    evaluation: Evaluation::ReadyState { token: 1 },
+                    evaluation: Evaluation::ReadyState { token: 1, started },
                     step: Step::Evaluate,
                 },
             );
             state.pending.insert(
                 2,
                 Pending {
+                    frame: None,
                     tab: 7,
                     epoch: 1,
                     reply: action_reply,

@@ -13,6 +13,9 @@
     #covered { width: 160px; }
     #overlay { position: absolute; inset: 0; background: #ddd; }
     #hover { transition: none; }
+    #menu-wrap { position: relative; display: inline-block; }
+    #hover-menu { position: absolute; top: 100%; left: 0; z-index: 2; width: 190px; padding: 4px; background: #eee; border: 1px solid; }
+    #menu-choice { width: 174px; }
     #scrollbox { width: 250px; height: 100px; overflow: auto; border: 1px solid; }
     #scroll-content { height: 800px; padding-top: 600px; box-sizing: border-box; }
     #frame-wrap { transform: scale(1.1, .95); transform-origin: 0 0; }
@@ -29,6 +32,14 @@
     <div id="shadow-host"></div>
   </div>
   <div class="row">
+    <div id="menu-wrap">
+      <button id="menu-trigger" type="button" aria-label="Hover menu trigger" aria-haspopup="menu" aria-expanded="false">Hover for menu</button>
+      <div id="hover-menu" role="menu" hidden>
+        <button id="menu-choice" type="button" role="menuitem" aria-label="Hover menu choice">Choose item</button>
+      </div>
+    </div>
+  </div>
+  <div class="row">
     <div id="covered-wrap"><button id="covered" type="button" aria-label="Covered button">Covered</button><div id="overlay">Overlay</div></div>
     <button id="hover" type="button" aria-label="Moving hover button">Moves on hover</button>
   </div>
@@ -36,13 +47,18 @@
   <div id="frame-wrap"><iframe id="outer" title="Scaled nested click frame"></iframe></div>
   <script>
     const counts = { pointerdown: 0, mousedown: 0, pointerup: 0, mouseup: 0, click: 0, input: 0, change: 0 };
-    const clicks = { button: 0, label: 0, checkbox: 0, canceled: 0, shadow: 0, covered: 0, overlay: 0, hover: 0, overflow: 0, nested: 0 };
+    const clicks = { button: 0, label: 0, checkbox: 0, canceled: 0, shadow: 0, covered: 0, overlay: 0, hover: 0, overflow: 0, nested: 0,
+      'menu-trigger': 0, 'menu-choice': 0 };
     const events = [];
     let sequence = 0, moves = 0, hoverMoves = 0, frameReady = false;
+    let hoverMenuOpens = 0, hoverMenuSelection = 0, hoverMenuTrusted = false;
+    const menuTrigger = document.querySelector('#menu-trigger');
+    const hoverMenu = document.querySelector('#hover-menu');
     const shadow = document.querySelector('#shadow-host').attachShadow({ mode: 'open' });
     shadow.innerHTML = '<button id="shadow" type="button" aria-label="Shadow click button">Shadow</button>';
     function show() {
       const state = { counts, clicks, events, sequence, moves, hoverMoves, frameReady,
+        hoverMenuOpen: !hoverMenu.hidden, hoverMenuOpens, hoverMenuSelection, hoverMenuTrusted,
         checked: document.querySelector('#checkbox').checked, canceledChecked: document.querySelector('#canceled').checked,
         scrollTop: document.querySelector('#scrollbox').scrollTop, hasFocus: document.hasFocus(), visibility: document.visibilityState };
       document.querySelector('#receipt').textContent = `NATIVE_CLICK_STATE_BEGIN ${encodeURIComponent(JSON.stringify(state))} NATIVE_CLICK_STATE_END`;
@@ -65,6 +81,18 @@
     document.querySelector('#hover').addEventListener('pointerover', event => {
       if (hoverMoves) return;
       hoverMoves += 1; event.currentTarget.style.transform = 'translateX(260px)'; show();
+    });
+    function closeHoverMenu() {
+      hoverMenu.hidden = true; menuTrigger.setAttribute('aria-expanded', 'false'); show();
+    }
+    menuTrigger.addEventListener('pointerenter', event => {
+      if (!hoverMenu.hidden) return;
+      hoverMenuOpens += 1; hoverMenuTrusted = event.isTrusted;
+      hoverMenu.hidden = false; menuTrigger.setAttribute('aria-expanded', 'true'); show();
+    });
+    document.querySelector('#menu-wrap').addEventListener('pointerleave', closeHoverMenu);
+    document.querySelector('#menu-choice').addEventListener('click', () => {
+      hoverMenuSelection += 1; closeHoverMenu();
     });
     observe(document);
     const outer = document.querySelector('#outer');

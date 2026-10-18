@@ -1,5 +1,355 @@
 # Naru 작업 기록
 
+## 2026-10-18, 누적 구현의 커밋과 푸시 준비
+
+현재 변경을 우선 커밋하고 푸시해 달라는 요청에 따라 Cargo.toml, README, src, docs, tests의 변경 파일 46개를 커밋 범위로 확인했다. Chromium 키보드 입력과 hover, insert, 프레임 읽기와 조작, 여러 문서의 공통 읽기 예산, 입력 포커스 준비와 해제, UI 상태 관찰 보완 및 관련 문서와 검사 자료를 포함한다. 이번 작업에서는 제품 동작을 추가로 수정하지 않았다. 목적지는 기존 `origin/codex/navigation-readiness`이며 GitHub 조회로 `FEABE/naru-browser`가 비공개임을 확인했다. 기본 브랜치 병합이나 배포는 요청 범위에 포함하지 않는다.
+
+현재 제품 소스와 Cargo 파일 36개의 SHA-256을 v10 통합 후보 기록과 다시 대조해 모두 일치함을 확인했다. `git diff --check`도 통과했다. 직전 release 빌드와 정적 검사의 성공 기록을 유지하며 새 빌드, 단위 검사, 모의 DOM 검사, 로컬 CEF 통합 검사, 네이티브 UI 확인, 외부 사이트 및 E2E 검사는 이번에 실행하지 않았다. 사용자 요청대로 반복 회귀 실행을 늘리지 않았다. E2E 01의 안정 실행 서명과 11의 대표 로그인 서비스 확인은 blocked, 다른 12개 여정은 pending이다. 이 상태를 브라우저 완성이나 실제 입력 검증 완료로 해석하지 않는다.
+
+빌드 생성물, 로컬 evidence artifacts, 캐시, 사용자 프로필은 기존 ignore 규칙에 따라 커밋 대상에서 제외한다. 문서에 기록한 로컬 artifacts는 원격 저장소에 포함되지 않는다. 앱이나 서버를 실행하지 않았고 새 빌드 생성물도 만들지 않아 추가 프로세스 종료나 생성물 정리는 없었다. 사용자 데이터는 보존했다. 이 기록은 커밋 직전에 작성했으며 실제 커밋 식별자와 원격 반영 여부는 후속 Git 실행 결과로 확인한다.
+
+## 2026-10-18, 입력 포커스 준비·해제와 대상 관찰, 통합 후보 v10
+
+직전 goal turn은 공통 예산 read-page와 v9 빌드를 완료한 progress다. 이번에는 첫 Chromium 입력의 페이지 포커스 전환을 준비 앞으로 옮기는 보완과 일반 fill의 입력 대상 관찰을 구현했다. Aside의 일상 사용성과 ego lite의 사용자·AI 공간 및 CLI를 갖춘 독립 Naru 완성 goal은 active다. 전체 회귀 묶음을 반복하지 않고 제품 구현, 한 번의 통합 release 빌드, 같은 바이너리의 E2E 목록 갱신을 진행했다. 독립판 다음 같은 Rust·CEF 구현을 Preseller에 내장하는 순서를 유지한다.
+
+`src/browser.rs`에 정확한 Browser·session·token의 임시 focus lease를 연결했다. press와 insert, Chromium fill은 enable ACK 뒤 원 ref를 새로 준비하고 기존 입력 한 번, disable ACK, 읽기 전용 사후 확인 순서로 처리한다. 프레임 경로는 기존 Runtime 정리도 이어간다. fill은 먼저 inspectOnly로 종류와 경로를 읽고 expectedInput·expectedKind를 고정한다. legacy DOM fill에는 임시 설정을 적용하지 않아 기존 값 확인 뒤 추가 blur를 만드는 경로를 피했다. CEF set_focus, 사용자 공간·선택 변경, 새 UI renderer나 저장소는 추가하지 않았다.
+
+탭당 하나·전체 최대 16개의 lease는 일반 pending이 없어져도 정리 책임을 유지한다. enable sender 재진입 중 취소되면 반환까지 disable 전송을 보류한다. enable ACK 이전의 disable만으로 정리 완료를 판단하지 않으며 확정된 enable 다음 disable을 최대 한 번 더 보낸다. 설정 정리는 최대 두 번이고 입력 재전송은 없다. ACK 한도는 5초이며 활성 lease가 있을 때 전역 감시 task 하나가 1초마다 기존 45초 수명을 확인한다. 정리 실패에는 요청 텍스트·continuation·프레임 command와 snapshot을 해제하고 필요한 session·root object group만 보존한다. 새 페이지 조작은 막고 닫기·중지·대기는 기존 경로를 유지한다.
+
+소스 검토에서 탭 닫기 중 Reply의 STATE 재진입, host getter 이후 취소된 준비의 재전송, 정확한 child session 종료 후 탭 전체가 실패 격리 상태로 남는 경계를 찾아 수정했다. 탭 종료는 borrow 밖에서 최종 오류와 자원을 정리한다. 준비를 예약하기 직전 임시 상태를 다시 확인한다. Registry가 확인한 제거 subtree에 원 child session이 포함되면 session-destroyed 오류로 끝내고 기존 frame 정리를 이어간다. root나 무관한 child를 이 알림으로 해제하지 않으며, 엔진의 비동기 session 폐기를 disable ACK나 renderer reset 완료로 표시하지 않는다. 최종 읽기 검토에서 추가 확정 차단 결함을 찾지 못했지만 런타임 통과를 뜻하지 않는다.
+
+`src/dom_bridge.js`의 일반 input·textarea fill은 insert와 임시 receipt 하나를 공유한다. beforeinput·input 각각의 첫 trusted 이벤트를 passive capture하고 원 ref·종류·요청값·세대를 확인한다. 다른 대상 관찰은 원 대상의 최종 값 일치보다 우선 INPUT_TARGET_MISMATCH로 반환한다. 성공은 기존 값 검증과 inputTarget matched/unconfirmed를 구분하며 token·입력 원문을 새 CLI 필드로 노출하지 않는다. 새 읽기·동작·소비·5초 단발 만료에서 최대 네 listener를 해제한다. 사람 입력 식별, 다른 문서 이벤트의 완전 관찰이나 이벤트 차단 기능은 아니다. contenteditable fill의 기존 값 확인과 insert·press의 계약을 유지한다.
+
+고정 Chromium·CEF·V8 원문 18개의 포커스·visibility·session 폐기 호출 근거를 `artifacts/focus-emulation-v1-sources.json`에 기록하고 `docs/focus-input.md`를 추가했다. README, architecture, product-plan, preseller-integration, native-fill-control, keyboard-input, insert-text, frame-input, devtools-routing, memory와 ego-parity-e2e를 갱신했다. 06·07 여정에 첫 포커스 전환과 지연 스크립트, disable 부작용, 취소와 늦은 ACK, 입력 중 탭 닫기, 정확한 OOPIF session 종료 및 자원 회수를 추가했다. 문서 패치 한 번은 존재하지 않는 제목 때문에 적용 전에 거절됐고 실제 제목 확인 후 재적용했다. 제품 소스나 실행 실패와 구분한다.
+
+`CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 ./scripts/dev.sh --release --build-only`를 한 번 실행했다. 세션 62956은 91.15초, exit 0이며 소스·Cargo 파일 36개의 빌드 전후 해시가 같다. 기존 Registry의 테스트 전용 remove·len·is_empty에 dead_code 경고 한 묶음만 있었고 빌드 오류는 없다. `artifacts/ego-parity-v10-build.json`과 로그가 근거다. 앱 SHA-256은 `feae3608a01f3b68e3b030b23b525808a7c59b47484f5155da362ae6b653913a`, 번들 CLI는 `a18e943813b2fbd72efbe020fef4c1e83c381d148a8b29c8256283d972f0875a`다. CLI help의 정상 JSON도 확인했으며 브라우저 입력 성공으로 계산하지 않는다.
+
+빌드 스크립트가 이전 번들을 교체하고 Cargo 중간 파일 1,271개·표시 크기 684.0MiB를 정리했다. `artifacts/ego-parity-v10-postbuild.json`의 읽기 전용 조회에서 프로젝트 dist 앱 PID, 임시 앱 번들과 임시 실행 파일 보관 폴더는 0개다. target에는 최신 실행 파일 세 개만 남았다. 서명은 local.lightbrowser.dev ad hoc이며 실행용 identity는 미지정이다. 기존 실행 보호를 유지해 앱·서버·검증 탭을 시작하지 않았고 사용자 프로필·자료를 보존했다. 키체인 재승인 질문이나 보안 설정 우회는 하지 않았다.
+
+cargo fmt, node --check와 git diff --check를 확인했다. 최종 소스·문서 해시와 링크 확인은 `artifacts/ego-parity-v10-final.json`에 기록한다. 단위 검사·모의 DOM·로컬 CEF 회귀·네이티브 UI·외부 사이트·E2E는 이번에 실행하지 않았다. E2E 01은 안정 실행 서명, 11은 대표 로그인 서비스가 없어 blocked이며 나머지 12개 여정은 pending이다. 첫 포커스 전환의 실제 개선 효과, 지연 focus·layout 경합, 사용자 화면 보존, IME·로그인·지속 메모리와 지원 밖 프레임 기하는 남아 있다. 탭 복원·확대 보류를 유지하고 독립판·Preseller 내장 완료를 선언하지 않는다. 커밋·푸시·배포는 하지 않았다.
+
+## 2026-10-18, 공통 예산의 여러 프레임 읽기와 통합 후보 v9
+
+직전 goal turn은 프레임 포인터와 v8 빌드를 완료한 progress다. 이번에는 AI가 탭의 여러 문서를 한 요청으로 읽고 각 문서 참조로 후속 조작을 이어가도록 구현했다. Aside의 일상 사용성과 ego lite의 사람·AI 공간 및 CLI를 갖춘 독립 Naru 완성 goal은 active다. 독립판 다음 같은 Rust·CEF 구현을 Preseller에 내장하는 순서를 유지하며, 전체 회귀 반복 대신 구현·통합 빌드·같은 앱의 E2E 목록을 진행했다.
+
+`src/protocol.rs`와 `src/cli.rs`에 `read-page TAB`, task run 및 wire의 read_page를 추가했다. 기존 read·read-frame 형식은 유지한다. `src/browser.rs`는 새 frame inventory의 단일 root와 부모 연결을 확인하고 루트부터 너비 우선으로 최대 16개 문서를 시도한다. 각 문서를 정확한 session·unique context에서 재귀 없이 읽어 자식 본문을 중복 합산하지 않는다. documents와 unread, 전체 frames 메타데이터, 합산 budget·truncated·atomic:false를 반환한다. 시작 전 body·readyState 검사에서만 PAGE_LOADING을 사용량 0인 개별 누락으로 처리하고 Runtime disable ACK 뒤 다음 문서를 읽는다. 나머지 오류나 frame/context/소유권 변경은 전체 실패로 처리한다.
+
+`src/dom_bridge.js`의 readFrameActions에 여섯 정수 한도를 받고 budgetLimit·budgetUsed를 반환하는 경로를 추가했다. 전체 본문 12,000 UTF-16 단위·요소 120개·walk 방문 10,000회·열린 root 64개·옵션 240개·로컬 iframe metadata 16개를 공유한다. 0 예산은 해당 수집을 제한하며 label의 반복 순회도 nodes에 포함한다. 문서 깊이 64와 조상·스타일·포커스 검사의 기존 제한은 별도다. 읽기 문자열이 emoji의 surrogate pair 중간에서 잘리는 경계를 소스로 확인해 본문 중간 샘플·최종 붙임과 compact·URL·제목에 작은 prefix 함수를 적용했다. 액션의 원문 입력이나 선택 영역 처리에는 적용하지 않았다.
+
+새 `src/page_read.rs`를 `src/lib.rs`에 등록했다. Rust는 받은 limit가 실제 remaining과 같은지, usage가 범위 안인지, 본문 UTF-16 길이와 요소·옵션·metadata 배열 수가 맞는지 확인한 뒤 차감한다. nodes·roots는 보고된 값의 범위 검사이며 전체 DOM 작업량 실측으로 해석하지 않는다. 각 문서 응답의 직렬화 바이트 합계와 최종 Response envelope를 각각 2MiB로 제한하고 크기 계산용 전체 문자열 사본을 만들지 않는다. 새 의존성·저장소·UI renderer·상주 프로세스·반복 타이머는 추가하지 않았다.
+
+native 참조는 최신 묶음 하나, 최대 16개 문서 binding·전체 120개 ref로 바꿨다. 요청 token과 문서 ordinal을 ref 접두어에 넣고, 액션은 ref가 속한 원 snapshot을 찾아 같은 frame/session/context·문서 세대를 재확인한다. 이미 수집한 문서의 ContextTracker도 후속 Runtime 이벤트를 받는다. 전체 active token을 유지하고 마지막 disable ACK·현재성·응답 크기 검사 뒤에만 참조를 한꺼번에 게시한다. 시작 전 TAB_BUSY·PAGE_LOADING 거절은 기존 묶음을 보존하지만, 새 읽기가 inventory 준비 단계에 접수되면 이전 묶음을 무효화하며 후속 실패에서 복구하지 않는다. 본문은 native snapshot에 보관하지 않는다. 각 world의 약한 DOM Map과 bridge는 즉시 모두 삭제하지 않으며 실제 누적 RAM은 미측정이다.
+
+분담한 읽기 검토에서 추가 확정 차단 결함은 찾지 못했다. cargo fmt --all --check, node --check src/dom_bridge.js, git diff --check와 문서 로컬 링크를 확인했다. 단위·모의 DOM·로컬 CEF 회귀·네이티브 UI·외부 사이트·E2E는 실행하지 않았다. 소스 검토와 빌드가 실제 CEF callback 순서, 입력 효과와 사용자 화면 보존을 입증하지 않는다.
+
+`CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 ./scripts/dev.sh --release --build-only`를 한 번 실행했다. 세션 88895는 95.05초, exit 0이며 제품 소스와 Cargo 파일 36개의 전후 해시가 같다. 기존 registry의 테스트 전용 remove·len·is_empty에 dead_code 경고 한 묶음이 있었고 빌드 오류는 없다. `artifacts/ego-parity-v9-build.json`과 로그가 근거다. 앱 SHA-256은 `00dcd205ebc95d23b189084d8e0241f17101efd0f88cfc0a792bdc4d0f0e1474`, 번들 CLI는 `2fcc1bd8b8157db9be2bd102eb6556ae985ca1c45e5462281f4cd6d52acf4c1a`다. 번들 CLI help의 정상 JSON과 read-page 표시를 확인했으며 실제 페이지 실행과 구분한다.
+
+빌드 스크립트가 이전 번들을 교체하고 Cargo 중간 파일 1,271개·표시 크기 683.5MiB를 정리했다. 읽기 전용 후속 조회에서 프로젝트 dist 앱 PID·임시 앱 번들·임시 실행 파일 보관 폴더는 0개이며 target에는 최신 실행 파일 3개만 남았다. `artifacts/ego-parity-v9-postbuild.json`에 해시·서명·도움말과 정리를 기록했다. 서명은 local.lightbrowser.dev ad hoc이고 실행용 identity는 미지정이다. 기존 실행 보호를 유지해 앱·서버·검증 작업·탭을 시작하지 않았고 사용자 프로필과 저장 자료를 보존했다. 키체인 재승인을 반복 질문하거나 보안 설정을 우회하지 않았다.
+
+`docs/page-read.md`를 추가하고 README·architecture·product-plan·preseller-integration·frame-read·frame-input·devtools-routing·iframe-control·memory·ego-parity-e2e를 갱신했다. E2E 08에 중복 없는 여러 문서 읽기, 여섯 공유 예산과 emoji 경계, 17번째 문서, 묶음 내 서로 다른 문서 참조, 부분 로딩과 전체 실패·정리·배경 선택 보존을 추가했다. 최신 후보·앱과 CLI 해시를 v9로 고정했으며 01·11은 blocked, 나머지는 pending이다.
+
+지원 밖 프레임 좌표 변환과 지연 focus 경합 예방, 최신 실제 앱의 CEF·네이티브 UI·사용자 화면 보존·로그인·IME·지속 메모리 E2E는 남아 있다. 안정 실행 서명도 해결된 것으로 표시하지 않는다. 탭 복원·확대 보류를 유지하고 독립 브라우저나 Preseller 내장 완료를 선언하지 않았다. 커밋·푸시·배포는 하지 않았다.
+
+## 2026-10-18, 프레임 포인터 좌표·가림 검사와 통합 후보 v8
+
+직전 goal turn은 원문서에 묶인 입력 5개와 v7 빌드를 완료한 progress다. 이번에는 남은 교차 출처 frame ref의 click·hover를 연결했다. goal은 active이며 Aside의 일상 사용성과 ego lite의 사람·AI 공간 및 CLI 협업을 갖춘 독립 Naru 완성 목표를 유지한다. 전체 회귀 묶음 대신 제품 구현·한 번의 통합 빌드·같은 앱의 E2E 목록 갱신을 진행했다. 독립판이나 Preseller 내장을 완료로 표시하지 않는다.
+
+`src/dom_bridge.js`에 frameAct의 로컬 geometry·후보 단계와 inspectFramePointer를 추가했다. leaf 요소와 최대 32개 부모의 content box·viewport를 교차해 공통 clip을 구하고, 최대 9개 로컬 후보를 부모별 좌표 변환과 실제 hit-test로 거른다. 부모 문서의 정확한 owner를 사용하며 contentDocument에 접근하지 않는다. 가시 후보를 못 찾으면 leaf scrollIntoView 한 번 후 전체 geometry를 다시 수집하고, 두 측정의 후보 생성 합계는 최대 18개다. 후보 목록은 로컬·현재 부모 좌표 각 최대 9개이며 부모별 hit-test와 사후 단일점 검사의 횟수와 구분한다. 새 노드 강한 참조·renderer·프로세스·저장소·반복 타이머는 추가하지 않았다.
+
+`src/browser.rs`는 원 leaf 좌표와 root 전송 좌표를 분리한다. 마우스 이동과 클릭 전송·ACK는 root session을 사용하고 DOM 검사는 원 child session·unique context·ref binding을 유지한다. mouseMoved 뒤 원 leaf 위치, 모든 부모의 hit-test와 같은 root 위치, 원 leaf 위치를 다시 확인한 다음 hover를 끝내거나 click press/release를 보낸다. 이동 뒤 후보 재선택·스크롤·입력 재시도는 없다. 부모 backendNodeId와 context를 유지하고 각 pass의 원격 객체 group을 해제한다. target으로 돌아올 때 Runtime replay로 원 context를 재확인하며 같은 session의 모든 관련 tracker에 생성·파괴·초기화 이벤트를 전달한다. 이미 이동을 보낸 뒤 부모 검사에서 실패해도 attempted·outcomeUnknown을 보존하며 성공은 기존 Runtime disable ACK 후 한 번만 보낸다.
+
+새 `src/frame_pointer.rs`는 유한 좌표·양수 스케일·사각형 교집합과 역변환, 후보 index 부분집합·중복·좌표 계산을 제한된 값으로 검사하며 `src/lib.rs`에 등록했다. DOM hit-test를 대신하지 않는다. `src/cli.rs` 도움말과 read-frame 응답은 지원 action 7개와 pointerActionsSupported:true로 갱신했다. 회전·skew·perspective·SVG 조상·motion path·pinch 및 visualViewport offset은 기존 지원 기하 밖이며, 순차 검사와 비동기 스크롤 사이의 레이아웃 변화·지연 focus 경합은 남아 있다. 엔진 ACK만으로 실제 클릭 대상과 페이지 효과를 확정하지 않는다.
+
+고정 Chromium 원문 21개에서 root/child 좌표와 widget 라우팅, local-root quads의 한계, scale factor와 remote 조상 스크롤을 확인해 `artifacts/frame-pointer-v1-sources.json`에 URL·해시·줄별 근거를 기록했다. source-only 검토에서 추가 확정 차단 결함은 찾지 못했다. cargo fmt, node --check src/dom_bridge.js, git diff --check와 문서 링크를 확인했다. 단위 검사·모의 DOM·로컬 CEF 회귀·네이티브 UI·외부 사이트·E2E는 실행하지 않았다. 원문 조사·빌드와 실제 Naru 실행 성공을 구분한다.
+
+`CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 ./scripts/dev.sh --release --build-only`를 한 번 실행했다. 세션 59083은 91.49초, exit 0이며 제품 소스와 Cargo 파일 35개의 빌드 전후 해시가 일치한다. 기존 registry의 테스트 전용 remove·len·is_empty에 dead_code 경고 한 묶음이 있고 빌드 오류는 없다. `artifacts/ego-parity-v8-build.json`과 로그가 근거다. 앱 SHA-256은 `54f8dcfedc5b4f93e3128bfc74ba34221a3b50ca68d6f10997a76e34394819b2`, 번들 CLI는 `4824b50e344844d9d1c70cf62a1998fa9da680def9c98e49ea6259353ef50a7a`다. CLI help의 정상 JSON과 지원 안내를 확인했으며 브라우저 입력 검증으로 계산하지 않는다.
+
+빌드 스크립트는 이전 번들을 교체하고 중간 파일 1,271개·표시 크기 683.2MiB를 정리했다. `artifacts/ego-parity-v8-postbuild.json`의 읽기 전용 후속 조회에서 이 프로젝트 dist 앱 PID와 임시 번들은 0개이며 target에는 최신 실행 파일 3개만 남았다. 서명은 local.lightbrowser.dev ad hoc이고 실행용 identity는 미지정이다. 기존 실행 보호를 유지해 앱·서버·검증 탭·작업을 시작하지 않았으며 키체인 재승인 질문과 보안 우회를 하지 않았다. 사용자 프로필과 저장 자료는 변경하지 않았다.
+
+`docs/frame-pointer.md`를 추가하고 frame-input, frame-read, devtools-routing, iframe-control, pointer-input, memory, README, architecture, product-plan, preseller-integration, ego-parity-e2e를 갱신했다. E2E 08에는 중첩 OOPIF·border/padding/scale/zoom·부분 노출과 overlay, 큰 iframe의 스크롤, 이동 후 target/부모 변경·가림과 지원 밖 기하 거절을 추가했다. 최신 후보와 앱·CLI 해시를 v8로 고정하고 01·11은 blocked, 나머지는 pending으로 유지했다. 여러 프레임 본문을 합치는 공통 예산, 지원 밖 기하, focus 경합 예방, 최신 앱의 실제 CEF·사용자 화면 보존·로그인·IME·지속 메모리 검증은 남는다. 탭 복원·확대 보류와 독립판 다음 Preseller 내장 순서를 유지한다. 커밋·푸시·배포는 하지 않았다.
+
+## 2026-10-18, 문서에 묶인 프레임 입력과 부모 검사, 통합 후보 v7
+
+직전 v6의 본문 읽기에 이어 교차 출처 프레임의 참조와 입력 5개를 구현했다. goal은 active이며 Aside의 일상 사용성과 ego lite의 사람·AI 공간 및 CLI 제어를 결합한 독립 Naru 완성 목표를 유지한다. 사용자 요청대로 전체 회귀 묶음은 반복하지 않고 기능 연결과 한 번의 통합 빌드, 같은 바이너리의 E2E 목록 갱신을 진행했다. 이번 단계로 전체 목표를 완료 처리하지 않는다.
+
+`src/browser.rs`의 read-frame은 문서·세대·unique context와 frame/session·Browser·소유권에 결합한 최신 snapshot을 탭마다 하나 보관한다. 최대 120개 공개 ref를 검증해 frame 접두사를 붙이고 focusedRef도 같은 집합에서만 반환한다. 기존 fill·insert·press·check·select가 이 참조를 받으면 현재 frame tree와 원 context를 다시 확인한다. 준비, Chromium 입력 배치, 사후 확인에 정확한 session과 unique context 및 DOM 바인딩을 유지하며 일반 check/select와 기존 DOM fill도 완료 시 같은 가드를 통과한다. 성공은 Runtime disable ACK 뒤 단일 응답으로 전송하고 취소·탐색·인계·늦은 응답은 기존 요청 수명 안에서 거절한다. click·hover는 frame ref에서 UNSUPPORTED_FRAME_POINTER로 거절한다. `src/cli.rs` 도움말에 지원 5개와 포인터 제한을 반영했다.
+
+입력 전 부모 chain을 최대 32단계 확인한다. 각 부모의 고정 world에서 getFrameOwner와 resolveNode로 실제 iframe 노드를 얻고, 원 부모 unique context에서 원문서 소속·연결·숨김·inert·비활성 상태를 검사한다. objectGroup은 resolve 전 예약하고 함수 호출의 예외 객체에도 지정한다. 정상 경로는 group 해제 ACK 뒤 다음 부모로 진행하며 root 취소 경로는 group·Runtime·autoAttach 정리를 별도 ID와 ACK로 추적한다. child 객체는 session detach로 정리한다. 부모 좌표·clipping·가림과 지연 focus 변경의 예방은 이 검사에 포함하지 않는다.
+
+`src/dom_bridge.js`의 readFrameActions는 WeakRef 요소와 WeakMap 문맥을 사용한다. frameAct는 binding을 먼저 검사해 오래된 요청이 새 관찰자를 지우지 않도록 하며 원문서와 읽기 세대가 다르면 입력하지 않는다. 부모 검사는 contentDocument·포커스·스크롤을 건드리지 않는다. 내부 clearFrame은 같은 세대의 명시적 해제를 제공하지만 native에서 호출하지 않으므로 이전 world의 메타데이터가 즉시 모두 해제된다고 설명하지 않는다. 임시 press·insert 관찰자는 소비·새 동작·읽기·최대 5초 단발 만료를 따르며 정지된 renderer의 타이머 지연도 가능하다. 새 프로세스, UI renderer, 저장소와 반복 타이머는 추가하지 않았다. 실제 RAM은 미측정이다.
+
+고정 Chromium·V8의 session별 입력과 widget focus 선택, unique context와 object 인수 검증 및 원격 객체 수명 조사 22개를 `artifacts/frame-input-v1-sources.json`에 기록했다. 소스 검토에서 확정 차단 결함은 발견하지 못했고 callFunctionOn 예외 객체도 같은 group에 포함하도록 보강했다. 엔진 입력에는 frame 선택 인자가 없고 포커스 확인과 입력이 원자적이지 않으므로 이 검토로 잘못된 입력 예방이나 실제 CEF 성공을 주장하지 않는다.
+
+cargo fmt, node --check src/dom_bridge.js, git diff --check와 문서의 로컬 링크 확인을 수행했다. 전체 Rust 단위, 모의 DOM, 로컬 CEF 회귀, 네이티브 UI, 외부 사이트와 E2E는 실행하지 않았다. 이전 바이너리의 통과 수를 새 소스에 적용하지 않았다. 문서 일괄 수정용 첫 Python 명령은 stdin 인코딩 SyntaxError로 쓰기 전에 종료됐으며 apply_patch와 ASCII로 인코딩한 데이터로 문서만 반영했다. 제품 빌드 실패나 런타임 실패와 구분한다.
+
+`CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 ./scripts/dev.sh --release --build-only`를 한 번 실행했다. 세션 12194는 90.42초, exit 0이며 제품 소스와 Cargo 파일 34개의 빌드 전후 해시가 일치한다. 테스트 전용 registry의 remove·len·is_empty에 기존 dead_code 경고 한 묶음이 있었고 빌드 오류는 없다. `artifacts/ego-parity-v7-build.json`과 로그가 근거다. 앱 SHA-256은 `8d2ca086a412529a58460a88c7ff2d1a6c5b4d0a2dd8ec3a0425cdc3d08b8056`, 번들 CLI는 `fc985050a002bb50073d36688bc9ecd790a89603c2af6490d56171185669a35d`다. CLI help의 정상 JSON과 새 지원 안내만 확인했으며 페이지 실행 검증과 구분한다.
+
+빌드 스크립트가 이전 번들을 교체하고 Cargo 중간 파일 1,271개·표시 크기 682.9MiB를 정리했다. 후속 읽기 전용 조회에서 이 프로젝트 dist 앱 PID와 임시 앱 번들은 0개이며 target에는 최신 실행 파일 3개가 남았다. 서명은 local.lightbrowser.dev ad hoc, 실행용 서명자는 미지정이다. `artifacts/ego-parity-v7-postbuild.json`에 해시·서명·도움말·정리를 기록했다. 앱·서버·검증 탭·작업을 실행하지 않았고 기존 프로필과 사용자 자료를 보존했다. 키체인 반복 승인 요청이나 보안 설정 우회는 하지 않았다.
+
+`docs/frame-input.md`를 추가하고 README, architecture, product-plan, preseller-integration, frame-read, devtools-routing, iframe-control, memory, ego-parity-e2e를 갱신했다. E2E 08에는 원문서 입력 5개·root 및 실제 OOPIF·숨김 부모·오래된 ref·실패한 새 읽기·정리 중 취소·예외 객체·실제 입력 대상과 누적 자원 관측을 추가했다. 최신 후보와 앱·CLI 해시를 v7로 고정했으며 01·11의 blocked와 나머지 pending을 유지했다. 프레임 포인터 입력·부모 좌표/가림·다중 프레임 공통 예산, 지연 focus 경합 예방과 최신 실제 앱의 E2E는 남아 있다. 탭 복원·확대 보류를 유지하며 Preseller 내장은 다음 단계다. 커밋·푸시·배포는 하지 않았다.
+
+## 2026-10-18, 프레임 본문 읽기와 context 수명, 통합 후보 v6
+
+직전 goal turn의 하위 프레임 연결·v5 빌드 완료에 이어 교차 출처 프레임의 본문 읽기를 구현했다. goal은 active이며 독립 Naru 완성 뒤 같은 Rust·CEF 구현을 Preseller에 내장하는 목표를 유지한다. 사용자 요청대로 전체 회귀 묶음은 반복하지 않고 제품 구현, 한 번의 통합 빌드와 같은 바이너리의 E2E 목록 갱신을 진행했다.
+
+`src/cli.rs`와 `src/protocol.rs`에 `read-frame TAB FRAME` 및 task run 범위 명령을 연결했다. `src/browser.rs`는 현재 inventory에서 대상 frame·session을 다시 찾고 Runtime disable ACK → enable replay → 고정 world 생성·재사용 → 고유 context 평가 → Runtime disable ACK 순서로 읽는다. `src/frame_sessions.rs`의 ContextTracker는 정확한 frame·world와 isolated 유형, isDefault=false, numeric ID와 uniqueId를 확인하며 파괴·초기화·교체 때 이전 읽기를 무효화한다. 원 Browser, session, 문서·탐색 세대, 작업 소유권과 token 검사를 유지하고 단계 사이 재진입에도 활성 inventory를 보존한다. 성공 응답의 요소 ref는 제거하고 focusedRef=null, actionsSupported=false, atomic=false로 반환한다. 프레임 입력을 지원한다고 표시하지 않는다.
+
+`src/dom_bridge.js`의 readFrame은 현재 문서와 열린 Shadow DOM만 읽는다. 자식 iframe은 메타데이터만 반환하고 contentDocument를 조회하지 않는다. 기존 read 동작은 유지한다. 본문 12,000자·요소 120개·노드 10,000회·열린 root 64개·깊이 64·옵션 전체 240개 예산과 frame metadata 16개를 유지한다. Read 응답은 파싱 전 2MiB, 다른 프레임 단계는 256KiB다. 읽기 성공·예외 모두 finally에서 refs Map과 contexts WeakMap을 비워 노드·문서 연결을 해제한다. 고정 world를 재사용하지만 Runtime disable이 world나 이미 시작한 evaluate를 제거하는 것은 아니다. 새 UI renderer, 프로세스, 반복 타이머와 저장소는 추가하지 않았고 RAM 절감은 측정하지 않았다.
+
+실패·인계·취소 때 child 연결을 해제하고 root Runtime을 활성화했을 가능성이 있으면 별도의 disable 요청을 보낸다. root Runtime과 auto-attach의 cleanup ACK를 각각 추적하며 정리 대기·실패를 성공으로 추정하지 않는다. 고정 Chromium·V8의 replay, 같은 이름 world 재사용과 disable 수명 조사 근거 13개를 `artifacts/frame-read-v1-sources.json`에 기록했다. 독립 소스 검토에서 추가 확정 차단 결함은 발견하지 못했지만 실제 callback 순서나 CEF 실행을 검증한 결과는 아니다.
+
+cargo fmt --all --check, node --check src/dom_bridge.js, git diff --check는 통과했다. ContextTracker 단위검사 3개와 기존 CLI·protocol 검사 6개 안의 새 명령 자료는 준비만 했고 실행하지 않았다. 전체 Rust 단위, 모의 DOM, 로컬 CEF 회귀, 네이티브 UI, 외부 사이트와 E2E는 실행하지 않았다. 이전 바이너리의 통과 수를 이번 소스에 적용하지 않는다. `docs/frame-read.md`를 만들고 README, architecture, product-plan, preseller-integration, memory, iframe-control, devtools-routing, ego-parity-e2e를 갱신했다. E2E 08에는 문서별 본문 일치·자식 비재귀, world 재사용과 context 교체, 입력 참조 비반환, 취소·두 cleanup ACK 및 상한·지속 메모리 확인을 추가했다.
+
+`CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 ./scripts/dev.sh --release --build-only`를 한 번 실행했다. 세션 29841은 89.88초, exit 0이며 제품 소스와 Cargo 파일 34개의 빌드 전후 해시가 일치한다. 테스트에서만 쓰는 registry의 remove·len·is_empty에 dead_code 경고 한 묶음이 있었으며 빌드 오류는 없다. `artifacts/ego-parity-v6-build.json`과 로그가 근거다. 앱 SHA-256은 `54bf8382e049a12d59d8b66c4745bbf31834dbfba812a3bc33ef0c1fc4d7ed8b`, 번들 CLI는 `23ed09d0341f132f6144032ac4448b1864963e33fef94b58a78cf7fd8acf4df1`다. CLI help의 정상 JSON과 read-frame 명령 표시를 확인했으며 브라우저 실행 검증과 구분한다.
+
+빌드 스크립트는 이전 번들을 교체하고 Cargo 중간 파일 1,271개·표시 크기 682.5MiB를 정리했다. 읽기 전용 후속 조회에서 이 프로젝트 dist 앱 PID와 임시 앱 번들은 0개이며 target에는 최신 실행 파일 3개가 남았다. 서명은 local.lightbrowser.dev ad hoc, 실행용 서명자는 미지정이다. `artifacts/ego-parity-v6-postbuild.json`에 해시·서명·도움말과 정리를 기록했다. 앱·서버·검증 탭·작업을 새로 실행하지 않았고 기존 프로필과 사용자 자료를 보존했다. 키체인 반복 승인 질문과 보안 설정 우회는 하지 않았다.
+
+교차 출처 입력용 ref와 frame-local 입력, 부모 좌표·가림 검사, 다중 프레임 본문의 전체 예산은 미구현이다. 지연 focus 경합 예방, 안정 서명과 최신 앱의 CEF·네이티브 UI·대표 서비스 로그인·IME·장시간 메모리 E2E도 남는다. 실행 보호와 대표 로그인 서비스 미정으로 E2E 01·11은 blocked, 나머지는 pending이다. 탭 복원·확대 보류를 유지하며 독립 브라우저나 Preseller 내장 완료로 보고하지 않는다. 커밋·푸시·배포는 하지 않았다.
+
+## 2026-10-18, 하위 프레임 연결과 frames CLI, 통합 후보 v5
+
+독립 Naru 완성이라는 active goal을 이어갔다. 사용자 요청대로 반복 전체 회귀 대신 구현과 통합 빌드, 같은 바이너리의 E2E 목록 준비를 진행했다. `src/protocol.rs`와 `src/cli.rs`에 frames TAB 및 task run 범위 명령을 추가하고 `src/browser.rs`에서 실제 Page.enable → iframe 필터의 Target.setAutoAttach → Page.getFrameTree로 연결했다. 각 child에도 준비와 조회를 수행하며 root ACK만으로 재귀 발견을 완료하지 않는다. 기존 창, 사용자 선택과 CLI를 유지하며 별도 UI renderer나 프로세스는 추가하지 않았다.
+
+새 `src/frame_sessions.rs`는 부모가 알려진 iframe session만 최대 16개·깊이 8로 보관한다. 조회는 최대 17개 연결 방문(루트 포함), 전체 프레임 128개, 트리 깊이 32, URL 4,096·이름 256 UTF-8 bytes, 파싱 전 응답 256KiB·관심 이벤트 32KiB를 제한한다. 결과는 frameId, parentId, sessionId, URL과 이름뿐이며 atomic:false, contentIncluded:false다. 메타데이터 잘림은 truncated, 잘못된 연결이나 연결 한도는 FRAME_LIMIT, 중복 frame ID와 수집 중 변경은 FRAME_CHANGED로 구분한다. 준비한 연결은 다음 조회에서 재사용하고 결과와 방문 상태는 응답 뒤 해제한다.
+
+`src/devtools_wire.rs`는 session별 직렬화와 빌린 Response/Event 파싱으로 확장했다. observer가 원 Browser·정확한 session·ID를 대조하고 루트 preview/capture/cleanup 응답과 분리한다. `src/lib.rs`에 browser 기능일 때만 새 모듈을 연결했다. 수집의 owner·scope·요청 token·탐색/문서 세대와 native getter 재진입을 검사한다. 소스 검토에서 pending 단계 사이에 이미 읽은 프레임의 변화가 누락될 수 있는 경계를 찾아 FrameControl.active_inventory와 invalidated 상태를 유지하도록 고쳤다. 재검토에서는 그 경계가 해소됐으며 추가 확정 결함을 찾지 못했지만 런타임 통과로 계산하지 않는다.
+
+취소와 타임아웃, 인계·오류·렌더러 종료에서는 root autoAttach를 해제하고 실제 cleanup ACK를 기다린다. 연결 종료와 탭 닫힘에서는 상태를 제거한다. 해제 실패나 미응답을 성공으로 추정하지 않는다. 고정 Chromium 조사에서 getFrameTree가 renderer-local subtree만 반환하며 OOPIF 경계 노드를 제외함을 확인했다. root 해제는 자손을 폐기하지만 자손별 알림과 오류 응답은 모두 오지 않을 수 있어 부모 detach로 로컬 subtree를 함께 취소한다. 근거는 artifacts/frame-session-v1-sources.json이며 실제 CEF 관측과 구분한다.
+
+전체 Rust 단위, 모의 DOM, 로컬 CEF 회귀와 실제 앱 E2E는 실행하지 않았다. Registry/정규화 경계 단위검사 7개, wire의 기존 2개 확장, CLI/protocol과 Browser 상관 검사 자료는 준비만 했다. cargo fmt와 git diff --check는 통과했다. README, architecture, product-plan, preseller-integration, memory, iframe-control, devtools-routing과 ego-parity-e2e 문서를 갱신했다. E2E 08에 단일·중첩·교차 site 프레임, 목록 재사용, 탐색 경쟁, 취소와 해제, 상한과 지속 메모리의 실제 확인 목록을 더했다.
+
+CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 ./scripts/dev.sh --release --build-only를 한 번 실행했다. 세션 17826은 99.08초, exit 0으로 종료했으며 제품 소스/Cargo 파일 34개의 전후 해시가 일치한다. artifacts/ego-parity-v5-build.json과 로그가 근거다. 테스트에서만 사용하는 registry 메서드 remove·len·is_empty의 dead_code 경고 한 묶음이 있었으며 빌드 오류는 없었다. 앱 SHA-256은 `919272876a8a0d810d2a3f6627a86f30181e98bb90239a8fd955be2f01fc350a`, 번들 CLI는 `24539d7b5f4b05a14996ff5c79cd1c196be28583fc8cb9281ab790d4295b7347`다. 실제 브라우저를 시작하지 않는 CLI help의 정상 JSON과 frames TAB 표시는 확인했고 페이지 실행으로 계산하지 않았다.
+
+번들은 local.lightbrowser.dev ad hoc이며 실행용 서명자는 미지정이다. 같은 날의 유효 서명자 조회를 반복하지 않았다. E2E 목록의 후보·앱/CLI 해시를 v5에 고정했다. 빌드 스크립트가 이전 번들을 교체하고 중간 파일 1,271개, 표시 크기 682.2MiB를 정리했다. 후속 읽기 조회에서 이 프로젝트 dist 앱 PID와 임시 번들은 0개이고 target에는 최신 실행 파일 3개만 남았다. artifacts/ego-parity-v5-postbuild.json에 서명 메타데이터·도움말·해시와 정리를 기록했다. 앱·서버·검증 작업이나 탭을 새로 실행하지 않았고 기존 프로필·사용자 자료는 변경하지 않았다.
+
+교차 출처 frame-local 본문 읽기·입력, unique context와 자식 문서에 묶인 ref, 전체 읽기 예산 합산과 부모 좌표 검사는 미구현이다. 지연 focus 경합 예방, 대표 서비스 로그인·실제 IME·지속 메모리와 네이티브 UI 검증도 남는다. 키체인 반복 승인을 요청하거나 보안 설정을 우회하지 않았으며 안정 서명자 미지정으로 새 앱을 자동 실행하지 않았다. E2E 01·11의 blocked와 나머지 pending을 유지하고 독립 완성·Preseller 내장 완료를 주장하지 않는다. 탭 복원과 확대 보류는 유지하며 커밋·푸시·배포는 하지 않았다.
+
+## 2026-10-18, DevTools raw 전송과 응답 상관관계, 통합 후보 v4
+
+직전 goal turn은 insert 구현과 통합 빌드를 끝낸 progress다. 이번에는 교차 출처 iframe 연결에 필요한 전송 계층을 현재 명령에 적용했다. goal 조회는 active이며 독립 Naru 완성, Aside의 일상 사용성과 ego lite의 사용자 공간 및 AI 제어를 결합하는 목표를 유지한다. 프레임 목록만 조회하는 작은 별도 기능을 전체 프레임 제어의 완성으로 바꾸지 않았다.
+
+`src/browser.rs`의 미리보기, 입력 배치, 입력 후 확인, 로딩 대기와 일반 명령 다섯 전송 지점을 공통 send_root_command로 연결했다. 예약한 ID를 raw JSON에 명시하고 SendDevToolsMessage에 전달한다. CEF Dictionary 중간 변환을 제거했으며 제출 접수와 실제 응답, 페이지 효과의 구분은 유지했다. 기존 unchecked ID 증가는 checked 발급으로 바꾸고 입력 배치의 checked 발급도 보존했다. ID 고갈 시 재사용하지 않으며 새 명령이나 미리보기 예약을 거절한다.
+
+새 `src/devtools_wire.rs`는 양의 i32 ID, 정확히 하나의 result 또는 error 객체, 알려진 필드 중복과 sessionId 존재 여부를 검사한다. null이나 잘못된 타입의 sessionId도 루트로 해석하지 않는다. 필드 순서와 무관하게 원 payload 바이트를 빌려 넘기며 새 전체 Value 트리나 payload 재직렬화를 만들지 않는다. 기존 serde_json에 raw_value 기능만 켰고 버전과 새 의존성을 추가하지 않았다. Cargo.lock은 변경하지 않았다. src/lib.rs에 브라우저 구성에서만 모듈을 연결했다.
+
+ControlObserver는 raw 응답을 전부 소비하고, ID가 가리키는 탭의 실제 Browser를 확인한 뒤 기존 완료 처리에 전달한다. 다른 Browser나 알 수 없는 하위 session 응답은 pending과 preview, capture를 제거하지 않는다. timeout이나 취소 뒤 남은 screenshot capture도 같은 Browser의 늦은 응답으로만 해제한다. typed callback은 제거해 중복 처리를 막았고 연결 종료도 현재 Browser를 확인한다. 이 단계는 루트 명령의 개선이며 child session registry, 지연 autoAttach, frame-local read와 입력은 아직 구현하지 않았다. 기존 작업 인계와 취소, 문서 검증, 입력의 재진입 가드와 캡처 수명을 유지한다.
+
+기존 graphify 지도는 탐색 위치만 확인하고 실제 소스를 따라 검토했다. 고정 CEF의 typed parser가 sessionId를 전달하지 못하고 필드 순서를 가정하는 근거, SendDevToolsMessage와 ID 발급 차이는 artifacts/devtools-session-v1-sources.json에 기록했다. 현재 Naru에서 다른 탭이 잘못 조작되는 현상을 재현한 것은 아니다. 독립 소스 검토에서 추가 차단 결함을 찾지 못했지만 런타임 검증과 구분한다. 새 parser 경계 두 개와 Browser 상관관계 및 ID 고갈 한 개의 단위검사를 준비했으며 실행하지 않았다. 전체 Rust 단위, 모의 DOM, 로컬 CEF 회귀와 E2E는 실행하지 않았다. cargo fmt와 git diff --check만 통과했다.
+
+CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 ./scripts/dev.sh --release --build-only를 한 번 실행했다. 실행 세션 20680은 87.18초, exit 0으로 종료했고 제품 소스와 Cargo 파일 33개의 전후 해시가 일치한다. artifacts/ego-parity-v4-build.json과 로그가 근거다. 앱 SHA-256은 `72c2011d98b1301dc405e1fcb25f48024a52f4473d1b56b72b771c951396c221`, 번들 CLI는 `43258e1238e0e0944cf234333a2d33c30633a28d352f8d3394058b042964881a`다. CLI help의 정상 JSON 응답만 확인했으며 브라우저 입력 검사로 계산하지 않았다. docs/ego-parity-e2e.md에 이 후보를 고정하고 read, screenshot, 입력과 취소, 복구 여정을 같은 앱으로 확인하도록 갱신했다. 연결 설계, iframe 계약의 오래된 합성 입력 설명, README, 아키텍처, 제품 계획, Preseller 내장과 메모리 문서도 갱신했다.
+
+실행 서명자는 미지정이고 이번 번들도 local.lightbrowser.dev ad hoc이다. 앞선 같은 날 유효 서명자 0개 조회를 다시 반복하거나 키체인 승인 질문을 하지 않았다. 앱과 실제 CEF, 네이티브 UI, 외부 사이트, 로그인, IME와 지속 메모리 E2E는 미실행이다. E2E 01과 대표 서비스 미정인 11은 blocked이며 나머지는 pending이다. 하위 프레임 연결, 각 프레임 문서 수명과 공통 예산, 부모 좌표 검사, 지연 focus 경합 예방은 남아 있다. 보류한 탭 복원과 확대는 유지하며 Preseller 내장 완료도 주장하지 않는다.
+
+빌드 스크립트가 이전 번들을 교체하고 중간 파일 1,270개, 표시 크기 681.4MiB를 정리했다. target에는 실행 파일 세 개만 있고 임시 앱 번들과 이 프로젝트 dist 앱 프로세스는 0개다. artifacts/ego-parity-v4-postbuild.json과 최종 소스 기록 ego-parity-v4-final.json에 남겼다. 사용자 프로필과 탭 자료는 변경하지 않았으며 앱, 서버나 검증 공간을 새로 실행하지 않았다. 추가 프로세스, renderer와 저장소 없이 기존 명령 상태와 빌린 payload를 사용하지만 실제 RAM 감소는 미측정이다. 커밋, 푸시와 배포는 하지 않았다.
+
+## 2026-10-18, 현재 커서와 선택 영역에 넣는 insert 구현과 통합 후보 v3
+
+독립 Naru를 먼저 완성하는 active goal을 이어갔다. 반복 전체 회귀검사 대신 제품 구현과 한 번의 통합 빌드, 최종 E2E 준비를 진행했다. `src/protocol.rs`와 `src/cli.rs`에 `insert TAB REF TEXT`와 작업 범위 명령을 추가했다. `src/browser.rs`는 기존 FillTarget과 Input.insertText 배치를 재사용하며 원래 Browser, 문서, 작업 제어권, isolated context와 임시 관찰 token을 사후 확인까지 유지한다. insert가 기존 합성 fill 경로로 들어가지 않게 구분했고 엔진 ACK만으로 성공하지 않는다.
+
+`src/dom_bridge.js`는 입력칸의 값과 선택 범위, 편집 영역의 단일 Range를 포커스 전후 비교한다. 준비 과정에서 선택을 덮어쓰지 않으며 변하면 입력 전에 거절한다. 입력칸과 textarea는 삽입 뒤 예상 값이 같은지 확인한다. contenteditable은 원래 host의 trusted input, insertText와 요청 텍스트 일치를 관찰해 input-event로 반환하며 서식이나 문서 전체, 외부 편집기 모델을 보장하지 않는다. 비밀번호, 원래 값, 선택 본문과 내부 token은 응답에 넣지 않는다. 값 불일치, 원래 대상의 확인 불가와 다른 대상 입력을 구분하며 자동 재시도나 DOM fallback은 없다. 빈 문자열도 같은 엔진 경로이며 편집기에서는 이벤트 미확정일 수 있다.
+
+추가 상태는 bridge마다 관찰 하나와 최대 5초 단발 정리, 제한된 문자열과 boolean이다. 새 프로세스, UI renderer, 반복 타이머와 저장 파일은 추가하지 않았다. 실제 메모리 절감은 측정하지 않았다. 준비와 엔진 입력 사이의 지연 focus 경합은 남으며 잘못된 입력의 예방이나 복구가 완료된 것으로 표시하지 않는다. 교차 출처 프레임의 공식 Chromium과 CEF 소스를 조사해 session별 연결, 문서 수명, 좌표와 공통 예산의 구현 경로를 `artifacts/cross-origin-frame-v1-sources.json`에 기록했다. 조사 결과는 기능 구현이나 런타임 검증이 아니다.
+
+전체 Rust 단위와 모의 DOM, 로컬 CEF 회귀 묶음은 실행하지 않았다. cargo fmt, 제품 JavaScript 구문과 git diff --check를 통과했다. 공백 검사에서 발견한 docs/memory.md의 끝 빈 줄만 고친 뒤 다시 통과했다. 기존 CLI parser 검사에는 직접 명령, 작업 범위와 wire의 insert 자료를 추가했으나 실행하지 않았다. Rust와 DOM 연결의 읽기 검토에서 확정 차단 결함을 찾지 못했지만 실행 결과는 아니다. `tests/insert_text_smoke.py`와 `tests/fixtures/insert_text.html`에 커서 이어쓰기, Shift 선택 치환, textarea 여러 줄, plain/rich 편집기, 열린 shadow와 같은 출처 frame, 빈 값, 취소, 최대 길이, 대상 변경, 비밀번호 비노출과 사용자 선택·task revision 보존을 준비했다. 담당 에이전트가 Python AST, inline JavaScript 구문과 조사 JSON 구문만 확인했으며 실제 앱과 E2E는 실행하지 않았다.
+
+`CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 ./scripts/dev.sh --release --build-only`를 한 번 실행했다. 같은 실행 세션 45446의 완료는 98.47초, exit 0이다. 제품 소스와 Cargo 파일 32개의 빌드 전후 해시가 일치한다. `artifacts/ego-parity-v3-build.json`과 로그가 근거다. 앱 SHA-256은 `92a6671440a399b6eed9d4c4f55ab6f8d1ba17f10a017aee3607538baf91b16d`, 번들 CLI는 `eea094fd8b506ddf73f61a291defd3be6872fc0af28590b9a6fcce139ee3d27d`다. 번들 CLI help에 insert가 포함된 것을 확인했으며 페이지 입력 실행과 구분한다. `docs/ego-parity-e2e.md`에 이 후보 해시와 입력 여정 06·07을 연결했다. 삽입 계약, README, 아키텍처, 제품 계획, 키 입력, Preseller 내장과 메모리 문서도 갱신했다.
+
+이번 빌드도 실행 서명자는 미지정이고 번들은 local.lightbrowser.dev ad hoc이다. 같은 날 앞선 유효 identity 0개 조회를 다시 반복하지 않았으며 새 인증서, 키체인 설정과 실행 보호를 조작하지 않았다. 앱을 실행하지 않았고 보안 승인 질문도 하지 않았다. 최신 Naru CEF, 네이티브 UI, 외부 사이트와 로그인, 실제 IME 및 장시간 메모리 E2E는 미검증이다. E2E 01과 대표 로그인 서비스 미정인 11은 blocked이며 나머지는 pending이다. 교차 출처 iframe, 지연 포커스 경합 예방과 범용 편집기 등의 잔여 구현을 목표에서 제외하지 않았다. 탭 복원과 확대 보류, Preseller 내장을 독립판 이후에 진행하는 순서를 유지한다.
+
+빌드가 이전 번들을 교체하고 Cargo 중간 파일 1,263개, 표시 크기 679.9MiB를 정리했다. target은 실행 파일 세 개만 남고 임시 앱 번들은 없다. 허용된 읽기 전용 ps 조회에서 이 프로젝트 dist 앱 프로세스는 0개다. 서명과 CLI help, 해시 및 정리 목록은 `artifacts/ego-parity-v3-postbuild.json`, 최종 소스와 준비 파일 기록은 `artifacts/ego-parity-v3-final.json`을 따른다. 앱과 서버, 검증 작업과 탭을 새로 만들지 않았으며 기존 프로필과 저장 자료를 보존했다. 커밋, 푸시와 배포는 하지 않았다. 독립 브라우저 전체 완료나 E2E 통과로 보고하지 않는다.
+
+## 2026-10-18, hover와 macOS 편집 단축키를 통합 후보에 반영
+
+사용자가 요청한 ego lite 수준의 독립 브라우저 완성 목표에 따라 제품 구현을 먼저 이어갔다. 이번 goal 조회는 active다. 앞선 기록의 paused는 당시 상태이며 현재 상태와 구분한다. 전체 회귀검사를 반복하지 않고 기능 구현, 통합 빌드, 실제 사용 여정의 E2E 준비 순서를 유지했다. 전체 목표나 실제 앱 검증을 완료로 표시하지 않았다.
+
+`src/protocol.rs`와 `src/cli.rs`에 hover TAB REF를 추가하고 작업 범위 wire 허용 목록까지 연결했다. `src/browser.rs`는 기존 ClickTarget에 원래 action을 보관해 DOM 준비, Chromium mouseMoved 한 번, 같은 참조와 위치의 사후 확인까지만 수행한다. hover가 클릭 누름과 해제 배치를 만들지 못하게 분기했고 사후 확인 뒤 요청을 종료한다. `src/dom_bridge.js`는 같은 좌표, iframe과 shadow hit test를 재사용하며 hover 응답에도 원래 action을 유지한다. 성공 응답의 pointVerified는 위치 확인이며 메뉴 효과 완료는 후속 read로 확인해야 한다. 취소와 제어권 변경, 문서와 Browser 검사, attempted와 outcomeUnknown을 유지한다. 호출 흐름의 읽기 검토에서 확정 결함을 찾지 못했지만 실행 검증 결과는 아니다.
+
+`src/keyboard.rs`에 macOS 편집 단축키 18개를 더해 지원 이름을 총 42개로 확장했다. Meta 전체 선택, 실행 취소와 다시 실행, 줄과 문서 경계 이동과 선택, Alt 단어 이동과 선택 및 삭제, Meta+Backspace를 포함한다. nativeVirtualKeyCode 0에서 네이티브 메뉴 처리를 추정하지 않고 keydown에 정적 Blink editing command 하나를 전달한다. keyup에는 command를 넣지 않는다. DOM 관찰은 원래 key와 code, Shift와 Alt 및 Meta, Ctrl false를 모두 대조한다. Meta+Delete, 클립보드와 임의 조합, IME는 추가하지 않았다. 공식 매핑과 조회의 한계는 `artifacts/mac-editing-commands-v1-sources.json`에 남겼다.
+
+새 프로세스, 웹 UI renderer, 반복 타이머와 저장소는 추가하지 않았다. hover는 기존 제한된 포인터 상태를 재사용하고 키는 작은 KeyPress와 정적 command 문자열을 쓴다. 실제 메모리 감소나 장시간 회수는 측정하지 않았다. README, 포인터와 키 입력, 아키텍처, 제품 계획, Preseller 내장과 메모리 문서를 갱신했다. `docs/ego-parity-e2e.md`의 06과 07에 hover 메뉴 열기와 클릭 0회, 새 ref 선택, 편집 단축키의 실제 값과 선택 영역, preventDefault, 사용자 화면 보존을 반영했다.
+
+전체 Rust 단위, 모의 DOM 회귀, 로컬 CEF 회귀, 독립 Chromium 검사와 실제 앱 E2E는 실행하지 않았다. cargo fmt, 제품 bridge의 node --check, git diff --check를 통과했다. CLI의 기존 허용과 거절 테스트 데이터는 새 지원 목록으로 맞췄으나 실행하지 않았다. `tests/native_click_smoke.py`와 fixture에 메뉴 열기부터 선택까지 한 흐름을 준비했고 Python AST와 inline JavaScript 구문 확인만 통과했다. `tests/native_press_smoke.py`와 fixture도 새 편집 조합 18개의 값과 선택 영역, native fill 뒤 Undo와 Redo, Meta+A와 Alt+Backspace 취소, 사용자 선택과 AI revision 보존을 확인하도록 준비했다. 이 두 파일 역시 Python AST와 inline JavaScript 구문 확인만 통과했고 실제 입력은 실행하지 않았다. 언어별 단어 경계와 범용 편집기의 undo 동작은 이 준비로 보장하지 않는다. 이전에 기록한 373개와 128개 등의 통과 수를 이번 소스에 적용하지 않는다. 이전 합성 contenteditable와 정확한 press 응답을 전제한 모의 DOM 기대 일부의 이행도 여전히 남아 있다.
+
+`CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 ./scripts/dev.sh --release --build-only`를 한 번 실행했다. 통합 release 빌드는 86.91초, exit 0이며 제품 소스와 Cargo 파일 32개의 빌드 전후 해시가 일치했다. `artifacts/ego-parity-v2-build.json`과 로그가 근거다. 새 앱 SHA-256은 `74394d5490b15bdfb96029f94a3ea1f81b1ebccf7d07f47a901d1e716372bbcb`, 번들 CLI는 `19fa05c2a15a0d6b18d1192816cffa58c037da30f861d1f907b6a77cfa9be25a`다. 번들 CLI help의 hover와 편집 키 표시를 확인했고 이는 브라우저 입력 실행 검증과 구분한다.
+
+서명은 local.lightbrowser.dev ad hoc이다. NARU_CODESIGN_IDENTITY는 미지정이며 읽기 전용 인증서 조회 결과 유효 identity 0개였다. `artifacts/ego-parity-v2-signing.json`에 기록했다. 기존 자동 실행 보호를 우회하거나 키체인 승인 질문을 다시 하지 않았다. 앱을 실행하지 않았으므로 최신 Naru의 CEF, 네이티브 UI, 외부 사이트, 로그인과 IME, 60분 지속 사용은 미검증이다. E2E 01과 대표 로그인 서비스가 미정인 11의 blocked, 나머지 pending을 유지한다. 지연 포커스 경합의 잘못된 입력 예방, 교차 출처 iframe과 범용 편집기 지원도 남아 있다. 탭 복원과 확대 보류는 유지한다.
+
+빌드 스크립트는 이전 번들을 교체하고 Cargo 중간 파일 1,263개, 표시 크기 679.6MiB를 정리했다. target에는 실행 파일 세 개만 남았고 임시 앱 번들과 이 프로젝트 dist 앱 프로세스는 0개다. 최초 ps 조회는 sandbox PermissionError였고 허용된 읽기 전용 재조회로 확인했다. `artifacts/ego-parity-v2-postbuild.json`에 서명, 해시, 프로세스와 파일 목록을 남겼다. 앱과 서버, 검증 작업이나 탭을 새로 만들지 않았고 사용자 프로필과 저장 자료는 변경하지 않았다. 커밋, 푸시와 배포는 하지 않았다.
+
+## 2026-10-16, ego lite 수준 목표와 구현 후 통합 E2E 방식으로 전환
+
+사용자는 기본 개발판에서 멈추지 않고 ego lite 수준의 독립 브라우저를 완성하도록 목표를 명확히 했다. 반복적인 전체 회귀검사보다 남은 제품 구현을 먼저 진행하고, 통합 빌드 후 실제 앱의 E2E 목록으로 확인하라고 요청했다. `docs/ego-parity-e2e.md`에 14개 사용 여정과 같은 앱 해시 기준, pending, pass, fail, blocked 판정을 만들고 제품 계획과 Preseller 내장 계획을 연결했다. 이 목록은 최소 통합 관문이며 현재 미지원 기능을 자동으로 목표에서 제외하지 않는다. 사용자가 보류한 탭 복원과 확대는 유지한다.
+
+앱 goal 조회 결과 기존 목표는 paused였다. 새 목표 등록은 unfinished goal이 있다는 오류로 거절됐다. 현재 goal 도구에는 재개나 목적 변경 기능이 없어 기존 목표를 완료 처리하거나 새 목표가 활성화됐다고 기록하지 않았다. 문서에는 변경한 목표와 개발 방식을 반영했고 사용자 요청에 따른 이번 구현은 진행했다. 최종 조회에서도 goal은 paused다.
+
+`src/browser.rs`는 PressTarget에 원래 키와 참조, isolated context와 관찰 token을 연결한다. 두 키 입력 응답 뒤 PressVerify로 이어지며 같은 탭의 pending을 유지한다. `src/dom_bridge.js`는 최대 하나의 passive keydown 관찰을 등록하고 원래 대상과 다른 요소로 전달된 관찰을 구분한다. Rust는 미일치에 KEY_TARGET_MISMATCH와 attempted, outcomeUnknown을 반환한다. 관찰이 없는 경우 unconfirmed이며 Enter 탐색이 ACK 직후 또는 사후 확인 중 발생한 경우에도 같은 의미를 유지한다. 제어권 상실, 취소, Browser 교체와 렌더러 종료 오류는 유지한다. 키 이벤트를 차단하거나 페이지 효과를 되돌리지 않으므로 지연 포커스 경합 자체는 해결된 것으로 판정하지 않는다.
+
+명시적 contenteditable fill은 기존 합성 beforeinput과 직접 자식 교체에서 전체 Range 선택, Chromium Input.insertText, native innerText 비교로 바꿨다. 준비에서 선택과 포커스를 확인하고 사후 읽기 전에 노드 10,000개, 깊이 64와 텍스트 상한을 확인한다. 요청과 결과의 줄바꿈을 임의로 정규화하지 않는다. 새 renderer나 상주 프로세스는 없으며 키 관찰은 새 읽기와 동작, 소비 또는 5초 단발 만료에서 정리한다. renderer가 멈추면 실제 만료 정리 시각은 지연될 수 있다. 키 입력, 일반 입력칸, contenteditable, 아키텍처와 메모리 문서, README를 갱신했다.
+
+검증은 사용자 요청에 따라 구분했다. 전체 Rust 단위, 모의 DOM 회귀와 CEF 회귀 묶음은 실행하지 않았다. cargo fmt, JavaScript 구문과 공백 검사는 통과했다. 기존 Rust 키 검사 연결은 새 사후 확인 계약으로 조정했지만 실행하지 않았다. 기존 모의 DOM의 합성 contenteditable와 정확한 이전 press 응답을 전제로 한 일부 기대는 새 계약으로 이행할 잔여 작업이며 이전 373개와 128개의 통과를 이번 코드에 적용하지 않는다. E2E용 tests/contenteditable_smoke.py와 fixture는 단일 줄, 여러 줄, 빈 값, shadow와 frame, 취소와 읽기 전용, 대상 변경과 인계 흐름으로 조정했다. tests/native_fill_smoke.py의 이전 synthetic 편집기 분기도 정리했다. Python AST 2개 확인은 exit 0이며 담당 에이전트 출력 bf0403이 근거다. 실제 E2E는 실행하지 않았다.
+
+`CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 ./scripts/dev.sh --release --build-only`로 통합 release 빌드를 한 번 실행했다. 전체 과정은 106.78초, exit 0이며 소스와 Cargo 파일 32개가 빌드 전후 일치한다. 근거는 `artifacts/ego-parity-v1-build.json`과 로그다. 새 앱 실행 파일 SHA-256은 `71989690515d8630669d1053f137306ae229a13dc0740ec7614d86fc0f1d111c`, 번들 내부 CLI는 `4e1e1e2a9243489ea407e9e1cd33f48ed37bb9aaa6bac5ccf9be1794bcc1149f`다. 후보 해시를 E2E 목록에 고정했으며 서명은 local.lightbrowser.dev ad hoc이다.
+
+실제 Naru CEF, 네이티브 UI, 외부 사이트, 로그인과 IME, 장시간 메모리 E2E는 미실행이다. NARU_CODESIGN_IDENTITY가 미지정이고 읽기 전용 유효 서명자 조회가 일반 환경과 허용 환경 모두 0개였다. 기존 dev.sh는 이 조건의 자동 실행을 빌드 전에 거절한다. 사용자에게 키체인 승인을 다시 요청하거나 보안 설정을 우회하지 않았다. E2E 01은 blocked, 대표 로그인 서비스가 미정인 11도 blocked이며 나머지는 pending이다. 빌드 성공을 앱 동작 성공으로 기록하지 않는다.
+
+빌드 스크립트가 Cargo 중간 파일 1,263개, 표시 크기 679.5MiB를 정리했다. 최종 target에는 실행 파일 3개만 남고 임시 앱 번들도 없다. 프로세스 조회는 최초 sandbox에서 ps 실행이 차단됐으며 허용된 읽기 전용 재조회로 이 프로젝트 dist 앱의 PID 0개를 확인했다. `artifacts/ego-parity-v1-postbuild.json`이 근거다. 새 앱과 서버를 실행하지 않았고 기존 프로필과 탭 데이터는 변경하지 않았다. 새 커밋과 푸시, 배포는 없다.
+
+## 2026-10-16, 키보드 확장 이후 ego lite 대비 진행 상태 확인
+
+사용자의 진행 상태 질문에 따라 실제 앱 비교 기록, 제품 계획, 내장 계획과 최신 검사 원본을 대조했다. 비교 기준은 2026-10-11에 직접 확인한 ego lite의 공간과 CLI 사용 흐름이며 최신 전체 기능 동등성을 평가한 것은 아니다. 현재는 사용자와 AI 공간, CLI와 일상 브라우저 기능을 갖춘 개발용 알파다. 최근 Chromium 클릭, 텍스트 입력과 24개 키 형식은 소스 구현 상태이며 기존 앱에 반영된 기능과 구분한다.
+
+`artifacts/keys-native-v1-rust-tests.json`의 소스 및 Cargo 파일 32개와 보존 실행 파일 2개의 해시가 현재 파일과 모두 일치했다. 해당 기록의 Rust 단위 373개 통과와 모의 DOM 기록의 128개 통과를 확인했으며 이번에 검사를 다시 실행하지 않았다. 독립 Chromium의 제품 bridge 검사는 28개 중 27개 통과이고, 첫 입력의 지연된 포커스 변경으로 다른 입력칸에 키가 전달된 실패 1개는 남아 있다. 별도 포커스 조건의 준비 거절 검사 통과를 원래 실패의 해결로 합산하지 않는다.
+
+직전 포커스 조사에서는 고정 Chromium 소스를 읽었다. focus emulation은 페이지의 포커스뿐 아니라 가시성과 이벤트, 해제 수명에도 영향을 주므로 해결책으로 적용하지 않았다. 근거는 `artifacts/focus-delivery-v1-sources.json`이다. 이번 상태 확인에서 제품 코드를 추가로 변경하지 않았다.
+
+최신 Naru CEF와 네이티브 UI의 통합, 외부 사이트의 로그인과 복잡한 입력, 실제 IME, 장시간 자원 회수와 같은 조건의 메모리 비교, 빌드 사이의 안정적인 서명이 남는다. Preseller 내장은 설계 단계이고 탭 복원 보류는 유지한다. 독립 Chromium 관찰과 이전 Naru 앱의 성공을 최신 앱 검증으로 계산하지 않았다.
+
+상태 확인으로 변경한 추적 파일은 이 작업 기록뿐이다. 새 빌드, 앱이나 서버 실행, 서명과 키체인 조작은 없으며 정리할 새 빌드 생성물도 없다. 기존 앱과 사용자 프로필, 탭 데이터를 보존했고 커밋과 푸시는 하지 않았다.
+
+## 2026-10-16, AI 키보드 이동과 현재 포커스 참조
+
+직전에는 ego lite 대비 상태를 확인하고 앞선 입력 작업의 검사 생성물과 기록을 정리했다. 이번에는 독립 브라우저의 웹 폼과 드롭다운 조작을 위해 Enter 전용 CLI를 확장했다. `src/keyboard.rs`의 작은 KeyPress 값을 CLI와 브라우저가 공유하며 기본 키 14개와 지정한 Shift 조합 10개를 지원한다. `src/lib.rs`, `src/cli.rs`, `src/browser.rs`를 연결하고 기존 프로토콜의 key 문자열 형식은 유지했다. 임의 문자와 미지원 조합은 CLI와 서버에서 포커스 준비 전에 거절한다.
+
+`ActionEvidence::Press`가 원래 키를 보관하고 준비 응답이 다른 허용 키로 바뀌어도 거절한다. 기존 Chromium 입력 배치를 재사용해 누름과 해제 두 요청, 접수와 응답 집계, TAB_BUSY, 취소와 제어권 및 문서 검사, 늦은 응답 차단을 유지한다. Enter와 Space만 텍스트 있는 keyDown이고 나머지는 rawKeyDown이다. nativeVirtualKeyCode는 0이며 Shift는 두 이벤트의 modifier 8이다. 별도 modifier 이벤트나 지속적인 키 상태, editing commands와 자동 재시도는 추가하지 않았다. 기본 이동과 삭제, 선택, 취소는 Chromium이 처리한다.
+
+`src/dom_bridge.js`는 같은 24개 키의 포커스 준비를 지원한다. `read.focusedRef`는 이번 interactive 목록에 포함된 가장 안쪽 논리 포커스 참조이며 기존 문서, 열린 root, frame과 깊이 상한을 사용한다. 읽기 세대와 ref, 두 포커스 관측을 확인하고 Rust에서 같은 반환 목록과 대조한 뒤 탐색 세대 접두사를 붙인다. 키 입력 후 다시 read해서 다음 대상으로 사용할 수 있다. 각 press는 지정 ref에 포커스를 요청하므로 같은 원래 ref에 Tab을 반복하는 동작은 연속 순회가 아니다. 새 영속 저장, 전체 문서 재순회, 프로세스나 UI renderer는 추가하지 않았다. 실제 메모리 절감량은 측정하지 않았다.
+
+공개 DOM에서는 닫힌 Shadow DOM 내부 포커스와 직접 host 포커스를 구별할 수 없었다. 열린 root가 없는 shadow host 가능 요소는 div와 일부 contenteditable을 포함해 null로 반환한다. 접근 불가 프레임, 반환 참조와 순회 상한 밖, 관찰 중 변경이나 예외도 null이다. 이것은 포커스 부재 확정값이나 OS 창 활성 상태가 아니다. read는 focus 호출이나 창 활성화를 하지 않는다.
+
+검증 근거는 다음과 같이 구분한다.
+
+- format, 오프라인 lib 테스트 컴파일, 기본 구성과 CLI 전용 구성의 전체 타깃 검사가 모두 exit 0이었다. 근거는 `artifacts/keys-native-v1-check.json`과 로그다. 같은 실행 파일의 Rust 단위는 `373 passed; 0 failed; 0 ignored`였고 테스트 출력 기준 1.84초였다. 새 검사 5개와 기존 수명 회귀 4개 확장으로 canonical 키 파싱, 실제 전송 파라미터, 원 키 치환 거절, raw 요청 거절, read 결과의 focusedRef 재사용을 확인했다. 근거는 `artifacts/keys-native-v1-rust-tests.json`이다. 자체 임시 Unix 소켓 검사가 가능한 허용 환경에서 실행했고 CEF는 초기화하지 않았다.
+- 모의 DOM은 128개 통과다. 지원 키와 준비 무부작용, readonly, alias 거절, 열린 shadow와 iframe의 포커스, 참조와 순회 상한, 예외와 문서 변경 및 재진입을 다룬다. 담당 에이전트의 실제 `node --test` exit 0 출력 chunk d30561과 최종 구문 및 해시 출력 chunk 7c8fc1을 `artifacts/keys-native-v1-dom-summary.json`에 명시했다. 원본 TAP 로그 파일을 새로 만든 것처럼 기록하지 않았다.
+- 독립 ego Chromium의 사전 관찰 46개와 추가 7개, closed shadow 관찰 6개는 제품 통과 수에 합산하지 않는다. 포커스된 div의 PageUp, PageDown과 Space에서 스크롤 효과가 없었던 관찰도 보존했다. 최종 제품 bridge와 fixture로 검사한 28개 중 27개가 통과했고, 준비 거절을 기대한 redirect 1개가 실패했다. 문서가 포커스되지 않아 준비 단계에서는 핸들러가 실행되지 않았고, CDP 입력의 활성화 뒤 다른 textarea로 이동해 Enter가 그곳에 전달된 실제 경합이다. 같은 제품 소스에서 이미 포커스된 문서의 준비만 따로 검사한 1개는 FOCUS_NOT_REACHED, attempted false, 엔진 전송 0개였다. 이를 원래 실패 해결이나 28개 일괄 통과로 재분류하지 않는다. 원본과 집계는 `artifacts/keys-native-v1-final-probe.json`, `keys-native-v1-focused-rejection.json`, `keys-native-v1-browser-summary.json`에 있다.
+- 독립 Chromium은 152이며 Naru의 CEF 156과 다르다. focus 에뮬레이션은 쓰지 않았지만 ego CDP의 자동 활성화가 있어 Naru의 배경 선택 보존과 AppKit 동작 증거가 아니다. `tests/native_press_smoke.py`, `tests/fixtures/native_press.html`, `tests/smoke.py`에 24개 키와 취소, focusedRef 후속 검사를 준비했다. Python 3개와 fixture inline JS 구문만 확인했으며 실제 Naru smoke는 실행하지 않았다. 구문 근거는 `artifacts/keys-native-v1-smoke-static.json`이다. 최신 앱 CEF, 네이티브 UI, 외부 사이트, IME, 첫 요소와 마지막 요소의 Tab 경계, 장시간 RAM과 자원 회수는 남는다.
+
+키 매핑은 고정 Chromium의 Input.pdl, keyboard_codes_posix.h, editing_behavior.cc를 확인했다. 처음 잘못된 editor_behavior.cc 경로의 404도 `artifacts/keys-native-v1-sources.json`에 보존하고 공식 디렉터리 목록에서 실제 파일명을 확인해 가져왔다. README, 아키텍처, 키 입력 계약, 제품 계획, 메모리와 Preseller 내장 계획을 갱신했다. 독립 최종 소스 검토에서 추가 차단 결함은 발견하지 못했다. 최종 해시와 문서 링크, 공백 및 전용 target 부재 확인은 `artifacts/keys-native-v1-final-static.json`에 기록했다. 독립 브라우저 완성과 Preseller 내장은 여전히 진행 중이며 이번 입력 확장을 전체 완성으로 판정하지 않는다.
+
+컴파일 세션 80812와 단위 세션 22019는 exit 0으로 종료됐다. 이번 전용 `target/.keys-native-test-6_cpy3__`의 경로와 inode를 확인한 뒤 파일 2,060개와 디렉터리 290개를 정리했다. 파일 크기 합계는 1,509,108,608바이트이며 물리 디스크 회수량은 아니다. symlink는 없었고 삭제 전후 소스와 보존한 앱, CLI 해시가 일치했다. `artifacts/keys-native-v1-processes.json`과 `artifacts/keys-native-v1-cleanup.json`이 근거다. ego TaskSpace 12는 finish 한 번으로 p1과 함께 종료했고 unmanaged 탭 0개였다. 업데이트 알림은 확인했지만 업그레이드하지 않았다. 새 Naru 앱, 서버, 서명과 키체인 조작은 없었다. 사용자 프로필과 기존 탭은 보존했으며 커밋과 푸시는 하지 않았다.
+
+## 2026-10-16, Chromium 텍스트 입력 연결과 ego lite 대비 상태 갱신
+
+독립 브라우저 목표를 이어 일반 텍스트 입력을 Chromium에 연결했다. 이후 사용자의 진행 상태 질문에 따라 현재 소스와 검사 원본, 2026-10-11 실제 앱 비교 기록을 다시 대조하고 남아 있던 검사 생성물과 기록을 정리했다. 질문 이후 제품 코드를 추가로 바꾸거나 앱을 빌드하지 않았다. 아래 결과는 직전 구현과 완료된 검사에 대한 기록이며 질문에 답하면서 새로 실행한 제품 검사로 계산하지 않는다.
+
+`src/browser.rs`와 `src/dom_bridge.js`의 fill은 text, search, tel, url, password와 textarea에서 전체 선택 준비, `Input.insertText` 한 번, 원래 대상의 값 확인 순서다. 빈 문자열 삭제도 같은 경로를 사용한다. Chromium의 beforeinput 취소와 maxlength를 따르며 최종 값이 요청 문자열과 같아야 성공한다. 준비부터 사후 확인까지 원 Browser, 문서, 참조와 제어권을 보존하고 대기 잠금을 유지한다. 전달 응답만으로 성공하지 않으며 입력 시도 뒤 자동 재시도하지 않는다. email, number, 날짜 등 나머지 지원 유형과 contenteditable은 기존 DOM 처리를 유지한다. 응답에는 원문이나 실제 입력값, 임의 페이지 예외를 넣지 않는다.
+
+포커스가 준비와 전송 사이에 바뀔 가능성은 남는다. Chromium 입력은 당시 포커스를 대상으로 하므로 사후 확인이 잘못 전달된 입력을 되돌리지 않는다. CRLF 정규화도 엄격한 문자열 비교에서는 미도달로 처리한다. 실제 하드웨어 입력, 모든 편집기 호환성, 입력 도중 다른 페이지 조작과의 원자성을 보장하지 않는다. 요청 동안의 원문과 Browser 참조 외에 새 상주 프로세스, renderer나 영속 저장은 추가하지 않았다. 실제 RAM 절감량은 측정하지 않았다.
+
+검증 근거는 다음과 같이 구분한다.
+
+- Rust 단위는 `368 passed; 0 failed; 0 ignored`였다. 새 회귀 8개는 입력 준비, 단일 전송, 사후 확인, 원 대상과 제어권, 취소와 늦은 응답, 오류의 정보 제한을 다룬다. `artifacts/text-native-v1-rust-tests.json`과 로그가 근거다. 자체 임시 Unix 소켓 사용이 허용된 환경에서 같은 테스트 실행 파일을 검사했으며 CEF 엔진은 초기화하지 않았다.
+- format, 오프라인 잠금 의존성 lib 테스트 컴파일, 기본 구성과 CLI 전용 구성의 전체 타깃 검사가 모두 exit 0이었다. 기존 test 전용 dead_code 경고 3개가 남았다. `artifacts/text-native-v1-check.json`에 기록했고 소스와 Cargo 파일 31개, 보존한 앱과 CLI 2개의 해시가 전후 일치했다.
+- 모의 DOM은 116개가 통과했다. `artifacts/text-native-v1-dom-after.json`이 근거다. 독립 ego lite Chromium에서는 입력 종류 40개와 선택 6개를 관찰했으며 이를 제품 통과 수로 세지 않는다. 최종 bridge 검사는 29개 중 28개가 통과했고 own getter fixture의 setter 누락으로 1개가 실패했다. fixture만 고쳐 같은 제품 소스로 해당 1개를 통과해 총 29개 계약을 확인했다. 전체 29개를 다시 일괄 실행한 결과는 아니다. 집계는 `artifacts/text-native-v1-summary.json`을 따른다.
+- 독립 검사는 Chromium 152이며 Naru가 고정한 CEF Chromium 156과 다르다. 포커스 에뮬레이션은 쓰지 않았으나 ego CDP의 대상 활성화가 있으므로 Naru의 배경 선택 보존이나 AppKit 입력 증거로 설명하지 않는다. 기본 제한 환경의 XPC 시작 실패는 로그에 보존했고 원인을 확인한 뒤 허용된 실행 환경에서 같은 공간을 이어 검사했다. TaskSpace 11은 finish 한 번으로 종료했으며 p1 종료와 closedSpace true를 확인했다. 업데이트 알림은 전달했지만 업그레이드하지 않았다.
+- `tests/native_fill_smoke.py`와 `tests/fixtures/native_fill.html`에 Naru 통합 검사 항목을 준비했다. 관련 Python 4개와 inline JavaScript 문법을 확인한 근거는 `artifacts/text-native-v1-final-smoke-static.json`이다. 이 smoke를 Naru에서 실행하지 않았다. 독립 검토에서 추가 차단 결함을 찾지 못했지만 최신 Naru CEF 전송, 네이티브 UI, 외부 로그인 사이트, IME와 장시간 자원 검증은 남는다.
+
+입력 계약, README, 아키텍처, 제품 계획, Preseller 내장 계획과 프로젝트 메모리를 갱신했다. ego lite에서 관찰한 공간과 CLI 협업 구조는 구현했으며 일상 탐색 기능도 갖췄지만 현재 판정은 개발용 알파다. 일반 키와 IME, 교차 출처 iframe, 내장 모델과 자율 실행기, 안정적인 개발 서명과 동일 앱의 통합 검증, 장시간 메모리 측정이 남는다. Preseller 내장은 설계 단계이고 재시작 탭 복원 보류를 유지한다.
+
+컴파일 세션 85682와 단위 세션 98601의 exit 0 종료 결과를 기록했다. 이번 전용 `target/.text-native-test-_0n0d8wx`의 경로와 inode를 확인한 뒤 파일 2,060개, 디렉터리 290개를 정리했다. 파일 크기 합계는 1,507,351,048바이트이며 물리 디스크 회수량은 아니다. symlink는 없었고 삭제 전후 소스와 기존 실행 파일 해시가 일치했다. 근거는 `artifacts/text-native-v1-processes.json`과 `artifacts/text-native-v1-cleanup.json`이다. 새 Naru 앱, 서버, 서명과 키체인 조작은 없었으며 사용자 프로필과 기존 탭 데이터를 보존했다. HEAD는 7074841이며 이번 후속 변경은 커밋하거나 푸시하지 않았다.
+
+## 2026-10-16, ego lite 기준 진행 상태 재확인
+
+사용자의 진행 상태 질문에 따라 제품 계획, 2026-10-11 실제 앱 비교 기록, 현재 CLI와 작업 제어 경로, 최신 검증 원본을 대조했다. 기존 graphify 지도는 구조 탐색에만 사용했다. 현재 소스와 Cargo 파일 31개의 SHA-256이 `artifacts/cli-observation-v1-rust-tests.json`의 검사 대상과 전부 일치하며, 해당 원본은 Rust 단위 360개 통과다. 이번에 단위 검사를 다시 실행한 것은 아니다.
+
+사용자와 AI 공간, 작업 생성과 인계, 중지와 종료, 기본 CLI와 일상 탐색 기능을 갖춘 개발용 알파로 판단한다. 클릭과 Enter의 Chromium 입력 전환은 소스 구현과 독립 Chromium 근거가 있지만 최신 Naru CEF 실행은 남았다. fill, select, check는 DOM 경로이며 일반 키, IME, 교차 출처 iframe, 내장 모델 연결과 자율 실행기는 미구현이다. Preseller 내장은 설계 단계다. 최신 앱 하나로 로그인, 입력, 다운로드, 사용자 개입과 중지를 이어 검증해야 하며 장시간 메모리와 복구, 안정적인 개발 서명도 남은 과제다. 과거 Naru CEF 결과나 독립 ego 실행을 최신 Naru 앱 검증으로 합산하지 않았다. 탭 복원 보류는 유지한다.
+
+직전 시작한 Input.insertText 조사는 기존 fill의 입력 종류와 값 정규화, 포커스 경합에 관한 소스 검토까지만 진행했다. 제품 구현이나 입력 fixture 검증은 없으므로 완료 기능에 포함하지 않는다. 검증 공간 10은 `finish({keep:[]})` 한 번으로 종료했고 실제 응답은 closedSpace true, p1 종료, 보존할 unmanaged 탭 0개였다. 처음 증거 파일 저장은 ego Node의 상대 경로에서 ENOENT로 실패했지만 공간 종료는 성공했다. 종료 호출을 반복하지 않고 실제 명령 출력의 응답을 `artifacts/text-input-v1-cleanup-space.json`에 보존했다. ego lite 업데이트 알림을 확인했으며 업그레이드는 실행하지 않았다.
+
+이번 제품 코드 변경, 새 단위 검사, 모의 DOM, Naru CEF, 네이티브 UI와 외부 사이트 검사는 없다. 앱 빌드, 서명, 앱이나 서버 실행도 없으며 새 빌드 생성물은 없다. 기존 앱, 사용자 프로필과 탭 데이터를 정리 대상으로 삼지 않았다. 현재 HEAD는 7074841이며 로컬 후속 변경을 새로 커밋하거나 푸시하지 않았다. 변경한 추적 파일은 이 작업 기록뿐이다.
+
+## 2026-10-16, CLI 관측과 로딩 대기 수정 완료, 단위 검증
+
+직전 진행 상태 답변은 기존 기능과 남은 일을 점검한 것이며 구현 진전은 없었다. 목표를 이어 현재 소스를 다시 확인하고 중단했던 CLI 상태 관측 수정을 마무리했다. `overview()` 메서드를 필드처럼 읽던 컴파일 오류도 해소했다. 독립 브라우저 완성과 같은 구현의 Preseller 내장 목표는 여전히 진행 중이며 이번 변경을 커밋하거나 푸시하지 않았다.
+
+`src/browser.rs`의 탭 목록, Open 생성 응답, renderer와 로딩 진단, 대기 결과는 공통 관측 경로를 사용한다. 원 Browser와 탐색, 문서, 로딩 세대 및 소유권을 잡은 뒤 STATE borrow 밖에서 CEF 값을 읽는다. getter 전후와 최종 JSON 조립 전에 상태를 재검사하며 `tab_info`는 네이티브 호출 없는 직렬화만 담당한다. 실제 main-frame URL과 요청 URL의 의미를 구분한다. 작업 범위의 목록은 최신 scope와 전체 대상 집합을 확인하고 범위 없는 목록은 모든 탭의 메타데이터를 볼 수 있다. 목록 일부만 성공으로 반환하지 않는다. 탭 생성 뒤 조회만 실패하면 같은 오류에 `tabCreated:true`, 생성된 `tab`, `stateUnavailable:true`, `outcomeUnknown:false`를 넣어 중복 생성으로 이어지지 않도록 구분한다.
+
+대기는 관측 전에 제거하지 않는다. tab, 시작 시각, 활성 플래그 Arc로 원래 대기를 식별하고 오래된 tick, probe 오류, DOM 응답과 예약 실패가 교체된 대기를 건드리지 않게 했다. 관측이 불안정해도 기존 절대 마감은 유지한다. 원래 탐색 실패나 renderer 종료는 별도 오류로 반환하며, 상태를 읽지 못했으면 `state:null`, `stateUnavailable:true`로 표시한다. 준비 상태 확인은 대기당 하나이고 최종 응답은 기존 Reply 활성 플래그로 한 번만 전달한다.
+
+ReadyState의 각 CDP 전송은 host와 파라미터 준비 뒤 원 Browser, 문서, 소유권, scope, 대기 식별과 마감을 확인한다. 내부 상태에 등록한 뒤 다른 네이티브 조회 없이 전송한다. callback도 원 Browser와 일치해야 최종 관측을 시작하고 완료할 수 있다. 일반 페이지 변경 명령 전체를 재설계하거나 자동 재시도를 추가하지 않았다. 탐색은 URL과 히스토리 및 로딩 확인, 권한 대기와 찾기 정리, 최종 관측, begin, 즉시 전송 순서다. 정리 중 대상이 바뀌면 전송하지 않은 탐색 의도를 남기지 않는다. 사람이 중지된 AI 탭을 탐색하는 권한과 CLI scope 검사는 분리하며, CLI 배경 탐색과 frame 없는 renderer 복구 Reload를 유지한다.
+
+검증은 다음과 같이 구분한다.
+
+- `cargo fmt --all --check`, 오프라인 잠금 의존성 lib 테스트 실행 파일 컴파일, 기본 구성과 CLI 전용 구성의 전체 타깃 검사가 모두 exit 0이었다. 근거는 `artifacts/cli-observation-v1-check.json`과 해당 로그다. 기존 test 전용 dead_code 경고 3개는 앞선 검사와 문구 및 개수가 같았다.
+- 컴파일이 만든 같은 해시의 실행 파일로 Rust 단위 `360 passed; 0 failed; 0 ignored`를 확인했다. 테스트 출력 기준 1.84초다. 기존 소켓 검사에 필요한 임시 Unix 소켓을 허용한 환경에서 실행했으며 Naru 앱이나 CEF 엔진을 초기화한 검사가 아니다. 근거는 `artifacts/cli-observation-v1-rust-tests.json`과 로그다. 소스 및 Cargo 파일 31개와 기존 앱, CLI 2개의 해시는 컴파일과 단위 검사 전후 일치했다.
+- 새 회귀 10개는 getter 5개 경계에서의 탭 제거, Browser와 문서 교체, 로딩과 소유권 변경, 실제 URL 구분, 목록 전체 재검사, Open의 생성 사실, 절대 마감과 오류 상태, 대기 교체 중 관측과 전송 및 예약, 원 Browser callback, CDP 준비 중 취소, 네이티브와 CLI 권한, 정리 뒤 탐색 차단을 다룬다. 기존 ReadyState fixture 3개는 시작 시각 식별자를 공유하도록 조정했다. 실제 함수에 조회와 전송 경계를 주입한 상태 검사이며 실제 CEF 재진입 증거로 설명하지 않는다.
+- 독립 소스 검토에서 최종 helper 연결과 신규 회귀에 추가 차단 결함을 발견하지 못했다. 모의 DOM, 독립 Chromium, 최신 Naru CEF, 네이티브 UI와 외부 사이트 검사는 이번에 실행하지 않았다. 느린 HTTP, redirect, 로그인과 사용자 인계, 종료 중 callback, 장시간 RAM과 실제 네이티브 참조 회수는 남은 검증이다.
+
+`docs/cli-state-observation.md`, README, 아키텍처, 제품 계획, 메모리와 화면 상태 읽기 문서를 갱신했다. 조회 동안 대상 Browser와 Frame, 실제 URL을 잠시 보관하고 목록의 비용은 대상 탭 수에 비례한다. 기존 대기 타이머를 재사용하며 새 worker, renderer, 반복 타이머나 영속 저장은 없다. RAM이나 응답 속도 절감량을 측정한 결과는 아니다.
+
+컴파일 세션 82953과 단위 세션 32935는 모두 exit 0으로 종료됐다. 전용 `target/.cli-observation-test-6ohvsee0`의 경로와 inode를 확인한 뒤 파일 2,060개, 디렉터리 290개를 정리했다. 파일 크기 합계는 1,505,035,583바이트이며 물리 디스크 회수량은 아니다. symlink는 없었고 삭제 전후 소스와 기존 실행 파일 해시가 일치했다. `artifacts/cli-observation-v1-processes.json`, `artifacts/cli-observation-v1-cleanup.json`에 근거를 남겼다. 앱 번들 교체, 앱이나 서버 실행, 서명과 키체인 조작은 없었으며 사용자 프로필과 기존 탭 데이터를 변경하지 않았다.
+
+최종 정적 확인에서도 소스와 기존 실행 파일 해시 33개가 일치했고 변경 문서의 로컬 링크 123개에 누락이 없었다. 공백 검사도 통과했다. `artifacts/cli-observation-v1-final-static.json`이 근거이며 HEAD는 `7074841`, 새 커밋과 푸시는 없다.
+
+## 2026-10-16, ego lite 대비 현재 개발 단계 점검
+
+사용자의 진행 상태 질문에 따라 2026-10-11 실제 비교 기록, 제품 계획, 현재 코드와 검증 원본을 읽었다. ego lite 기준은 당시 확인한 버전 0.5.1.13의 사용자 공간, CLI 작업 공간, 배경 선택 유지와 실제 페이지 입력이다. 이번에는 ego lite를 다시 실행하지 않았으며 전체 기능 동등성이나 최신 버전 비교를 수행한 것은 아니다. 기존 graphify 구조 지도는 호출 경로를 찾는 데만 쓰고 현재 소스를 별도로 확인했다.
+
+현재 단계는 사용자와 AI의 협업 구조, 기본 CLI 조작과 일상 브라우저 기능을 구현한 개발용 알파다. 과거 Naru 실행에서 공간과 선택 보존, 일부 사용자 인계, 북마크, 검색, 다운로드와 찾기를 확인한 기록이 있다. 이후 추가한 방문 기록, 탭 정렬, iframe과 입력 보강 등은 소스 검사와 실제 앱 검증을 구분해야 한다. 내장 대화와 모델 연결은 없으며 Preseller의 부모 뷰와 수명주기를 받는 공통 연결 API도 아직 없다. Rust를 썼다는 이유로 ego lite보다 가볍다고 결론 내릴 수 없고 동일 조건의 자원 비교와 장시간 회수 검증이 남아 있다.
+
+`native-focus-v3-suite.json`의 과거 로컬 CEF 32개 exit 0과 `shell-snapshot-v1-permitted-rust-tests.json`의 앞선 소스 단위 350개 통과를 다시 확인했다. 현재 `src/browser.rs` 해시는 후자의 검사 대상과 다르며, 미완성 CLI 관측 수정에는 `overview` 메서드를 필드처럼 사용하는 코드와 대기 수명 관련 미완료 범위가 남아 있다. 따라서 현재 작업 폴더를 최종 빌드 가능한 완료본으로 보고하지 않는다. 원격 커밋 7074841, 그 이후의 로컬 변경, 기존 앱 번들을 구분한다.
+
+제품 코드는 변경하지 않았고 이번 기록만 추가했다. 새 단위 검사, 모의 DOM, CEF 통합, 네이티브 UI와 외부 사이트 검사는 실행하지 않았다. 빌드나 앱, 서버를 시작하지 않아 새 실행 프로세스와 빌드 생성물 정리는 없다. 우선 미완성 수정을 끝낸 뒤 최신 소스를 하나의 앱으로 검증하고, 실제 로그인과 입력, 다운로드, 사용자 인계 및 중지 흐름을 확인해야 한다. 키체인 재승인 문제, 복잡한 페이지 호환성, 장시간 자원 사용은 남은 과제이며 재시작 탭 복원은 사용자의 보류 결정을 유지한다.
+
+## 2026-10-16, 기존 커밋의 비공개 원격 푸시 재확인
+
+사용자의 “푸시까지 해야지” 요청에 따라 기존 `codex/navigation-readiness` 브랜치의 커밋을 푸시했다. GitHub 조회에서 `FEABE/naru-browser`의 비공개 상태를 확인했고, 로컬 HEAD와 원격 작업 브랜치가 모두 `707484185feaa0cc14bff75c81c8cca18b87e76d`임을 확인했다. `git push origin HEAD:refs/heads/codex/navigation-readiness`는 exit 0과 `Everything up-to-date`를 반환했다. 기본 브랜치 main은 변경하지 않았다. 첫 제한 환경 네트워크 조회는 이름 해석과 연결 오류로 실패했고, 허용된 네트워크 환경에서 다시 조회해 확인했다.
+
+이후 로컬에서 진행하던 변경은 스테이징하거나 새로 커밋하지 않았다. 완료된 Reload/Stop과 화면 상태 조회 변경 외에 `src/browser.rs`의 CLI 상태 관측 작업이 미완성 상태로 섞여 있다. 구현 담당자의 쓰기를 중지하고 그대로 보존했다. 상태 관측 helper, Tabs/Open과 navigate 전환 일부만 저장됐으며, `overview()` 호출 수정 두 곳, waiter 식별과 ReadyState 전송 경합 보호, 회귀 검사가 남아 있다. `docs/cli-state-observation.md`도 아직 검증 전 초안이다. 이전 350개 단위 검사 통과는 앞선 소스에 대한 결과이며 현재 미완성 소스의 통과 결과로 재사용하지 않는다.
+
+이번 작업의 변경은 이 기록뿐이다. GitHub 비공개 상태, 원격 SHA와 푸시 명령 결과를 확인했으며 단위 검사, 모의 DOM, 로컬 CEF, 네이티브 UI와 외부 사이트 검사는 실행하지 않았다. 새 빌드, 앱이나 서버 실행, 서명과 키체인 조작이 없어 정리할 실행 프로세스와 빌드 생성물은 없다. 사용자 프로필과 기존 탭 데이터는 변경하지 않았다. 전체 브라우저 완성과 Preseller 내장은 여전히 진행 중이다.
+
+## 2026-10-16, 화면 상태 조회의 borrow 분리와 갱신 보류
+
+직전 목표 턴은 Reload/Stop 의도와 주소 초안 보존 소스, Rust 345개 검사와 생성물 정리를 마친 진전이다. 이번에는 Naru의 사용자 공간과 AI 배경 탭을 함께 표시하는 상태 조회 경계를 보완했다. 독립 브라우저 완성과 같은 구현의 Preseller 내장 목표는 유지하며 이번 변경은 커밋하거나 푸시하지 않았다.
+
+`src/browser.rs`의 기존 `shell_snapshot`은 STATE borrow 안에서 CEF 로딩과 뒤로가기, 앞으로가기 getter를 호출했다. 소스에서 확인한 borrow 충돌 가능성이며 실제 앱에서 충돌을 재현한 결과는 아니다. 현재 구현은 Browser와 탐색, 문서, 로딩 관측 세대를 캡처하고 borrow 밖에서 조회한다. getter 전후와 모든 탭 조회 후에 원래 관측을 재검사한다. 뒤쪽 탭의 조회가 앞선 탭을 바꾸거나 새 탭을 만들면 전체 스냅샷을 보류한다. 최종 STATE에서 최신 제목, 공간별 순서와 선택, AI 소유권을 조립한다. 로딩 시작과 완료 콜백은 탐색 세대와 별개인 관측 세대를 올린다.
+
+중첩 조회는 Cell과 RAII로 차단한다. 구현 중 검토에서 `then_some(Self)`의 eager 생성이 실패한 취득에서도 Drop을 실행해 바깥 가드를 해제하는 오류를 찾아 명시적 분기로 고쳤다. 연속 두 번의 중첩 조회와 정상 종료 후 재취득을 회귀에 포함했다. 소스가 동결되기 전에 수정했으며 실패한 컴파일이나 앱 실행 결과로 기록하지 않는다.
+
+`src/control_panel.rs`의 여섯 호출부는 `Option<ShellSnapshot>`을 처리한다. 무효 결과를 빈 탭 목록으로 바꾸지 않고 기존 화면을 유지하며 브라우저의 기존 100ms 갱신 예약을 사용한다. 다운로드 사이트 조회는 같은 대상의 카드를 지우지 않도록 Skipped로 처리한다. 선택 확인이 실패하면 후속 포커스 이동을 중단한다. refresh의 창 표시와 최소화 조회도 SHELL borrow 밖으로 옮겼다.
+
+통합 검토에서 첫 sync가 보류되면 캐시된 이전 탐색 세대 때문에 Stop 주소 초안이 다시 만료되는 연결 회귀를 찾았다. 명령 결과 직후에 opaque NavigationAddressReceipt를 잡고 sync 뒤에 내부 상태만으로 확인하도록 수정했다. 원래 Browser, 문서, 제어권, 탭과 공간, URL, 결과 세대를 확인하며 로딩 관측만 바뀌거나 무관한 배경 탭이 닫힌 경우는 허용한다. UI는 기존 초안의 메타데이터가 그대로인 경우에만 기준 세대를 옮기고 문자열을 덮지 않는다. 무효 receipt에는 이전 오류 안내도 표시하지 않는다. 보존 상태는 동기 호출을 넘겨 유지하지 않는다.
+
+검증은 다음과 같이 구분한다.
+
+- `cargo fmt --all --check`, 오프라인 잠금 의존성의 lib 테스트 실행 파일 컴파일, 기본 구성과 CLI 전용 구성의 전체 타깃 검사가 모두 통과했다. 근거는 `artifacts/shell-snapshot-v1-check.json`과 해당 로그다. 소스와 Cargo 파일 31개, 기존 앱과 CLI 2개의 해시가 검사 전후 일치했다.
+- 첫 제한 환경 단위 검사는 `347 passed; 3 failed`였다. 실패는 기존 protocol 소켓 검사 3개의 `bind socket: Operation not permitted (os error 1)`이며, 신규 상태 조회 검사 실패가 아니었다. 원본은 `shell-snapshot-v1-rust-tests.json`과 로그에 보존했다. 테스트가 자체 임시 폴더에 Unix 소켓을 만들고 정리하는 경로임을 확인한 뒤, 소켓 사용이 허용된 환경에서 같은 해시의 실행 파일을 재실행했다. 최종 결과는 `350 passed; 0 failed; 0 ignored`, 3.23초이며 근거는 `shell-snapshot-v1-permitted-rust-tests.json`과 로그다. 이를 Naru 앱 실행 결과로 설명하지 않는다.
+- 신규 Rust 회귀 5개는 getter 중 mutable STATE 접근, 최신 선택과 소유권 투영, 각 getter 경계의 닫힘과 Browser 교체, 탐색과 문서 변경, rejected 탭, 로딩 시작과 완료를 다룬다. 앞선 관측의 무효화, 새 탭 누락 방지, 중첩 취득과 해제도 포함한다. 실제 `shell_snapshot_with`에서 로딩 콜백이나 배경 탭 제거로 None을 만든 뒤 주소 receipt의 보존과 만료를 검사한다. 기존 UI 순수 검사 2개는 오래된 표시 세대와 유효하거나 무효한 receipt 경계에 맞춰 갱신했다. CEF getter를 주입한 상태 검사이며 실제 CEF 재진입이나 AppKit 입력 검사는 아니다.
+- 독립 소스 검토에서 최종 snapshot, 여섯 UI 호출부와 receipt 연결에 추가 차단 결함을 발견하지 못했다. 모의 DOM, 독립 Chromium, 실제 Naru CEF, 네이티브 UI, 외부 사이트와 장시간 RAM 검사는 이번에 실행하지 않았다. 기존 바이너리나 과거 검사를 최신 소스의 앱 검증으로 대신하지 않는다.
+
+`docs/shell-snapshot.md`를 추가하고 README, 아키텍처, 제품 계획, 메모리와 Reload/Stop 문서를 갱신했다. 조회 한 번의 임시 관측은 현재 탭 수에 비례하며, 주소 증표는 Browser 참조 하나와 기존 가드 및 URL을 호출 동안만 보관한다. 영속 캐시, 새 worker, 반복 타이머, 창이나 renderer를 추가하지 않았다. 실제 메모리 감소량을 측정한 것은 아니다. CLI의 `tab_info`와 탐색 시작, 스냅샷 반환 이후 전체 AppKit 렌더의 재진입 경계는 별도 후속 작업이다.
+
+컴파일 세션 35918은 exit 0, 첫 단위 세션 44962는 exit 101, 최종 단위 세션 27416은 exit 0으로 종료를 확인했다. 별도 ps 조회는 샌드박스에서 차단됐으며 프로세스 종료 판단에는 도구의 세션 종료 결과를 사용했다. 전용 `target/.shell-snapshot-test-1127dj9v`의 경로와 inode를 확인한 뒤 파일 2,060개, 디렉터리 290개를 삭제했다. 파일 크기 합계는 1,499,556,252바이트이며 물리 디스크 회수량이나 RAM 측정값은 아니다. 심볼릭 링크는 없었고 삭제 전후 소스와 기존 앱 및 CLI 해시가 일치했다. `artifacts/shell-snapshot-v1-cleanup.json`에 결과를 기록했다. 새 Naru 앱, CEF 초기화, 외부 HTTP 서버, 서명과 키체인 조작은 없었고 사용자 프로필과 기존 탭 데이터는 건드리지 않았다.
+
+최종 정적 확인에서 변경 문서의 로컬 링크 117개에 누락이 없었고 `git diff --check`가 통과했다. 소스와 기존 실행 파일 33개 해시도 다시 일치했다. lib 테스트 컴파일 경고는 기존 dead_code 3개와 같았다. 최종 HEAD는 `7074841`이며 새 커밋과 푸시는 없다. 근거는 `artifacts/shell-snapshot-v1-final-static.json`이다.
+
+## 2026-10-16, 새로고침과 로딩 중지의 의도 및 주소 초안 보존
+
+직전 턴은 클릭 변경을 `7074841`로 커밋하고 비공개 원격 SHA 일치까지 확인한 진전이다. 독립 브라우저 목표를 이어 로딩 중지 표시가 실행 단계에서 새로고침으로 바뀌는 경로와 주소 초안 소실을 보완했다. 이번 추가 변경은 커밋하거나 푸시하지 않았다. Naru 전체 완성과 같은 구현의 Preseller 내장은 미완료다.
+
+`src/browser.rs`는 표시한 탭, 공간, 탐색 세대와 중지 여부를 `NavigationControlTarget`으로 받는다. CEF 로딩 상태, provisional과 intent_pending을 함께 확인한다. 완료된 로딩과 진행 중인 같은 중지의 중복 요청은 인계, 정리와 전송 없이 끝낸다. 과거 stopped 상태가 남아 있어도 이후 새 리소스 로딩은 중지할 수 있다. 새로고침을 선택한 뒤 새 로딩이 시작됐다면 중지로 바꾸지 않고 거절한다. 오류 화면의 다시 시도도 명시적인 새로고침 경로를 사용한다.
+
+네이티브 조회와 정리 콜백 전후 원래 Browser, 문서, 탐색 세대와 작업 소유권, 현재 공간과 선택을 검사한다. 필요한 AI 인계가 만든 정확한 revision과 epoch 증가만 허용한다. AppKit 조회는 마지막 CEF 로딩 표본보다 먼저 하고 이후에는 순수 상태만 검사한다. 처음 구현을 검토하면서 표본 뒤 AppKit 조회가 로딩을 완료시키면 오래된 표본으로 AI 작업을 멈출 수 있는 경계를 찾아 이 순서를 바꿨다. CLI stop은 별도 경로에서 로딩이 없어도 권한 대기, 찾기와 방문 후보 정리 후 stop_load를 보내는 기존 계약을 유지한다. 배경 선택을 바꾸지 않고 전송 전 요청 취소와 대상 변경은 거절한다.
+
+`src/control_panel.rs`는 버튼, 메뉴와 ⌘R을 같은 경로로 연결했다. 기존 ⌘⇧R도 같은 해석을 유지하며 강제 새로고침 기능은 추가하지 않았다. 메뉴는 열릴 때의 대상을 보관하고 검색, 북마크, 다운로드와 공간 목록, 입력기 조합 상황에서는 실행을 막는다. 동기 호출 문맥 한 개로 주소 자동 갱신을 잠시 보류한다. 주소 텍스트를 저장해 되쓰지 않으며 최신 sync 후 런타임이 확인한 epoch에만 원래 초안의 기준을 맞춘다. 검토 중 중지 이후 epoch를 아직 반영하지 않은 화면으로 보정하면 항상 실패하는 경계를 확인해 sync와 보정 순서를 연결했다.
+
+첫 구현의 341개 검사가 통과한 뒤 AI 인계 직후 창 포커스 변화로 명령이 실패하면 E와 E+1 차이로 초안이 만료되는 조건부 소스 경로를 확인했다. 실제 UI 재현 결과는 아니다. 최종 구현은 실패 결과에도 원래 Browser, 문서, 소유권과 선택, 예상 epoch가 유지된 경우만 보존 근거를 함께 반환한다. Stop과 전송 전에 실패한 Reload 모두 적용하며 성공 Reload에는 보존 예외를 주지 않는다. 명령 실행 가능 여부와 주소 보존 가능 여부를 분리해 같은 페이지의 overlay나 창 포커스 변화가 입력 내용을 버리지 않게 했다. 실제 새 문서, 다른 소유권과 공간, 바뀐 초안 메타데이터에는 보정하지 않는다. 오류를 성공으로 표시하거나 자동으로 반복하지 않는다.
+
+README, 아키텍처, 제품 계획, 메모리 문서와 새 `docs/reload-stop.md`에 계약과 한계를 기록했다. 아키텍처와 Preseller 계획에 남아 있던 클릭 전체를 합성 입력으로 설명한 문장도 이미 커밋한 Chromium 클릭과 Enter 소스에 맞췄다. 독립 Chromium 관찰을 최신 Naru 통합 성공으로 바꾸지는 않았다. 새 저장소, 상주 프로세스, renderer와 반복 타이머는 추가하지 않았다.
+
+검증은 다음과 같이 구분한다.
+
+- v1 Rust 단위 341개와 format, 오프라인 잠금 의존성 lib 테스트 컴파일, 기본 구성과 CLI 전용 구성의 전체 타깃 검사가 통과했다. `artifacts/reload-intent-v1-check.json`, `reload-intent-v1-rust-tests.json`에 당시 소스와 결과를 보존했다. 이후 확인한 실패 초안 경계는 이 결과만으로 완료했다고 판정하지 않았다.
+- 최종 v2 Rust 단위 345개가 전부 통과했다. 기존 330개에 런타임 회귀 10개와 UI 상태 회귀 5개를 추가했다. 실제 상태 전환 함수에 네이티브 조회와 전송 경계를 주입해 중지 무동작, 중복 중지, 인계, 전송 횟수, 새 로딩 거절, Browser와 문서 교체, 소유권 변화, 실패 이후 초안 보존과 만료를 확인했다. UI 검사는 표시 대상과 주소 메타데이터 함수의 순수 검사이며 실제 AppKit 클릭 검사가 아니다.
+- v2의 format, lib 테스트 컴파일, 기본 구성과 CLI 전용 구성의 전체 타깃 검사도 통과했다. `artifacts/reload-intent-v2-check.json`, `reload-intent-v2-rust-tests.json`이 근거다. test 전용 dead_code 경고 3개와 CLI 전용 lib 9개, lib test 1개는 v1과 문구, 개수가 같고 출력 순서만 일부 달랐다. `reload-intent-v2-warnings.json`에 비교 결과를 기록했다.
+- 이번에는 모의 DOM, 독립 Chromium, 실제 Naru CEF 통합, 네이티브 UI와 외부 사이트 검사를 실행하지 않았다. DOM bridge 변경은 없고 앱 번들, release 바이너리와 서명을 새로 만들지 않았다. 키체인 승인 질문이나 조작 없이 소스와 상태 회귀 검사로 제한했다. 느린 HTTP 응답, 실제 메뉴와 주소 편집, IME, renderer 복구와 장시간 자원 회수는 후속 검증이다.
+
+기존 전체 shell snapshot의 CEF getter 호출 수명은 이 변경의 guard 검사와 별도 검토 대상이다. 이번에 stop 경로의 STATE borrow 안에서 네이티브 getter를 호출하던 부분을 제거했지만 브라우저 전체의 재진입 검사가 끝났다는 뜻은 아니다. 새로운 native command를 전송한 뒤 CEF가 실제 로딩을 멈췄는지도 단위 검사로 입증하지 않는다.
+
+컴파일 세션 62910, 14115와 단위 검사 세션 35901, 3730은 모두 exit 0으로 종료됐다. v2는 v1의 같은 임시 target을 재사용했다. 마지막에 `target/.reload-intent-test-hfqzt9we`의 identity와 symlink 0개를 확인한 뒤 파일 2,353개, 크기 합계 1,674,374,878바이트를 정리했다. 이 합계는 물리 디스크 회수량이나 RAM 측정값이 아니다. 최종 소스 31개와 기존 앱, CLI 2개의 해시는 컴파일, 검사와 정리 전후 일치했다. `artifacts/reload-intent-v2-cleanup.json`에 결과를 기록했다. 이번 작업에서 Naru 앱, HTTP 서버나 브라우저 검증 공간은 실행하지 않았다.
+
+최종 공백 검사와 변경 문서의 로컬 링크 111개 존재 검사를 통과했다. 소스와 기존 바이너리 해시 33개가 검증 기록과 일치하며 임시 target 부재를 확인했다. `artifacts/reload-intent-v2-final-static.json`에 기록했고 HEAD는 `7074841`, 이번 9개 변경 파일은 미커밋 상태다.
+
 ## 2026-10-16, Chromium 클릭 변경의 커밋과 비공개 푸시 요청
 
 사용자의 커밋 요청과 이어진 푸시 요청에 따라 CLI 클릭 구현, 테스트, 문서의 15개 파일을 기존 `codex/navigation-readiness` 브랜치에 커밋하고 같은 원격 브랜치로 올리는 범위다. 새로고침과 로딩 중지 보완은 설계만 진행한 상태에서 멈췄으며 이번 커밋에 포함하지 않는다. 제품 코드를 추가로 수정하지 않았고 아래 구현 기록의 미커밋 표시는 당시 상태다.

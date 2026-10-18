@@ -11,8 +11,8 @@
   </style>
 </head>
 <body>
-  <h1>Plain text editing-host replacement</h1>
-  <p>Local synthetic beforeinput/input actions. Formatting, selection, native undo and application editor models are not preserved.</p>
+  <h1>Chromium plain text editing-host fill</h1>
+  <p>Local native editing with full host selection. Rendered plain text is verified; DOM formatting, selection and editor undo are not guaranteed.</p>
   <pre id="receipt"></pre>
   <div id="normal" contenteditable aria-label="Normal editor"><b>old</b></div>
   <div id="plain" contenteditable="plaintext-only" aria-label="Plain editor">old plain</div>
@@ -25,7 +25,7 @@
   <div id="before-remove" contenteditable="true" aria-label="Remove on beforeinput">old</div>
   <div id="before-readonly" contenteditable="true" aria-label="Readonly on beforeinput">old</div>
   <div id="rollback" contenteditable="true" aria-label="Rollback on input">old</div>
-  <div id="rewrite" contenteditable="true" aria-label="Rewrite on input">old</div>
+  <div id="rewrite" contenteditable="true" aria-label="Replace host on input">old</div>
   <div id="input-remove" contenteditable="true" aria-label="Remove on input">old</div>
   <div contenteditable="true" aria-label="Outer editor">
     <span id="inherited" role="textbox" aria-label="Inherited editor">inherited</span>
@@ -41,14 +41,19 @@
     const counts = { beforeinput: 0, input: 0, change: 0 };
     const focuses = {};
     const events = [];
+    let sequence = 0;
     let childReady = false;
+    function plainText(host) {
+      const prototype = host.ownerDocument.defaultView.HTMLElement.prototype;
+      return Object.getOwnPropertyDescriptor(prototype, 'innerText').get.call(host);
+    }
     function show() {
       const states = Object.fromEntries(hosts.map(host => [host.id, {
-        text: host.textContent, connected: host.isConnected, editable: host.isContentEditable,
+        text: host.textContent, plainText: plainText(host), connected: host.isConnected, editable: host.isContentEditable,
         readonly: host.getAttribute('aria-readonly') === 'true',
         canonical: !host.firstChild || (host.childNodes.length === 1 && host.firstChild.nodeType === Node.TEXT_NODE),
       }]));
-      const value = { states, counts, focuses, events, childReady,
+      const value = { states, counts, focuses, sequence, events, childReady,
         hasFocus: document.hasFocus(), visibilityState: document.visibilityState };
       document.querySelector('#receipt').textContent = `EDITOR_STATE_BEGIN ${encodeURIComponent(JSON.stringify(value))} EDITOR_STATE_END`;
     }
@@ -57,20 +62,18 @@
     document.querySelector('#focus-disable').addEventListener('focus', event => event.target.contentEditable = 'false', { once: true });
     document.querySelector('#before-remove').addEventListener('beforeinput', event => event.target.remove());
     document.querySelector('#before-readonly').addEventListener('beforeinput', event => event.target.setAttribute('aria-readonly', 'true'));
-    document.querySelector('#rollback').addEventListener('input', event => event.target.firstChild.data = 'rollback');
+    document.querySelector('#rollback').addEventListener('input', event => event.target.textContent = 'rollback');
     document.querySelector('#rewrite').addEventListener('input', event => {
-      const bold = document.createElement('b');
-      bold.textContent = event.data;
-      event.target.replaceChildren(bold);
+      event.target.replaceWith(event.target.cloneNode(true));
     });
     document.querySelector('#input-remove').addEventListener('input', event => event.target.remove());
     function observe(host) {
       host.addEventListener('focus', () => { focuses[host.id] = (focuses[host.id] || 0) + 1; show(); });
       for (const type of Object.keys(counts)) host.addEventListener(type, event => {
         counts[type] += 1;
-        events.push({ type, target: host.id, trusted: event.isTrusted, cancelable: event.cancelable,
-          composed: event.composed, data: event.data ?? null, inputType: event.inputType ?? null });
-        if (events.length > 4) events.shift();
+        events.push({ sequence: ++sequence, type, target: host.id, trusted: event.isTrusted,
+          inputType: event.inputType ?? null, canceled: event.defaultPrevented });
+        if (events.length > 16) events.shift();
         show();
       });
     }

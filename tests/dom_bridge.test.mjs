@@ -200,6 +200,13 @@ function fixture() {
     }
     get value() { return this._value; }
     set value(value) { this._value = value; }
+    get selectionStart() { return this._selectionStart ?? 0; }
+    get selectionEnd() { return this._selectionEnd ?? 0; }
+    setSelectionRange(start, end) {
+      this.selectionCalls = (this.selectionCalls || 0) + 1;
+      this._selectionStart = start; this._selectionEnd = end;
+      this.onSelect?.();
+    }
     get checked() { return this._checked; }
     set checked(value) { this.checkedWrites += 1; this._checked = !!value; }
     get indeterminate() { return this._indeterminate; }
@@ -250,6 +257,13 @@ function fixture() {
     constructor(attributes) { super("TEXTAREA", attributes); }
     get value() { return this._value; }
     set value(value) { this._value = value; }
+    get selectionStart() { return this._selectionStart ?? 0; }
+    get selectionEnd() { return this._selectionEnd ?? 0; }
+    setSelectionRange(start, end) {
+      this.selectionCalls = (this.selectionCalls || 0) + 1;
+      this._selectionStart = start; this._selectionEnd = end;
+      this.onSelect?.();
+    }
   }
   class Select extends Element {
     constructor(attributes) {
@@ -383,6 +397,202 @@ function fixture() {
   };
 }
 
+test("focusedRef reports the current read's logical target without changing focus or disclosing its value", () => {
+  const f = fixture();
+  const first = f.add("INPUT", { "aria-label": "First" });
+  const second = f.add("INPUT", { type: "password", "aria-label": "Second" });
+  second.value = "focused-password-sentinel";
+  f.window.focus = () => assert.fail("Reading must not activate a window");
+  f.document.hasFocus = () => assert.fail("Logical focus does not require OS focus");
+  assert.equal(f.bridge.read().focusedRef, null);
+  first.focus();
+  const firstRead = f.bridge.read();
+  assert.equal(firstRead.focusedRef, firstRead.interactive.find((item) => item.label === "First").ref);
+  second.focus(); // Model a changed DOM target, not native Tab behavior.
+  const secondRead = f.bridge.read();
+  assert.equal(secondRead.focusedRef, secondRead.interactive.find((item) => item.label === "Second").ref);
+  assert.notEqual(secondRead.focusedRef, firstRead.focusedRef);
+  assert.equal(first.focused, 1);
+  assert.equal(second.focused, 1);
+  assert.deepEqual(first.events, []);
+  assert.deepEqual(second.events, []);
+  assert.equal(JSON.stringify(secondRead).includes("focused-password-sentinel"), false);
+});
+
+test("focusedRef resolves nested open shadows and accessible frames instead of their interactive hosts", () => {
+  const f = fixture();
+  const outer = f.add("DIV", { tabindex: "0", "aria-label": "Outer" });
+  const outerRoot = outer.attachShadow({ mode: "open" });
+  const first = embed(f, { tabindex: "0", "aria-label": "Frame" }, outerRoot);
+  const inner = first.child.add("DIV", { tabindex: "0", "aria-label": "Inner" });
+  const innerRoot = inner.attachShadow({ mode: "open" });
+  const second = embed(first.child, {}, innerRoot);
+  const target = second.child.add("BUTTON", { "aria-label": "Deep target" });
+  target.focus();
+  const result = f.bridge.read();
+  assert.equal(result.focusedRef, result.interactive.find((item) => item.label === "Deep target").ref);
+  for (const label of ["Outer", "Frame", "Inner"]) {
+    assert.notEqual(result.focusedRef, result.interactive.find((item) => item.label === label).ref);
+  }
+  assert.equal(target.focused, 1);
+  assert.equal(outer.focused, undefined);
+  assert.equal(inner.focused, undefined);
+});
+
+test("focusedRef can report a directly focused open-shadow host when its root has no active target", () => {
+  const f = fixture();
+  const host = f.add("DIV", { tabindex: "0", "aria-label": "Host" });
+  const root = host.attachShadow({ mode: "open" });
+  f.add("BUTTON", {}, root);
+  host.focus();
+  const result = f.bridge.read();
+  assert.equal(result.focusedRef, result.interactive.find((item) => item.label === "Host").ref);
+  assert.equal(host.focused, 1);
+});
+
+test("focusedRef does not mistake a closed-shadow host for its concealed target", () => {
+  for (const tag of ["DIV", "SPAN", "X-FOCUS-HOST"]) {
+    const f = fixture();
+    const host = f.add(tag, { tabindex: "0", "aria-label": "Host" });
+    const root = host.attachShadow({ mode: "closed" });
+    const target = f.add("INPUT", { "aria-label": "Concealed" }, root);
+    target.focus();
+    assert.equal(f.document.activeElement, host);
+    const result = f.bridge.read();
+    assert.equal(result.interactive.length, 1);
+    assert.equal(result.interactive[0].label, "Host");
+    assert.equal(result.focusedRef, null, tag);
+    assert.equal(target.focused, 1, tag);
+    assert.equal(host.focused, undefined, tag);
+  }
+  // Public DOM cannot tell these direct-focus cases apart from a closed root.
+  for (const attributes of [{ tabindex: "0" }, { contenteditable: "true" }]) {
+    const f = fixture();
+    const target = f.add("DIV", attributes);
+    target.focus();
+    const result = f.bridge.read();
+    assert.equal(result.interactive.length, 1);
+    assert.equal(result.focusedRef, null);
+  }
+});
+
+test("focusedRef stays null for targets outside the returned interactive refs", () => {
+  for (const missing of ["unlisted", "hidden", "interactive-limit"]) {
+    const f = fixture();
+    if (missing === "interactive-limit") {
+      for (let index = 0; index < 120; index += 1) f.add("BUTTON");
+    }
+    const target = f.add(missing === "unlisted" ? "DIV" : "INPUT", { "aria-label": "Missing" });
+    if (missing === "hidden") target.hidden = true;
+    f.document.activeElement = target;
+    const result = f.bridge.read();
+    assert.equal(result.focusedRef, null, missing);
+    assert.equal(result.interactive.some((item) => item.label === "Missing"), false, missing);
+    assert.equal(target.focused, undefined, missing);
+  }
+});
+
+test("focusedRef never falls back to an iframe ref when its inner document is inaccessible or unlisted", () => {
+  for (const kind of ["cross-origin", "loading", "no-ref", "frame-limit"]) {
+    const f = fixture();
+    if (kind === "frame-limit") {
+      for (let index = 0; index < 16; index += 1) embed(f);
+    }
+    const { frame, child } = embed(f, { tabindex: "0", "aria-label": "Frame" });
+    const target = child.add("INPUT");
+    target.focus();
+    if (kind === "cross-origin") frame.contentDocument = null;
+    if (kind === "loading") child.document.readyState = "loading";
+    if (kind === "no-ref") child.document.activeElement = child.document.body;
+    const result = f.bridge.read();
+    assert.ok(result.interactive.find((item) => item.label === "Frame"));
+    assert.equal(result.focusedRef, null, kind);
+    assert.equal(target.focused, 1, kind);
+  }
+});
+
+test("focusedRef respects the existing frame, shadow-root and traversal-depth budgets", () => {
+  for (const kind of ["frame-depth", "shadow-limit", "tree-depth"]) {
+    const f = fixture();
+    let current = f;
+    let container = f.document.body;
+    if (kind === "frame-depth") {
+      for (let index = 0; index < 9; index += 1) current = embed(current).child;
+      container = current.document.body;
+    } else if (kind === "shadow-limit") {
+      for (let index = 0; index < 64; index += 1) f.add("DIV").attachShadow({ mode: "open" });
+      container = f.add("DIV", { tabindex: "0" }).attachShadow({ mode: "open" });
+    } else {
+      for (let index = 0; index < 65; index += 1) container = f.add("DIV", {}, container);
+    }
+    const target = current.add("INPUT", { "aria-label": "Outside budget" }, container);
+    target.focus();
+    const result = f.bridge.read();
+    assert.equal(result.focusedRef, null, kind);
+    assert.equal(result.interactive.some((item) => item.label === "Outside budget"), false, kind);
+    assert.equal(target.focused, 1, kind);
+  }
+});
+
+test("focusedRef contains getter failures without exposing their message or changing the rest of read", () => {
+  const f = fixture();
+  f.add("INPUT", { "aria-label": "Target" });
+  Object.defineProperty(f.document, "activeElement", {
+    get() { throw new Error("private-focus-getter-sentinel"); },
+  });
+  const result = f.bridge.read();
+  assert.equal(result.focusedRef, null);
+  assert.equal(result.interactive.length, 1);
+  assert.equal(JSON.stringify(result).includes("private-focus-getter-sentinel"), false);
+});
+
+test("focusedRef rejects removal, replacement documents and a changing focus sample", () => {
+  for (const kind of ["removed", "frame-replaced", "focus-changed"]) {
+    const f = fixture();
+    const embedded = kind === "frame-replaced" ? embed(f) : null;
+    const owner = embedded?.child || f;
+    const target = owner.add("INPUT", { "aria-label": "Target" });
+    const other = owner.add("BUTTON");
+    target.focus();
+    let samples = 0;
+    Object.defineProperty(owner.document, "activeElement", {
+      get() {
+        samples += 1;
+        if (kind === "removed") target.remove();
+        if (kind === "frame-replaced") embedded.frame.contentDocument = fixture().document;
+        return kind === "focus-changed" && samples > 1 ? other : target;
+      },
+    });
+    assert.equal(f.bridge.read().focusedRef, null, kind);
+    assert.ok(samples <= 2, kind);
+    assert.equal(target.focused, 1, kind);
+  }
+});
+
+test("focusedRef bounds a reentrant read and never returns refs from the replaced generation", () => {
+  const f = fixture();
+  const target = f.add("INPUT");
+  target.focus();
+  let samples = 0;
+  let nested;
+  Object.defineProperty(f.document, "activeElement", {
+    configurable: true,
+    get() {
+      samples += 1;
+      nested = f.bridge.read();
+      return target;
+    },
+  });
+  const result = f.bridge.read();
+  assert.equal(result.focusedRef, null);
+  assert.equal(nested.focusedRef, null);
+  assert.equal(samples, 1);
+  Object.defineProperty(f.document, "activeElement", { configurable: true, writable: true, value: target });
+  const next = f.bridge.read();
+  assert.equal(next.focusedRef, next.interactive[0].ref);
+  assert.equal(target.focused, 1);
+});
+
 test("refs expire after another read and never alias a new document", () => {
   const first = fixture();
   const button = first.add();
@@ -419,15 +629,17 @@ test("password values never appear in snapshots, fill results or exception resul
   assert.equal(JSON.stringify(snapshot).includes("old-secret"), false);
   const request = { action: "fill", ref: snapshot.interactive[0].ref, text: "new-secret" };
   assert.equal(f.bridge.act(request).ok, true);
-  assert.equal(password.value, "new-secret");
+  assert.equal(password.value, "old-secret");
+  password._value = "new-secret";
+  assert.equal(f.bridge.act({ ...request, verifyOnly: true, kind: "password" }).verified, true);
   assert.equal(JSON.stringify(f.bridge.act(request)).includes("new-secret"), false);
-  password.onEvent = () => { throw new Error("new-secret"); };
+  password.onFocus = () => { throw new Error("new-secret"); };
   const failure = f.bridge.act(request);
   assert.equal(failure.error, "ACTION_FAILED");
   assert.equal(JSON.stringify(failure).includes("new-secret"), false);
 });
 
-test("fill uses the native value setter and stops if focus replaces the element", () => {
+test("fill prepares native selection and stops if focus replaces the element", () => {
   const f = fixture();
   const input = f.add("INPUT");
   Object.defineProperty(input, "value", {
@@ -436,11 +648,12 @@ test("fill uses the native value setter and stops if focus replaces the element"
   });
   const ref = f.bridge.read().interactive[0].ref;
   assert.equal(f.bridge.act({ action: "fill", ref, text: "hello" }).ok, true);
-  assert.equal(input.value, "hello");
-  assert.deepEqual(input.events, ["input", "change"]);
+  assert.equal(input.value, "");
+  assert.equal(input.selectionCalls, 1);
+  assert.deepEqual(input.events, []);
   input.onFocus = () => { input.isConnected = false; };
   assert.equal(f.bridge.act({ action: "fill", ref, text: "replacement" }).ok, false);
-  assert.equal(input.value, "hello");
+  assert.equal(input.value, "");
 });
 
 for (const type of ["checkbox", "radio", "button", "submit", "reset", "image", "hidden", "file"]) {
@@ -480,8 +693,10 @@ test("fill preserves supported text, textarea and text/password focus conversion
     const result = f.bridge.act({ action: "fill", ref, text: "replacement" });
 
     assert.equal(result.ok, true, `${tagName} ${before} to ${after}`);
-    assert.equal(element.value, "replacement");
-    assert.deepEqual(element.events, ["input", "change"]);
+    assert.equal(result.prepared, true);
+    assert.equal(result.kind, tagName === "TEXTAREA" ? "textarea" : after);
+    assert.equal(element.value, "");
+    assert.deepEqual(element.events, []);
   }
 });
 
@@ -500,9 +715,43 @@ test("Enter prepares logical focus without dispatching keys or requesting form s
   assert.equal(f.bridge.act({ action: "press", ref, key: "Enter" }).prepared, true);
   assert.equal(submissions, 0);
   assert.deepEqual(input.events, []);
-  const unsupported = f.bridge.act({ action: "press", ref, key: "Tab" });
+  const unsupported = f.bridge.act({ action: "press", ref, key: "F1" });
   assert.equal(unsupported.error, "UNSUPPORTED_KEY");
   assert.equal(unsupported.attempted, false);
+});
+
+test("press prepares the 24 canonical keys without synthesizing keys or editing", () => {
+  const f = fixture();
+  const input = f.add("TEXTAREA"); input._value = "unchanged";
+  input.readOnly = true; // Navigation keys remain meaningful in read-only fields.
+  input._selectionStart = 2; input._selectionEnd = 4;
+  const ref = f.bridge.read().interactive[0].ref;
+  const keys = ["Enter", "Tab", "Escape", "ArrowLeft", "ArrowUp", "ArrowRight", "ArrowDown",
+    "Home", "End", "PageUp", "PageDown", "Backspace", "Delete", "Space",
+    "Shift+Enter", "Shift+Tab", "Shift+ArrowLeft", "Shift+ArrowUp", "Shift+ArrowRight", "Shift+ArrowDown",
+    "Shift+Home", "Shift+End", "Shift+PageUp", "Shift+PageDown"];
+  for (const key of keys) {
+    assert.deepEqual({ ...f.bridge.act({ action: "press", ref, key }) },
+      { ok: true, action: "press", key, prepared: true, attempted: false });
+    assert.equal(f.document.activeElement, input);
+    assert.equal(input._value, "unchanged");
+    assert.deepEqual([input._selectionStart, input._selectionEnd], [2, 4]);
+    assert.deepEqual(input.events, []);
+  }
+  assert.equal(input.focused, keys.length, "Every command starts from its explicit ref");
+});
+
+test("press rejects aliases and unapproved modifier combinations before focusing", () => {
+  const f = fixture(); const input = f.add("INPUT");
+  const ref = f.bridge.read().interactive[0].ref;
+  for (const key of ["", " ", "space", "Esc", "Escape ", "ArrowLeft+Shift", "Shift+Delete",
+    "Shift+Backspace", "Shift+Space", "Shift+Escape", "Control+A", "Meta+Tab", "Shift+Shift+Tab", null, 1, {}]) {
+    const result = f.bridge.act({ action: "press", ref, key });
+    assert.equal(result.error, "UNSUPPORTED_KEY");
+    assert.equal(result.attempted, false);
+    assert.equal(input.focused, undefined);
+    assert.deepEqual(input.events, []);
+  }
 });
 
 test("Enter preparation rejects ignored focus, non-focusable refs and immediate focus theft", () => {
@@ -966,13 +1215,14 @@ test("open and nested shadow roots use root-local labels and preserve ref action
   assert.equal(page.interactive.find((item) => item.label === "Shadow password").value, undefined);
   assert.equal(JSON.stringify(page).includes("shadow-secret"), false);
   assert.equal(f.bridge.act({ action: "fill", ref: named.ref, text: "hello shadow" }).ok, true);
-  assert.equal(input.value, "hello shadow");
-  assert.deepEqual(input.events, ["input", "change"]);
+  assert.equal(input.value, "");
+  assert.equal(input.selectionCalls, 1);
+  assert.deepEqual(input.events, []);
   assert.equal(f.bridge.act({ action: "press", ref: named.ref, key: "Enter" }).prepared, true);
   assert.equal(submissions, 0);
   assert.equal(root.activeElement, input);
   assert.equal(f.document.activeElement, host);
-  assert.deepEqual(input.events, ["input", "change"]);
+  assert.deepEqual(input.events, []);
   const nestedRef = page.interactive.find((item) => item.label === "Nested action").ref;
   f.pointAt(button);
   assert.equal(f.bridge.act({ action: "click", ref: nestedRef }).prepared, true);
@@ -1845,8 +2095,9 @@ test("same-origin frames expose bounded context and flat refs with nested shadow
   assert.equal(item("Child input").frame, page.frames[0].id);
   assert.equal(item("Nested shadow action").frame, page.frames[1].id);
   assert.equal(f.bridge.act({ action: "fill", ref: item("Child input").ref, text: "changed" }).ok, true);
-  assert.equal(input.value, "changed");
-  assert.equal(childWrites, 1);
+  assert.equal(input.value, "");
+  assert.equal(childWrites, 0);
+  assert.equal(input.selectionCalls, 1);
   assert.equal(f.bridge.act({ action: "select", ref: item("Child choice").ref, value: "b" }).ok, true);
   assert.equal(select.value, "b");
   f.pointAt(button);
@@ -1858,7 +2109,7 @@ test("same-origin frames expose bounded context and flat refs with nested shadow
   assert.equal(submitted, 0);
   assert.equal(child.document.activeElement, input);
   assert.equal(f.document.activeElement, child.window.frameElement);
-  assert.deepEqual(input.events, ["input", "change"]);
+  assert.deepEqual(input.events, []);
   assert.equal(page.viewport.width, f.window.innerWidth);
   f.bridge.act({ action: "scroll", y: 100 });
   assert.equal(f.window.scrollY, 100);
@@ -2015,7 +2266,7 @@ test("frame changes after input report partial dispatch and stop the old change 
   for (const action of ["fill", "select"]) {
     const f = fixture();
     const { frame, child } = embed(f);
-    const element = child.add(action === "fill" ? "INPUT" : "SELECT");
+    const element = child.add(action === "fill" ? "INPUT" : "SELECT", { type: "email" });
     if (action === "select") {
       child.add("OPTION", { value: "a" }, element);
       child.add("OPTION", { value: "b" }, element);
@@ -2271,17 +2522,17 @@ test("native form controls retain their existing fill policy despite a contented
     assert.equal(element.replacements, undefined);
   }
   assert.equal(f.bridge.act({ action: "fill", ref: page.interactive.find((item) => item.label === "Input").ref, text: "new" }).ok, true);
-  assert.equal(input.value, "new");
-  assert.deepEqual(input.events, ["input", "change"]);
+  assert.equal(input.value, "native value");
+  assert.equal(input.selectionCalls, 1);
+  assert.deepEqual(input.events, []);
 });
 
-test("native fill detects setter normalization instead of claiming exact text success", () => {
+test("legacy DOM fill detects setter normalization instead of claiming exact text success", () => {
   // Model observable native setter results; actual HTML type sanitization is
   // verified separately in Chromium, not implemented by this DOM double.
   for (const [tag, type, text, stored] of [
     ["INPUT", "number", "not-number", ""], ["INPUT", "date", "bad-date", ""],
-    ["INPUT", "range", "999", "100"], ["INPUT", "text", "a\nb", "ab"],
-    ["TEXTAREA", "textarea", "a\r\nb", "a\nb"],
+    ["INPUT", "range", "999", "100"], ["INPUT", "email", " a@example.test ", "a@example.test"],
   ]) {
     const f = fixture();
     const element = f.add(tag, { type });
@@ -2298,10 +2549,10 @@ test("native fill detects setter normalization instead of claiming exact text su
   }
 });
 
-test("native fill observes handler rollback after input/change through the native getter", () => {
-  for (const phase of ["input", "change"]) for (const tag of ["INPUT", "TEXTAREA"]) {
+test("legacy DOM fill observes handler rollback after input/change through the native getter", () => {
+  for (const phase of ["input", "change"]) for (const type of ["email", "number"]) {
     const f = fixture();
-    const element = f.add(tag);
+    const element = f.add("INPUT", { type });
     element.onEvent = (event) => { if (event.type === phase) element._value = "page rollback"; };
     Object.defineProperty(element, "value", { get() { return "requested"; } });
     const ref = f.bridge.read().interactive[0].ref;
@@ -2314,7 +2565,7 @@ test("native fill observes handler rollback after input/change through the nativ
   }
 });
 
-test("native fill stops remaining events when setter/input/change invalidate the target", () => {
+test("legacy DOM fill stops remaining events when setter/input/change invalidate the target", () => {
   const mutations = [
     (_f, element) => element.remove(),
     (_f, element) => { element.hidden = true; },
@@ -2328,7 +2579,7 @@ test("native fill stops remaining events when setter/input/change invalidate the
   ];
   for (const phase of ["setter", "input", "change"]) for (const mutate of mutations) {
     const f = fixture();
-    const element = f.add("INPUT");
+    const element = f.add("INPUT", { type: "email" });
     if (phase === "setter") {
       const prototype = Object.getPrototypeOf(element);
       const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
@@ -2345,10 +2596,10 @@ test("native fill stops remaining events when setter/input/change invalidate the
   }
 });
 
-test("native fill verifies accessors and focus target before attempting the setter", () => {
+test("legacy DOM fill verifies accessors and focus target before attempting the setter", () => {
   for (const change of ["getter", "setter", "tag", "readonly", "stale"]) {
     const f = fixture();
-    const element = f.add("INPUT");
+    const element = f.add("INPUT", { type: "email" });
     element.value = "old";
     const ref = f.bridge.read().interactive[0].ref;
     const prototype = Object.getPrototypeOf(element);
@@ -2368,10 +2619,10 @@ test("native fill verifies accessors and focus target before attempting the sett
   }
 });
 
-test("native fill preserves attempted evidence on accessor exceptions without exposing password text", () => {
+test("legacy DOM fill preserves attempted evidence on accessor exceptions without exposing page text", () => {
   for (const phase of ["focus", "setter", "input", "change", "getter"]) {
     const f = fixture();
-    const element = f.add("INPUT", { type: "password" });
+    const element = f.add("INPUT", { type: "email" });
     const ref = f.bridge.read().interactive[0].ref;
     const secret = "private-native-fill-value";
     const fail = () => { throw new Error(secret); };
@@ -2390,9 +2641,9 @@ test("native fill preserves attempted evidence on accessor exceptions without ex
   }
 });
 
-test("native fill revalidates after reading the final value", () => {
+test("legacy DOM fill revalidates after reading the final value", () => {
   const f = fixture();
-  const element = f.add("INPUT");
+  const element = f.add("INPUT", { type: "email" });
   const ref = f.bridge.read().interactive[0].ref;
   const prototype = Object.getPrototypeOf(element);
   const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
@@ -2407,25 +2658,199 @@ test("native fill revalidates after reading the final value", () => {
   assert.deepEqual(element.events, ["input", "change"]);
 });
 
-test("native fill retains ordinary empty/same-value events and accessible shadow/frame behavior", () => {
+test("Chromium fill retains empty/same-value preparation and shadow/frame verification", () => {
   const f = fixture();
   const shadow = f.add("DIV").attachShadow({ mode: "open" });
   const input = f.add("INPUT", { "aria-label": "Shadow native" }, shadow);
   const { child } = embed(f);
   const textarea = child.add("TEXTAREA", { "aria-label": "Frame native" });
-  child.window.Event = class extends child.window.Event {
-    constructor(...args) { super(...args); this.realm = "child"; }
-  };
-  textarea.onEvent = (event) => assert.equal(event.realm, "child");
-  for (const [element, label] of [[input, "Shadow native"], [textarea, "Frame native"]]) {
+  for (const [element, label, kind] of [[input, "Shadow native", "text"], [textarea, "Frame native", "textarea"]]) {
     for (const text of ["", "same", "same"]) {
       const ref = f.bridge.read().interactive.find((item) => item.label === label).ref;
-      const before = element.events.length;
-      const result = f.bridge.act({ action: "fill", ref, text });
-      assert.equal(result.ok, true);
-      assert.equal(result.trusted, false);
-      assert.equal(element.value, text);
-      assert.deepEqual(element.events.slice(before), ["input", "change"]);
+      const old = element._value;
+      assert.equal(f.bridge.act({ action: "fill", ref, text }).prepared, true);
+      assert.equal(element._value, old);
+      assert.deepEqual(element.events, []);
+      element._value = text; // Engine completion is modeled independently.
+      const result = f.bridge.act({ action: "fill", ref, text, verifyOnly: true, kind });
+      assert.equal(result.verified, true);
+      assert.equal(result.attempted, true);
+      assert.equal(result.trusted, undefined);
     }
   }
+});
+
+test("Chromium fill prepares a full native selection without writing or dispatching input", () => {
+  for (const kind of ["text", "search", "tel", "url", "password", "textarea"]) {
+    const f = fixture();
+    const element = f.add(kind === "textarea" ? "TEXTAREA" : "INPUT", { type: kind });
+    element._value = "original😀";
+    Object.defineProperty(element, "value", { get: () => "spoofed", set: () => assert.fail("own setter") });
+    Object.defineProperty(element, "selectionStart", { get: () => 999 });
+    Object.defineProperty(element, "selectionEnd", { get: () => 999 });
+    element.setSelectionRange = () => assert.fail("own selection method");
+    const ref = f.bridge.read().interactive[0].ref;
+    for (const text of ["changed", "", "original😀"]) {
+      const result = f.bridge.act({ action: "fill", ref, text });
+      assert.deepEqual({ ...result }, { ok: true, action: "fill", prepared: true, attempted: false, input: "chromium", kind });
+      assert.equal(element._value, "original😀");
+      assert.equal(element._selectionStart, 0);
+      assert.equal(element._selectionEnd, "original😀".length);
+      assert.deepEqual(element.events, []);
+    }
+    assert.equal(element.selectionCalls, 3, "same/empty requests still prepare selection");
+  }
+});
+
+test("Chromium fill never switches to DOM writes when focus changes its input policy", () => {
+  for (const type of ["email", "number", "date", "range", "color", "checkbox"]) {
+    const f = fixture();
+    const input = f.add("INPUT"); input._value = "original";
+    input.onFocus = () => { input.type = type; };
+    const result = f.bridge.act({ action: "fill", ref: f.bridge.read().interactive[0].ref, text: "new" });
+    assert.equal(result.error, "ELEMENT_UNAVAILABLE", type);
+    assert.equal(result.attempted, false);
+    assert.equal(input._value, "original");
+    assert.equal(input.selectionCalls, undefined);
+    assert.deepEqual(input.events, []);
+  }
+});
+
+test("Chromium fill rejects focus loss and partial selection after preparation", () => {
+  for (const mode of ["focus-redirect", "selection-redirect", "partial", "wrong-start"]) {
+    const f = fixture(); const input = f.add("INPUT"); const other = f.add("INPUT");
+    input._value = "original";
+    if (mode === "focus-redirect") input.onFocus = () => other.focus();
+    else input.onSelect = () => {
+      if (mode === "selection-redirect") other.focus();
+      if (mode === "partial") input._selectionEnd = 1;
+      if (mode === "wrong-start") input._selectionStart = 1;
+    };
+    const result = f.bridge.act({ action: "fill", ref: f.bridge.read().interactive[0].ref, text: "new" });
+    assert.equal(result.error, mode.endsWith("redirect") ? "FOCUS_NOT_REACHED" : "SELECTION_NOT_REACHED", mode);
+    assert.equal(result.attempted, false);
+    assert.equal(input._value, "original");
+    assert.deepEqual(input.events, []);
+  }
+});
+
+test("Chromium fill revalidates ref identity and control state after selection", () => {
+  for (const mutate of [
+    (f, e) => e.remove(), (f, e) => { e.hidden = true; }, (f, e) => { e.disabled = true; },
+    (f, e) => { e.readOnly = true; }, (f, e) => { e.type = "password"; },
+    (f, e) => { e.ownerDocument = fixture().document; }, (f) => f.bridge.read(),
+  ]) {
+    const f = fixture(); const input = f.add("INPUT"); input._value = "original";
+    input.onSelect = () => mutate(f, input);
+    const result = f.bridge.act({ action: "fill", ref: f.bridge.read().interactive[0].ref, text: "new" });
+    assert.equal(result.error, "ELEMENT_UNAVAILABLE");
+    assert.equal(result.attempted, false);
+    assert.equal(input._value, "original");
+    assert.deepEqual(input.events, []);
+  }
+});
+
+test("Chromium fill verification observes native value without focus or input side effects", () => {
+  const f = fixture(); const input = f.add("INPUT", { type: "password" }); input._value = "old private";
+  const ref = f.bridge.read().interactive[0].ref;
+  const prepared = f.bridge.act({ action: "fill", ref, text: "new private" });
+  assert.equal(prepared.kind, "password");
+  input._value = "new private"; // Independently model the already-completed engine operation.
+  Object.defineProperty(input, "value", { get: () => "page spoof" });
+  const focusCount = input.focused, selectionCount = input.selectionCalls;
+  const result = f.bridge.act({ action: "fill", ref, text: "new private", verifyOnly: true, kind: "password" });
+  assert.deepEqual({ ...result }, { ok: true, action: "fill", verified: true, input: "chromium", attempted: true });
+  assert.equal(input.focused, focusCount);
+  assert.equal(input.selectionCalls, selectionCount);
+  assert.deepEqual(input.events, []);
+  assert.ok(!JSON.stringify(result).includes("private"));
+});
+
+test("Chromium fill verification distinguishes final value mismatch from unavailable state", () => {
+  for (const mode of ["canceled", "maxlength", "normalized", "reset", "detached", "hidden", "disabled", "readonly", "retyped", "new-read", "wrong-kind"]) {
+    const f = fixture(); const input = f.add("INPUT"); input._value = "old";
+    const ref = f.bridge.read().interactive[0].ref;
+    f.bridge.act({ action: "fill", ref, text: "requested" });
+    input._value = "requested";
+    if (["canceled", "maxlength", "normalized", "reset"].includes(mode)) input._value = mode;
+    if (mode === "detached") input.remove();
+    if (mode === "hidden") input.hidden = true;
+    if (mode === "disabled") input.disabled = true;
+    if (mode === "readonly") input.readOnly = true;
+    if (mode === "retyped") input.type = "password";
+    if (mode === "new-read") f.bridge.read();
+    const value = input._value, events = input.events.slice(), focusCount = input.focused;
+    const result = f.bridge.act({ action: "fill", ref, text: "requested", verifyOnly: true, kind: mode === "wrong-kind" ? "email" : "text" });
+    assert.equal(result.error, ["canceled", "maxlength", "normalized", "reset"].includes(mode) ? "FILL_STATE_NOT_REACHED" : "FILL_STATE_UNCONFIRMED", mode);
+    assert.equal(result.attempted, true);
+    assert.equal(result.input, "chromium");
+    assert.equal(result.trusted, undefined);
+    assert.equal(input._value, value);
+    assert.equal(input.focused, focusCount);
+    assert.deepEqual(input.events, events);
+  }
+});
+
+test("Chromium fill uses bounded logical focus through shadow and frame contexts", () => {
+  const f = fixture(); const { frame, child } = embed(f);
+  const host = child.add("DIV"); const root = host.attachShadow({ mode: "open" });
+  const input = child.add("TEXTAREA", {}, root); input._value = "original";
+  const ref = f.bridge.read().interactive[0].ref;
+  assert.equal(f.bridge.act({ action: "fill", ref, text: "changed" }).prepared, true);
+  input._value = "changed";
+  assert.equal(f.bridge.act({ action: "fill", ref, text: "changed", kind: "textarea", verifyOnly: true }).verified, true);
+  const focused = input.focus;
+  input.focus = () => { focused.call(input); f.document.activeElement = f.document.body; };
+  assert.equal(f.bridge.act({ action: "fill", ref, text: "later" }).error, "FOCUS_NOT_REACHED");
+  frame.contentDocument = fixture().document;
+  assert.equal(f.bridge.act({ action: "fill", ref, text: "changed", kind: "textarea", verifyOnly: true }).error, "FILL_STATE_UNCONFIRMED");
+});
+
+test("Chromium fill sanitizes native access failures and rechecks after its getters", () => {
+  for (const phase of ["value", "range", "start", "end", "value-detach", "verify-get", "verify-detach"]) {
+    const f = fixture(); const input = f.add("INPUT", { type: "password" }); input._value = "private sentinel";
+    const ref = f.bridge.read().interactive[0].ref;
+    const prototype = Object.getPrototypeOf(input);
+    const verify = phase.startsWith("verify-");
+    if (verify) assert.equal(f.bridge.act({ action: "fill", ref, text: "private sentinel" }).prepared, true);
+    const fail = () => { throw new Error("private sentinel"); };
+    if (phase === "range") prototype.setSelectionRange = fail;
+    else {
+      const property = phase === "start" ? "selectionStart" : phase === "end" ? "selectionEnd" : "value";
+      const descriptor = Object.getOwnPropertyDescriptor(prototype, property);
+      Object.defineProperty(prototype, property, { ...descriptor, get: phase.endsWith("detach") ? function() {
+        const value = descriptor.get.call(this); this.remove(); return value;
+      } : fail });
+    }
+    const result = f.bridge.act({ action: "fill", ref, text: "private sentinel", ...(verify ? { verifyOnly: true, kind: "password" } : {}) });
+    assert.equal(result.error, verify ? "FILL_STATE_UNCONFIRMED" : phase.endsWith("detach") ? "ELEMENT_UNAVAILABLE" : "ACTION_FAILED", phase);
+    assert.equal(result.attempted, verify);
+    assert.equal(result.trusted, undefined);
+    assert.ok(!JSON.stringify(result).includes("private sentinel"));
+    assert.deepEqual(input.events, []);
+  }
+});
+
+test("Chromium fill rejects selection-time value changes even when the full new value remains selected", () => {
+  const f = fixture(); const input = f.add("INPUT"); input._value = "original";
+  input.onSelect = () => { input._value = "modified"; };
+  const result = f.bridge.act({ action: "fill", ref: f.bridge.read().interactive[0].ref, text: "requested" });
+  assert.equal(result.error, "SELECTION_NOT_REACHED");
+  assert.equal(result.attempted, false);
+  assert.equal(input._value, "modified", "The bridge must not undo the handler's change");
+  assert.equal(input._selectionEnd, input._value.length);
+  assert.deepEqual(input.events, []);
+});
+
+test("Chromium fill cannot verify an unchanged matching value after focus moves elsewhere", () => {
+  const f = fixture(); const input = f.add("INPUT"); const other = f.add("INPUT");
+  input._value = "same";
+  const ref = f.bridge.read().interactive[0].ref;
+  assert.equal(f.bridge.act({ action: "fill", ref, text: "same" }).prepared, true);
+  other.focus(); other._value = "same";
+  const result = f.bridge.act({ action: "fill", ref, text: "same", kind: "text", verifyOnly: true });
+  assert.equal(result.error, "FILL_STATE_UNCONFIRMED");
+  assert.equal(result.attempted, true);
+  assert.equal(f.document.activeElement, other);
+  assert.deepEqual(input.events, []);
 });

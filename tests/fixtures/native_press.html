@@ -22,10 +22,28 @@
   <label>Redirect destination <textarea id="other" aria-label="Focus destination"></textarea></label>
   <div id="shadow-host"></div>
   <iframe id="child" title="Same-origin Enter textarea"></iframe>
+  <section>
+    <h2>Keyboard navigation and editing</h2>
+    <input id="key-first" aria-label="Key first" value="first">
+    <input id="key-second" aria-label="Key second" value="second">
+    <input id="key-edit" aria-label="Key edit" value="abcd">
+    <textarea id="key-lines" aria-label="Key lines" rows="4" cols="30"></textarea>
+    <input id="key-check" type="checkbox" aria-label="Key checkbox">
+    <select id="key-select" size="4" aria-label="Key select">
+      <option value="a">Alpha</option><option value="b" selected>Beta</option>
+      <option value="c">Gamma</option><option value="d">Delta</option>
+    </select>
+    <button id="key-popup" type="button" aria-label="Key popup" aria-expanded="true">Popup</button>
+    <input id="key-cancel" aria-label="Key canceled deletion" value="abcd">
+    <textarea id="key-document" aria-label="Shortcut document" rows="3" cols="40" wrap="off"></textarea>
+    <input id="key-word" aria-label="Shortcut word" value="alphabet">
+    <input id="key-command-cancel" aria-label="Canceled shortcut" value="alphabet">
+    <input id="key-undo" aria-label="Shortcut undo" value="">
+  </section>
   <script>
     const shadow = document.querySelector('#shadow-host').attachShadow({ mode: 'open' });
     shadow.innerHTML = '<button id="shadow" type="button" aria-label="Shadow Enter button">Shadow click</button>';
-    const controls = [...document.querySelectorAll('input, textarea, button, [contenteditable]'), shadow.querySelector('button')];
+    const controls = [...document.querySelectorAll('input, textarea, button, select, [contenteditable]'), shadow.querySelector('button')];
     const counts = { keydown: 0, keypress: 0, keyup: 0, beforeinput: 0, input: 0, click: 0, submit: 0 };
     const clicks = { button: 0, shadow: 0, primary: 0, secondary: 0 };
     const events = [];
@@ -37,12 +55,16 @@
       const states = Object.fromEntries(controls.map(control => [control.id, {
         value: control.value ?? null,
         html: control.isContentEditable ? control.innerHTML : null,
+        start: control.selectionStart ?? null,
+        end: control.selectionEnd ?? null,
+        checked: control.checked ?? null,
+        expanded: control.getAttribute('aria-expanded'),
       }]));
       document.querySelector('#receipt').textContent = `NATIVE_PRESS_STATE_BEGIN ${encodeURIComponent(JSON.stringify({ states, counts, clicks, submitter, redirects, childReady, sequence, events, active: document.activeElement?.id ?? null, hasFocus: document.hasFocus(), visibility: document.visibilityState }))} NATIVE_PRESS_STATE_END`;
     }
     function record(type, target, event) {
       counts[type] += 1;
-      events.push({ sequence: ++sequence, type, target, trusted: event.isTrusted, key: event.key ?? null, defaultPrevented: event.defaultPrevented, inputType: event.inputType ?? null });
+      events.push({ sequence: ++sequence, type, target, trusted: event.isTrusted, key: event.key ?? null, code: event.code ?? null, shift: event.shiftKey ?? null, alt: event.altKey ?? null, meta: event.metaKey ?? null, ctrl: event.ctrlKey ?? null, defaultPrevented: event.defaultPrevented, inputType: event.inputType ?? null });
       if (events.length > 12) events.shift();
       show();
     }
@@ -60,6 +82,25 @@
       record('submit', 'form', event);
     });
     document.querySelector('#cancel').addEventListener('keydown', event => event.preventDefault());
+    for (const id of ['key-edit', 'key-cancel']) {
+      document.getElementById(id).addEventListener('focus', event => {
+        event.target.setSelectionRange(2, 2); show();
+      });
+    }
+    const lines = document.getElementById('key-lines');
+    lines.value = Array.from({ length: 20 }, (_, i) => `Line ${String(i).padStart(2, '0')}`).join('\n');
+    lines.addEventListener('focus', () => { lines.setSelectionRange(40, 40); show(); });
+    document.getElementById('key-document').value = 'alpha beta\ngamma delta\nomega';
+    for (const [id, offset] of [['key-document', 17], ['key-word', 4], ['key-command-cancel', 4]]) {
+      document.getElementById(id).addEventListener('focus', event => {
+        event.target.setSelectionRange(offset, offset); show();
+      });
+    }
+    document.getElementById('key-popup').addEventListener('keydown', event => {
+      if (event.key === 'Escape') event.currentTarget.setAttribute('aria-expanded', 'false');
+    });
+    document.getElementById('key-cancel').addEventListener('keydown', event => event.preventDefault());
+    document.getElementById('key-command-cancel').addEventListener('keydown', event => event.preventDefault());
     document.querySelector('#redirect').addEventListener('focus', () => {
       redirects += 1;
       document.querySelector('#other').focus();

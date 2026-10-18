@@ -1,10 +1,11 @@
+use crate::keyboard::{KeyPress, UNSUPPORTED_KEY_MESSAGE};
 use crate::protocol::{self, Command, Request, Response, WaitUntil};
 use serde_json::json;
 use std::io::{self, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const USAGE: &str = "Usage: lightbrowser <command>\n\nCommands:\n  open URL                 Return a created tab immediately; navigation may still be loading\n  navigate TAB URL         Request navigation in an existing tab\n  back TAB                 Request backward navigation\n  forward TAB              Request forward navigation\n  reload TAB               Request a reload of the current page\n  stop TAB                 Request loading to stop; does not wait for load completion\n  tabs                     List tabs\n  wait TAB [dom|load] [TIMEOUT_MS]\n                           Wait for readiness (defaults: dom, 10000 ms; range: 1..30000)\n  read TAB                 Read page text and interactive element refs\n  scroll TAB DX DY          Scroll the page by relative integer CSS pixels (-10000..10000)\n  click TAB REF            Dispatch a Chromium pointer click to a reference\n  check TAB REF true|false Set a native checkbox/radio checked state\n  fill TAB REF TEXT        Replace an input, textarea or editable host with text\n  select TAB REF VALUE     Select one native HTML option by exact value\n  press TAB REF Enter      Dispatch Chromium Enter to a focused reference\n  close TAB                Close a tab\n  screenshot TAB PATH      Save a screenshot to PATH\n  status                   Show browser status\n  panel                    Bring the browser window forward (compatibility alias)\n  help                     Show this help\n\nSpaces:\n  spaces                   List user and task spaces (also available in task run)\n  space show user|TASK_ID  Show a space without handing off control\n  space overview           Show the space overview\n                           show and overview are global UI controls; task run rejects them\n\nTasks:\n  task create NAME         Create a named task\n  task list                List tasks\n  task info ID             Inspect a task and its current revision\n  task handoff ID REV       Hand control to the user\n  task resume ID REV        Resume agent control\n  task adopt ID REV TAB     Attach an existing tab to a task\n  task release ID REV TAB   Release a tab from a task\n  task finish ID REV [--keep TAB ...]\n                           Finish a task, retaining only the listed tabs\n  task run ID REV COMMAND  Run an existing browser command in a task\n\nID uses 1..128 ASCII letters, digits, hyphens or underscores.\nSpace IDs use user or an existing task ID, at most 120 ASCII characters.\nREV is the positive revision returned by task info or a task update.\nNAME is trimmed, contains 1..120 characters, and has no control characters.\ntask run cannot contain task commands.\n\nNavigation commands return when the request is accepted; use wait for readiness.\nwait dom: document.readyState is interactive or complete.\nwait load: the browser's overall loading has ended.\nSpecify dom or load before TIMEOUT_MS. open and navigate accept HTTP(S) URLs.\nTAB is a positive integer. Quote arguments containing spaces.\nEvery command writes one JSON response to stdout. Errors also use stderr.\n";
+pub const USAGE: &str = "Usage: lightbrowser <command>\n\nCommands:\n  open URL                 Return a created tab immediately; navigation may still be loading\n  navigate TAB URL         Request navigation in an existing tab\n  back TAB                 Request backward navigation\n  forward TAB              Request forward navigation\n  reload TAB               Request a reload of the current page\n  stop TAB                 Request loading to stop; does not wait for load completion\n  tabs                     List tabs\n  wait TAB [dom|load] [TIMEOUT_MS]\n                           Wait for readiness (defaults: dom, 10000 ms; range: 1..30000)\n  read TAB                 Read page text and interactive element refs\n  read-page TAB            Read discovered frame documents under a shared budget\n  frames TAB               Inspect the tab frame tree, including discovered child sessions\n                           Inventory only; does not read or control child-frame content\n  read-frame TAB FRAME     Read one current frame, including cross-origin content\n                           Refs support click, hover, fill, insert, press, check and select\n  scroll TAB DX DY          Scroll the page by relative integer CSS pixels (-10000..10000)\n  click TAB REF            Dispatch a Chromium pointer click to a reference\n  hover TAB REF            Move the Chromium pointer to a reference without clicking\n  check TAB REF true|false Set a native checkbox/radio checked state\n  fill TAB REF TEXT        Replace an input, textarea or editable host with text\n  insert TAB REF TEXT      Insert text at the existing caret or selection\n  select TAB REF VALUE     Select one native HTML option by exact value\n  press TAB REF KEY        Dispatch a Chromium key pair from a focused reference\n  close TAB                Close a tab\n  screenshot TAB PATH      Save a screenshot to PATH\n  status                   Show browser status\n  panel                    Bring the browser window forward (compatibility alias)\n  help                     Show this help\n\nSpaces:\n  spaces                   List user and task spaces (also available in task run)\n  space show user|TASK_ID  Show a space without handing off control\n  space overview           Show the space overview\n                           show and overview are global UI controls; task run rejects them\n\nTasks:\n  task create NAME         Create a named task\n  task list                List tasks\n  task info ID             Inspect a task and its current revision\n  task handoff ID REV       Hand control to the user\n  task resume ID REV        Resume agent control\n  task adopt ID REV TAB     Attach an existing tab to a task\n  task release ID REV TAB   Release a tab from a task\n  task finish ID REV [--keep TAB ...]\n                           Finish a task, retaining only the listed tabs\n  task run ID REV COMMAND  Run an existing browser command in a task\n\nKeys:\n  Enter Tab Escape ArrowLeft ArrowUp ArrowRight ArrowDown\n  Home End PageUp PageDown Backspace Delete Space\n  Shift+ only with Enter, Tab, arrows, Home, End, PageUp or PageDown.\n  Meta+A Meta+Z Meta+Shift+Z Meta+Backspace\n  Meta+arrows Meta+Shift+arrows\n  Alt+ArrowLeft Alt+ArrowRight Alt+Shift+ArrowLeft Alt+Shift+ArrowRight\n  Alt+Backspace Alt+Delete\n  Key names are case-sensitive; only the listed combinations are supported.\n\nID uses 1..128 ASCII letters, digits, hyphens or underscores.\nSpace IDs use user or an existing task ID, at most 120 ASCII characters.\nREV is the positive revision returned by task info or a task update.\nNAME is trimmed, contains 1..120 characters, and has no control characters.\ntask run cannot contain task commands.\n\nNavigation commands return when the request is accepted; use wait for readiness.\nwait dom: document.readyState is interactive or complete.\nwait load: the browser's overall loading has ended.\nSpecify dom or load before TIMEOUT_MS. open and navigate accept HTTP(S) URLs.\nTAB is a positive integer. Quote arguments containing spaces.\nEvery command writes one JSON response to stdout. Errors also use stderr.\n";
 
 /// `args` excludes the executable name. The caller supplies the configured socket.
 pub fn run(args: &[String], socket: &Path) -> i32 {
@@ -116,12 +117,26 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         ["read", tab] => Ok(Command::Read {
             tab: parse_tab(tab)?,
         }),
+        ["read-page", tab] => Ok(Command::ReadPage {
+            tab: parse_tab(tab)?,
+        }),
+        ["frames", tab] => Ok(Command::Frames {
+            tab: parse_tab(tab)?,
+        }),
+        ["read-frame", tab, frame] => Ok(Command::ReadFrame {
+            tab: parse_tab(tab)?,
+            frame: (*frame).into(),
+        }),
         ["scroll", tab, x, y] => Ok(Command::Scroll {
             tab: parse_tab(tab)?,
             x: parse_scroll_delta(x)?,
             y: parse_scroll_delta(y)?,
         }),
         ["click", tab, reference] => Ok(Command::Click {
+            tab: parse_tab(tab)?,
+            reference: parse_ref(reference)?,
+        }),
+        ["hover", tab, reference] => Ok(Command::Hover {
             tab: parse_tab(tab)?,
             reference: parse_ref(reference)?,
         }),
@@ -139,14 +154,19 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
             reference: parse_ref(reference)?,
             text: (*text).into(),
         }),
+        ["insert", tab, reference, text] => Ok(Command::Insert {
+            tab: parse_tab(tab)?,
+            reference: parse_ref(reference)?,
+            text: (*text).into(),
+        }),
         ["select", tab, reference, value] => Ok(Command::Select {
             tab: parse_tab(tab)?,
             reference: parse_ref(reference)?,
             value: (*value).into(),
         }),
         ["press", tab, reference, key] => {
-            if key.is_empty() {
-                return Err("KEY must not be empty.".into());
+            if KeyPress::parse(key).is_none() {
+                return Err(UNSUPPORTED_KEY_MESSAGE.into());
             }
             Ok(Command::Press {
                 tab: parse_tab(tab)?,
@@ -193,10 +213,15 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
                     | "space"
                     | "wait"
                     | "read"
+                    | "read-page"
+                    | "frames"
+                    | "read-frame"
                     | "scroll"
                     | "click"
+                    | "hover"
                     | "check"
                     | "fill"
+                    | "insert"
                     | "select"
                     | "press"
                     | "close"
@@ -556,6 +581,33 @@ mod tests {
                 }),
             },
         );
+        assert_eq!(
+            parse_command(&args(&["task", "run", "task-1", "2", "frames", "3"])).unwrap(),
+            Command::TaskRun {
+                task: "task-1".into(),
+                revision: 2,
+                command: Box::new(Command::Frames { tab: 3 }),
+            },
+        );
+        for frame in ["frame-A1".to_owned(), "F".repeat(256)] {
+            assert_eq!(
+                parse_command(&args(&[
+                    "task",
+                    "run",
+                    "task-1",
+                    "2",
+                    "read-frame",
+                    "3",
+                    &frame,
+                ]))
+                .unwrap(),
+                Command::TaskRun {
+                    task: "task-1".into(),
+                    revision: 2,
+                    command: Box::new(Command::ReadFrame { tab: 3, frame }),
+                },
+            );
+        }
         for invalid in [
             vec!["task", "run", "task-1", "2"],
             vec!["task", "run", "task-1", "2", "task", "list"],
@@ -563,6 +615,20 @@ mod tests {
                 "task", "run", "task-1", "2", "task", "run", "task-2", "1", "tabs",
             ],
             vec!["task", "run", "task-1", "2", "read", "0"],
+            vec!["task", "run", "task-1", "2", "frames", "0"],
+            vec!["task", "run", "task-1", "2", "frames", "3", "extra"],
+            vec!["task", "run", "task-1", "2", "read-frame", "0", "frame-A1"],
+            vec!["task", "run", "task-1", "2", "read-frame", "3"],
+            vec![
+                "task",
+                "run",
+                "task-1",
+                "2",
+                "read-frame",
+                "3",
+                "frame-A1",
+                "extra",
+            ],
             vec!["task", "run", "task-1", "2", "scroll", "3", "0", "10001"],
             vec!["task", "run", "task-1", "2", "tabs", "extra"],
         ] {
@@ -635,8 +701,15 @@ mod tests {
             ("forward", Command::Forward { tab: 3 }),
             ("reload", Command::Reload { tab: 3 }),
             ("stop", Command::Stop { tab: 3 }),
+            ("frames", Command::Frames { tab: 3 }),
         ] {
             assert_eq!(parse_command(&args(&[name, "3"])).unwrap(), command);
+        }
+        for frame in ["frame-A1".to_owned(), "F".repeat(256)] {
+            assert_eq!(
+                parse_command(&args(&["read-frame", "3", &frame])).unwrap(),
+                Command::ReadFrame { tab: 3, frame },
+            );
         }
     }
 
@@ -653,10 +726,20 @@ mod tests {
                 "{url}"
             );
         }
-        for name in ["navigate", "back", "forward", "reload", "stop"] {
+        for name in [
+            "navigate",
+            "back",
+            "forward",
+            "reload",
+            "stop",
+            "frames",
+            "read-frame",
+        ] {
             let mut valid = vec![name, "3"];
             if name == "navigate" {
                 valid.push("https://example.test");
+            } else if name == "read-frame" {
+                valid.push("frame-A1");
             }
             let mut extra = valid.clone();
             extra.push("extra");
@@ -669,6 +752,31 @@ mod tests {
                 invalid[1] = tab;
                 assert!(parse_command(&args(&invalid)).is_err(), "{invalid:?}");
             }
+        }
+        for frame in [
+            "".to_owned(),
+            "프레임".into(),
+            "frame\n1".into(),
+            "frame\u{7f}".into(),
+            "F".repeat(257),
+        ] {
+            assert!(
+                parse_command(&args(&["read-frame", "3", &frame])).is_err(),
+                "{frame:?}"
+            );
+            assert!(
+                parse_command(&args(&[
+                    "task",
+                    "run",
+                    "task-1",
+                    "2",
+                    "read-frame",
+                    "3",
+                    &frame,
+                ]))
+                .is_err(),
+                "{frame:?}"
+            );
         }
     }
 
@@ -839,23 +947,186 @@ mod tests {
     }
 
     #[test]
-    fn fill_preserves_empty_text_and_unicode() {
-        assert_eq!(
-            parse_command(&args(&["fill", "1", "2:a", ""])).unwrap(),
-            Command::Fill {
-                tab: 1,
-                reference: "2:a".into(),
-                text: "".into()
+    fn press_named_keys_keep_wire_strings_and_task_scopes() {
+        for key in [
+            "Enter",
+            "Tab",
+            "Escape",
+            "ArrowLeft",
+            "ArrowUp",
+            "ArrowRight",
+            "ArrowDown",
+            "Home",
+            "End",
+            "PageUp",
+            "PageDown",
+            "Backspace",
+            "Delete",
+            "Space",
+            "Shift+Enter",
+            "Shift+Tab",
+            "Shift+ArrowLeft",
+            "Shift+ArrowUp",
+            "Shift+ArrowRight",
+            "Shift+ArrowDown",
+            "Shift+Home",
+            "Shift+End",
+            "Shift+PageUp",
+            "Shift+PageDown",
+            "Meta+A",
+            "Meta+Z",
+            "Meta+Shift+Z",
+            "Meta+ArrowLeft",
+            "Meta+ArrowUp",
+            "Meta+ArrowRight",
+            "Meta+ArrowDown",
+            "Meta+Shift+ArrowLeft",
+            "Meta+Shift+ArrowUp",
+            "Meta+Shift+ArrowRight",
+            "Meta+Shift+ArrowDown",
+            "Meta+Backspace",
+            "Alt+ArrowLeft",
+            "Alt+ArrowRight",
+            "Alt+Shift+ArrowLeft",
+            "Alt+Shift+ArrowRight",
+            "Alt+Backspace",
+            "Alt+Delete",
+        ] {
+            let command = parse_command(&args(&["press", "7", "4/doc:2:3", key])).unwrap();
+            assert_eq!(
+                command,
+                Command::Press {
+                    tab: 7,
+                    reference: "4/doc:2:3".into(),
+                    key: key.into()
+                }
+            );
+            assert_eq!(serde_json::to_value(&command).unwrap()["key"], key);
+            assert_eq!(
+                parse_command(&args(&[
+                    "task",
+                    "run",
+                    "task-1",
+                    "2",
+                    "press",
+                    "7",
+                    "4/doc:2:3",
+                    key
+                ]))
+                .unwrap(),
+                Command::TaskRun {
+                    task: "task-1".into(),
+                    revision: 2,
+                    command: Box::new(command)
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn press_rejects_aliases_unsupported_modifiers_and_malformed_arguments() {
+        for key in [
+            "",
+            "enter",
+            "Esc",
+            "Return",
+            " ",
+            "a",
+            "Enter ",
+            " Shift+Tab",
+            "shift+Tab",
+            "Shift+Shift+Tab",
+            "Control+Tab",
+            "Ctrl+Enter",
+            "Alt+ArrowUp",
+            "Meta+Delete",
+            "Shift+Escape",
+            "Shift+Backspace",
+            "Shift+Delete",
+            "Shift+Space",
+            "Tab\n",
+        ] {
+            assert!(
+                parse_command(&args(&["press", "7", "4/doc:2:3", key])).is_err(),
+                "{key:?}"
+            );
+            assert!(
+                parse_command(&args(&[
+                    "task",
+                    "run",
+                    "task-1",
+                    "2",
+                    "press",
+                    "7",
+                    "4/doc:2:3",
+                    key
+                ]))
+                .is_err(),
+                "{key:?}"
+            );
+        }
+        for input in [
+            vec!["press", "7", "4/doc:2:3"],
+            vec!["press", "7", "4/doc:2:3", "Tab", "extra"],
+            vec!["press", "0", "4/doc:2:3", "Tab"],
+            vec!["press", "7", "", "Tab"],
+        ] {
+            assert!(parse_command(&args(&input)).is_err(), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn fill_and_insert_preserve_empty_text_and_unicode() {
+        for text in ["", "한글 text"] {
+            for (name, expected) in [
+                (
+                    "fill",
+                    Command::Fill {
+                        tab: 1,
+                        reference: "2:a".into(),
+                        text: text.into(),
+                    },
+                ),
+                (
+                    "insert",
+                    Command::Insert {
+                        tab: 1,
+                        reference: "2:a".into(),
+                        text: text.into(),
+                    },
+                ),
+            ] {
+                assert_eq!(
+                    parse_command(&args(&[name, "1", "2:a", text])).unwrap(),
+                    expected
+                );
+                assert_eq!(
+                    serde_json::to_value(&expected).unwrap(),
+                    serde_json::json!({"type":name,"tab":1,"ref":"2:a","text":text})
+                );
+                assert_eq!(
+                    parse_command(&args(&[
+                        "task", "run", "task-1", "2", name, "1", "2:a", text
+                    ]))
+                    .unwrap(),
+                    Command::TaskRun {
+                        task: "task-1".into(),
+                        revision: 2,
+                        command: Box::new(expected),
+                    }
+                );
             }
-        );
-        assert_eq!(
-            parse_command(&args(&["fill", "1", "2:a", "한글 text"])).unwrap(),
-            Command::Fill {
-                tab: 1,
-                reference: "2:a".into(),
-                text: "한글 text".into()
+        }
+        for name in ["fill", "insert"] {
+            for input in [
+                vec![name, "1", "2:a"],
+                vec![name, "1", "2:a", "text", "extra"],
+                vec![name, "0", "2:a", "text"],
+                vec![name, "1", "", "text"],
+            ] {
+                assert!(parse_command(&args(&input)).is_err(), "{input:?}");
             }
-        );
+        }
     }
 
     #[test]

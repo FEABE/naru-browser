@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Prepared local CEF check for native click dispatch and observable page effects.
+"""Prepared local CEF check for native hover/click and observable page effects.
 
 Requires an already-running compatible app and exclusive CLI access. Uses one
 owned task/tab and localhost fixture, preserving the user's selected space/tab.
 Does not launch an app, force window focus, retry pointer actions or submit externally.
-Syntax checking is not a CEF result. Hover relocation must actually run; dispatch acknowledgement alone never proves
-the page effect.
+Syntax checking is not a CEF result. Menu opening and hover relocation must
+actually run; dispatch acknowledgement alone never proves the page effect.
 """
 
 import argparse
@@ -34,7 +34,7 @@ def receipt(page):
 
 def run(args):
     cli = BrowserCli(args.cli.resolve(), args.data_dir.resolve())
-    report = {"ok": False, "scope": "local CEF native click and background selection", "checks": []}
+    report = {"ok": False, "scope": "local CEF native hover/click and background selection", "checks": []}
     initial, owned = set(), set()
     task = baseline = server = server_thread = last_response = None
     server_started = False
@@ -61,7 +61,7 @@ def run(args):
     def preserved():
         status = call("status")
         require((status["activeSpace"], status["activeTab"], status["overview"]) == baseline,
-                "Native click changed the user's selected space/tab")
+                "Native hover/click changed the user's selected space/tab")
         require(initial <= ids(), "An initial tab disappeared")
 
     try:
@@ -89,9 +89,9 @@ def run(args):
             require(page.get("title") == "Naru native click fixture", "Unexpected fixture")
             return page
 
-        def click(label, target):
+        def click(label, target, observed_page=None):
             preserved()
-            page = read()
+            page = read() if observed_page is None else observed_page
             before = receipt(page)
             result = scoped("click", tab, element(page, label)["ref"])
             require_native_click_ack(result["page"])
@@ -113,6 +113,39 @@ def run(args):
 
         poll(read, lambda page: receipt(page)["frameReady"] is True, "Nested frame fixture did not become ready")
         preserved()
+        page = read()
+        before = receipt(page)
+        require(before["hoverMenuOpen"] is False and before["hoverMenuOpens"] == 0 and
+                all(value == 0 for value in before["clicks"].values()) and
+                not any(item.get("label") == "Hover menu choice" for item in page.get("interactive", [])),
+                "Hover menu must begin closed, without a selectable item or prior clicks")
+        result = scoped("hover", tab, element(page, "Hover menu trigger")["ref"])
+        ack = result["page"]
+        require(isinstance(ack, dict) and ack.get("ok") is True and ack.get("action") == "hover" and
+                ack.get("input") == "chromium" and ack.get("attempted") is True and
+                ack.get("dispatchAcknowledged") is True and ack.get("pointVerified") is True,
+                "hover: expected Chromium move acknowledgement and point verification")
+        require("trusted" not in ack and "prepared" not in ack,
+                "hover: internal preparation or event trust must not be reported as success")
+        # Read after hover exposes the newly opened item and supplies its new ref.
+        # Poll observations only; the hover command is never repeated.
+        menu_page = poll(read, lambda value: receipt(value)["hoverMenuOpen"] is True and
+                         any(item.get("label") == "Hover menu choice" for item in value.get("interactive", [])),
+                         "Hover acknowledgement did not expose the menu item")
+        after = receipt(menu_page)
+        require(after["hoverMenuOpens"] == 1 and after["hoverMenuTrusted"] is True and
+                after["counts"] == before["counts"] and after["clicks"] == before["clicks"] and
+                all(after["counts"][kind] == 0 for kind in
+                    ("pointerdown", "mousedown", "pointerup", "mouseup", "click")),
+                "Hover must open the menu without pointer down/up, clicks, or selection")
+        preserved()
+        before, after, events = click("Hover menu choice", "menu-choice", menu_page)
+        require(after["hoverMenuSelection"] == 1 and after["hoverMenuOpen"] is False and
+                after["clicks"]["menu-trigger"] == 0 and after["clicks"]["menu-choice"] == 1 and
+                after["counts"]["click"] == before["counts"]["click"] + 1,
+                "The newly read menu ref did not select its item exactly once")
+        report["checks"].append("hover opens a menu with zero clicks/down/up; a fresh read ref selects its item once; user selection preserved")
+
         for label, target in (("Native click button", "button"), ("Shadow click button", "shadow"),
                               ("Nested frame button", "nested"), ("Overflow button", "overflow")):
             before, after, events = click(label, target)

@@ -6,6 +6,7 @@ pub mod config;
 pub mod download_permissions;
 pub mod downloads;
 pub mod history;
+pub mod keyboard;
 pub mod page_find;
 pub mod page_recovery;
 pub mod protocol;
@@ -24,13 +25,21 @@ pub mod capture;
 #[cfg(all(feature = "browser", target_os = "macos"))]
 pub mod control_panel;
 #[cfg(feature = "browser")]
+mod devtools_wire;
+#[cfg(feature = "browser")]
 pub mod download_permission_runtime;
 #[cfg(feature = "browser")]
 pub mod download_runtime;
 #[cfg(feature = "browser")]
+mod frame_pointer;
+#[cfg(feature = "browser")]
+mod frame_sessions;
+#[cfg(feature = "browser")]
 pub mod history_runtime;
 #[cfg(all(feature = "browser", target_os = "macos"))]
 pub mod mac;
+#[cfg(feature = "browser")]
+mod page_read;
 
 #[cfg(feature = "browser")]
 pub fn initialize_cef_api() -> bool {

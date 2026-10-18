@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepared local CEF check for native Enter dispatch and observable page effects.
+"""Prepared local CEF check for keyboard dispatch and observable page effects.
 
 Requires an already-running compatible app and exclusive CLI access. Uses one
 owned task/tab and localhost fixture, preserving the user's selected space/tab.
@@ -34,7 +34,7 @@ def receipt(page):
 
 def run(args):
     cli = BrowserCli(args.cli.resolve(), args.data_dir.resolve())
-    report = {"ok": False, "scope": "local CEF native Enter and background selection", "checks": []}
+    report = {"ok": False, "scope": "local CEF keyboard input and background selection", "checks": []}
     initial, owned = set(), set()
     task = baseline = server = server_thread = last_response = None
     server_started = False
@@ -165,6 +165,129 @@ def run(args):
                 after["states"]["other"]["value"] == "", "Rejected focus still dispatched keys or editing")
         preserved()
         report["checks"].append("actual focus redirection rejects before key dispatch; every action preserves the user space/tab")
+
+        # Each action starts in the fixture's declared state. Only observations
+        # are polled; an uncertain key action is never dispatched a second time.
+        cases = [
+            ("Tab", "Key first", "key-first", "Key second", {}),
+            ("Shift+Tab", "Key second", "key-second", "Key first", {}),
+            ("ArrowLeft", "Key edit", "key-edit", "Key edit", {"start": 1, "end": 1}),
+            ("ArrowRight", "Key edit", "key-edit", "Key edit", {"start": 3, "end": 3}),
+            ("Home", "Key edit", "key-edit", "Key edit", {"start": 0, "end": 0}),
+            ("End", "Key edit", "key-edit", "Key edit", {"start": 4, "end": 4}),
+            ("Backspace", "Key edit", "key-edit", "Key edit", {"value": "acd"}),
+            ("Delete", "Key edit", "key-edit", "Key edit", {"value": "abd"}),
+            ("Space", "Key checkbox", "key-check", "Key checkbox", {"checked": True}),
+            ("Escape", "Key popup", "key-popup", "Key popup", {"expanded": "false"}),
+            ("ArrowUp", "Key select", "key-select", "Key select", {"value": "a"}),
+            ("ArrowDown", "Key select", "key-select", "Key select", {"value": "c"}),
+            ("PageUp", "Key select", "key-select", "Key select", {"value": "a"}),
+            ("PageDown", "Key select", "key-select", "Key select", {"value": "d"}),
+            ("Enter", "Enter textarea", "textarea", "Enter textarea", {"value": "\n"}),
+            ("Shift+Enter", "Enter textarea", "textarea", "Enter textarea", {"value": "\n"}),
+            ("Shift+ArrowLeft", "Key edit", "key-edit", "Key edit", {"start": 1, "end": 2}),
+            ("Shift+ArrowRight", "Key edit", "key-edit", "Key edit", {"start": 2, "end": 3}),
+            ("Shift+Home", "Key edit", "key-edit", "Key edit", {"start": 0, "end": 2}),
+            ("Shift+End", "Key edit", "key-edit", "Key edit", {"start": 2, "end": 4}),
+            *[(key, "Key lines", "key-lines", "Key lines", {"selection": True}) for key in
+              ("Shift+ArrowUp", "Shift+ArrowDown", "Shift+PageUp", "Shift+PageDown")],
+            ("Backspace", "Key canceled deletion", "key-cancel", "Key canceled deletion", {"value": "abcd"}),
+        ]
+        def press_key(key, label, target, focused_label, expected, *, fresh=True):
+            preserved()
+            if fresh:
+                scoped("reload", tab)
+                scoped("wait", tab, "load", 10000)
+            page = poll(read, lambda value: receipt(value)["childReady"] is True,
+                        "Reloaded key fixture did not become ready")
+            before = receipt(page)
+            result = scoped("press", tab, element(page, label)["ref"], key)
+            require_native_press_ack(result["page"], key)
+            page = poll(read, lambda value: receipt(value)["counts"]["keyup"] > before["counts"]["keyup"],
+                        f"{key}: no observable keyup after acknowledgement")
+            after = receipt(page)
+            events = [event for event in after["events"] if event["sequence"] > before["sequence"]]
+            key_events = [event for event in events if event["type"] in ("keydown", "keyup")]
+            parts = key.split("+")
+            base_key, modifiers = parts[-1], set(parts[:-1])
+            event_key = {"Space": " ", "A": "a", "Z": "Z" if "Shift" in modifiers else "z"}.get(base_key, base_key)
+            code = f"Key{base_key}" if base_key in ("A", "Z") else base_key
+            require([event["type"] for event in key_events] == ["keydown", "keyup"] and
+                    key_events[0]["target"] == target and key_events[1]["target"] == after["active"] and all(
+                        event["key"] == event_key and event["code"] == code and
+                        event["shift"] is ("Shift" in modifiers) and event["alt"] is ("Alt" in modifiers) and
+                        event["meta"] is ("Meta" in modifiers) and event["ctrl"] is False and
+                        event["trusted"] is True
+                        for event in key_events), f"{key}: wrong event pair or payload")
+            require(all(event["trusted"] is True for event in events), f"{key}: untrusted editing/default event")
+            require(result["page"].get("keydownTarget") == "matched", f"{key}: original keydown target was not confirmed")
+            require(page.get("focusedRef") == element(page, focused_label)["ref"],
+                    f"{key}: read did not identify the resulting focused element")
+            state = after["states"][target]
+            for field, value in expected.items():
+                if field == "selection":
+                    require(state["start"] < state["end"], f"{key}: no native text selection")
+                else:
+                    require(state[field] == value, f"{key}: unexpected {field}: {state[field]!r}")
+            preserved()
+            return before, after, events
+
+        for case in cases:
+            press_key(*case)
+        report["checks"].append("24 key forms and canceled deletion: native effects, focused refs, user selection preserved")
+
+        # The fixture uses an unwrapped, short ASCII document and one ASCII
+        # word. These explicit command boundaries do not assert OS-specific
+        # word segmentation for punctuation, languages or bidirectional text.
+        editing_cases = [
+            ("Meta+A", "Key edit", "key-edit", "Key edit", {"start": 0, "end": 4}),
+            ("Meta+ArrowLeft", "Shortcut document", "key-document", "Shortcut document", {"start": 11, "end": 11}),
+            ("Meta+ArrowRight", "Shortcut document", "key-document", "Shortcut document", {"start": 22, "end": 22}),
+            ("Meta+ArrowUp", "Shortcut document", "key-document", "Shortcut document", {"start": 0, "end": 0}),
+            ("Meta+ArrowDown", "Shortcut document", "key-document", "Shortcut document", {"start": 28, "end": 28}),
+            ("Meta+Shift+ArrowLeft", "Shortcut document", "key-document", "Shortcut document", {"start": 11, "end": 17}),
+            ("Meta+Shift+ArrowRight", "Shortcut document", "key-document", "Shortcut document", {"start": 17, "end": 22}),
+            ("Meta+Shift+ArrowUp", "Shortcut document", "key-document", "Shortcut document", {"start": 0, "end": 17}),
+            ("Meta+Shift+ArrowDown", "Shortcut document", "key-document", "Shortcut document", {"start": 17, "end": 28}),
+            ("Meta+Backspace", "Shortcut document", "key-document", "Shortcut document", {"value": "alpha beta\ndelta\nomega"}),
+            ("Alt+ArrowLeft", "Shortcut word", "key-word", "Shortcut word", {"start": 0, "end": 0}),
+            ("Alt+ArrowRight", "Shortcut word", "key-word", "Shortcut word", {"start": 8, "end": 8}),
+            ("Alt+Shift+ArrowLeft", "Shortcut word", "key-word", "Shortcut word", {"start": 0, "end": 4}),
+            ("Alt+Shift+ArrowRight", "Shortcut word", "key-word", "Shortcut word", {"start": 4, "end": 8}),
+            ("Alt+Backspace", "Shortcut word", "key-word", "Shortcut word", {"value": "abet"}),
+            ("Alt+Delete", "Shortcut word", "key-word", "Shortcut word", {"value": "alph"}),
+        ]
+        for case in editing_cases:
+            before, after, events = press_key(*case)
+            if "value" in case[4]:
+                require(after["counts"]["input"] > before["counts"]["input"],
+                        f"{case[0]}: deletion changed no observable native input state")
+        report["checks"].append("SelectAll, line/document/word navigation and selection, line/word deletion verified by native state")
+
+        for key in ("Meta+A", "Alt+Backspace"):
+            before, after, events = press_key(key, "Canceled shortcut", "key-command-cancel", "Canceled shortcut",
+                                             {"value": "alphabet", "start": 4, "end": 4})
+            require(all(after["counts"][kind] == before["counts"][kind] for kind in ("beforeinput", "input")) and
+                    any(event["type"] == "keydown" and event["defaultPrevented"] is True for event in events),
+                    f"{key}: canceled keydown still executed an editing command")
+        report["checks"].append("preventDefault blocks explicit SelectAll and word deletion commands")
+
+        scoped("reload", tab)
+        scoped("wait", tab, "load", 10000)
+        page = poll(read, lambda value: receipt(value)["childReady"] is True, "Undo fixture did not become ready")
+        fill = scoped("fill", tab, element(page, "Shortcut undo")["ref"], "undo draft")["page"]
+        require(fill.get("ok") is True and fill.get("input") == "chromium" and fill.get("attempted") is True and
+                fill.get("verified") is True and fill.get("dispatchAcknowledged") is True and "trusted" not in fill,
+                "Undo setup did not use verified Chromium text input")
+        require(receipt(read())["states"]["key-undo"]["value"] == "undo draft", "Undo setup text was not inserted")
+        preserved()
+        for key, value in (("Meta+Z", ""), ("Meta+Shift+Z", "undo draft")):
+            before, after, events = press_key(key, "Shortcut undo", "key-undo", "Shortcut undo", {"value": value}, fresh=False)
+            require(after["counts"]["input"] > before["counts"]["input"], f"{key}: history operation emitted no native input")
+        current = info()
+        require(current["status"] == "active" and current["revision"] == task["revision"],
+                "Keyboard operations changed the AI task's status or revision")
+        report["checks"].append("native insertText Undo/Redo restores exact text without reload; all 42 keys preserve background task ownership and user selection")
         report["ok"] = True
     except (CheckFailed, OSError, KeyError, TypeError, ValueError, RuntimeError) as error:
         report.update(error=str(error), lastResponse=last_response)

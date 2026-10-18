@@ -1,6 +1,74 @@
 # Naru 독립 브라우저 완성 계획
 
-기준일: 2026-10-16. 개발 목표는 **Naru를 먼저 완성하고 Aside와 ego lite의 장점을 결합하는 것**이다. 완성한 Naru 화면과 기능을 Preseller에 내장하는 순서는 유지한다. 사용자는 Aside의 장점 중 **세로 탭·검색·북마크 등 일상 브라우저 사용성을 우선**하도록 선택했다.
+기준일: 2026-10-18. 개발 목표는 **Naru를 먼저 완성하고 Aside와 ego lite의 장점을 결합하는 것**이다. 완성한 Naru 화면과 기능을 같은 Rust·CEF·Chromium 구현으로 Preseller에 내장하는 순서는 유지하며 목표는 진행 중이다. 사용자는 Aside의 장점 중 **세로 탭·검색·북마크 등 일상 브라우저 사용성을 우선**하도록 선택했다.
+
+2026-10-16 개발 방식 변경을 반영해 남은 기능을 합의한 범위에서 먼저 구현한다. 기능별로 전체 회귀 묶음을 반복하는 대신 통합 빌드가 준비되면 [독립 브라우저 E2E 체크리스트](ego-parity-e2e.md)의 14개 실제 사용 여정을 같은 앱 바이너리로 확인한다. 결함 수정 뒤에는 실패한 여정과 영향을 받는 범위를 확인하며, 이전 바이너리의 통과를 새 빌드의 결과로 옮기지 않는다.
+
+완료 여부는 체크리스트의 `pending`, `pass`, `fail`, `blocked`와 실행 근거로 판단한다. 사용자 공간 보존, AI 중지와 인계, 실제 입력 대상, 데이터 보존과 자원 회수 같은 핵심 항목이 미완료면 독립 브라우저 완성을 선언하지 않는다. 아래 기능별 기록은 구현과 과거 검증의 이력이며 최종 E2E 통과표가 아니다. 기준은 2026-10-11 실제 앱 관찰과 Naru의 합의 범위다. 최신 ego lite의 모든 기능과 동등하다는 뜻은 아니다. 탭 복원과 페이지 확대는 사용자 보류를 유지한다.
+
+## 텍스트·키 입력의 임시 페이지 포커스 준비
+
+후속 구현은 정확한 session의 focus emulation enable ACK 뒤 원래 대상의 준비를 새로 수행한다. 입력을 한 번 요청하고 disable ACK 뒤 값을 읽거나 입력 대상 관찰을 소비하며, 사용자 창의 포커스를 옮기는 호출은 추가하지 않는다. 일반 입력칸의 fill은 입력 종류를 먼저 분류하고 다른 대상으로 전달된 이벤트 증거를 최종 값 일치보다 우선 실패로 처리한다. [포커스 준비 계약](focus-input.md)에 취소·늦은 응답·정리와 페이지 visibility 부작용을 기록한다. 첫 페이지 focus 전환을 준비 앞으로 옮기는 보완이며 지연된 모든 스크립트와 사람 입력의 경합을 막는 기능은 아니다. 실제 CEF의 입력과 사용자 화면 보존은 E2E에서 확인한다.
+
+## 교차 출처 프레임의 읽기와 입력
+
+후속 `read-page TAB`은 현재 탭의 루트와 하위 문서를 순차 읽어 한 응답으로 돌려준다. 문서 시도는 최대 16개이며 본문 12,000 UTF-16 단위·요소 120개·순회 10,000회·열린 root 64개·옵션 240개·로컬 iframe 메타데이터 16개를 공유한다. 본문을 중복 순회하지 않고, 읽지 않은 문서는 사유와 함께 구분한다. 여러 프레임의 참조는 마지막 정리 ACK 뒤에 한 묶음으로 게시하며 부분 실패에서 일부 참조만 성공처럼 반환하지 않는다. [통합 읽기 계약](page-read.md)에 범위와 실제 앱에서 확인할 항목을 기록한다.
+
+2026-10-18 `read-frame TAB FRAME`을 본문 전용 조회에서 문서에 결합한 입력 참조까지 확장했다. 현재 프레임을 정확한 session과 고유 context로 읽고 `click`, `hover`, `fill`, `insert`, `press`, `check`, `select`를 연결한다. 기존 `read`의 다중 문서 결과와는 별도 명령이며 `supportedActions`와 `pointerActionsSupported:true`, `atomic:false`로 범위를 알린다.
+
+입력은 새 프레임 목록, 원래 context, 문서 ID와 읽기 세대를 확인한다. 부모 iframe은 각 부모의 실제 context에서 연결·숨김·비활성 상태를 검사하며 임시 원격 노드는 object group 해제 ACK까지 추적한다. 성공 응답도 Runtime disable ACK 뒤에 전달한다. 엔진 입력에 frame 선택 인자가 있는 것은 아니므로 준비 뒤 지연 focus 변경을 막거나 전달된 입력을 취소하는 보장은 없다.
+
+| 상태 | 범위와 근거 |
+| --- | --- |
+| 소스 구현·검토 | 단일 프레임 읽기와 7개 입력, context와 ref 수명, 부모 상태·좌표와 hit-test 및 정리. [입력 계약](frame-input.md), [고정 엔진 조사](../artifacts/frame-input-v1-sources.json) 참조 |
+| 미구현 | 회전·perspective·pinch 등 지원 밖 프레임 변환, 지연 focus 경합 예방 |
+| 미검증 | 최신 Naru CEF의 실제 입력과 읽기, OOPIF·문서 교체·취소·정리 및 사용자 선택 보존, 외부 사이트와 E2E. 통합 빌드 근거는 [작업 기록](work-log.md)을 따름 |
+
+탭마다 최대 16개 문서·전체 120개 ref인 최신 native 묶음 하나를 보관한다. 각 world의 DOM ref는 WeakRef를 쓰며 강한 노드 참조로 대체하지 않는다. 고정 world를 재사용하지만 Runtime disable은 world를 제거하지 않고 이전 world의 메타데이터도 즉시 모두 지우지 않는다. 실제 메모리는 E2E에서 확인한다. 전체 회귀 묶음은 반복하지 않았으며 구현·빌드만으로 독립 브라우저 완성을 선언하지 않는다.
+
+프레임 포인터는 [별도 계약](frame-pointer.md)에 따라 leaf와 최대 32개 부모의 content box·viewport를 교차해 가시 영역을 구한다. 제한된 9개 후보를 각 부모의 hit-test로 거르고 root session으로 마우스 이동을 보낸다. 이후 원 leaf 위치와 모든 부모, 최종 root 위치를 재검사해 hover를 끝내거나 클릭한다. 유효 후보를 찾지 못했을 때만 leaf scrollIntoView 한 번 뒤 geometry를 새로 모으며, 이동 이후에는 위치를 재선택하거나 입력을 반복하지 않는다. [고정 Chromium 조사](../artifacts/frame-pointer-v1-sources.json)는 remote 조상 스크롤의 실제 경로를 확인하지만 비동기 완료나 순차 검사 이후 화면 고정을 보장하지 않는다.
+
+## 커서와 선택 영역을 유지하는 텍스트 삽입
+
+2026-10-18 후속 소스에 insert 명령을 추가한다. 키로 선택한 단어의 치환과 문장 이어쓰기를 기존 Chromium Input.insertText로 연결하며 준비에서 선택을 새로 만들지 않는다. 입력칸의 예상 값 일치와 contenteditable의 입력 대상 및 이벤트 관찰을 구분한다. [삽입 계약](insert-text.md)에 사후 검증, 메모리 상한과 기존 포커스 경합의 한계를 기록했다. 실제 앱 검증은 통합 E2E에서 진행한다.
+
+## 마우스 올리기와 macOS 편집 조작
+
+2026-10-18에는 hover를 클릭과 분리해 포인터 이동과 같은 위치의 확인까지만 실행하도록 연결했다. 새 read로 열린 메뉴의 참조를 받아 클릭하는 흐름을 지원한다. macOS 편집 단축키 18개를 추가해 전체 선택, 실행 취소와 다시 실행, 줄과 문서 경계 및 단어 단위 이동과 삭제를 연결했다. 지원 이름은 총 42개이고 클립보드, 임의 조합과 IME는 포함하지 않는다.
+
+hover와 편집은 기존 입력 배치와 작업 소유권을 재사용한다. 별도 프로세스나 UI renderer는 없다. 소스 구현과 빌드, 실제 앱 E2E의 결과를 구분하며 최신 후보와 남은 실행은 [E2E 목록](ego-parity-e2e.md)을 따른다. 아래 기능별 검증 수치는 당시 소스의 이력이다.
+
+## 통합 입력 보완과 첫 E2E 후보
+
+키 입력의 원래 대상 관찰을 연결해 다른 요소가 keydown을 받은 경우 오류로 알린다. 이 관찰은 잘못된 입력을 되돌리거나 지연 포커스 경합 자체를 막지 않으므로 E2E의 핵심 확인 항목으로 유지한다. contenteditable은 전체 선택 뒤 Chromium 입력과 렌더된 텍스트 확인으로 전환했다. 별도 UI renderer나 상주 프로세스는 추가하지 않았다.
+
+이번 변경은 전체 단위 회귀를 반복하지 않고 통합 release 빌드와 구문 확인을 진행한다. 실제 앱 검증은 [E2E 목록](ego-parity-e2e.md)에 기록한다. 아래 373개와 128개 등 수치는 이 보완 전 소스의 이력이며 새 코드의 통과 수가 아니다.
+
+## AI 키보드 이동과 포커스 관찰
+
+Enter 전용 press를 Tab, Escape, Space, 방향키, Home, End, PageUp, PageDown, Backspace와 Delete로 확장하고 지정한 Shift 조합 10개를 지원한다. 원 요청 키를 포커스 준비 응답과 대조한 뒤 기존 Chromium 입력 배치를 사용한다. 읽기의 focusedRef로 Tab 이후 관찰한 대상의 새 참조를 얻을 수 있다. 접근 불가 프레임과 닫힌 Shadow DOM 등 확인할 수 없는 대상은 null이며 OS 포커스나 원자적 관찰로 설명하지 않는다. [키 입력 계약](keyboard-input.md)에 정확한 지원 이름과 재시도, 포커스 이동의 한계를 기록한다. 최신 Naru CEF와 배경 선택 보존, IME와 외부 사이트 검증은 남으며 검증 수준은 작업 기록을 따른다.
+
+Rust 단위 373개와 두 구성의 전체 타깃 검사가 통과했다. 독립 Chromium의 제품 bridge 검사 28개 중 27개가 통과했으며, 지연된 focus 핸들러가 입력 대상을 바꾼 1개는 실패로 보존했다. 이미 포커스된 문서의 별도 준비 거절 검사 1개 통과를 원래 경합 해결로 합산하지 않는다. 같은 최신 Naru 앱의 통합 검증은 남는다.
+
+## 일반 텍스트 입력의 Chromium 연결
+
+text, search, tel, url, password와 textarea의 fill을 전체 선택 준비, Input.insertText 한 번, 원래 대상의 값 확인으로 연결한다. 빈 문자열도 같은 경로로 삭제하며 beforeinput 취소와 maxlength를 Chromium에 맡긴다. email, number와 날짜 등 나머지 지원 유형은 기존 DOM 처리를 유지한다. 후속 contenteditable은 위 통합 입력 보완의 Chromium 경로로 전환했다. [입력 계약](native-fill-control.md)에 유형별 지원과 입력 경합, 성공의 의미를 기록한다. 최신 Naru CEF와 배경 선택 보존, 외부 서비스 검증은 남아 있으며 이번 검증 결과는 작업 기록을 따른다.
+
+최신 소스는 Rust 단위 368개, 모의 DOM 116개와 두 구성의 전체 타깃 검사를 통과했다. 독립 ego Chromium에서 29개 입력 계약을 확인했으며 fixture 오류 1개 수정 후 해당 항목만 다시 검사한 결과를 포함한다. 최신 Naru 앱 통합 결과는 아니다. 전용 검사 중간물을 정리했고 상세 근거와 미검증 범위는 [작업 기록](work-log.md)을 따른다.
+
+## CLI 상태 관측과 대기 수명
+
+탭 목록, 생성 결과, 탐색 진단과 로딩 대기에서도 CEF getter를 내부 상태 borrow 밖으로 옮긴다. 실제 URL과 요청 URL을 구분하며, 조회 중 페이지나 제어권이 바뀐 관측은 폐기한다. DOM 대기는 관측이 확인되기 전에 대기 항목을 지우지 않고 원래 마감 시간과 단일 probe를 유지한다. [상태 관측 계약](cli-state-observation.md)에 생성 후 조회 실패와 불안정 상태의 시간 초과, 네이티브 탐색과 CLI 권한의 차이를 기록한다. 실제 Naru의 HTTP, 인계와 지연 응답 검증은 남아 있다.
+
+중단했던 관측 수정의 컴파일 오류를 해소하고 기존 검사를 포함한 Rust 단위 360개, format, 오프라인 lib 테스트 컴파일, 기본 구성과 CLI 전용 구성의 전체 타깃 검사를 통과했다. 새 회귀 10개는 native getter와 host 준비 경계에 상태 변경을 주입하는 검사다. 같은 token의 다른 대기와 원 Browser가 아닌 callback을 배제하며, 준비 단계가 끝난 뒤 실제 전송 직전까지 권한과 마감을 확인한다. 최신 앱 번들은 만들거나 실행하지 않았고 전체 브라우저 완성으로 판정하지 않는다. 검증과 전용 빌드 파일 정리는 작업 기록을 따른다.
+
+## 화면 상태 읽기의 재진입 경계
+
+탭 목록과 탐색 막대의 상태를 읽을 때 내부 상태 borrow 밖에서 CEF를 조회한다. 조회 중 닫힌 탭, 바뀐 문서와 로딩, 새 탭을 감지하면 기존 화면을 유지하고 다음 갱신으로 넘긴다. 최종 상태의 공간별 순서와 사용자 선택, AI 소유권을 함께 반영한다. [상태 읽기 계약](shell-snapshot.md)은 반환 시점의 검사이며 전체 AppKit 렌더나 CLI 상태 조회를 모두 해결한 것으로 보지 않는다. 최신 앱의 실제 CEF와 UI 검증은 남아 있다.
+
+## 새로고침과 로딩 중지의 의도 보존
+
+표시한 중지 동작이 로딩 완료 후 새로고침으로 바뀌는 경로를 보완한다. 현재 탭과 문서, AI 소유권을 확인하고 실제 중지가 필요한 경우에만 인계한다. 중지 중 주소 초안은 보존하며 실제 탐색이나 선택 변경과 구분한다. 버튼, ⌘R, 메뉴와 오류 화면 재시도의 경계는 [동작 계약](reload-stop.md)을 따른다. 최신 앱의 실제 입력과 CEF 검증은 남아 있다.
 
 ## CLI 클릭의 Chromium 입력
 
@@ -20,7 +88,7 @@
 
 ## 일반 입력칸의 성공 판정 보완
 
-일반 input과 textarea의 fill도 마지막 네이티브 value가 요청 문자열과 같은지 확인하도록 보완한다. 독립 Chromium에서 확인한 숫자·날짜 값 정규화, 페이지의 되돌림과 대상 제거 후 성공 응답을 구분한다. input/change 순서는 유지하며 정규화로 달라진 값은 미도달, 대상 변경은 미확정으로 반환한다. [입력칸 계약](native-fill-control.md)에 엄격한 문자열 비교와 동기 확인의 한계를 명시한다. 이를 trusted 입력, 외부 편집기 전체 호환성과 최신 Naru CEF 실행 완료로 확대하지 않는다.
+기존 DOM fill에 마지막 네이티브 value가 요청 문자열과 같은지 확인하는 보완을 추가했다. 독립 Chromium에서 확인한 숫자와 날짜 값 정규화, 페이지의 되돌림과 대상 제거 후 성공 응답을 구분한다. 후속 텍스트 경로는 위 Chromium 입력으로 전환하며, 나머지 DOM 유형의 input, change 순서는 유지한다. 정규화로 달라진 값은 미도달, 대상 변경은 미확정으로 반환한다. [입력칸 계약](native-fill-control.md)에 엄격한 문자열 비교와 동기 확인의 한계를 명시한다. 이를 trusted 입력, 외부 편집기 전체 호환성과 최신 Naru CEF 실행 완료로 확대하지 않는다.
 
 ## HTML 편집 영역 입력
 
@@ -301,3 +369,13 @@ IME 조합·좁은 창·외부 사이트·장시간 사용은 남아 있다. v1�
 Naru는 탭마다 global request context를 사용한다. 공식 구현의 기본 확대는 공유 host 값에 기록되며, HTTP(S)의 키는 끝 점을 제거한 host로 scheme·port를 포함하지 않는다. 현재 열린 탭이나 요청 URL의 충돌만 막아도 이후 같은 host로 이동하는 AI 탭에 영향을 줄 수 있어, 현재 탭 목록만 검사하는 방어로는 작업 격리를 보장할 수 없다. [CEF 확대 호출 경로](https://github.com/chromiumembedded/cef/blob/master/libcef/browser/browser_host_base.cc), [Chromium 확대 처리](https://chromium.googlesource.com/chromium/src/+/refs/heads/main/components/zoom/zoom_controller.cc), [host 키 생성](https://chromium.googlesource.com/chromium/src/+/main/net/base/url_util.cc).
 
 Chromium 내부에는 탭별 temporary/isolated 확대가 있지만 설치된 CEF 공개 API에는 모드 설정이 없고, 내부 격리 모드도 문서 탐색 시 초기화된다. Chromium은 host 확대값의 프로필 저장·복원 경로도 갖지만 Naru의 재시작 보존은 미검증이다. 후속 구현은 엔진과 호스트의 경계에서 탭별 확대·탐색·기본값 복원·저장 정책을 설계하고, 다른 AI 탭에 영향이 없음을 검증한 뒤 진행한다. [격리 모드와 탐색 처리](https://chromium.googlesource.com/chromium/src/+/refs/heads/main/components/zoom/zoom_controller.cc), [확대값 저장·복원](https://chromium.googlesource.com/chromium/src/+/lkgr/chrome/browser/ui/zoom/chrome_zoom_level_prefs.cc).
+
+## 2026-10-18, 하위 프레임 연결을 위한 명령 전송 정리
+
+기존 명령 다섯 경로를 raw DevTools 전송으로 통합하고 응답을 소비하기 전에 루트 연결과 원 Browser를 대조한다. 미리보기와 screenshot의 늦은 응답도 같은 경계를 따르며 ID를 재사용하지 않는다. 이 단계에서는 child session 연결과 frame-local 읽기·입력이 후속 범위였으며, 이후 메타데이터 수집과 위 단일 프레임 내용 조회를 소스에 연결했다. [연결 설계](devtools-routing.md)의 전송 경계와 실제 앱 검증을 구분한다. 교차 출처 iframe 지원 완료나 실제 앱 통과는 아니다. 전체 회귀 묶음은 반복하지 않고 최종 사용 여정의 E2E에서 기존 입력, 캡처와 프레임을 이어서 확인한다.
+
+## 2026-10-18, 현재 탭의 프레임 연결과 메타데이터 조회
+
+`frames TAB`과 작업 범위의 같은 명령을 구현했다. 현재 탭의 루트와 iframe child session에 Page.enable, 제한된 autoAttach, getFrameTree를 연결하며 원 Browser·정확한 session·요청 ID를 확인한다. root ACK만으로 재귀 수집이 끝났다고 판단하지 않는다. 16개 자식 연결·깊이 8과 전체 128개 메타데이터 행 예산을 적용했다. 중복 frame ID, 수집 중 탐색·프레임 변경과 제어권 변경은 실패로 처리하며 자동 재시도하지 않는다.
+
+`frames` 결과는 비원자적 메타데이터이며 본문이나 조작 가능한 ref가 아니다. 후속 `read-frame`의 단일 문서 내용 조회와 context identity는 위 기록처럼 소스에 연결했으며, 이후 action ref와 7개 입력, 부모 좌표와 포인터 hit-test도 연결했다. 후속 read-page는 여러 프레임 본문을 공통 예산으로 읽는다. 지원 밖 변환은 남아 있다. 실제 OOPIF 연결과 해제, 사용자 선택 보존, 취소와 누적 자원은 [통합 E2E 08·14](ego-parity-e2e.md)에서 같은 최종 바이너리로 확인해야 한다. 전체 회귀 묶음을 실행하지 않았으며 새 프로세스나 UI 렌더러 없이 기존 CEF 연결을 이용한다.

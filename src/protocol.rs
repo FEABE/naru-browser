@@ -115,12 +115,27 @@ pub enum Command {
     Read {
         tab: i32,
     },
+    ReadPage {
+        tab: i32,
+    },
+    Frames {
+        tab: i32,
+    },
+    ReadFrame {
+        tab: i32,
+        frame: String,
+    },
     Scroll {
         tab: i32,
         x: i32,
         y: i32,
     },
     Click {
+        tab: i32,
+        #[serde(rename = "ref")]
+        reference: String,
+    },
+    Hover {
         tab: i32,
         #[serde(rename = "ref")]
         reference: String,
@@ -132,6 +147,12 @@ pub enum Command {
         checked: bool,
     },
     Fill {
+        tab: i32,
+        #[serde(rename = "ref")]
+        reference: String,
+        text: String,
+    },
+    Insert {
         tab: i32,
         #[serde(rename = "ref")]
         reference: String,
@@ -170,10 +191,15 @@ impl Command {
             | Self::Stop { tab }
             | Self::Wait { tab, .. }
             | Self::Read { tab }
+            | Self::ReadPage { tab }
+            | Self::Frames { tab }
+            | Self::ReadFrame { tab, .. }
             | Self::Scroll { tab, .. }
             | Self::Click { tab, .. }
+            | Self::Hover { tab, .. }
             | Self::Check { tab, .. }
             | Self::Fill { tab, .. }
+            | Self::Insert { tab, .. }
             | Self::Select { tab, .. }
             | Self::Press { tab, .. }
             | Self::Close { tab }
@@ -215,6 +241,16 @@ impl Command {
             return Err(invalid("TAB must be a positive 32-bit integer."));
         }
         match self {
+            Self::ReadFrame { frame, .. }
+                if frame.is_empty()
+                    || frame.len() > 256
+                    || !frame.is_ascii()
+                    || frame.bytes().any(|byte| byte.is_ascii_control()) =>
+            {
+                return Err(invalid(
+                    "FRAME must be a current CDP frame identifier of 1 to 256 ASCII bytes without control characters.",
+                ));
+            }
             Self::TaskCreate { name } => {
                 if name.trim().is_empty()
                     || name.trim().chars().count() > 120
@@ -888,10 +924,14 @@ fn validate_command_fields(value: &Value, allow_task: bool) -> Result<(), Protoc
                     | "space_overview"
                     | "wait"
                     | "read"
+                    | "frames"
+                    | "read_frame"
                     | "scroll"
                     | "click"
+                    | "hover"
                     | "check"
                     | "fill"
+                    | "insert"
                     | "select"
                     | "press"
                     | "close"
@@ -1047,6 +1087,14 @@ mod tests {
             ),
             (Command::Reload { tab: 3 }, json!({"type":"reload","tab":3})),
             (Command::Stop { tab: 3 }, json!({"type":"stop","tab":3})),
+            (Command::Frames { tab: 3 }, json!({"type":"frames","tab":3})),
+            (
+                Command::ReadFrame {
+                    tab: 3,
+                    frame: "frame-A1".into(),
+                },
+                json!({"type":"read_frame","tab":3,"frame":"frame-A1"}),
+            ),
             (
                 Command::Scroll {
                     tab: 3,
@@ -1423,6 +1471,8 @@ mod tests {
             json!({"type":"wait","tab":1,"until":"dom","timeout_ms":0}),
             json!({"type":"scroll","tab":1,"x":0,"y":10001}),
             json!({"type":"read","tab":1,"extra":true}),
+            json!({"type":"frames","tab":0}),
+            json!({"type":"frames","tab":3,"session":"untrusted"}),
         ] {
             let command = json!({"type":"task_run","task":"task-1","revision":1,"command":inner});
             assert_eq!(
@@ -1446,16 +1496,36 @@ mod tests {
 
     #[test]
     fn task_helpers_identify_tab_targets_without_claiming_multi_tab_commands() {
-        let inner = Command::Read { tab: 3 };
-        assert!(!inner.is_task_command());
-        assert_eq!(inner.tab_id(), Some(3));
-        let run = Command::TaskRun {
-            task: "task-1".into(),
-            revision: 1,
-            command: Box::new(inner),
-        };
-        assert!(run.is_task_command());
-        assert_eq!(run.tab_id(), Some(3));
+        for inner in [
+            Command::Read { tab: 3 },
+            Command::Frames { tab: 3 },
+            Command::ReadFrame {
+                tab: 3,
+                frame: "frame-A1".into(),
+            },
+            Command::ReadFrame {
+                tab: 3,
+                frame: "F".repeat(256),
+            },
+        ] {
+            assert!(!inner.is_task_command());
+            assert_eq!(inner.tab_id(), Some(3));
+            assert_eq!(
+                request_from_command_value(serde_json::to_value(&inner).unwrap())
+                    .unwrap()
+                    .command,
+                inner,
+            );
+            let run = Command::TaskRun {
+                task: "task-1".into(),
+                revision: 1,
+                command: Box::new(inner),
+            };
+            assert!(run.is_task_command());
+            assert_eq!(run.tab_id(), Some(3));
+            let wire = serde_json::to_value(&run).unwrap();
+            assert_eq!(request_from_command_value(wire).unwrap().command, run);
+        }
         assert_eq!(
             Command::TaskAdopt {
                 task: "task-1".into(),
@@ -1546,14 +1616,52 @@ mod tests {
                 "INVALID_REQUEST"
             );
         }
-        for name in ["back", "forward", "reload", "stop"] {
+        for name in ["back", "forward", "reload", "stop", "frames"] {
             for command in [
                 json!({"type":name}),
                 json!({"type":name,"tab":3,"url":"https://example.test"}),
+                json!({"type":name,"tab":"3"}),
+                json!({"type":name,"tab":0}),
+                json!({"type":name,"tab":2147483648_i64}),
             ] {
                 assert_eq!(
                     request_from_command_value(command).unwrap_err().code,
                     "INVALID_REQUEST"
+                );
+            }
+        }
+        let mut invalid_frames = vec![
+            json!({"type":"read_frame","tab":3}),
+            json!({"type":"read_frame","frame":"frame-A1"}),
+            json!({"type":"read_frame","tab":0,"frame":"frame-A1"}),
+            json!({"type":"read_frame","tab":"3","frame":"frame-A1"}),
+            json!({"type":"read_frame","tab":2147483648_i64,"frame":"frame-A1"}),
+            json!({"type":"read_frame","tab":3,"frame":null}),
+            json!({"type":"read_frame","tab":3,"frame":42}),
+            json!({"type":"read_frame","tab":3,"frame":"frame-A1","extra":true}),
+            json!({"type":"read_frame","tab":3,"frame":"frame-A1","session":"untrusted"}),
+            json!({"type":"read_frame","tab":3,"frame":"frame-A1","sessionId":"untrusted"}),
+        ];
+        for frame in [
+            "".to_owned(),
+            "프레임".into(),
+            "frame\n1".into(),
+            "frame\u{7f}".into(),
+            "F".repeat(257),
+        ] {
+            invalid_frames.push(json!({"type":"read_frame","tab":3,"frame":frame}));
+        }
+        for inner in invalid_frames {
+            for command in [
+                inner.clone(),
+                json!({"type":"task_run","task":"task-1","revision":1,"command":inner}),
+            ] {
+                assert_eq!(
+                    request_from_command_value(command.clone())
+                        .unwrap_err()
+                        .code,
+                    "INVALID_REQUEST",
+                    "{command}",
                 );
             }
         }

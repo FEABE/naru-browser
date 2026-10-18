@@ -7,44 +7,63 @@
   <style>body { font: 16px system-ui; margin: 24px; } label { display: block; margin: 8px; } iframe { width: 450px; height: 80px; } pre { white-space: pre-wrap; overflow-wrap: anywhere; }</style>
 </head>
 <body>
-  <h1>Exact native value verification</h1>
-  <p>Synthetic input/change, exact literal comparison. No native beforeinput or same-value no-op.</p>
+  <h1>Chromium text insertion and DOM fallback verification</h1>
+  <p>Text controls use Chromium input; other input types and editing hosts retain their DOM fallback.</p>
   <pre id="receipt"></pre>
   <label>Text <input id="text" aria-label="Text input" value="old"></label>
+  <label>Search <input id="search" type="search" aria-label="Search input" value="old"></label>
+  <label>Telephone <input id="tel" type="tel" aria-label="Telephone input" value="old"></label>
+  <label>URL <input id="url" type="url" aria-label="URL input" value="https://example.test/old"></label>
+  <label>Password <input id="password" type="password" aria-label="Password input"></label>
+  <label>Email <input id="email" type="email" aria-label="Email input" value="old@example.test"></label>
   <label>Number <input id="number" type="number" aria-label="Number input" value="1"></label>
   <label>Date <input id="date" type="date" aria-label="Date input" value="2026-10-16"></label>
+  <label>Range <input id="range" type="range" aria-label="Range input" value="25"></label>
+  <label>Color <input id="color" type="color" aria-label="Color input" value="#112233"></label>
   <label>Textarea <textarea id="textarea" aria-label="Textarea input">old</textarea></label>
+  <label>Maximum length <input id="maxlength" maxlength="4" aria-label="Maximum length input" value="old"></label>
+  <label>Textarea maximum length <textarea id="textarea-maxlength" maxlength="4" aria-label="Maximum length textarea">old</textarea></label>
+  <label>Canceled input <input id="cancel" aria-label="Canceled input" value="old"></label>
+  <label>Canceled textarea <textarea id="textarea-cancel" aria-label="Canceled textarea">old</textarea></label>
   <label>Readonly <input id="readonly" readonly aria-label="Readonly input" value="old"></label>
   <label>Input rollback <input id="reset-input" aria-label="Rollback on input" value="old"></label>
   <label>Change rollback <input id="reset-change" aria-label="Rollback on change" value="old"></label>
+  <label>DOM change rollback <input id="dom-reset-change" type="email" aria-label="DOM rollback on change" value="old@example.test"></label>
   <label>Remove <input id="remove" aria-label="Remove on input" value="old"></label>
   <label>Readonly after input <input id="lock" aria-label="Lock on input" value="old"></label>
   <label>Type after input <input id="type" aria-label="Retype on input" value="old"></label>
   <label>Getter spoof <input id="spoof" aria-label="Spoofed own getter" value="old"></label>
-  <label>Password rollback <input id="password" type="password" aria-label="Password rollback"></label>
+  <label>Password rollback <input id="password-reset" type="password" aria-label="Password rollback"></label>
+  <div id="editable" contenteditable="true" role="textbox" aria-label="Editable host">old</div>
   <div id="shadow-host"></div>
   <iframe id="child" title="Same-origin native input" srcdoc="&lt;input id='frame' aria-label='Frame input' value='old'&gt;"></iframe>
   <script>
     const shadow = document.querySelector('#shadow-host').attachShadow({ mode: 'open' });
     shadow.innerHTML = '<input id="shadow" aria-label="Shadow input" value="old">';
-    const controls = [...document.querySelectorAll('input, textarea'), shadow.querySelector('input')];
-    const counts = { beforeinput: 0, input: 0, change: 0 };
+    const controls = [...document.querySelectorAll('input, textarea, [contenteditable]'), shadow.querySelector('input')];
     const events = [];
+    let sequence = 0;
     let childReady = false;
     function nativeValue(element) {
+      if (element.isContentEditable) return element.textContent;
       const view = element.ownerDocument.defaultView;
       const prototype = element.tagName === 'TEXTAREA' ? view.HTMLTextAreaElement.prototype : view.HTMLInputElement.prototype;
       return Object.getOwnPropertyDescriptor(prototype, 'value').get.call(element);
     }
     function show() {
       const states = Object.fromEntries(controls.map(element => [element.id, {
-        ...(element.id === 'password' ? { length: nativeValue(element).length } : { value: nativeValue(element) }),
+        ...(element.type === 'password' || element.id.startsWith('password') ?
+          { length: nativeValue(element).length } : { value: nativeValue(element) }),
         connected: element.isConnected, type: element.type, readonly: element.readOnly,
       }]));
-      document.querySelector('#receipt').textContent = `NATIVE_FILL_STATE_BEGIN ${encodeURIComponent(JSON.stringify({ states, counts, events, childReady }))} NATIVE_FILL_STATE_END`;
+      document.querySelector('#receipt').textContent = `NATIVE_FILL_STATE_BEGIN ${encodeURIComponent(JSON.stringify({ states, sequence, events, childReady }))} NATIVE_FILL_STATE_END`;
+    }
+    for (const id of ['cancel', 'textarea-cancel']) {
+      document.getElementById(id).addEventListener('beforeinput', event => event.preventDefault());
     }
     document.querySelector('#reset-input').addEventListener('input', event => event.target.value = 'rollback');
     document.querySelector('#reset-change').addEventListener('change', event => event.target.value = 'rollback');
+    document.querySelector('#dom-reset-change').addEventListener('change', event => event.target.value = 'rollback');
     document.querySelector('#remove').addEventListener('input', event => event.target.remove());
     document.querySelector('#lock').addEventListener('input', event => event.target.readOnly = true);
     document.querySelector('#type').addEventListener('input', event => event.target.type = 'password');
@@ -52,12 +71,13 @@
     document.querySelector('#spoof').addEventListener('input', event => {
       Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(event.target, 'rollback');
     });
-    document.querySelector('#password').addEventListener('change', event => event.target.value = '');
+    document.querySelector('#password-reset').addEventListener('input', event => event.target.value = '');
     function observe(element) {
-      for (const type of Object.keys(counts)) element.addEventListener(type, event => {
-        counts[type] += 1;
-        events.push({ type, target: element.id, trusted: event.isTrusted });
-        if (events.length > 4) events.shift();
+      for (const type of ['beforeinput', 'input', 'change']) element.addEventListener(type, event => {
+        // Do not retain event.data or values: password input uses this listener too.
+        events.push({ sequence: ++sequence, type, target: element.id, trusted: event.isTrusted,
+          inputType: event.inputType || null, canceled: event.defaultPrevented });
+        if (events.length > 12) events.shift();
         show();
       });
     }
