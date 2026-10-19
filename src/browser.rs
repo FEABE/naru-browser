@@ -11033,6 +11033,13 @@ fn devtools_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) {
 wrap_app! {
     pub struct BrowserApp;
     impl App {
+        fn on_before_command_line_processing(&self, process_type: Option<&CefString>, command_line: Option<&mut CommandLine>) {
+            // command_line_args_disabled blocks real arguments, so verification builds add this switch here.
+            let browser_process = process_type.is_none_or(|kind| kind.to_string().is_empty());
+            if browser_process && crate::config::mock_keychain().unwrap_or(false) {
+                if let Some(command_line) = command_line { command_line.append_switch(Some(&"use-mock-keychain".into())); }
+            }
+        }
         fn browser_process_handler(&self) -> Option<BrowserProcessHandler> { Some(ProcessHandler::new()) }
     }
 }

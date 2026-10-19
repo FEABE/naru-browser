@@ -20,7 +20,8 @@ while [[ $# -gt 0 ]]; do
     --) shift; break ;;
     -h|--help)
       printf '%s\n' 'Usage: scripts/dev.sh [--release] [--build-only | --run] [-- browser arguments]'
-      printf '%s\n' 'Builds without launching by default. --run requires an explicitly selected non-ad-hoc NARU_CODESIGN_IDENTITY.'
+      printf '%s\n' 'Builds without launching by default. --run requires an explicitly selected non-ad-hoc NARU_CODESIGN_IDENTITY,'
+      printf '%s\n' 'or, for verification only, NARU_MOCK_KEYCHAIN=1 with LIGHT_BROWSER_DATA_DIR set (mock keychain, separate profile).'
       printf '%s\n' 'Build-only defaults to ad hoc signing. A selected identity does not guarantee Keychain authorization.'
       exit 0
       ;;
@@ -45,9 +46,14 @@ if [[ "${NARU_CODESIGN_IDENTITY+x}" == x ]]; then
   fi
   bundle_args+=(--signing-identity "$NARU_CODESIGN_IDENTITY")
 fi
-if [[ "$run_app" == 1 && "${NARU_CODESIGN_IDENTITY:--}" == '-' ]]; then
+mock_keychain=0
+if [[ "${NARU_MOCK_KEYCHAIN:-}" == 1 && -n "${LIGHT_BROWSER_DATA_DIR:-}" ]]; then
+  mock_keychain=1
+fi
+if [[ "$run_app" == 1 && "${NARU_CODESIGN_IDENTITY:--}" == '-' && "$mock_keychain" == 0 ]]; then
   printf '%s\n' 'Automatic launch of an ad-hoc build is disabled because changed builds can request Keychain access again.' >&2
   printf '%s\n' 'Use --build-only, or select an existing signing identity with NARU_CODESIGN_IDENTITY before --run.' >&2
+  printf '%s\n' 'For verification only, set NARU_MOCK_KEYCHAIN=1 and LIGHT_BROWSER_DATA_DIR to use a mock keychain.' >&2
   exit 2
 fi
 

@@ -9,6 +9,7 @@ use std::{
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    config::mock_keychain()?;
     let data_dir = config::data_dir()?;
     let socket_path = config::socket_path()?;
     let listener = protocol::bind_listener(&socket_path)?;

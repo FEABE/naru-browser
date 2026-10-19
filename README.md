@@ -97,6 +97,8 @@ NARU_CODESIGN_IDENTITY='선택한 코드 서명 인증서의 이름 또는 해�
 
 `scripts/dev.sh`는 브라우저 데이터를 프로젝트의 `.local-data`에 저장합니다. 다른 터미널의 CLI에도 같은 경로를 설정합니다.
 
+검증 전용으로 ad hoc 빌드를 `--run`하려면 `NARU_MOCK_KEYCHAIN=1`과 `LIGHT_BROWSER_DATA_DIR`을 함께 지정합니다(Chromium `use-mock-keychain`). `LIGHT_BROWSER_DATA_DIR` 없이 지정하면 시작을 거부하며, 이 프로필의 암호화 데이터는 실제 키체인 프로필과 호환되지 않습니다. CLI도 같은 `LIGHT_BROWSER_DATA_DIR`이 있어야 `control.sock`을 찾습니다.
+
 
 ```bash
 export LIGHT_BROWSER_DATA_DIR="$PWD/.local-data"
