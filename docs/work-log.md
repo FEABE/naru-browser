@@ -1,5 +1,69 @@
 # Naru 작업 기록
 
+## 2026-10-19, 메모리 측정의 footprint 복구와 e2e-v15 진행
+
+e2e-v14의 14번 측정에서 footprint가 모든 시점에서 비었던 원인을 확인했다. Chromium 프로세스에 `vmmap -summary`를 실행하면 종료 코드는 0이고 `Physical footprint` 값도 나오지만, stderr에 "Can't examine target process's malloc zone PartitionAlloc_…"와 "Reason: failed to resolve canonical path …" 두 줄이 찍힌다. `scripts/measure-memory.py`는 stderr가 비어 있지 않으면 모두 `footprint_warning`으로 처리했다. malloc zone 분석 실패는 커널이 보고하는 physical footprint에 영향을 주지 않으므로 이 두 줄만 허용하고 다른 stderr는 계속 경고로 처리하도록 바꿨다.
+
+- 관련 파일: `scripts/measure-memory.py`, `tests/memory_report_test.py`
+- 단위 테스트: `python3 -m unittest tests.memory_report_test` 10개 통과. 허용 경고만 있을 때 값 반환, 다른 경고가 섞이면 `footprint_warning`을 확인한다.
+- 로컬 실측: 검증 프로필 `.local-data/fp-probe`에서 v14 앱을 띄워 `--footprint`로 측정했다. 프로세스 6개 모두 값이 나왔고 합계 192.8MiB였다. 측정 뒤 앱을 종료하고 프로필을 지웠다.
+- 진행 중: 14번 60분 재실행(잠자기 방지 `caffeinate`, 자식 프로세스 종류 기록), 08번 남은 항목, 13·05·09·11번의 CLI 부분을 같은 v14 바이너리에서 실행하고 있다. 결과는 끝난 뒤 이 절에 추가한다.
+
+## 2026-10-18, E2E e2e-v14 로컬 CEF 통합 실행
+
+요청 범위는 [E2E 체크리스트](ego-parity-e2e.md)의 14개 여정을 같은 앱 바이너리에서 확인하는 것이다. 앱 SHA-256은 `877bb5993ae3e7f9383bc8c690a6fabb066fa3642140c34c692c2f74b02c24eb`, CLI SHA-256은 `a47eff17b9f5f92358624974848b0e6078df6a6be66801230ab5285e9aa0eb5f`이다. 실행 ID는 e2e-v14이고 검증 프로필은 `.local-data/e2e-v14`다. `NARU_MOCK_KEYCHAIN=1`로 실행했다. 실제 사용자 프로필은 건드리지 않았고 프로필 폴더의 수정 시각도 바뀌지 않았다. 증거 파일은 `artifacts/e2e-v14/`에 있다. 앱 충돌은 0건이었다.
+
+| 여정 | 검증 구분 | 결과 |
+| --- | --- | --- |
+| 01 시작과 사람 공간 | 로컬 CEF 통합 | 통과. task open 뒤 사용자 공간 `user`와 활성 탭 1이 유지됐다. 메인 프로세스 pid 85395 하나 |
+| 04 배경 탐색 | 로컬 CEF 통합 | 통과. `spaces_smoke` 10개 검사, `single_window_smoke` 6개, `tasks_smoke` 통과. `wait` 시간 초과는 `WAIT_TIMEOUT`, elapsedMs 1033으로 응답했고 `navigationContinues`가 true였다 |
+| 06 클릭과 값 변경 | 로컬 CEF 통합, 자체 fixture | 통과. 숨은 탭에서 로드 뒤 나타난 대상을 포함한다. hover만 실행하면 click과 누름, 해제가 0회였다. `native_fill`, contenteditable, `insert_text`, check, select 통과 |
+| 07 키 이동 | 로컬 CEF 통합 | 통과. `native_press_smoke` 42개 키 형식 |
+| 08 iframe과 Shadow DOM | 로컬 CEF 통합, 자체 fixture | 일부 확인, pending. `shadow_smoke`와 다른 출처 iframe 3회 반복에서 open, `frames`, `read-page` 문서 2개, `read-frame`, fill 뒤 재읽기 검증, frame ref click 응답 확인, 탭 닫기 뒤 앱 유지를 확인했다. frame ref click의 페이지 효과는 확인하지 않았다 |
+| 11 공개 사이트와 로그인 | 외부 사이트 읽기 | 공개 읽기 통과. Wikipedia 링크 클릭으로 URL이 바뀌었고 뒤로 가기로 복원됐다. 네이버 메인은 읽기와 클릭을 확인했으며 CAPTCHA는 나오지 않았다. 로그인 서비스 부분은 blocked |
+| 12 실패 복구 | 로컬 CEF 통합, 자체 탭과 서버 | 통과. `navigation_recovery_smoke`와 `controls_smoke`에서 사용자 선택이 유지됐다. 검증 탭의 renderer 종료 뒤 read는 `RENDERER_TERMINATED`를 반환했고 사용자 탭은 영향을 받지 않았다. reload로 복구됐다 |
+| 13 종료와 재시작 | 로컬 CEF 통합 | 일부 확인, pending. `restart_smoke` 2회. 같은 앱 해시에서 쿠키와 localStorage가 유지됐고 정상 종료했다 |
+| 02, 03, 05, 09, 10 | 네이티브 UI | pending. AppKit UI 절반에 필요한 macOS 손쉬운 사용 자동화를 사용자가 보류했다 |
+| 14 지속 사용 | 로컬 CEF 통합 | 부분 확인, pending. 10회 모두 기준으로 돌아왔고 충돌은 없었다. 약 45분 만에 멈춰 60분을 채우지 못했고 footprint는 비었다. 6회에서 자식 프로세스가 6개에서 9개(utility 2개, renderer 1개)로 늘었다 |
+
+이 실행은 네이티브 AppKit UI 확인이 아니다. 외부 사이트 전체 호환성의 근거도 아니다. 실제 서명 식별자는 여전히 없으므로 릴리스 서명 확인으로 보지 않는다. 검증 모드의 키체인 우회로 앱 시작이 막히던 문제는 해소됐다.
+
+작업은 세 개의 git worktree(`.local-data/wt-crash`, `.local-data/wt-input`, `.local-data/wt-readpage`)에 나누어 진행했고 변경마다 리뷰를 거쳤다. 정리 상태는 다음과 같다. 여정 14가 끝날 때까지 앱을 `.local-data/e2e-v14` 프로필에서 실행 유지하며 사용자 탭 1개가 열려 있다. 14 종료 뒤 러너가 fixture 서버를 끄고 자체 탭 35를 닫았으며 resources 값이 모두 0임을 확인했다. 앱 pid 85395는 2026-10-19 확인 때 이미 종료돼 있었다. 사용자 탭 1은 실행 중 Google 검색 결과(검색어 "구매대행 반자동", 창 폭 1840)로 바뀌어 있었다. 러너는 그 탭에 명령을 보내지 않았으므로 사람이 직접 검색한 것으로 보이며, 6회의 자식 프로세스 증가와 시점이 겹치는지는 확인하지 못했다. 빌드 중간 산출물은 `scripts/dev.sh`가 정리했다. worktree는 커밋 결정 뒤 제거한다. 커밋, 푸시, 배포는 하지 않았다.
+
+## 2026-10-18, 입력 포커스 임시 준비와 숨은 탭 포인터 입력 연결
+
+사용자가 숨은 탭 입력에는 임시 focus emulation을 쓰기로 했다. click과 hover가 이 lease를 사용한다. lease는 move 확인부터 press와 release까지 이어진다. 루트 키나 포인터 press가 전달된 뒤 탐색이 일어나도 성공 결과를 유지한다. 이 과정에서 `restart_smoke`의 press PAGE_CHANGED 경합도 함께 고쳤다. `docs/focus-input.md`와 `docs/pointer-input.md`를 갱신했고 `tests/native_click_smoke.py`와 `tests/fixtures/native_click.html`에 숨은 뒤 로드되는 탭 사례를 추가했다.
+
+| 구분 | 내용 | 결과 |
+| --- | --- | --- |
+| 단위 테스트 | `cargo test --locked --lib` | 390개 통과. 이전에 실패하던 `fill_*` 테스트 6개는 오래된 테스트 helper를 갱신해 통과 |
+| 모의 DOM | `node --test tests/dom_bridge.test.mjs` | 101개 통과, 27개 실패. 수정 전부터 있던 실패이며 이번 변경으로 늘지 않았다 |
+| 로컬 CEF 통합 | e2e-v14의 `native_click_smoke` 숨은 탭 사례 | 통과 |
+
+## 2026-10-18, 입력 실패 응답과 fill 대상 바인딩, insertion 범위 보정
+
+`FillPreflight` 실패는 `details`의 attempted를 false로, `outcomeUnknown`을 false로 응답한다. dispatch는 focus lease를 시작하기 전에 fill 대상을 먼저 바인딩한다. 대상 바인딩이 실패하면 PAGE_CHANGED로 응답한다. `src/dom_bridge.js`의 insertionSnapshot은 Range prototype 체인을 따라 메서드를 찾도록 바꿨다. Chromium 156에서 NodeRange와 AbstractRange에 메서드가 나뉘어 있기 때문이다. 관련 파일은 `src/browser.rs`와 `src/dom_bridge.js`다.
+
+## 2026-10-18, 탭 닫기 크래시 수정
+
+`frames`로 OOPIF 하위 session을 붙인 탭을 닫으면 `EXC_BAD_ACCESS`로 앱이 종료됐다. 로그에는 ObserverList 재진입이 남았다. 탭을 정리하는 동안 하위 session의 detach 콜백이 DevTools 명령을 다시 보냈기 때문이다. `LifeHandler::do_close`에서 teardown 전에 탭의 DevTools 관찰자 Registration을 먼저 해제하도록 바꿨다. `on_before_close`는 여전히 대기 중인 요청에 `TAB_CLOSED`로 응답한다.
+
+| 구분 | 내용 | 결과 |
+| --- | --- | --- |
+| 로컬 CEF 통합 | 격리 worktree 빌드에서 OOPIF 탭 닫기 | 5회 통과 |
+| 로컬 CEF 통합 | e2e-v14의 frames 뒤 탭 닫기 | 3회 통과 |
+
+남은 한계는 `frames`가 호출마다 재진입 확인 로그를 한 줄 남기는 것이다. 충돌은 없었다. 후속 과제로 둔다.
+
+## 2026-10-18, read-page 허용 목록과 서버 거절 ID 표시 수정
+
+task 안에서 `read-page`를 실행하면 CLI가 `RESPONSE_ID_MISMATCH`를 표시했다. 프로토콜 허용 목록에 `read_page`가 없어서 서버가 요청 ID를 `invalid`로 돌려보냈고, CLI는 이를 응답 ID 불일치로 해석했다. `src/protocol.rs`의 허용 목록에 `read_page`를 추가했다. `src/browser.rs`에서는 ID가 `invalid`인 서버 거절을 서버의 오류 코드 그대로 표시하도록 바꿨다. 이때 `INVALID_REQUEST_ID` 상수와 `ProtocolError.code` 문자열을 쓴다. 이 경우 `outcomeUnknown`은 false다.
+
+| 구분 | 내용 | 결과 |
+| --- | --- | --- |
+| 로컬 CEF 통합 | e2e-v14의 task `read-page`, 08번 여정 | 통과 |
+| 리뷰 | 변경마다 수행 | 완료 |
+
 ## 2026-10-18, 누적 구현의 커밋과 푸시 준비
 
 현재 변경을 우선 커밋하고 푸시해 달라는 요청에 따라 Cargo.toml, README, src, docs, tests의 변경 파일 46개를 커밋 범위로 확인했다. Chromium 키보드 입력과 hover, insert, 프레임 읽기와 조작, 여러 문서의 공통 읽기 예산, 입력 포커스 준비와 해제, UI 상태 관찰 보완 및 관련 문서와 검사 자료를 포함한다. 이번 작업에서는 제품 동작을 추가로 수정하지 않았다. 목적지는 기존 `origin/codex/navigation-readiness`이며 GitHub 조회로 `FEABE/naru-browser`가 비공개임을 확인했다. 기본 브랜치 병합이나 배포는 요청 범위에 포함하지 않는다.
@@ -1716,3 +1780,45 @@ ego lite의 임시 사용자 북마크와 테스트 공간을 정리했다. CLI 
 - 숨긴 탭을 자동 폐기하지 않으며 Chromium 전체 RAM 상한은 없다.
 - 실제 미리보기 PNG 픽셀 치수·디코딩 할당량, 8개 카드 페이지 부하, 최종 버전의 마지막 탭 종료와 beforeunload 취소는 이번 실행에서 검증하지 않았다.
 - 외부 사이트 로그인·전체 호환성, 안정적인 코드 서명과 공증, 배포는 별도 작업이다.
+
+## 검증 전용 mock keychain 모드
+
+### 요청 범위와 변경
+
+ad hoc 서명 빌드를 키체인 재승인 없이 검증 실행할 수 있도록 `NARU_MOCK_KEYCHAIN=1` 모드를 추가했다. `command_line_args_disabled`로 명령행 스위치를 줄 수 없어 `BrowserApp`의 `on_before_command_line_processing`에서 브라우저 프로세스에만 `use-mock-keychain`을 붙인다. `LIGHT_BROWSER_DATA_DIR` 없이 `NARU_MOCK_KEYCHAIN=1`이면 `main`이 시작 전에 오류로 종료한다. 실제 프로필이 mock 키로 열려 기존 암호화 쿠키를 읽지 못하게 되는 일을 막기 위해서다. 관련 파일은 `src/config.rs`(판정 함수와 단위 테스트), `src/main.rs`, `src/browser.rs`, `scripts/dev.sh`(두 변수가 모두 있으면 ad hoc `--run` 허용, 도움말 갱신), `README.md`다. `dev.sh`는 이미 번들 바이너리를 `exec`하므로 환경 변수가 그대로 전달된다.
+
+### 검증
+
+| 구분 | 내용 | 결과 |
+|---|---|---|
+| 단위 테스트 | `cargo test --locked --lib mock_keychain` | 1개 통과 |
+| 빌드 검사 | `cargo check --locked` | 통과, 기존 dead_code 경고 1건 |
+| 스크립트 검사 | `bash -n`, `--help`, 환경 변수 없는 `--run` 거부(exit 2) | 확인 |
+| 릴리스 번들 | `./scripts/dev.sh --release --build-only` | 성공, 약 45초, 바이너리에 `use-mock-keychain` 문자열 포함 확인 |
+
+### 한계와 남은 작업
+
+- E2E v11부터 v14까지 이 모드로 앱을 실행했고 키체인 프롬프트 없이 시작했다. `NARU_MOCK_KEYCHAIN=1` 단독 실행의 거부 메시지와 두 변수를 준 `--run` 경로는 이 실행에서 직접 확인하지 않았다.
+- 스위치는 browser process에만 붙인다. 헬퍼 프로세스는 이 훅을 거치지 않는다.
+- mock 키로 만든 프로필은 실제 키체인 프로필과 호환되지 않는다. 검증 후 별도 데이터 경로를 그대로 둘지 지울지는 사용자가 정한다.
+- 빌드 후 `cleanup-build.py`가 Cargo 중간 산출물(5258개, 3.1GiB)을 제거했고 최신 릴리스 실행 파일은 보존했다. 사용자 데이터와 키체인은 건드리지 않았다. 실행 중인 앱 프로세스는 없다. 커밋·푸시는 하지 않았다.
+
+## CEF 브라우저 동일성 비교 수정
+
+### 증상과 원인
+
+375e41a 이후 빌드에서 `read TAB`은 45초 뒤 `TIMEOUT`으로 끝났다. `open`은 매번 `PAGE_CHANGED`와 `stateUnavailable:true`를 반환했다. 375e41a가 브라우저 동일성을 `get_raw()` 포인터 비교로 바꿨는데, CEF는 API 경계를 넘을 때마다 같은 브라우저를 새 C 구조체로 감싼다. 그래서 `on_after_created`에서 저장한 핸들과 `create_browser_sync`나 콜백에서 받은 핸들이 같은 브라우저인데도 다르다고 판정됐다. 샌드박스 밖 실행과 창 앞 배치에서도 같은 증상이었다.
+
+### 변경
+
+`src/browser.rs`에 `same_browser`를 추가했다. 포인터가 같으면 바로 같다고 보고, 아니면 CEF `is_same`으로 비교한다. Browser 포인터 비교 30여 곳을 모두 이 함수로 바꿨다. Frame은 `identifier()` 문자열로 비교하고 있어서 바꾸지 않았다. 리뷰에서 근거, 누락 여부, UI 스레드 호출 조건을 확인했고 승인을 받았다.
+
+### 검증
+
+| 구분 | 내용 | 결과 |
+|---|---|---|
+| 로컬 CEF 통합 | 수정 전 빌드에서 `read 1`, `open https://example.com` | 실패 재현, `TIMEOUT`과 `PAGE_CHANGED` |
+| 로컬 CEF 통합 | 수정 빌드(앱 SHA-256 `6c422b23…`)에서 `read 1`, 사용자 `open`, 작업의 `open`, `wait load`, `read`, `task finish` | 통과, 작업 실행 전후 사용자 선택 `user 2` 유지 |
+| 단위 테스트 | 실행하지 않음 | 다음 통합 회귀에서 실행 예정 |
+
+검증 프로필은 `.local-data/e2e-v11`이다. 실제 사용자 프로필은 건드리지 않았다. 이 수정 뒤의 E2E 실행 결과는 2026-10-18 `e2e-v14` 기록에 있다.
