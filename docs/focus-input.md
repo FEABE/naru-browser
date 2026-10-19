@@ -10,7 +10,7 @@ DOM의 `element.focus()`와 `activeElement` 확인이 끝나도 뒤의 `Input.in
 
 이 범위는 Chromium 텍스트·키 입력 준비다. 기존 check·select 등의 DOM 액션 의미, 사용자 탭 선택과 AI 작업 소유권을 바꾸는 설계가 아니다. 입력 대상 고정이나 모든 focus 경쟁 해결을 뜻하지 않는다. 조사한 공개 Input API에는 DOM node, frame ID, unique context 또는 예상 target을 지정하는 인자가 없다.
 
-fill은 먼저 `inspectOnly`로 종류와 경로만 읽는다. 이후 `expectedInput`·`expectedKind`를 고정하여 실행 전과 focus 후 종류 변경을 거절한다. Chromium 경로만 임시 설정을 사용하고 legacy DOM 입력은 설정 없이 실행하므로 DOM 최종 값 검사가 끝난 뒤 새로운 disable 부작용을 추가하지 않는다. check·select·포인터에는 이 설정을 적용하지 않는다.
+fill은 먼저 `inspectOnly`로 종류와 경로만 읽는다. 이후 `expectedInput`·`expectedKind`를 고정하여 실행 전과 focus 후 종류 변경을 거절한다. Chromium 경로만 임시 설정을 사용하고 legacy DOM 입력은 설정 없이 실행하므로 DOM 최종 값 검사가 끝난 뒤 새로운 disable 부작용을 추가하지 않는다. click과 hover의 Chromium 포인터 입력도 아래 [포인터 입력](#포인터-입력)의 순서로 이 설정을 사용한다. check와 select는 DOM 동작이라 Chromium 입력 억제의 영향을 받지 않으므로 이 설정을 적용하지 않는다.
 
 ## 요청 순서
 
@@ -26,7 +26,22 @@ fill은 먼저 `inspectOnly`로 종류와 경로만 읽는다. 이후 `expectedI
 
 enable 뒤 prepare가 실패했거나 입력 전에 취소됐더라도 disable 책임은 남는다. 입력이 이미 전달됐으면 정리 실패나 취소가 페이지 효과를 되돌리지 못한다. disable 또는 필요한 frame 정리에 실패한 요청을 성공으로 반환하지 않는다. 늦은 ACK는 원래 요청과 정확한 Browser·session에만 적용하며 새 작업의 상태를 해제하는 근거로 사용하지 않는다.
 
-Enter 자체 탐색이나 frame 교체로 원 context를 잃었을 때는 기존 액션의 보수적인 수명·결과 불확실성 정책을 유지한다. 새 문서에서 다시 준비하거나 postverification을 이어서 이전 대상의 성공으로 만들지 않는다.
+Enter 자체 탐색이나 frame 교체로 원 context를 잃었을 때는 기존 액션의 보수적인 수명·결과 불확실성 정책을 유지한다. 새 문서에서 다시 준비하거나 postverification을 이어서 이전 대상의 성공으로 만들지 않는다. root에서 키를 보낸 뒤의 탐색은 disable ACK를 기다리는 동안 일어나도 임시 상태를 `PAGE_CHANGED`로 끝내지 않는다. disable 뒤 기존 키 확인 경로가 탐색된 문서를 처리한다.
+
+## 포인터 입력
+
+숨은 상태에서 로드되어 한 번도 그려지지 않은 페이지는 Chromium 156 renderer가 mouseMoved를 뺀 입력을 버린다. `widget_input_handler_manager.cc`의 `DispatchEvent`는 main frame 갱신이나 commit을 미루는 동안 이벤트를 `kNotConsumed`로 응답하고 페이지에 전달하지 않는다. 이 응답도 CDP에서는 성공 ACK가 된다. 2026-10-18 Naru 진단에서 작업 공간을 전환한 뒤 숨은 탭에서 로드한 문서는 `visibilityState:"hidden"`이고 rAF가 한 번도 실행되지 않았다. click은 ACK를 받았지만 페이지에는 mousemove만 도착했다. focus emulation을 쓰는 press 뒤에는 같은 탭의 click이 정상 전달됐다.
+
+그래서 click과 hover도 첫 `Page.getFrameTree` 전에 같은 임시 설정을 켠다. frame ref는 geometry와 후보 수집을 마친 뒤, 원래 frame session에서 고정한 점을 확인하는 첫 평가 전에 켠다. 순서는 다음과 같다.
+
+1. enable ACK 뒤 원래 ref와 context로 위치를 준비한다.
+2. mouseMoved를 보내고, 설정을 유지한 채 원래 위치를 다시 확인한다. frame ref는 부모 연결 검사까지 이 단계에 포함한다.
+3. click만 같은 위치에 mousePressed와 mouseReleased를 보낸다.
+4. 최종 응답을 만들 때 disable을 보내고 ACK 뒤 응답한다. hover는 위치 재확인 결과, click은 버튼 입력 ACK 결과가 최종 응답이다.
+
+키와 텍스트 입력은 disable 효과 뒤에 사후 확인을 하지만 포인터는 위치 재확인 뒤에도 버튼 입력이 남아 있어 그 전에 해제하지 않는다. 실패, 취소, 인계, 탭 닫기, 시간 초과는 기존 임시 상태 정리 경로를 그대로 사용하며 disable은 요청마다 한 번 처리한다. 버튼 입력을 보낸 뒤의 탐색은 클릭의 정상 결과일 수 있으므로 임시 상태를 오류로 끝내지 않고 기존 응답과 disable을 이어 간다. 버튼 입력 전의 탐색은 지금처럼 `PAGE_CHANGED`다. 교차 출처 프레임 ref의 click이 top 문서를 탐색하면 disable ACK 전에 하위 session이 사라질 수 있다. 이때는 `FRAME_CHANGED`와 `focusCleanup:"session-destroyed"`, `outcomeUnknown:true`로 끝나므로 다시 읽고 판단한다. click과 hover마다 enable과 disable의 ACK 왕복이 두 번 늘어난다.
+
+이 설정은 페이지에 보이는 상태를 바꾼다. 포인터 동작 동안 숨은 작업 탭도 `visibilityState`가 visible이 되고 `document.hasFocus()`가 true가 될 수 있다. focus, blur, visibilitychange 핸들러가 실행될 수 있고, 해제 시 다시 blur와 hidden 전환이 생길 수 있다. 사용자 창의 활성화, AppKit first responder, Naru의 공간과 선택 탭은 바꾸지 않는다. 한 번 그려진 뒤 숨은 페이지는 설정 없이도 클릭이 전달됐지만, 그려졌는지를 브라우저에서 확인할 방법이 없어 모든 포인터 동작에 적용한다.
 
 ## 취소와 메모리 상한
 

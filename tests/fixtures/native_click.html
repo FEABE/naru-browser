@@ -50,19 +50,22 @@
     const clicks = { button: 0, label: 0, checkbox: 0, canceled: 0, shadow: 0, covered: 0, overlay: 0, hover: 0, overflow: 0, nested: 0,
       'menu-trigger': 0, 'menu-choice': 0 };
     const events = [];
-    let sequence = 0, moves = 0, hoverMoves = 0, frameReady = false;
+    let sequence = 0, moves = 0, hoverMoves = 0, frameReady = false, frames = 0;
     let hoverMenuOpens = 0, hoverMenuSelection = 0, hoverMenuTrusted = false;
     const menuTrigger = document.querySelector('#menu-trigger');
     const hoverMenu = document.querySelector('#hover-menu');
     const shadow = document.querySelector('#shadow-host').attachShadow({ mode: 'open' });
     shadow.innerHTML = '<button id="shadow" type="button" aria-label="Shadow click button">Shadow</button>';
     function show() {
-      const state = { counts, clicks, events, sequence, moves, hoverMoves, frameReady,
+      const state = { counts, clicks, events, sequence, moves, hoverMoves, frameReady, frames,
         hoverMenuOpen: !hoverMenu.hidden, hoverMenuOpens, hoverMenuSelection, hoverMenuTrusted,
         checked: document.querySelector('#checkbox').checked, canceledChecked: document.querySelector('#canceled').checked,
         scrollTop: document.querySelector('#scrollbox').scrollTop, hasFocus: document.hasFocus(), visibility: document.visibilityState };
       document.querySelector('#receipt').textContent = `NATIVE_CLICK_STATE_BEGIN ${encodeURIComponent(JSON.stringify(state))} NATIVE_CLICK_STATE_END`;
     }
+    // rAF runs only after the page can paint; the interval keeps visibility and frames current.
+    requestAnimationFrame(function frame() { frames += 1; requestAnimationFrame(frame); });
+    setInterval(show, 250);
     function observe(doc) {
       doc.addEventListener('mousemove', () => { moves += 1; show(); });
       for (const type of Object.keys(counts)) doc.addEventListener(type, event => {

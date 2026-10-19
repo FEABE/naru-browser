@@ -187,6 +187,33 @@ def run(args):
                 require(after["moves"] == before["moves"], "Preparation rejection still moved the pointer")
             preserved()
         report["checks"].append("overlay rejects before dispatch; hover relocation rejects after move without down/up; user selection preserved")
+
+        def load_hidden(query):
+            # Switching spaces hides the task view; the next document loads without painting.
+            call("space", "show", task["id"])
+            call("space", "show", "user")
+            preserved()
+            scoped("navigate", tab, f"http://127.0.0.1:{server.server_port}{path}?{query}")
+            scoped("wait", tab, "load", 10000)
+            page = poll(read, lambda value: receipt(value)["frameReady"] is True, "Hidden fixture frames did not load")
+            state = receipt(page)
+            require(state["visibility"] == "hidden" and state["frames"] == 0 and state["sequence"] == 0,
+                    "Precondition: the reloaded task tab must be hidden, never painted and without input")
+            return page
+
+        page = load_hidden("hidden-click")
+        before, after, _ = click("Native click button", "button", page)
+        require(after["counts"]["pointerdown"] == 1 and after["counts"]["click"] == 1,
+                "Never-painted hidden tab did not receive exactly one native click")
+        page = load_hidden("hidden-hover")
+        scoped("hover", tab, element(page, "Hover menu trigger")["ref"])
+        after = receipt(poll(read, lambda value: receipt(value)["hoverMenuOpen"] is True,
+                             "Hover did not reach the never-painted hidden tab"))
+        require(after["counts"]["pointerdown"] == 0 and after["counts"]["click"] == 0 and
+                all(value == 0 for value in after["clicks"].values()),
+                "Hover in a never-painted hidden tab produced pointer down or clicks")
+        preserved()
+        report["checks"].append("hidden-then-loaded task tab (hidden, rAF 0) receives one native click; hover-only yields zero clicks")
         report["ok"] = True
     except (CheckFailed, OSError, KeyError, TypeError, ValueError, RuntimeError) as error:
         report.update(error=str(error), lastResponse=last_response)

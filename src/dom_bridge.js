@@ -1285,8 +1285,14 @@
     if (!selection || selectionValue("rangeCount") !== 1 ||
         typeof selectionPrototype.getRangeAt !== "function" || typeof rangePrototype.intersectsNode !== "function") return null;
     const range = selectionPrototype.getRangeAt.call(selection, 0);
-    const rangeValue = name => (Object.getOwnPropertyDescriptor(context.view.AbstractRange?.prototype || rangePrototype, name) ||
-      Object.getOwnPropertyDescriptor(rangePrototype, name))?.get?.call(range);
+    // Chromium 156 defines containers on NodeRange and offsets on AbstractRange.
+    const rangeValue = name => {
+      for (let prototype = rangePrototype, depth = 0; prototype && depth < 8; prototype = Object.getPrototypeOf(prototype), depth += 1) {
+        const descriptor = Object.getOwnPropertyDescriptor(prototype, name);
+        if (descriptor) return descriptor.get?.call(range);
+      }
+      return undefined;
+    };
     const snapshot = { startNode: rangeValue("startContainer"), start: rangeValue("startOffset"),
       endNode: rangeValue("endContainer"), end: rangeValue("endOffset"),
       anchorNode: selectionValue("anchorNode"), anchor: selectionValue("anchorOffset"),

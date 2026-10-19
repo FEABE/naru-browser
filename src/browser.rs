@@ -1195,6 +1195,7 @@ impl FocusLease {
             || match &self.evidence {
                 Some(ActionEvidence::Press(target)) => target.attempted.get(),
                 Some(ActionEvidence::Fill(target)) => target.attempted.get(),
+                Some(ActionEvidence::Click(target)) => target.attempted.get(),
                 _ => false,
             }
     }
@@ -6404,8 +6405,10 @@ fn focus_preparation(pending: &Pending) -> bool {
     let initial = matches!(pending.step, Step::Frame(_))
         || (pending.frame.is_some() && matches!(pending.step, Step::Evaluate));
     match &pending.evaluation {
+        // A page loaded while hidden drops pointer down/up until it paints.
+        // Focus emulation keeps it visible across the whole pointer action.
         Evaluation::Page {
-            evidence: Some(ActionEvidence::Press(_)),
+            evidence: Some(ActionEvidence::Press(_) | ActionEvidence::Click(_)),
             ..
         } => initial,
         Evaluation::Page {
@@ -6589,11 +6592,14 @@ wrap_task! {
 fn focus_navigation_changed(tab: i32) {
     let preserve_key_ack = STATE.with(|slot| {
         let state = slot.borrow();
-        state.focus_leases.get(&tab).is_some_and(|lease| lease.phase == FocusPhase::Active
-            && lease.session.is_none() && matches!(&lease.evidence, Some(ActionEvidence::Press(target)) if target.attempted.get()))
+        state
+            .focus_leases
+            .get(&tab)
+            .is_some_and(|lease| root_key_dispatched(lease) || pointer_press_dispatched(&state, lease))
     });
-    // Root keys can navigate as their intended effect. Their existing ACK path
-    // still finishes the lease, or cancellation/watchdog does so if no ACK comes.
+    // Root keys and dispatched pointer presses can navigate as their intended
+    // effect. Their ACK path still finishes the lease, or cancellation/watchdog
+    // does so if no ACK comes.
     if !preserve_key_ack {
         abort_focus_lease(
             tab,
@@ -6602,6 +6608,33 @@ fn focus_navigation_changed(tab: i32) {
             true,
         );
     }
+}
+
+/// Root keys were sent and the lease is still active or disabling before its
+/// key verification. Their verification already accepts a navigated document.
+fn root_key_dispatched(lease: &FocusLease) -> bool {
+    lease.session.is_none()
+        && matches!(&lease.evidence, Some(ActionEvidence::Press(target)) if target.attempted.get())
+        && match lease.phase {
+            FocusPhase::Active => true,
+            FocusPhase::Disabling => matches!(&lease.after, Some(FocusContinuation::Verify(_))),
+            _ => false,
+        }
+}
+
+/// Press/release is in flight, or acknowledged with only the disable pending.
+fn pointer_press_dispatched(state: &State, lease: &FocusLease) -> bool {
+    matches!(&lease.evidence, Some(ActionEvidence::Click(_)))
+        && match lease.phase {
+            FocusPhase::Active => state.pending.values().any(|pending| {
+                pending.reply.token == lease.token
+                    && matches!(&pending.step, Step::Input { batch, .. }
+                        if matches!(batch.kind, NativeInput::Click(_)))
+            }),
+            FocusPhase::Disabling => matches!(&lease.after,
+                Some(FocusContinuation::Respond { response, .. }) if response.ok),
+            _ => false,
+        }
 }
 
 fn focus_message_current(
@@ -7258,7 +7291,9 @@ fn reserve_input_verification(
 }
 
 fn dispatch_input_verification(batch: &Shared<InputBatch>) {
-    if defer_focus_verification(batch) {
+    // Pointer verification precedes press/release, which still need the lease;
+    // the final pointer reply releases it.
+    if !matches!(batch.kind, NativeInput::MouseMove(_)) && defer_focus_verification(batch) {
         return;
     }
     let params = input_verification_params(batch);
@@ -10366,6 +10401,12 @@ fn dispatch(browser: &Browser, method: &str, mut params: Json, mut pending: Pend
             pending.step = Step::FillPreflight;
         }
     }
+    // Bind before a focus lease: its reservation checks the fill binding, and
+    // insert reaches the lease on its first dispatch.
+    if let Some(failure) = bind_fill_target(browser, &pending) {
+        pending_error(&pending, failure.code, failure.message);
+        return;
+    }
     if focus_preparation(&pending) && pending.reply.focus_completion.is_none() {
         start_focus_lease(browser, method, params, pending);
         return;
@@ -10383,10 +10424,6 @@ fn dispatch(browser: &Browser, method: &str, mut params: Json, mut pending: Pend
         })
     });
     if let Some(failure) = frame_failure {
-        pending_error(&pending, failure.code, failure.message);
-        return;
-    }
-    if let Some(failure) = bind_fill_target(browser, &pending) {
         pending_error(&pending, failure.code, failure.message);
         return;
     }
@@ -10824,8 +10861,13 @@ fn devtools_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) {
             }
             let value = &result["result"]["value"];
             if value["ok"] == false {
+                // Classification is read-only and precedes focus or dispatch.
                 let (code, message) = fill_error(value);
-                pending_error(&pending, code, message);
+                pending.reply.error_details(
+                    code,
+                    message,
+                    json!({"attempted":false,"outcomeUnknown":false}),
+                );
                 return;
             }
             let path = value["input"].as_str();
@@ -17776,8 +17818,82 @@ mod tests {
         (pending, browser, receiver)
     }
 
+    #[test]
+    fn pointer_actions_start_focus_preparation_on_their_first_step() {
+        let (mut pending, _browser, _receiver) = test_input_preparation();
+        for command in [
+            Command::Click { tab: 7, reference: "4/document:3:8".into() },
+            Command::Hover { tab: 7, reference: "4/document:3:8".into() },
+        ] {
+            pending.evaluation = Evaluation::Page {
+                mutation: true,
+                evidence: ActionEvidence::for_command(&command),
+            };
+            pending.step = Step::Frame(String::new());
+            assert!(focus_preparation(&pending));
+            // Later main-document steps run inside the lease already started.
+            pending.step = Step::Evaluate;
+            assert!(!focus_preparation(&pending));
+        }
+        clear();
+    }
+
+    #[test]
+    fn navigation_after_dispatched_root_keys_or_pointer_press_keeps_the_lease_result() {
+        let (pending, browser, _receiver) = test_input_preparation();
+        let lease = |phase, evidence, after| FocusLease {
+            browser: browser.clone(),
+            session: None,
+            token: pending.reply.token,
+            reply: pending.reply.clone(),
+            evidence: Some(evidence),
+            attempted: false,
+            phase,
+            enable: FocusMessage::new(1),
+            disable: None,
+            disable_after_enable: false,
+            initial: None,
+            after,
+            stop_frames: false,
+            started: Instant::now(),
+        };
+        let key = pending.press_target().unwrap().clone();
+        let batch = reserve_input_batch(42, &pending, &browser, NativeInput::Key(key.clone())).unwrap();
+        let verify = || Some(FocusContinuation::Verify(batch.clone()));
+        let respond = |ok: bool| Some(FocusContinuation::Respond {
+            reply: pending.reply.clone(),
+            response: if ok { Response::success("id", json!({})) } else { Response::error("id", "X", "x") },
+        });
+        // Keys not yet sent: the document change is not their effect.
+        assert!(!root_key_dispatched(&lease(FocusPhase::Active, ActionEvidence::Press(key.clone()), None)));
+        key.attempted.set(true);
+        assert!(root_key_dispatched(&lease(FocusPhase::Active, ActionEvidence::Press(key.clone()), None)));
+        assert!(root_key_dispatched(&lease(FocusPhase::Disabling, ActionEvidence::Press(key.clone()), verify())));
+        assert!(!root_key_dispatched(&lease(FocusPhase::Disabling, ActionEvidence::Press(key.clone()), respond(false))));
+        let mut child = lease(FocusPhase::Active, ActionEvidence::Press(key.clone()), None);
+        child.session = Some("child".into());
+        assert!(!root_key_dispatched(&child));
+
+        let click = ActionEvidence::for_command(&Command::Click { tab: 7, reference: "4/document:3:8".into() }).unwrap();
+        STATE.with(|state| {
+            let state = state.borrow();
+            // Only the key batch is pending; no press/release is in flight.
+            assert!(!pointer_press_dispatched(&state, &lease(FocusPhase::Active, click.clone(), None)));
+            assert!(pointer_press_dispatched(&state, &lease(FocusPhase::Disabling, click.clone(), respond(true))));
+            assert!(!pointer_press_dispatched(&state, &lease(FocusPhase::Disabling, click.clone(), respond(false))));
+        });
+        clear();
+    }
+
+    const FILL_OBSERVATION: &str = "0123456789abcdef0123456789abcdef";
+
     fn fill_prepared(kind: &str) -> Json {
-        json!({"ok":true,"action":"fill","prepared":true,"attempted":false,"input":"chromium","kind":kind})
+        // Non-contenteditable Chromium fill arms a passive input observation.
+        let mut value = json!({"ok":true,"action":"fill","prepared":true,"attempted":false,"input":"chromium","kind":kind});
+        if kind != "contenteditable" {
+            value["observation"] = json!(FILL_OBSERVATION);
+        }
+        value
     }
 
     fn test_fill_batch(kind: &str, text: &str) -> (Shared<InputBatch>, mpsc::Receiver<Response>) {
@@ -17836,7 +17952,7 @@ mod tests {
                 params["expression"],
                 format!(
                     "window.__lightBrowserBridge.act({})",
-                    json!({"action":"fill","ref":"document:3:8","text":text,"kind":kind,"verifyOnly":true})
+                    json!({"action":"fill","ref":"document:3:8","text":text,"kind":kind,"verifyOnly":true,"observation":FILL_OBSERVATION})
                 )
             );
             let (id, pending) = reserve_input_verification(&batch).unwrap().unwrap();
@@ -17846,7 +17962,7 @@ mod tests {
             devtools_result(&batch.browser, batch.ids[0], true, b"{}");
             assert!(receiver.try_recv().is_err());
             let bytes = serde_json::to_vec(&json!({"result":{"value":{
-                "ok":true,"action":"fill","verified":true,"input":"chromium","attempted":true,
+                "ok":true,"action":"fill","verified":true,"input":"chromium","attempted":true,"inputTarget":"matched",
                 "text":"private fill sentinel","value":"private fill sentinel"}}}))
             .unwrap();
             devtools_result(&batch.browser, id, true, &bytes);

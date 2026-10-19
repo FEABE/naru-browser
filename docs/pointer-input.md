@@ -6,7 +6,7 @@
 
 먼저 참조와 문서, 표시 상태를 확인하고 viewport 안의 제한된 후보에서 실제 hit test로 대상을 찾는다. 기존 `read` 경로는 필요하면 대상과 접근 가능한 부모 iframe을 스크롤한다. `read-frame` 경로는 아래처럼 leaf를 한 번 스크롤한 뒤 부모 기하를 다시 수집한다. 대상 자체와 비대화형 자식은 허용하지만, 대상 아래의 다른 버튼이나 링크를 대신 누르지 않는다. 스크롤은 페이지의 scroll 핸들러를 실행할 수 있으며 입력을 보내기 전부터 페이지 상태가 바뀔 수 있다.
 
-위치를 얻으면 `Input.dispatchMouseEvent`의 mouseMoved를 요청한다. 응답 뒤 원래 참조와 정확히 같은 위치를 다시 확인한다. 이 재검사는 스크롤하거나 다른 점을 고르지 않는다. 통과한 위치에 왼쪽 mousePressed와 mouseReleased를 차례로 보내며, 다른 대상이나 새 문서로 자동 재시도하지 않는다. hover는 같은 위치의 재검사를 통과하면 종료한다. mousePressed와 mouseReleased를 보내지 않는다. 포인터 이동의 효과로 메뉴가 열리면 새 read로 메뉴 항목 참조를 얻은 뒤 별도 click을 요청한다. DOM 검사와 엔진 입력 사이의 페이지 변경을 원자적으로 막는 기능은 아니다.
+위치를 얻으면 `Input.dispatchMouseEvent`의 mouseMoved를 요청한다. 응답 뒤 원래 참조와 정확히 같은 위치를 다시 확인한다. 이 재검사는 스크롤하거나 다른 점을 고르지 않는다. 통과한 위치에 왼쪽 mousePressed와 mouseReleased를 차례로 보내며, 다른 대상이나 새 문서로 자동 재시도하지 않는다. hover는 같은 위치의 재검사를 통과하면 종료한다. mousePressed와 mouseReleased를 보내지 않는다. 준비부터 최종 응답까지 [임시 페이지 포커스 준비](focus-input.md#포인터-입력)를 유지한다. 숨은 상태에서 로드되어 그려지지 않은 작업 탭은 이 설정이 없으면 버튼 입력이 페이지에 전달되지 않는다. 대신 동작 중 페이지에 focus, blur, visibilitychange가 생길 수 있다. 포인터 이동의 효과로 메뉴가 열리면 새 read로 메뉴 항목 참조를 얻은 뒤 별도 click을 요청한다. DOM 검사와 엔진 입력 사이의 페이지 변경을 원자적으로 막는 기능은 아니다.
 
 ## 좌표와 지원 범위
 
@@ -34,7 +34,7 @@ clip이 비거나 유효 후보가 없으면 포인터를 보내기 전에 leaf�
 
 hover 성공은 `action:"hover"`, `input:"chromium"`, `attempted:true`, `dispatchAcknowledged:true`, `pointVerified:true`다. pointVerified는 원래 위치의 사후 hit test를 뜻하며 frame ref에서는 leaf와 부모 연결의 검사를 포함한다. 메뉴 표시 완료나 일정 시간의 머무름을 보장하지 않는다. 메뉴가 원래 대상을 덮거나 이동시키면 오류를 반환할 수 있다. 이 경우 자동 재이동이나 클릭을 하지 않고 다시 읽는다. `CLICK_POINT_UNAVAILABLE` 등 기존 포인터 오류 코드도 hover에 적용하되 응답 action은 hover를 유지한다.
 
-설치된 Chromium 156.0.8078.17의 [InputHandler](https://github.com/chromium/chromium/blob/156.0.8078.17/content/browser/devtools/protocol/input_handler.cc)는 CSS 좌표를 엔진 배율에 맞춰 전달하고 대상 페이지에 포커스를 요청한다. 입력이 큐에 들어가지 않거나 정리되는 경로에도 성공 응답이 존재한다. Naru가 창 활성화나 공간 선택 명령을 추가하지 않아도 페이지의 hover와 focus 효과는 생길 수 있다.
+설치된 Chromium 156.0.8078.17의 [InputHandler](https://github.com/chromium/chromium/blob/156.0.8078.17/content/browser/devtools/protocol/input_handler.cc)는 CSS 좌표를 엔진 배율에 맞춰 전달하고 대상 페이지에 포커스를 요청한다. 입력이 큐에 들어가지 않거나 정리되는 경로에도 성공 응답이 존재한다. Naru가 창 활성화나 공간 선택 명령을 추가하지 않아도 페이지의 hover와 focus 효과는 생길 수 있다. renderer가 버린 입력도 이 응답은 성공이므로 숨은 탭 전달은 위 임시 설정에 의존한다.
 
 `attempted`는 엔진 포인터 요청을 시도했는지를 나타낸다. 이동 요청 이후 클릭 전 검사에서 실패해도 true다. false여도 준비 중 스크롤의 부작용이 없었다는 뜻은 아니다. 오류의 `outcomeUnknown`을 확인하고 같은 클릭을 무조건 반복하지 않는다.
 
