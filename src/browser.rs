@@ -1842,10 +1842,17 @@ struct ShellObservation {
     forward: bool,
 }
 
+/// CEF wraps the same browser in a new C struct each time it crosses the API
+/// (create_browser_sync, callbacks), so raw pointers differ for one browser.
+/// Equal pointers are always the same browser and need no CEF call.
+fn same_browser(a: &Browser, b: &Browser) -> bool {
+    a.get_raw() == b.get_raw() || a.is_same(Some(&mut b.clone())) != 0
+}
+
 fn shell_observation_matches(state: &State, sample: &ShellObservation) -> bool {
     state.tabs.get(&sample.tab).is_some_and(|tab| {
         !tab.rejected_creation
-            && tab.browser.get_raw() == sample.browser.get_raw()
+            && same_browser(&tab.browser, &sample.browser)
             && tab.navigation.epoch == sample.epoch
             && tab.navigation.document_epoch == sample.document_epoch
             && tab.navigation.loading_event_revision == sample.loading_revision
@@ -3441,7 +3448,7 @@ fn navigation_address_matches(state: &State, guard: &NavigationControlGuard) -> 
     }) && link_owner(&state.tasks, guard.tab) == guard.owner
         && state.tabs.get(&guard.tab).is_some_and(|page| {
             !page.rejected_creation
-                && page.browser.get_raw() == guard.browser.get_raw()
+                && same_browser(&page.browser, &guard.browser)
                 && page.navigation.epoch == guard.epoch
                 && page.navigation.document_epoch == guard.document_epoch
         })
@@ -4172,7 +4179,7 @@ fn diagnostic_tab_info(
         return Ok(None);
     }
     let observed = observe_tab(tab, reply, ObservationAccess::Tab)?;
-    if observed.sample.browser.get_raw() != browser.get_raw() {
+    if !same_browser(&observed.sample.browser, &browser) {
         return Err(OBSERVATION_CHANGED);
     }
     STATE.with(|slot| {
@@ -4190,7 +4197,7 @@ fn reply_created_tab_with(
     mut observe: impl FnMut(i32, &Reply, ObservationAccess) -> Result<TabObservation, TaskError>,
 ) {
     let info = observe(tab, reply, ObservationAccess::Tab).and_then(|observed| {
-        if observed.sample.browser.get_raw() != browser.get_raw() {
+        if !same_browser(&observed.sample.browser, &browser) {
             return Err(OBSERVATION_CHANGED);
         }
         observed_tab_info(reply, &observed)
@@ -4671,7 +4678,7 @@ fn finish_dom_wait_with(
         slot.borrow()
             .tabs
             .get(&captured.tab)
-            .is_some_and(|tab| !tab.rejected_creation && tab.browser.get_raw() == browser.get_raw())
+            .is_some_and(|tab| !tab.rejected_creation && same_browser(&tab.browser, &browser))
     });
     if !original_browser {
         pending_error(
@@ -4689,7 +4696,7 @@ fn finish_dom_wait_with(
             return None;
         }
         let valid = observed.as_ref().ok().filter(|observation| {
-            observation.sample.browser.get_raw() == browser.get_raw()
+            same_browser(&observation.sample.browser, &browser)
                 && observation.sample.epoch == pending.epoch
                 && observation_matches(&state, &waiter.reply, observation).is_ok()
                 && waiter.started.elapsed() < Duration::from_millis(waiter.timeout_ms)
@@ -5470,7 +5477,7 @@ fn handle(command: &Command, reply: Reply) {
                     let epoch = STATE.with(|slot| {
                         let state = slot.borrow();
                         let tab = state.tabs.get(&tab_id)?;
-                        (tab.browser.get_raw() == browser.get_raw() && !tab.rejected_creation)
+                        (same_browser(&tab.browser, &browser) && !tab.rejected_creation)
                             .then_some(tab.navigation.epoch)
                     });
                     let Some(epoch) = epoch else {
@@ -5610,7 +5617,7 @@ fn stop_loading(
     still_current: impl Fn() -> bool,
 ) -> Result<(), String> {
     let guard = STATE.with(|slot| navigation_control_guard(&slot.borrow(), tab, None))?;
-    if guard.browser.get_raw() != browser.get_raw() {
+    if !same_browser(&guard.browser, &browser) {
         return Err(NAVIGATION_CONTROL_CHANGED.into());
     }
     execute_cli_stop(
@@ -5689,7 +5696,7 @@ fn navigate_with(
     };
     let tab_id = command.tab_id().expect("navigation command has a tab");
     let first = match observe(tab_id, reply, access) {
-        Ok(observed) if observed.sample.browser.get_raw() == browser.get_raw() => observed,
+        Ok(observed) if same_browser(&observed.sample.browser, &browser) => observed,
         Ok(_) => {
             observation_error(reply, OBSERVATION_CHANGED);
             return;
@@ -5990,7 +5997,7 @@ fn input_target_failure(
             message: "The tab closed during input preparation.",
         });
     };
-    if tab.rejected_creation || tab.browser.get_raw() != browser.get_raw() {
+    if tab.rejected_creation || !same_browser(&tab.browser, &browser) {
         return Some(InputFailure {
             code: "TAB_CLOSED",
             message: "The original browser is no longer available.",
@@ -6024,7 +6031,7 @@ fn fill_binding_failure(
 ) -> Option<InputFailure> {
     let binding = target.binding.borrow();
     let current = binding.as_ref().is_some_and(|binding| {
-        binding.browser.get_raw() == browser.get_raw()
+        same_browser(&binding.browser, &browser)
             && state
                 .tabs
                 .get(&tab)
@@ -6523,7 +6530,7 @@ fn focus_input_active(
         || state.focus_leases.get(&tab).is_some_and(|lease| {
             lease.token == reply.token
                 && lease.phase == FocusPhase::Active
-                && lease.browser.get_raw() == browser.get_raw()
+                && same_browser(&lease.browser, &browser)
                 && lease.session.as_deref() == session
         })
 }
@@ -6608,10 +6615,10 @@ fn focus_message_current(
     state
         .tabs
         .get(&tab)
-        .is_some_and(|page| page.browser.get_raw() == browser.get_raw())
+        .is_some_and(|page| same_browser(&page.browser, &browser))
         && state.focus_leases.get(&tab).is_some_and(|lease| {
             lease.token == token
-                && lease.browser.get_raw() == browser.get_raw()
+                && same_browser(&lease.browser, &browser)
                 && if enabled {
                     lease.phase == FocusPhase::Enabling && lease.enable.id == id
                 } else {
@@ -6879,7 +6886,7 @@ fn focus_session_detached(browser: &Browser, tab: i32, removed: &[String]) {
     let retired = STATE.with(|slot| {
         let mut state = slot.borrow_mut();
         let lease = state.focus_leases.get(&tab)?;
-        if lease.browser.get_raw() != browser.get_raw()
+        if !same_browser(&lease.browser, &browser)
             || !lease
                 .session
                 .as_ref()
@@ -7018,7 +7025,7 @@ fn complete_focus_message(browser: &Browser, id: i32, success: bool, bytes: &[u8
     let completed = STATE.with(|slot| {
         let mut state = slot.borrow_mut();
         let (tab, lease) = state.focus_leases.iter_mut().find(|(_, lease)| {
-            lease.browser.get_raw() == browser.get_raw()
+            same_browser(&lease.browser, &browser)
                 && (lease.enable.id == id
                     || lease
                         .disable
@@ -7918,7 +7925,7 @@ fn readiness_dispatch_current(
         && link_owner(&state.tasks, pending.tab) == guard.owner
         && state.tabs.get(&pending.tab).is_some_and(|tab| {
             !tab.rejected_creation
-                && tab.browser.get_raw() == guard.browser.get_raw()
+                && same_browser(&tab.browser, &guard.browser)
                 && tab.navigation.epoch == pending.epoch
                 && tab.navigation.epoch == guard.epoch
                 && tab.navigation.document_epoch == guard.document_epoch
@@ -8059,7 +8066,7 @@ fn start_frame_action(browser: &Browser, tab: i32, command: &Command, reply: Rep
     });
     let Some(snapshot) = snapshot.filter(|snapshot| {
         !snapshot.invalidated.get()
-            && snapshot.browser.get_raw() == browser.get_raw()
+            && same_browser(&snapshot.browser, &browser)
             && command_reference(command)
                 .is_some_and(|reference| snapshot.references.contains(reference))
     }) else {
@@ -8091,14 +8098,14 @@ fn frame_snapshot_failure(
     snapshot: &Shared<FrameSnapshot>,
 ) -> Option<InputFailure> {
     let current = !snapshot.invalidated.get()
-        && snapshot.browser.get_raw() == browser.get_raw()
+        && same_browser(&snapshot.browser, &browser)
         && snapshot.epoch == epoch
         && snapshot.owner == link_owner(&state.tasks, tab)
         && state.tasks.check_tab(reply.scope.as_ref(), tab).is_ok()
         && reply.active.load(Ordering::Acquire)
         && state.tabs.get(&tab).is_some_and(|page| {
             !page.rejected_creation
-                && page.browser.get_raw() == browser.get_raw()
+                && same_browser(&page.browser, &browser)
                 && page.navigation.epoch == epoch
                 && page.navigation.document_epoch == snapshot.document_epoch
                 && page.navigation.document_available
@@ -8244,14 +8251,14 @@ fn frame_inventory_current(state: &State, browser: &Browser, pending: &Pending) 
                     .iter()
                     .all(|parent| !parent.context.invalidated())
         })
-        && inventory.browser.get_raw() == browser.get_raw()
+        && same_browser(&inventory.browser, &browser)
         && inventory.owner == link_owner(&state.tasks, pending.tab)
         && state
             .tasks
             .check_tab(pending.reply.scope.as_ref(), pending.tab)
             .is_ok()
         && state.tabs.get(&pending.tab).is_some_and(|tab| {
-            tab.browser.get_raw() == browser.get_raw()
+            same_browser(&tab.browser, &browser)
                 && !tab.rejected_creation
                 && tab.navigation.epoch == pending.epoch
                 && tab.navigation.document_epoch == inventory.document_epoch
@@ -8305,7 +8312,7 @@ fn start_frame_inventory(
     let prepared = STATE.with(|slot| {
         let mut state = slot.borrow_mut();
         let page = state.tabs.get(&tab).filter(|page| {
-            !page.rejected_creation && page.browser.get_raw() == browser.get_raw()
+            !page.rejected_creation && same_browser(&page.browser, &browser)
         })?;
         let epoch = page.navigation.epoch;
         let inventory = Shared::new(FrameInventory {
@@ -8589,7 +8596,7 @@ fn stop_frame_tracking(tab: i32, token: Option<u64>) {
             state
                 .tabs
                 .get(&tab)
-                .is_some_and(|page| page.browser.get_raw() == browser.get_raw())
+                .is_some_and(|page| same_browser(&page.browser, &browser))
                 && state.frame_controls.get(&tab).is_some_and(|control| {
                     control.cleanup == Some(id)
                         || control.runtime_cleanup == Some(id)
@@ -8616,7 +8623,7 @@ fn complete_frame_cleanup(browser: &Browser, id: i32, success: bool) -> bool {
                 && state
                     .tabs
                     .get(tab)
-                    .is_some_and(|page| page.browser.get_raw() == browser.get_raw()))
+                    .is_some_and(|page| same_browser(&page.browser, &browser)))
             .then_some(*tab)
         }) else {
             return false;
@@ -10200,7 +10207,7 @@ fn frame_event(browser: &Browser, session: Option<&str>, method: &str, bytes: &[
         let state = slot.borrow();
         state.tabs.iter().find_map(|(id, tab)| {
             (!tab.rejected_creation
-                && tab.browser.get_raw() == browser.get_raw()
+                && same_browser(&tab.browser, &browser)
                 && state.frame_controls.get(id).is_some_and(|control| {
                     control.enabled
                         && session.is_none_or(|session| control.sessions.contains(session))
@@ -10611,7 +10618,7 @@ fn response_matches(state: &State, browser: &Browser, id: i32, session: Option<&
         .map(|pending| pending.tab)
         .or_else(|| {
             state.focus_leases.iter().find_map(|(tab, lease)| {
-                (lease.browser.get_raw() == browser.get_raw()
+                (same_browser(&lease.browser, &browser)
                     && lease.session.as_deref() == session
                     && (lease.enable.id == id
                         || lease
@@ -10647,7 +10654,7 @@ fn response_matches(state: &State, browser: &Browser, id: i32, session: Option<&
                 .flatten()
         });
     tab.and_then(|tab| state.tabs.get(&tab))
-        .is_some_and(|tab| !tab.rejected_creation && tab.browser.get_raw() == browser.get_raw())
+        .is_some_and(|tab| !tab.rejected_creation && same_browser(&tab.browser, &browser))
 }
 
 fn prefix_read_references(page: &mut Json, epoch: u64) {
@@ -10739,7 +10746,7 @@ fn devtools_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) {
                 .get(&pending.reply.token)
                 .is_some_and(|waiter| pending_matches_waiter(&pending, waiter))
                 && state.tabs.get(&pending.tab).is_some_and(|tab| {
-                    !tab.rejected_creation && tab.browser.get_raw() == browser.get_raw()
+                    !tab.rejected_creation && same_browser(&tab.browser, &browser)
                 })
         });
         if !current {
@@ -11550,7 +11557,7 @@ wrap_dev_tools_message_observer! {
         fn on_dev_tools_agent_detached(&self,browser:Option<&mut Browser>) {
             if let Some(browser) = browser {
                 let id = browser.identifier();
-                if STATE.with(|state| state.borrow().tabs.get(&id).is_some_and(|tab| tab.browser.get_raw() == browser.get_raw())) {
+                if STATE.with(|state| state.borrow().tabs.get(&id).is_some_and(|tab| same_browser(&tab.browser, &browser))) {
                     control_detached(id);
                 }
             }
