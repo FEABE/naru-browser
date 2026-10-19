@@ -118,6 +118,15 @@ class MemoryReportTests(unittest.TestCase):
         with patch.object(memory.subprocess, "run", return_value=result):
             with self.assertRaisesRegex(memory.MeasurementError, "^footprint_warning$"):
                 memory.read_footprint(10, 8)
+        partition = ("Can't examine target process's malloc zone PartitionAlloc_0x1, so memory analysis will be incomplete or incorrect.\n"
+                     "Reason: failed to resolve canonical path for /x in dyld shared cache.\n\n")
+        result = subprocess.CompletedProcess([], 0, "Physical footprint: 92.3M", partition)
+        with patch.object(memory.subprocess, "run", return_value=result):
+            self.assertEqual(memory.read_footprint(10, 8), 92.3)
+        result = subprocess.CompletedProcess([], 0, "Physical footprint: 92.3M", partition + "other warning")
+        with patch.object(memory.subprocess, "run", return_value=result):
+            with self.assertRaisesRegex(memory.MeasurementError, "^footprint_warning$"):
+                memory.read_footprint(10, 8)
         with patch.object(memory.subprocess, "run", side_effect=subprocess.TimeoutExpired("vmmap", 8)):
             with self.assertRaisesRegex(memory.MeasurementError, "^footprint_timeout$"):
                 memory.read_footprint(10, 8)

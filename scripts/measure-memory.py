@@ -123,7 +123,11 @@ def read_footprint(pid, timeout):
         raise MeasurementError("footprint_unavailable") from None
     if result.returncode:
         raise MeasurementError("footprint_unavailable")
-    if result.stderr.strip():
+    # Chromium's PartitionAlloc zones only defeat vmmap's malloc analysis;
+    # the kernel-reported physical footprint stays valid.
+    lines = [line for line in result.stderr.splitlines() if line.strip()]
+    if any(not (line.startswith("Can't examine target process's malloc zone PartitionAlloc_")
+                or line.startswith("Reason: failed to resolve canonical path for ")) for line in lines):
         raise MeasurementError("footprint_warning")
     return parse_footprint(result.stdout)
 
