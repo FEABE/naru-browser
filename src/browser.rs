@@ -11221,6 +11221,12 @@ wrap_life_span_handler! {
         }
         fn do_close(&self, browser: Option<&mut Browser>) -> i32 {
             if let Some(browser) = browser {
+                // Teardown reports child-session detaches synchronously; a
+                // command sent from that callback re-enters the dying DevTools
+                // agent and crashes. Stop observing now; OnBeforeClose answers
+                // the tab's pending requests.
+                let devtools = STATE.with(|state| state.borrow_mut().tabs.get_mut(&browser.identifier()).and_then(|tab| tab._devtools.take()));
+                drop(devtools);
                 crate::download_permission_runtime::cancel_tab(browser.identifier());
                 crate::download_runtime::cancel_tab(browser.identifier());
                 invalidate_page_find(browser.identifier());
