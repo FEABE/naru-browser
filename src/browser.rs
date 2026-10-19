@@ -4267,7 +4267,7 @@ fn serve_connection(
         Err(error) => {
             let _ = protocol::write_response(
                 &mut stream,
-                &Response::error("invalid", error.code, error.message),
+                &Response::error(protocol::INVALID_REQUEST_ID, error.code, error.message),
             );
             return;
         }

@@ -18,6 +18,8 @@ use std::time::{Duration, Instant};
 pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_SELECT_VALUE_UTF16: usize = 1024;
+/// Response id the server uses when it rejects a request before reading its id.
+pub const INVALID_REQUEST_ID: &str = "invalid";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -412,16 +414,16 @@ impl Response {
 
 #[derive(Debug)]
 pub struct ProtocolError {
-    pub code: &'static str,
+    pub code: String,
     pub message: String,
     /// A failed response does not establish whether the browser performed the action.
     pub outcome_unknown: bool,
 }
 
 impl ProtocolError {
-    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
-            code,
+            code: code.into(),
             message: message.into(),
             outcome_unknown: false,
         }
@@ -925,6 +927,7 @@ fn validate_command_fields(value: &Value, allow_task: bool) -> Result<(), Protoc
                     | "wait"
                     | "read"
                     | "frames"
+                    | "read_page"
                     | "read_frame"
                     | "scroll"
                     | "click"
@@ -1007,6 +1010,12 @@ pub fn call(socket: &Path, request: &Request) -> Result<Response, ProtocolError>
         .map_err(|e| ProtocolError::new("INVALID_RESPONSE", e.to_string()).after_send())?;
     response.validate().map_err(ProtocolError::after_send)?;
     if response.id != request.id {
+        // The server answers requests it rejects before execution with this id.
+        if response.id == INVALID_REQUEST_ID {
+            if let Some(error) = &response.error {
+                return Err(ProtocolError::new(error.code.clone(), error.message.clone()));
+            }
+        }
         return Err(ProtocolError::new(
             "RESPONSE_ID_MISMATCH",
             "Response id does not match the request; the action outcome is unknown.",
@@ -1473,6 +1482,7 @@ mod tests {
             json!({"type":"read","tab":1,"extra":true}),
             json!({"type":"frames","tab":0}),
             json!({"type":"frames","tab":3,"session":"untrusted"}),
+            json!({"type":"read_page","tab":0}),
         ] {
             let command = json!({"type":"task_run","task":"task-1","revision":1,"command":inner});
             assert_eq!(
@@ -1480,6 +1490,8 @@ mod tests {
                 "INVALID_REQUEST"
             );
         }
+        let read_page = json!({"type":"task_run","task":"task-1","revision":1,"command":{"type":"read_page","tab":3}});
+        assert!(request_from_command_value(read_page).is_ok());
         // Programmatic callers cannot bypass the same nested-command restriction.
         assert_eq!(
             Command::TaskRun {
@@ -1735,6 +1747,34 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code, "RESPONSE_ID_MISMATCH");
         assert!(error.outcome_unknown);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn surfaces_server_rejection_of_invalid_request_as_known_outcome() {
+        let directory = TestDirectory::new();
+        let socket = directory.socket();
+        let listener = bind_listener(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_request(&mut stream).unwrap();
+            write_response(
+                &mut stream,
+                &Response::error(INVALID_REQUEST_ID, "INVALID_REQUEST", "bad frame"),
+            )
+            .unwrap();
+        });
+        let error = call(
+            &socket,
+            &Request {
+                id: "check".into(),
+                command: Command::Status,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "INVALID_REQUEST");
+        assert_eq!(error.message, "bad frame");
+        assert!(!error.outcome_unknown);
         server.join().unwrap();
     }
 
