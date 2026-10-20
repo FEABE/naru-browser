@@ -142,13 +142,10 @@ impl Registry {
             ));
         }
         let prune = if self.records.len() >= MAX_TASKS {
-            Some(
-                self.oldest_finished()
-                    .ok_or(TaskError::new(
-                        "TASK_LIMIT",
-                        "Finish an existing task before creating another task.",
-                    ))?,
-            )
+            Some(self.oldest_finished().ok_or(TaskError::new(
+                "TASK_LIMIT",
+                "Finish an existing task before creating another task.",
+            ))?)
         } else {
             None
         };

@@ -547,7 +547,10 @@ mod tests {
         assert!(registry.has_crashed());
         assert_eq!(registry.next_live(&visited), Some(("b".into(), true)));
         // A duplicate attach must not hide an already reported crash.
-        assert_eq!(registry.attach(None, &attached("a", "ta")), AttachOutcome::Duplicate);
+        assert_eq!(
+            registry.attach(None, &attached("a", "ta")),
+            AttachOutcome::Duplicate
+        );
         assert!(registry.get("a").unwrap().crashed);
         visited.insert(Some("b".into()));
         assert_eq!(registry.next_live(&visited), None);

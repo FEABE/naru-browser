@@ -523,7 +523,10 @@ fn reset_settings(
         return Err("초기화할 사이트 권한을 확인할 수 없습니다.".into());
     }
     // Require the exact canonical scope that was displayed, including port.
-    if native.as_slice().is_none_or(|units| !units.iter().copied().eq(origin.encode_utf16())) {
+    if native
+        .as_slice()
+        .is_none_or(|units| !units.iter().copied().eq(origin.encode_utf16()))
+    {
         return Err("초기화할 사이트 주소를 확인할 수 없습니다.".into());
     }
     let kinds = [
@@ -626,15 +629,16 @@ mod tests {
         raw: *mut sys::_cef_permission_prompt_callback_t,
         result: sys::cef_permission_request_result_t,
     ) {
-        let data =
-            &cef::rc::RcImpl::<sys::_cef_permission_prompt_callback_t, Recorder>::get(raw).interface;
+        let data = &cef::rc::RcImpl::<sys::_cef_permission_prompt_callback_t, Recorder>::get(raw)
+            .interface;
         data.calls.borrow_mut().push(result as u32);
         dismissed(Some(7), 1);
         cancel_tab(7);
     }
 
     unsafe extern "C" fn media_result(raw: *mut sys::_cef_media_access_callback_t, mask: u32) {
-        let data = &cef::rc::RcImpl::<sys::_cef_media_access_callback_t, Recorder>::get(raw).interface;
+        let data =
+            &cef::rc::RcImpl::<sys::_cef_media_access_callback_t, Recorder>::get(raw).interface;
         data.calls.borrow_mut().push(mask);
         cancel_tab(7);
     }

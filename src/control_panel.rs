@@ -543,7 +543,8 @@ impl PageDialogBar {
             };
             self.field.setStringValue(&NSString::from_str(&text));
             self.primary.setTitle(&NSString::from_str(primary));
-            self.cancel.setTitle(&NSString::from_str(cancel.unwrap_or("")));
+            self.cancel
+                .setTitle(&NSString::from_str(cancel.unwrap_or("")));
             self.cancel.setHidden(cancel.is_none());
             // Re-showing the same dialog never takes focus a second time.
             self.focus_pending = self.focused_token != Some(dialog.token);
@@ -562,8 +563,12 @@ impl PageDialogBar {
         self.field.setFrame(rect(16.0, 46.0, text_width, 24.0));
         self.primary
             .setFrame(rect((width - 16.0 - 96.0).max(10.0), 6.0, 96.0, 28.0));
-        self.cancel
-            .setFrame(rect((width - 16.0 - 96.0 - 8.0 - 96.0).max(10.0), 6.0, 96.0, 28.0));
+        self.cancel.setFrame(rect(
+            (width - 16.0 - 96.0 - 8.0 - 96.0).max(10.0),
+            6.0,
+            96.0,
+            28.0,
+        ));
     }
 }
 
@@ -983,8 +988,8 @@ fn tab_row_frames(width: f64, collapsed: bool, y: f64) -> TabRowFrames {
     let available = (width - 4.0).max(0.0);
     let controls = if collapsed { 1.0 } else { 2.0 };
     let gap = (available / controls).min(if collapsed { 2.0 } else { 4.0 });
-    let close_width = ((available - gap * controls) / (controls + 1.0))
-        .min(if collapsed { 22.0 } else { 24.0 });
+    let close_width =
+        ((available - gap * controls) / (controls + 1.0)).min(if collapsed { 22.0 } else { 24.0 });
     let mute_width = if collapsed { 0.0 } else { close_width };
     let selection_width = available - gap * controls - close_width - mute_width;
     let icon_width = selection_width.min(16.0);
@@ -2977,7 +2982,9 @@ impl DownloadPanel {
         let summary = if !file_selections.is_empty() {
             format!(
                 "파일 선택 요청 {}개 · 다운로드 진행 중 {}개 · 다운로드 허용 대기 {}개",
-                file_selections.len(), snapshot.active_count, permissions.len()
+                file_selections.len(),
+                snapshot.active_count,
+                permissions.len()
             )
         } else if !permissions.is_empty() {
             format!(
@@ -3118,8 +3125,14 @@ impl DownloadPanel {
         let responder = window.firstResponder();
         let mut action_focus_removed = false;
         let mut previous_files = std::mem::take(&mut self.file_selections);
-        for item in file_selections.into_iter().take(crate::file_selection::MAX_PENDING) {
-            let mut row = if let Some(index) = previous_files.iter().position(|row| row.token == item.token) {
+        for item in file_selections
+            .into_iter()
+            .take(crate::file_selection::MAX_PENDING)
+        {
+            let mut row = if let Some(index) = previous_files
+                .iter()
+                .position(|row| row.token == item.token)
+            {
                 previous_files.remove(index)
             } else {
                 let surface = surface_child(&self.document, SurfaceKind::Card, 9.0, true, marker);
@@ -3160,8 +3173,16 @@ impl DownloadPanel {
                     marker,
                 );
                 FileSelectionRow {
-                    token: item.token, choosing: item.choosing, surface, title, source, detail,
-                    delivery_hint, upload_hint, choose, cancel,
+                    token: item.token,
+                    choosing: item.choosing,
+                    surface,
+                    title,
+                    source,
+                    detail,
+                    delivery_hint,
+                    upload_hint,
+                    choose,
+                    cancel,
                 }
             };
             let source = format!("{} · 요청 탭 {}", item.source, item.tab);
@@ -3170,7 +3191,8 @@ impl DownloadPanel {
                 label.setStringValue(&NSString::from_str(&compact(value, 180)));
                 label.setToolTip(Some(&NSString::from_str(value)));
                 unsafe {
-                    let _: () = msg_send![&**label, setAccessibilityHelp: &*NSString::from_str(value)];
+                    let _: () =
+                        msg_send![&**label, setAccessibilityHelp: &*NSString::from_str(value)];
                 }
             }
             row.choose.setTitle(&NSString::from_str(if item.choosing {
@@ -3183,13 +3205,17 @@ impl DownloadPanel {
             row.choose.setEnabled(!item.choosing);
             if item.choosing {
                 let control: &NSView = &row.choose;
-                action_focus_removed |= responder.as_ref()
+                action_focus_removed |= responder
+                    .as_ref()
                     .and_then(|responder| responder.downcast_ref::<NSView>())
                     .is_some_and(|view| std::ptr::eq(view, control));
             }
             row.choosing = item.choosing;
-            for (control, action) in [(&row.choose, "파일 선택"), (&row.cancel, "요청 취소")] {
-                let hint = NSString::from_str(&format!("{source} · {action}. 선택한 파일을 요청 페이지에 전달합니다. 사이트에서 바로 업로드할 수 있습니다."));
+            for (control, action) in [(&row.choose, "파일 선택"), (&row.cancel, "요청 취소")]
+            {
+                let hint = NSString::from_str(&format!(
+                    "{source} · {action}. 선택한 파일을 요청 페이지에 전달합니다. 사이트에서 바로 업로드할 수 있습니다."
+                ));
                 control.setToolTip(Some(&hint));
                 unsafe {
                     let _: () = msg_send![&**control, setAccessibilityLabel: &*hint];
@@ -3337,7 +3363,8 @@ impl DownloadPanel {
                 previous
                     .iter()
                     .any(|row| responder.isDescendantOf(&row.surface))
-                    || previous_files.iter()
+                    || previous_files
+                        .iter()
                         .any(|row| responder.isDescendantOf(&row.surface))
                     || previous_permissions
                         .iter()
@@ -3377,20 +3404,27 @@ impl DownloadPanel {
             0.0,
             0.0,
             width,
-            (selection_height + site_height + permission_height + self.rows.len() as f64 * 128.0).max(height),
+            (selection_height + site_height + permission_height + self.rows.len() as f64 * 128.0)
+                .max(height),
         ));
         self.site.layout(width);
-        self.site.surface.setFrameOrigin(NSPoint::new(0.0, selection_height));
+        self.site
+            .surface
+            .setFrameOrigin(NSPoint::new(0.0, selection_height));
         for (index, row) in self.file_selections.iter().enumerate() {
-            row.surface.setFrame(rect(0.0, index as f64 * 180.0, width, 172.0));
+            row.surface
+                .setFrame(rect(0.0, index as f64 * 180.0, width, 172.0));
             let text_width = (width - 28.0).max(1.0);
             row.title.setFrame(rect(14.0, 141.0, text_width, 21.0));
             row.source.setFrame(rect(14.0, 117.0, text_width, 18.0));
             row.detail.setFrame(rect(14.0, 94.0, text_width, 18.0));
-            row.delivery_hint.setFrame(rect(14.0, 68.0, text_width, 18.0));
+            row.delivery_hint
+                .setFrame(rect(14.0, 68.0, text_width, 18.0));
             row.upload_hint.setFrame(rect(14.0, 47.0, text_width, 18.0));
-            row.choose.setFrame(rect((width - 224.0).max(14.0), 10.0, 100.0, 30.0));
-            row.cancel.setFrame(rect((width - 116.0).max(122.0), 10.0, 102.0, 30.0));
+            row.choose
+                .setFrame(rect((width - 224.0).max(14.0), 10.0, 100.0, 30.0));
+            row.cancel
+                .setFrame(rect((width - 116.0).max(122.0), 10.0, 102.0, 30.0));
         }
         for (index, row) in self.permissions.iter().enumerate() {
             row.surface.setFrame(rect(
@@ -3769,7 +3803,10 @@ fn site_permission_label(label: &NSTextField, text: &str) {
 /// Untrusted page text: at most 600 characters, controls become spaces, the
 /// label truncates with an ellipsis and the tooltip/help keep the stored text.
 fn dialog_message_label(label: &NSTextField, text: &str) {
-    label.setStringValue(&NSString::from_str(&compact(text, PAGE_DIALOG_MESSAGE_CHARS)));
+    label.setStringValue(&NSString::from_str(&compact(
+        text,
+        PAGE_DIALOG_MESSAGE_CHARS,
+    )));
     let full = NSString::from_str(text);
     label.setToolTip(Some(&full));
     unsafe {
@@ -4881,7 +4918,11 @@ impl Shell {
             .as_deref()
             .filter(|_| file_count == 0);
         let download_title = if file_notice.is_some() {
-            let title = if self.sidebar_collapsed { "!" } else { "파일 선택 안내" };
+            let title = if self.sidebar_collapsed {
+                "!"
+            } else {
+                "파일 선택 안내"
+            };
             Some(title.to_owned())
         } else {
             (active_downloads > 0 || permission_count > 0 || file_count > 0).then(|| {
@@ -4978,7 +5019,8 @@ impl Shell {
         } else {
             NSColor::secondaryLabelColor()
         };
-        self.site_permissions_button.setContentTintColor(Some(&permission_color));
+        self.site_permissions_button
+            .setContentTintColor(Some(&permission_color));
         if self.sidebar_collapsed {
             align_center(&self.spaces_button);
             align_center(&self.search_button);
@@ -5141,7 +5183,11 @@ impl Shell {
                     "speaker"
                 },
                 "",
-                if tab.audio_muted == Some(true) { "음" } else { "소리" },
+                if tab.audio_muted == Some(true) {
+                    "음"
+                } else {
+                    "소리"
+                },
                 mute_action,
             );
             let mute_color = if tab.audio_muted == Some(true) {
@@ -5231,7 +5277,10 @@ impl Shell {
                     space
                         .tabs
                         .iter()
-                        .filter(|id| self.tabs.iter().any(|tab| tab.id == **id && tab.dialog_pending))
+                        .filter(|id| self
+                            .tabs
+                            .iter()
+                            .any(|tab| tab.id == **id && tab.dialog_pending))
                         .count(),
                     space
                         .selected_tab
@@ -5298,7 +5347,11 @@ impl Shell {
             let dialogs = space
                 .tabs
                 .iter()
-                .filter(|id| self.tabs.iter().any(|tab| tab.id == **id && tab.dialog_pending))
+                .filter(|id| {
+                    self.tabs
+                        .iter()
+                        .any(|tab| tab.id == **id && tab.dialog_pending)
+                })
                 .count();
             let mut detail_text = representative_title
                 .map(|title| format!("탭 {}개, {}", space.tabs.len(), compact(title, 48)))
@@ -6409,7 +6462,8 @@ fn file_selection_action(sender: &NSButton, choose: bool) {
         crate::file_selection_runtime::choose(token)
     } else {
         crate::file_selection_runtime::cancel(token)
-    }.err();
+    }
+    .err();
     SHELL.with(|slot| {
         let Ok(mut slot) = slot.try_borrow_mut() else {
             return;
@@ -8005,16 +8059,14 @@ fn layout() {
     // Permission decisions must reach a still-visible document. The opaque
     // sibling permission surface covers CEF without Blink's hidden/unhidden
     // transition; every other overlay keeps the previous hiding behavior.
-    let permission_covers_page = site_permissions_open
-        && !overview
-        && !search_open
-        && !bookmarks_open
-        && !downloads_open;
+    let permission_covers_page =
+        site_permissions_open && !overview && !search_open && !bookmarks_open && !downloads_open;
     let find_visible = find_open && !overview && !overlay_open;
     let recovery_visible = recovery_open && !overview && !overlay_open;
     let dialog_visible = dialog_open && !overview && !overlay_open;
     let start_page_visible = start_page_open && !overview && !overlay_open;
-    let content_hidden = overview || (overlay_open && !permission_covers_page) || start_page_visible;
+    let content_hidden =
+        overview || (overlay_open && !permission_covers_page) || start_page_visible;
     let visibility_changed = sidebar.isHidden() != overlay_open
         || toolbar.isHidden() != overlay_open
         || content.isHidden() != content_hidden
@@ -8027,7 +8079,8 @@ fn layout() {
         || bookmarks_surface.isHidden() == bookmarks_open
         || downloads_surface.isHidden() == downloads_open
         || site_permissions_surface.isHidden() == site_permissions_open;
-    let vertical = page_vertical_layout(size.height, find_visible, recovery_visible, dialog_visible);
+    let vertical =
+        page_vertical_layout(size.height, find_visible, recovery_visible, dialog_visible);
     let page_height = vertical.page_height;
     sidebar.setFrame(rect(0.0, 0.0, side, size.height));
     toolbar.setFrame(rect(side, toolbar_bottom, main_width, TOOLBAR_HEIGHT));
@@ -12643,7 +12696,10 @@ mod tests {
             let only = page_vertical_layout(height, false, false, true);
             assert_eq!(only.dialog_y + PAGE_DIALOG_HEIGHT, height - TOOLBAR_HEIGHT);
             assert!(only.page_height >= 1.0);
-            assert_eq!(only.page_height, (height - TOOLBAR_HEIGHT - PAGE_DIALOG_HEIGHT).max(1.0));
+            assert_eq!(
+                only.page_height,
+                (height - TOOLBAR_HEIGHT - PAGE_DIALOG_HEIGHT).max(1.0)
+            );
         }
     }
 
@@ -12655,14 +12711,32 @@ mod tests {
         ];
         // AI-owned (not handed over) dialogs never get the native panel.
         tabs[0].dialog_pending = true;
-        assert_eq!(visible_user_dialog_tab(&tabs, "task-1", Some(7), false, false), None);
+        assert_eq!(
+            visible_user_dialog_tab(&tabs, "task-1", Some(7), false, false),
+            None
+        );
         tabs[0].dialog_user = true;
-        assert_eq!(visible_user_dialog_tab(&tabs, "task-1", Some(7), false, false), Some(7));
+        assert_eq!(
+            visible_user_dialog_tab(&tabs, "task-1", Some(7), false, false),
+            Some(7)
+        );
         // Not the selected tab, another space, overview or an overlay: not shown, no focus.
-        assert_eq!(visible_user_dialog_tab(&tabs, "task-1", Some(8), false, false), None);
-        assert_eq!(visible_user_dialog_tab(&tabs, "user", Some(7), false, false), None);
-        assert_eq!(visible_user_dialog_tab(&tabs, "task-1", Some(7), true, false), None);
-        assert_eq!(visible_user_dialog_tab(&tabs, "task-1", Some(7), false, true), None);
+        assert_eq!(
+            visible_user_dialog_tab(&tabs, "task-1", Some(8), false, false),
+            None
+        );
+        assert_eq!(
+            visible_user_dialog_tab(&tabs, "user", Some(7), false, false),
+            None
+        );
+        assert_eq!(
+            visible_user_dialog_tab(&tabs, "task-1", Some(7), true, false),
+            None
+        );
+        assert_eq!(
+            visible_user_dialog_tab(&tabs, "task-1", Some(7), false, true),
+            None
+        );
     }
 
     #[test]
@@ -12700,7 +12774,10 @@ mod tests {
         assert_eq!(dialog_button_titles(Kind::Alert), ("확인", None));
         assert_eq!(dialog_button_titles(Kind::Confirm), ("확인", Some("취소")));
         assert_eq!(dialog_button_titles(Kind::Prompt), ("확인", Some("취소")));
-        assert_eq!(dialog_button_titles(Kind::BeforeUnload), ("떠나기", Some("머무르기")));
+        assert_eq!(
+            dialog_button_titles(Kind::BeforeUnload),
+            ("떠나기", Some("머무르기"))
+        );
     }
 
     #[test]

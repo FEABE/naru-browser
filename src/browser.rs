@@ -14087,9 +14087,20 @@ mod tests {
         install_wait(reply, text());
         let (browser, pending) = poll_wait_with(17, test_observation).unwrap();
         STATE.with(|slot| {
-            slot.borrow_mut().pending.insert(45, Pending { step: Step::Evaluate, ..pending });
+            slot.borrow_mut().pending.insert(
+                45,
+                Pending {
+                    step: Step::Evaluate,
+                    ..pending
+                },
+            );
         });
-        devtools_result(&browser, 45, true, br#"{"result":{"value":"absent-truncated"}}"#);
+        devtools_result(
+            &browser,
+            45,
+            true,
+            br#"{"result":{"value":"absent-truncated"}}"#,
+        );
         STATE.with(|slot| {
             let mut state = slot.borrow_mut();
             assert!(state.waits[&17].text_truncated);
@@ -17288,15 +17299,38 @@ mod tests {
             (crashed, inventory.invalidated.get())
         };
         // Probe: the crashed child is skipped and the inventory continues.
-        assert_eq!(run((Some("child".into()), FramePhase::CrashProbe), false, Some("child")), (Some(true), false));
+        assert_eq!(
+            run(
+                (Some("child".into()), FramePhase::CrashProbe),
+                false,
+                Some("child")
+            ),
+            (Some(true), false)
+        );
         // A pending command on, or frames from, that renderer can never finish:
         // the inventory fails and tracking stops, clearing the registry.
-        assert_eq!(run((Some("child".into()), FramePhase::Enable), false, Some("child")), (None, true));
-        assert_eq!(run((None, FramePhase::Tree), true, Some("child")), (None, true));
+        assert_eq!(
+            run(
+                (Some("child".into()), FramePhase::Enable),
+                false,
+                Some("child")
+            ),
+            (None, true)
+        );
+        assert_eq!(
+            run((None, FramePhase::Tree), true, Some("child")),
+            (None, true)
+        );
         // Unvisited: skipped by the next selection instead of failing now.
-        assert_eq!(run((None, FramePhase::Tree), false, Some("child")), (Some(true), false));
+        assert_eq!(
+            run((None, FramePhase::Tree), false, Some("child")),
+            (Some(true), false)
+        );
         // The root renderer keeps its RENDERER_TERMINATED path.
-        assert_eq!(run((None, FramePhase::Tree), true, None), (Some(false), false));
+        assert_eq!(
+            run((None, FramePhase::Tree), true, None),
+            (Some(false), false)
+        );
     }
 
     #[test]
@@ -19151,7 +19185,10 @@ mod tests {
         };
         let (reply, receiver) = test_reply(1);
         handle(&command, reply);
-        assert_eq!(receiver.try_recv().unwrap().error.unwrap().code, "TASK_REQUIRED");
+        assert_eq!(
+            receiver.try_recv().unwrap().error.unwrap().code,
+            "TASK_REQUIRED"
+        );
         for (reference, expected) in [
             ("3/document:1:1", "STALE_REF"),
             ("frame/4/99/document:1:1", "STALE_FRAME_SNAPSHOT"),
@@ -19256,16 +19293,31 @@ mod tests {
                 match change {
                     "document" => state.tabs.get_mut(&7).unwrap().navigation.document_epoch += 1,
                     "generation" => {
-                        state.tabs.get_mut(&7).unwrap().navigation.download_source_generation += 1
+                        state
+                            .tabs
+                            .get_mut(&7)
+                            .unwrap()
+                            .navigation
+                            .download_source_generation += 1
                     }
                     "file-generation" => {
-                        state.tabs.get_mut(&7).unwrap().navigation.file_selection_generation += 1
+                        state
+                            .tabs
+                            .get_mut(&7)
+                            .unwrap()
+                            .navigation
+                            .file_selection_generation += 1
                     }
                     "renderer" => {
                         state.tabs.get_mut(&7).unwrap().navigation.renderer_exit = Some(json!({}))
                     }
                     "unavailable" => {
-                        state.tabs.get_mut(&7).unwrap().navigation.document_available = false
+                        state
+                            .tabs
+                            .get_mut(&7)
+                            .unwrap()
+                            .navigation
+                            .document_available = false
                     }
                     "closed" => {
                         state.tabs.remove(&7);
@@ -19303,14 +19355,19 @@ mod tests {
                 let mut state = slot.borrow_mut();
                 match change {
                     "handoff" => {
-                        state.tasks.handoff(pending.reply.scope.as_ref().unwrap()).unwrap();
+                        state
+                            .tasks
+                            .handoff(pending.reply.scope.as_ref().unwrap())
+                            .unwrap();
                     }
                     "navigation" => state.tabs.get_mut(&7).unwrap().navigation.begin(None),
                     "cancel" => pending.reply.active.store(false, Ordering::Release),
                     _ => unreachable!(),
                 }
                 assert_eq!(
-                    pending_input_failure(&state, &browser, &pending).unwrap().code,
+                    pending_input_failure(&state, &browser, &pending)
+                        .unwrap()
+                        .code,
                     expected
                 );
                 assert!(state.focus_leases.is_empty());
@@ -20315,7 +20372,8 @@ mod tests {
             started: Instant::now(),
         };
         let key = pending.press_target().unwrap().clone();
-        let batch = reserve_input_batch(42, &pending, &browser, NativeInput::Key(key.clone())).unwrap();
+        let batch =
+            reserve_input_batch(42, &pending, &browser, NativeInput::Key(key.clone())).unwrap();
         let verify = || Some(FocusContinuation::Verify(batch.clone()));
         let respond = |ok: bool| {
             Some(FocusContinuation::Respond {
@@ -20328,11 +20386,27 @@ mod tests {
             })
         };
         // Keys not yet sent: the document change is not their effect.
-        assert!(!root_key_dispatched(&lease(FocusPhase::Active, ActionEvidence::Press(key.clone()), None)));
+        assert!(!root_key_dispatched(&lease(
+            FocusPhase::Active,
+            ActionEvidence::Press(key.clone()),
+            None
+        )));
         key.attempted.set(true);
-        assert!(root_key_dispatched(&lease(FocusPhase::Active, ActionEvidence::Press(key.clone()), None)));
-        assert!(root_key_dispatched(&lease(FocusPhase::Disabling, ActionEvidence::Press(key.clone()), verify())));
-        assert!(!root_key_dispatched(&lease(FocusPhase::Disabling, ActionEvidence::Press(key.clone()), respond(false))));
+        assert!(root_key_dispatched(&lease(
+            FocusPhase::Active,
+            ActionEvidence::Press(key.clone()),
+            None
+        )));
+        assert!(root_key_dispatched(&lease(
+            FocusPhase::Disabling,
+            ActionEvidence::Press(key.clone()),
+            verify()
+        )));
+        assert!(!root_key_dispatched(&lease(
+            FocusPhase::Disabling,
+            ActionEvidence::Press(key.clone()),
+            respond(false)
+        )));
         let mut child = lease(FocusPhase::Active, ActionEvidence::Press(key.clone()), None);
         child.session = Some("child".into());
         assert!(!root_key_dispatched(&child));
@@ -20345,9 +20419,18 @@ mod tests {
         STATE.with(|state| {
             let state = state.borrow();
             // Only the key batch is pending; no press/release is in flight.
-            assert!(!pointer_press_dispatched(&state, &lease(FocusPhase::Active, click.clone(), None)));
-            assert!(pointer_press_dispatched(&state, &lease(FocusPhase::Disabling, click.clone(), respond(true))));
-            assert!(!pointer_press_dispatched(&state, &lease(FocusPhase::Disabling, click.clone(), respond(false))));
+            assert!(!pointer_press_dispatched(
+                &state,
+                &lease(FocusPhase::Active, click.clone(), None)
+            ));
+            assert!(pointer_press_dispatched(
+                &state,
+                &lease(FocusPhase::Disabling, click.clone(), respond(true))
+            ));
+            assert!(!pointer_press_dispatched(
+                &state,
+                &lease(FocusPhase::Disabling, click.clone(), respond(false))
+            ));
         });
         clear();
     }
@@ -21629,7 +21712,9 @@ mod tests {
         let (mut reply, receiver) = test_reply(token);
         reply.scope = Some(scope.clone());
         handle(&command, reply);
-        receiver.try_recv().expect("dialog commands reply synchronously")
+        receiver
+            .try_recv()
+            .expect("dialog commands reply synchronously")
     }
 
     #[test]
@@ -21640,21 +21725,50 @@ mod tests {
         assert_eq!(dialog_disposition(99), Disposition::Default, "unknown tab");
         assert_eq!(dialog_disposition(7), Disposition::Queue, "active task tab");
         crate::dialog_runtime::settle_tabs([7], true);
-        assert_eq!(dialog_disposition(7), Disposition::AutoClose, "explicitly closing tab");
+        assert_eq!(
+            dialog_disposition(7),
+            Disposition::AutoClose,
+            "explicitly closing tab"
+        );
         crate::dialog_runtime::unmark_closing(7);
         assert_eq!(dialog_disposition(7), Disposition::Queue);
         STATE.with(|state| state.borrow_mut().tasks.handoff(&scope).unwrap());
-        assert_eq!(dialog_disposition(7), Disposition::Default, "paused task tab belongs to the user");
+        assert_eq!(
+            dialog_disposition(7),
+            Disposition::Default,
+            "paused task tab belongs to the user"
+        );
         STATE.with(|state| {
             let mut state = state.borrow_mut();
-            let resumed = TaskScope { task: scope.task.clone(), revision: scope.revision + 1 };
+            let resumed = TaskScope {
+                task: scope.task.clone(),
+                revision: scope.revision + 1,
+            };
             state.tasks.resume(&resumed).unwrap();
-            let finished = TaskScope { task: scope.task.clone(), revision: scope.revision + 2 };
+            let finished = TaskScope {
+                task: scope.task.clone(),
+                revision: scope.revision + 2,
+            };
             state.tasks.finish(&finished, &[]).unwrap();
         });
-        assert_eq!(dialog_disposition(7), Disposition::AutoClose, "finishing task never blocks close");
-        STATE.with(|state| state.borrow_mut().tabs.get_mut(&8).unwrap().rejected_creation = true);
-        assert_eq!(dialog_disposition(8), Disposition::AutoClose, "rejected tab");
+        assert_eq!(
+            dialog_disposition(7),
+            Disposition::AutoClose,
+            "finishing task never blocks close"
+        );
+        STATE.with(|state| {
+            state
+                .borrow_mut()
+                .tabs
+                .get_mut(&8)
+                .unwrap()
+                .rejected_creation = true
+        });
+        assert_eq!(
+            dialog_disposition(8),
+            Disposition::AutoClose,
+            "rejected tab"
+        );
         crate::dialog_runtime::forget_tab(7);
         clear();
     }
@@ -21664,25 +21778,52 @@ mod tests {
         use crate::dialogs::Kind;
         let (scope, _receiver, _reply) = dialog_fixture();
         let dialog = |action| Command::Dialog { tab: 7, action };
-        let accept = |text: Option<&str>| dialog(crate::protocol::DialogAction::Accept { text: text.map(Into::into) });
+        let accept = |text: Option<&str>| {
+            dialog(crate::protocol::DialogAction::Accept {
+                text: text.map(Into::into),
+            })
+        };
         // Unscoped use is refused even for a user tab.
         let (reply, receiver) = test_reply(1);
         handle(&accept(None), reply);
-        assert_eq!(receiver.try_recv().unwrap().error.unwrap().code, "TASK_REQUIRED");
+        assert_eq!(
+            receiver.try_recv().unwrap().error.unwrap().code,
+            "TASK_REQUIRED"
+        );
         // No dialog yet.
         let response = run_scoped(&scope, accept(None), 2);
         assert_eq!(response.error.unwrap().code, "NO_DIALOG");
         // TEXT is only for prompt and does not consume the dialog.
-        assert!(crate::dialog_runtime::test_insert(7, Kind::Confirm, "sure?", ""));
+        assert!(crate::dialog_runtime::test_insert(
+            7,
+            Kind::Confirm,
+            "sure?",
+            ""
+        ));
         let response = run_scoped(&scope, accept(Some("x")), 3);
         assert_eq!(response.error.unwrap().code, "DIALOG_TEXT_NOT_ALLOWED");
         assert!(crate::dialog_runtime::tab_json(7).is_some());
         // A foreign task cannot answer.
-        let other = STATE.with(|state| state.borrow_mut().tasks.create("Other dialog task").unwrap());
-        let foreign = TaskScope { task: other.id, revision: other.revision };
-        assert_eq!(run_scoped(&foreign, accept(None), 4).error.unwrap().code, "TASK_TAB_MISMATCH");
+        let other = STATE.with(|state| {
+            state
+                .borrow_mut()
+                .tasks
+                .create("Other dialog task")
+                .unwrap()
+        });
+        let foreign = TaskScope {
+            task: other.id,
+            revision: other.revision,
+        };
+        assert_eq!(
+            run_scoped(&foreign, accept(None), 4).error.unwrap().code,
+            "TASK_TAB_MISMATCH"
+        );
         // A stale revision cannot answer.
-        let stale = TaskScope { task: scope.task.clone(), revision: scope.revision + 3 };
+        let stale = TaskScope {
+            task: scope.task.clone(),
+            revision: scope.revision + 3,
+        };
         assert!(run_scoped(&stale, accept(None), 5).error.is_some());
         assert!(crate::dialog_runtime::tab_json(7).is_some());
         // Page commands fail fast while the dialog is pending; Close does not.
@@ -21690,8 +21831,15 @@ mod tests {
         let error = response.error.unwrap();
         assert_eq!(error.code, "DIALOG_PENDING");
         assert_eq!(error.details.as_ref().unwrap()["dialog"]["type"], "confirm");
-        let wait = Command::Wait { tab: 7, until: crate::protocol::WaitUntil::Dom, timeout_ms: 1000 };
-        assert_eq!(run_scoped(&scope, wait, 7).error.unwrap().code, "DIALOG_PENDING");
+        let wait = Command::Wait {
+            tab: 7,
+            until: crate::protocol::WaitUntil::Dom,
+            timeout_ms: 1000,
+        };
+        assert_eq!(
+            run_scoped(&scope, wait, 7).error.unwrap().code,
+            "DIALOG_PENDING"
+        );
         // Answering clears it and a second answer is NO_DIALOG.
         let answered = run_scoped(&scope, dialog(crate::protocol::DialogAction::Dismiss {}), 8);
         let result = answered.result.unwrap();
@@ -21701,10 +21849,20 @@ mod tests {
         let response = run_scoped(&scope, dialog(crate::protocol::DialogAction::Dismiss {}), 9);
         assert_eq!(response.error.unwrap().code, "NO_DIALOG");
         // A prompt echoes the accepted text; omitted TEXT uses the default.
-        assert!(crate::dialog_runtime::test_insert(7, Kind::Prompt, "name?", "anon"));
+        assert!(crate::dialog_runtime::test_insert(
+            7,
+            Kind::Prompt,
+            "name?",
+            "anon"
+        ));
         let result = run_scoped(&scope, accept(None), 10).result.unwrap();
         assert_eq!(result["text"], "anon");
-        assert!(crate::dialog_runtime::test_insert(7, Kind::Prompt, "name?", "anon"));
+        assert!(crate::dialog_runtime::test_insert(
+            7,
+            Kind::Prompt,
+            "name?",
+            "anon"
+        ));
         let result = run_scoped(&scope, accept(Some("bob")), 11).result.unwrap();
         assert_eq!(result["text"], "bob");
         clear();
@@ -21719,35 +21877,72 @@ mod tests {
     fn handoff_keeps_the_queued_dialog_for_the_user() {
         use crate::dialogs::Kind;
         let (scope, _receiver, _reply) = dialog_fixture();
-        assert!(crate::dialog_runtime::test_insert(7, Kind::Prompt, "name?", "anon"));
+        assert!(crate::dialog_runtime::test_insert(
+            7,
+            Kind::Prompt,
+            "name?",
+            "anon"
+        ));
         assert_eq!(dialog_owner(7).as_deref(), Some("task"));
-        let handed = run_task_command(Command::TaskHandoff { task: scope.task.clone(), revision: scope.revision }, 20);
+        let handed = run_task_command(
+            Command::TaskHandoff {
+                task: scope.task.clone(),
+                revision: scope.revision,
+            },
+            20,
+        );
         assert!(handed.ok, "{handed:?}");
         // Kept, not dismissed; now user-owned and shown to the panel only.
         assert_eq!(dialog_owner(7).as_deref(), Some("user"));
         assert_eq!(crate::dialog_runtime::pending_count(), 1);
-        assert_eq!(crate::dialog_runtime::user_owned_tabs(), [7].into_iter().collect());
+        assert_eq!(
+            crate::dialog_runtime::user_owned_tabs(),
+            [7].into_iter().collect()
+        );
         let user = crate::dialog_runtime::user_dialog(7).unwrap();
         assert_eq!(user.default_prompt, "anon");
         // A resumed task still cannot answer; it keeps the page rejecting commands.
-        let resumed = run_task_command(Command::TaskResume { task: scope.task.clone(), revision: scope.revision + 1 }, 21);
+        let resumed = run_task_command(
+            Command::TaskResume {
+                task: scope.task.clone(),
+                revision: scope.revision + 1,
+            },
+            21,
+        );
         assert!(resumed.ok, "{resumed:?}");
-        let scope = TaskScope { task: scope.task, revision: scope.revision + 2 };
+        let scope = TaskScope {
+            task: scope.task,
+            revision: scope.revision + 2,
+        };
         for (token, action) in [
             (22, crate::protocol::DialogAction::Accept { text: None }),
-            (23, crate::protocol::DialogAction::Accept { text: Some("bob".into()) }),
+            (
+                23,
+                crate::protocol::DialogAction::Accept {
+                    text: Some("bob".into()),
+                },
+            ),
             (24, crate::protocol::DialogAction::Dismiss {}),
         ] {
-            let error = run_scoped(&scope, Command::Dialog { tab: 7, action }, token).error.unwrap();
+            let error = run_scoped(&scope, Command::Dialog { tab: 7, action }, token)
+                .error
+                .unwrap();
             assert_eq!(error.code, "DIALOG_USER_OWNED");
         }
         assert_eq!(dialog_owner(7).as_deref(), Some("user"));
-        let error = run_scoped(&scope, Command::Read { tab: 7 }, 25).error.unwrap();
+        let error = run_scoped(&scope, Command::Read { tab: 7 }, 25)
+            .error
+            .unwrap();
         assert_eq!(error.code, "DIALOG_PENDING");
         assert_eq!(error.details.as_ref().unwrap()["dialog"]["owner"], "user");
         assert!(error.message.contains("user"), "{}", error.message);
         // A new dialog on the same tab is refused by the 1/tab cap (user-owned counts).
-        assert!(!crate::dialog_runtime::test_insert(7, Kind::Alert, "second", ""));
+        assert!(!crate::dialog_runtime::test_insert(
+            7,
+            Kind::Alert,
+            "second",
+            ""
+        ));
         assert_eq!(crate::dialog_runtime::tab_overflow(7), 1);
         // A stale token (a different dialog) is not answered by the panel.
         assert!(answer_user_dialog(7, user.token + 100, true, None).is_err());
@@ -21756,7 +21951,10 @@ mod tests {
         assert!(answer_user_dialog(7, user.token, true, Some("bob".into())).is_ok());
         assert!(crate::dialog_runtime::tab_json(7).is_none());
         assert!(answer_user_dialog(7, user.token, true, None).is_err());
-        assert!(crate::dialog_runtime::focus_grace_active(7), "resumed renderer gets the ack grace");
+        assert!(
+            crate::dialog_runtime::focus_grace_active(7),
+            "resumed renderer gets the ack grace"
+        );
         assert_eq!(crate::dialog_runtime::pending_count(), 0);
         crate::dialog_runtime::forget_tab(7);
         clear();
@@ -21766,14 +21964,26 @@ mod tests {
     fn user_panel_cannot_answer_a_task_owned_dialog() {
         use crate::dialogs::Kind;
         let (scope, _receiver, _reply) = dialog_fixture();
-        assert!(crate::dialog_runtime::test_insert(7, Kind::Confirm, "sure?", ""));
+        assert!(crate::dialog_runtime::test_insert(
+            7,
+            Kind::Confirm,
+            "sure?",
+            ""
+        ));
         let token = crate::dialog_runtime::tab_json(7).map(|_| ()).and(Some(0));
         assert!(token.is_some());
         assert!(crate::dialog_runtime::user_dialog(7).is_none());
         assert!(answer_user_dialog(7, 1, true, None).is_err());
         assert_eq!(dialog_owner(7).as_deref(), Some("task"));
         // The CLI still answers it.
-        let result = run_scoped(&scope, Command::Dialog { tab: 7, action: crate::protocol::DialogAction::Dismiss {} }, 30);
+        let result = run_scoped(
+            &scope,
+            Command::Dialog {
+                tab: 7,
+                action: crate::protocol::DialogAction::Dismiss {},
+            },
+            30,
+        );
         assert!(result.ok, "{result:?}");
         clear();
     }
@@ -21787,7 +21997,12 @@ mod tests {
             state.spaces.show(&scope.task);
             state.spaces.select_tab(7);
         });
-        assert!(crate::dialog_runtime::test_insert(7, Kind::BeforeUnload, "leave?", ""));
+        assert!(crate::dialog_runtime::test_insert(
+            7,
+            Kind::BeforeUnload,
+            "leave?",
+            ""
+        ));
         assert!(handoff_page_input(7).unwrap());
         assert_eq!(dialog_owner(7).as_deref(), Some("user"));
         assert_eq!(crate::dialog_runtime::pending_count(), 1);
@@ -21811,17 +22026,41 @@ mod tests {
         use crate::dialogs::Kind;
         let (scope, _receiver, _reply) = dialog_fixture();
         // Release: the tab is the user's now, with its dialog.
-        assert!(crate::dialog_runtime::test_insert(7, Kind::BeforeUnload, "leave?", ""));
-        let released = run_task_command(Command::TaskRelease { task: scope.task.clone(), revision: scope.revision, tab: 7 }, 22);
+        assert!(crate::dialog_runtime::test_insert(
+            7,
+            Kind::BeforeUnload,
+            "leave?",
+            ""
+        ));
+        let released = run_task_command(
+            Command::TaskRelease {
+                task: scope.task.clone(),
+                revision: scope.revision,
+                tab: 7,
+            },
+            22,
+        );
         assert!(released.ok, "{released:?}");
         assert_eq!(dialog_owner(7).as_deref(), Some("user"));
         // The user closes the tab natively: user-owned dialogs settle (no hang).
         crate::dialog_runtime::settle_tabs([7], false);
         assert!(crate::dialog_runtime::tab_json(7).is_none());
         // Re-adopt, then an explicit close settles and marks the tab closing.
-        let adopted = run_task_command(Command::TaskAdopt { task: scope.task.clone(), revision: scope.revision, tab: 7 }, 23);
+        let adopted = run_task_command(
+            Command::TaskAdopt {
+                task: scope.task.clone(),
+                revision: scope.revision,
+                tab: 7,
+            },
+            23,
+        );
         assert!(adopted.ok, "{adopted:?}");
-        assert!(crate::dialog_runtime::test_insert(7, Kind::BeforeUnload, "leave?", ""));
+        assert!(crate::dialog_runtime::test_insert(
+            7,
+            Kind::BeforeUnload,
+            "leave?",
+            ""
+        ));
         let closed = run_scoped(&scope, Command::Close { tab: 7 }, 24);
         assert!(closed.ok, "{closed:?}");
         assert!(crate::dialog_runtime::tab_json(7).is_none());
@@ -21829,7 +22068,14 @@ mod tests {
         // Finish with --keep hands the kept tab's dialog to the user.
         crate::dialog_runtime::unmark_closing(7);
         assert!(crate::dialog_runtime::test_insert(7, Kind::Alert, "a", ""));
-        let finished = run_task_command(Command::TaskFinish { task: scope.task.clone(), revision: scope.revision, keep: vec![7] }, 25);
+        let finished = run_task_command(
+            Command::TaskFinish {
+                task: scope.task.clone(),
+                revision: scope.revision,
+                keep: vec![7],
+            },
+            25,
+        );
         assert!(finished.ok, "{finished:?}");
         assert_eq!(dialog_owner(7).as_deref(), Some("user"));
         crate::dialog_runtime::forget_tab(7);
@@ -21843,7 +22089,14 @@ mod tests {
         use crate::dialogs::Kind;
         let (scope, _receiver, _reply) = dialog_fixture();
         assert!(crate::dialog_runtime::test_insert(7, Kind::Alert, "a", ""));
-        let finished = run_task_command(Command::TaskFinish { task: scope.task.clone(), revision: scope.revision, keep: vec![] }, 26);
+        let finished = run_task_command(
+            Command::TaskFinish {
+                task: scope.task.clone(),
+                revision: scope.revision,
+                keep: vec![],
+            },
+            26,
+        );
         assert!(finished.ok, "{finished:?}");
         assert!(crate::dialog_runtime::tab_json(7).is_none());
         assert!(crate::dialog_runtime::is_closing(7));
@@ -21855,14 +22108,37 @@ mod tests {
     fn user_owned_dialogs_leave_the_global_cap_to_task_dialogs_and_settle_on_quit() {
         use crate::dialogs::Kind;
         let (scope, _receiver, _reply) = dialog_fixture();
-        assert!(crate::dialog_runtime::test_insert(7, Kind::BeforeUnload, "leave?", ""));
-        let handed = run_task_command(Command::TaskHandoff { task: scope.task.clone(), revision: scope.revision }, 27);
+        assert!(crate::dialog_runtime::test_insert(
+            7,
+            Kind::BeforeUnload,
+            "leave?",
+            ""
+        ));
+        let handed = run_task_command(
+            Command::TaskHandoff {
+                task: scope.task.clone(),
+                revision: scope.revision,
+            },
+            27,
+        );
         assert!(handed.ok, "{handed:?}");
         for tab in 101..=104 {
-            assert!(crate::dialog_runtime::test_insert(tab, Kind::Alert, "a", ""));
+            assert!(crate::dialog_runtime::test_insert(
+                tab,
+                Kind::Alert,
+                "a",
+                ""
+            ));
         }
-        assert!(!crate::dialog_runtime::test_insert(105, Kind::Alert, "a", ""), "four task-owned entries fill the global cap");
-        assert_eq!(crate::dialog_runtime::pending_count(), 5, "the user-owned entry sits outside the cap");
+        assert!(
+            !crate::dialog_runtime::test_insert(105, Kind::Alert, "a", ""),
+            "four task-owned entries fill the global cap"
+        );
+        assert_eq!(
+            crate::dialog_runtime::pending_count(),
+            5,
+            "the user-owned entry sits outside the cap"
+        );
         // Quit settles user-owned and task-owned entries of known tabs alike.
         close_all();
         assert!(crate::dialog_runtime::tab_json(7).is_none());
@@ -21879,7 +22155,12 @@ mod tests {
         use crate::dialog_runtime::Disposition;
         use crate::dialogs::Kind;
         let (_scope, _receiver, _reply) = dialog_fixture();
-        assert!(crate::dialog_runtime::test_insert(7, Kind::BeforeUnload, "leave?", ""));
+        assert!(crate::dialog_runtime::test_insert(
+            7,
+            Kind::BeforeUnload,
+            "leave?",
+            ""
+        ));
         assert_eq!(crate::dialog_runtime::pending_count(), 1);
         close_all();
         assert_eq!(crate::dialog_runtime::pending_count(), 0);
@@ -21894,11 +22175,24 @@ mod tests {
     fn reentrant_reset_during_overflow_keeps_the_queued_dialog() {
         use crate::dialogs::Kind;
         let (_scope, _receiver, _reply) = dialog_fixture();
-        assert!(crate::dialog_runtime::test_insert(7, Kind::Confirm, "first", ""));
+        assert!(crate::dialog_runtime::test_insert(
+            7,
+            Kind::Confirm,
+            "first",
+            ""
+        ));
         // A second dialog on the same tab overflows (model refuses it).
-        assert!(!crate::dialog_runtime::test_insert(7, Kind::Alert, "second", ""));
+        assert!(!crate::dialog_runtime::test_insert(
+            7,
+            Kind::Alert,
+            "second",
+            ""
+        ));
         crate::dialog_runtime::test_reset_during_guard(7);
-        assert_eq!(crate::dialog_runtime::tab_json(7).unwrap()["message"], "first");
+        assert_eq!(
+            crate::dialog_runtime::tab_json(7).unwrap()["message"],
+            "first"
+        );
         // Outside the guard a CEF reset removes it.
         crate::dialog_runtime::reset_tab(7);
         assert!(crate::dialog_runtime::tab_json(7).is_none());
@@ -21913,7 +22207,10 @@ mod tests {
         assert!(crate::dialog_runtime::test_insert(7, Kind::Alert, "a", ""));
         assert!(crate::dialog_runtime::focus_grace_active(7));
         crate::dialog_runtime::settle_tabs([7], false);
-        assert!(crate::dialog_runtime::focus_grace_active(7), "one grace period after resume");
+        assert!(
+            crate::dialog_runtime::focus_grace_active(7),
+            "one grace period after resume"
+        );
         crate::dialog_runtime::forget_tab(7);
         assert!(!crate::dialog_runtime::focus_grace_active(7));
         clear();
@@ -21922,7 +22219,9 @@ mod tests {
     fn run_task_command(command: Command, token: u64) -> Response {
         let (reply, receiver) = test_reply(token);
         handle(&command, reply);
-        receiver.try_recv().expect("task commands reply synchronously")
+        receiver
+            .try_recv()
+            .expect("task commands reply synchronously")
     }
 
     #[test]
@@ -21943,7 +22242,10 @@ mod tests {
                     frame: None,
                     tab: 7,
                     epoch: 4,
-                    evaluation: Evaluation::Page { mutation: true, evidence: None },
+                    evaluation: Evaluation::Page {
+                        mutation: true,
+                        evidence: None,
+                    },
                     reply: pending_reply,
                     step: Step::Evaluate,
                 },
@@ -21954,7 +22256,10 @@ mod tests {
                     frame: None,
                     tab: 8,
                     epoch: 4,
-                    evaluation: Evaluation::Page { mutation: false, evidence: None },
+                    evaluation: Evaluation::Page {
+                        mutation: false,
+                        evidence: None,
+                    },
                     reply: other_reply,
                     step: Step::Evaluate,
                 },
@@ -21972,7 +22277,12 @@ mod tests {
                 },
             );
         });
-        assert!(crate::dialog_runtime::test_insert(7, Kind::Alert, "hello", ""));
+        assert!(crate::dialog_runtime::test_insert(
+            7,
+            Kind::Alert,
+            "hello",
+            ""
+        ));
         let dialog = crate::dialog_runtime::tab_json(7).unwrap();
         dialog_opened(7, dialog);
         let error = pending_receiver.try_recv().unwrap().error.unwrap();
@@ -21993,7 +22303,10 @@ mod tests {
         let status = crate::dialog_runtime::status_json();
         assert_eq!(status["pending"], 1);
         assert_eq!(status["requests"][0]["type"], "alert");
-        assert_eq!(crate::dialog_runtime::pending_tabs(), [7].into_iter().collect());
+        assert_eq!(
+            crate::dialog_runtime::pending_tabs(),
+            [7].into_iter().collect()
+        );
         clear();
     }
 

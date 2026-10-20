@@ -3,10 +3,8 @@
 use crate::file_selection::{MAX_EXTENSIONS, MAX_FILES, MAX_PATH_BYTES, Mode};
 use block2::RcBlock;
 use objc2::{
-    DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
-    rc::Retained,
-    runtime::NSObjectProtocol,
-    sel,
+    DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, rc::Retained,
+    runtime::NSObjectProtocol, sel,
 };
 use objc2_app_kit::{
     NSButton, NSControlStateValueOn, NSModalResponse, NSModalResponseCancel, NSModalResponseOK,
@@ -19,7 +17,11 @@ struct Dialog {
     token: u64,
     mode: Mode,
     panel: Retained<NSOpenPanel>,
-    filter: Option<(Retained<FilterTarget>, Retained<NSButton>, Retained<NSArray<NSString>>)>,
+    filter: Option<(
+        Retained<FilterTarget>,
+        Retained<NSButton>,
+        Retained<NSArray<NSString>>,
+    )>,
     starting: bool,
     canceled: bool,
     completing: bool,
@@ -76,14 +78,18 @@ pub fn show(token: u64, mode: Mode, extensions: &[String]) -> Result<(), String>
                 || extension.len() > 64
                 || !extension.as_bytes()[0].is_ascii_alphanumeric()
                 || extension.split('.').any(str::is_empty)
-                || !extension.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-+".contains(&byte))
+                || !extension
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"._-+".contains(&byte))
         })
     {
         return Err("요청한 파일 형식을 선택 창에 표시할 수 없습니다.".into());
     }
     let window = crate::control_panel::file_selection_window()
         .ok_or_else(|| "파일을 선택할 브라우저 창이 없습니다.".to_owned())?;
-    if !window.isVisible() || !window.isKeyWindow() || window.isMiniaturized()
+    if !window.isVisible()
+        || !window.isKeyWindow()
+        || window.isMiniaturized()
         || window.attachedSheet().is_some()
     {
         return Err("브라우저 창의 다른 선택 창을 닫은 뒤 다시 선택해 주세요.".into());
@@ -100,7 +106,10 @@ pub fn show(token: u64, mode: Mode, extensions: &[String]) -> Result<(), String>
     panel.setCanCreateDirectories(false);
     panel.setResolvesAliases(true);
     let filter = if mode != Mode::Folder && !extensions.is_empty() {
-        let values: Vec<_> = extensions.iter().map(|value| NSString::from_str(value)).collect();
+        let values: Vec<_> = extensions
+            .iter()
+            .map(|value| NSString::from_str(value))
+            .collect();
         let values = NSArray::from_retained_slice(&values);
         #[allow(deprecated)]
         panel.setAllowedFileTypes(Some(&values));
@@ -113,8 +122,13 @@ pub fn show(token: u64, mode: Mode, extensions: &[String]) -> Result<(), String>
                 marker,
             )
         };
-        button.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(240.0, 28.0)));
-        button.setToolTip(Some(&NSString::from_str("사이트가 제안한 형식 이외의 파일도 선택")));
+        button.setFrame(NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(240.0, 28.0),
+        ));
+        button.setToolTip(Some(&NSString::from_str(
+            "사이트가 제안한 형식 이외의 파일도 선택",
+        )));
         panel.setAccessoryView(Some(&button));
         Some((target, button, values))
     } else {
@@ -123,21 +137,31 @@ pub fn show(token: u64, mode: Mode, extensions: &[String]) -> Result<(), String>
         None
     };
     // Native getters/configuration above may reenter and revoke the request.
-    if !window.isVisible() || !window.isKeyWindow() || window.isMiniaturized()
+    if !window.isVisible()
+        || !window.isKeyWindow()
+        || window.isMiniaturized()
         || window.attachedSheet().is_some()
         || !crate::control_panel::file_selection_window()
             .is_some_and(|current| std::ptr::eq(&*current, &*window))
         || !crate::file_selection_runtime::snapshot()
-            .iter().any(|row| row.token == token && row.choosing)
+            .iter()
+            .any(|row| row.token == token && row.choosing)
     {
         return Err("파일 선택 요청이 만료되었거나 다른 선택 창이 열렸습니다.".into());
     }
     let stored = DIALOG.with(|slot| {
         let mut slot = slot.borrow_mut();
-        if slot.is_some() { return false; }
+        if slot.is_some() {
+            return false;
+        }
         *slot = Some(Dialog {
-            token, mode, panel: panel.clone(), filter,
-            starting: true, canceled: false, completing: false,
+            token,
+            mode,
+            panel: panel.clone(),
+            filter,
+            starting: true,
+            canceled: false,
+            completing: false,
         });
         true
     });
@@ -154,7 +178,9 @@ pub fn show(token: u64, mode: Mode, extensions: &[String]) -> Result<(), String>
         (dialog.canceled && !dialog.completing).then(|| dialog.panel.clone())
     });
     if let Some(panel) = cancel_after_start {
-        unsafe { panel.cancel(None); }
+        unsafe {
+            panel.cancel(None);
+        }
     }
     Ok(())
 }
@@ -168,7 +194,9 @@ pub fn cancel(token: u64) {
     });
     if let Some(panel) = panel {
         // Keep the slot until AppKit reports the sheet's completion.
-        unsafe { panel.cancel(None); }
+        unsafe {
+            panel.cancel(None);
+        }
     }
 }
 
@@ -183,7 +211,9 @@ fn selected_paths(panel: &NSOpenPanel, mode: Mode) -> Result<Vec<String>, String
         if !url.isFileURL() {
             return Err("로컬 파일이나 폴더만 선택할 수 있습니다.".into());
         }
-        let path = url.path().ok_or_else(|| "선택한 파일 경로를 읽을 수 없습니다.".to_owned())?;
+        let path = url
+            .path()
+            .ok_or_else(|| "선택한 파일 경로를 읽을 수 없습니다.".to_owned())?;
         // Bound the UTF-16 input before allocating its UTF-8 representation.
         if path.length() > MAX_PATH_BYTES {
             return Err("선택한 파일 경로가 너무 깁니다.".into());
@@ -200,11 +230,15 @@ fn selected_paths(panel: &NSOpenPanel, mode: Mode) -> Result<Vec<String>, String
 fn finished(token: u64, response: NSModalResponse) {
     let current = DIALOG.with(|slot| {
         let mut slot = slot.borrow_mut();
-        let dialog = slot.as_mut().filter(|dialog| dialog.token == token && !dialog.completing)?;
+        let dialog = slot
+            .as_mut()
+            .filter(|dialog| dialog.token == token && !dialog.completing)?;
         dialog.completing = true;
         Some((dialog.panel.clone(), dialog.mode, dialog.canceled))
     });
-    let Some((panel, mode, canceled)) = current else { return };
+    let Some((panel, mode, canceled)) = current else {
+        return;
+    };
     panel.orderOut(None);
     let result = if canceled || response == NSModalResponseCancel {
         Ok(Vec::new())
@@ -223,7 +257,11 @@ fn finished(token: u64, response: NSModalResponse) {
     });
     let Some(dialog) = dialog else { return };
     // Cancellation may have reentered during orderOut/URL extraction.
-    let result = if dialog.canceled { Ok(Vec::new()) } else { result };
+    let result = if dialog.canceled {
+        Ok(Vec::new())
+    } else {
+        result
+    };
     if let Some((_, button, _)) = &dialog.filter {
         unsafe {
             button.setTarget(None);
