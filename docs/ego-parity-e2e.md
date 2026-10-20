@@ -4,6 +4,61 @@
 
 참고 기준은 [2026-10-11 실제 앱 비교](browser-comparison-2026-10-11.md)다. 당시 ego lite `0.5.1.13`에서 별도 AI 공간, 사용자 선택 유지, 작업 표시, 로컬 페이지 클릭과 입력을 관찰했다. Aside에서는 새 탭, 세로 탭, 북마크, 통합 검색과 중지 UI를 관찰했다. 당시 확인하지 않은 로그인, 모든 중지 경합, 전체 웹 호환성과 메모리 우열을 동등성 기준에 추가하지 않는다. 아래 항목은 그 관찰과 Naru의 제품 목표를 합친 지원 범위이며, 최신 ego lite의 전체 기능 목록을 복제한 표가 아니다.
 
+## 2026-10-21 최종 통합 실행 (HEAD `d5e14d6`, release 빌드 1회, 앱 SHA-256 `55fb024b...21e1`)
+
+M0~M5, M4 포인터·선택자, M9 사용자 소유 대화상자 패널, M10 테스트·보관 한도, rustfmt를 포함한 커밋 `d5e14d6`(깨끗한 트리)에서 `NARU_MOCK_KEYCHAIN=1 ./scripts/dev.sh --release --build-only`를 한 번 실행했다. 앱 `Contents/MacOS/light-browser` SHA-256은 `55fb024b6c6140b6881299b592ae3347d0ed20a8a66b0b1215dd4d8f044e21e1`, 번들 CLI `lightbrowser`는 `25355d982ae6b4688a22464376c87aec7a70fac0a67c01f39c02690ba5dce828`이다([빌드 기록](../artifacts/final-20261021/build-receipt.json)). 아래 모든 실행은 이 번들과 앱이 직접 만든 새 mock-keychain 프로필(`.local-data/e2e-final-main`, `-j13`, `-j14`, `-restart`)로 했고 재빌드는 없었다. 앞선 M7·M8 바이너리(`e36b0dd5...0ff0`)의 결과는 옮기지 않았다. 외부 사이트, 실제 프로필, 로그인, 네이티브 AppKit·접근성 자동화는 사용하지 않았다. 원본은 `artifacts/final-20261021/`(`results.tsv`, `j05.stdout`, `j13_report.json`, `j14/`)다.
+
+### 정적 검사
+
+| 검사 | 결과 |
+| --- | --- |
+| `cargo test --locked --lib` | 493개 통과 |
+| `cargo check --locked --bins` | 통과(기존 dead_code 경고 1개) |
+| `cargo fmt --all --check` | 통과 |
+| `node --test tests/` | 162개 전부 통과(M7의 27개 실패는 M10에서 정리됨) |
+| `python3 -m unittest discover -s tests -p '*_test.py'` | 31개 통과 |
+| `git diff --check` | 통과 |
+
+### 로컬 CEF 스모크 (모두 위 바이너리, exit 0)
+
+single_window, spaces, tasks, navigation, navigation_recovery, wait, dialog, stop, geolocation_hidden(`--expect-fixed`), native_click, native_fill, native_press, select, check, shadow(M7에서 고친 하네스로 첫 실행 통과), insert_text, contenteditable, pointer_ext(10개 검사), scroll_target(81개), frame_journey(56개), download_permissions, resources, controls, frame_crash(10개 시나리오 x 5회, 120초), restart(앱 2회 실행, 정상 종료), `e2e_v17_j05` 임시 사본(프로필 경로만 바꿈; 24개 PASS, `ALL PASS`), `j13_driver`(아래), 마지막에 `dialog_smoke --quit-pid`(13개 검사, 대기 중 alert와 armed beforeunload 상태의 SIGTERM에 앱 종료). `dialog_smoke`는 M9 계약에 따라 handoff 때 대화상자를 취소하지 않고 사용자 소유로 유지하는 검사를 포함한다. 하네스 불일치는 이번에 발견하지 못해 `tests/`는 수정하지 않았다.
+
+### 여정 판정 (이 바이너리의 실행만)
+
+| 여정 | 이 바이너리에서 실행한 것 | 판정 | 남은 일 |
+| --- | --- | --- | --- |
+| 01 시작과 사람 공간 보존 | single_window, spaces, tasks | pass (CLI·로컬 CEF 범위) | 실제 창 개수, 마우스 선택, 팝업은 네이티브 확인 |
+| 02 주소 입력부터 탐색과 중지 | navigation, navigation_recovery, stop, controls | pending | 주소창 입력, 검색어, 중지 버튼, 뒤로·앞으로는 네이티브 |
+| 03 탭·검색·북마크·방문 기록 | 실행 안 함(방문 기록 파일은 13번에서) | pending | 네이티브 UI 필요 |
+| 04 두 AI 작업의 배경 탐색 | tasks, spaces, wait, resources, 14번 주기 | pass (CLI·로컬 CEF 범위) | 대규모 동시 부하 |
+| 05 사람의 인계와 AI 중지 | e2e_v17_j05 사본(CLI 반쪽 24 PASS, TASK_CONTROL_LOST 포함, 사용자 상태 불변), tasks·dialog의 handoff 정리 | pending | 본문 직접 입력으로 A만 중지, UI 중지 버튼, 사용자 소유 대화상자 네이티브 패널 응답은 네이티브 |
+| 06 클릭과 폼 값 변경 | native_click, native_fill, select, check, insert_text, contenteditable, pointer_ext | pass (CLI·로컬 CEF 범위) | 보이는 사용자 탭의 실제 포인터, IME |
+| 07 키 이동과 다음 대상 읽기 | native_press | pass (CLI·로컬 CEF 범위) | 실제 키보드 포커스, IME |
+| 08 iframe과 Shadow DOM | frame_journey, shadow, scroll_target, native_fill, frame_crash, pointer_ext | pending | M8 20개 항목 대조표의 pending·partial 항목은 이번에 새로 채우지 않았다 |
+| 09 파일 다운로드·선택·저장 | download_permissions | pending | 네이티브 저장창·파일 선택창·Finder |
+| 10 한국어 입력과 화면 사용성 | 실행 안 함 | pending | 네이티브 UI, IME |
+| 11 공개 사이트와 로그인 서비스 | 실행 안 함 | blocked | 사용자가 직접 로그인할 서비스 |
+| 12 실패한 페이지 복구 | controls, navigation_recovery, stop, frame_crash | pending | 식별한 시험 탭의 렌더러 강제 종료와 reload, 안내 UI(네이티브) |
+| 13 종료와 재시작 | restart_smoke(쿠키·localStorage 보존), `j13_driver`(아래), dialog `--quit-pid` | pending | 북마크의 화면 표시와 UI에서 만든 항목 보존, 손상 복구의 읽기 전용 UI 표시는 네이티브 |
+| 14 지속 사용과 정리 | 10분 j14형 실행(아래) | pending | 60분 실행은 하지 않았다. 숨은 탭 대용량 부하 없음 |
+
+### 13번 상세 (파일·CLI 수준, 네이티브 UI 아님)
+
+`j13_report.json`: 사용자 공간 페이지 3개가 `history-v1.json`(0600)에 기록되고 AI 작업의 주소는 기록되지 않았다. SIGTERM 종료 4회가 모두 0.11~0.12초에 끝났고 종료 뒤 control.sock과 자식 프로세스가 없었다. 재시작 뒤 탭 1·사용자 공간·작업 목록 비어 있음·이전 CLI 요청 재실행 없음, 기존 방문 기록 해시 동일, 새 방문이 id 4로 이어 붙었다. 심은 유효 북마크 파일은 재시작과 종료 뒤 해시가 같았고 `.bak`이 생기지 않았다. 본문이 잘리고 `.bak`이 유효한 경우와 방문 기록이 잘린 경우 모두 앱이 정상 실행·종료하고 본문·`.bak`·방문 기록 해시가 변하지 않았다. 북마크 목록의 화면 표시는 관찰하지 못했다.
+
+### 14번 10분 실행 (CLI·로컬 CEF, 지속 사용 증명 아님)
+
+M8의 `j14_driver.py`에서 스크린샷 경로를 주기·작업·탭마다 고유한 파일명으로 고치고(하네스 수정, `artifacts/final-20261021/j14_driver.py`) 매 주기에 스크린샷을 찍게 했다. 앱 한 인스턴스에 60초 주기 10회(작업 15개, 주기마다 탭 2개씩 열기·wait·read·navigate·read-page·frames·screenshot, 탭 닫기, 사용자 공간 탭 열기·탐색·읽기·닫기, 작업 finish)를 실행했다.
+
+- 오류 0건(스크린샷 30개가 모두 성공해 M8의 경로 결함은 재현되지 않음), 10주기 모두 사용자 선택 탭 불변.
+- 회수: 활동 종료 뒤 60초 안정화에서 탭 1, pendingWaits·다이얼로그·파일 선택·사이트 권한 대기 0, focusLeases·capturesInFlight·pendingTabCreations·focusCleanupFailed 0, 프로세스 6개(시작과 동일). 끝난 작업은 `finished`로 15개 남았다(M10 보관 한도 16 미만이라 정리 동작은 이번에 관찰하지 못함).
+- 메모리: RSS 합은 공유 페이지를 중복 계산해 고유 RAM이 아니다. 시작 639.6MiB, 최대 709.0MiB, 안정화 후 691.8MiB. vmmap footprint 합은 시작 205.4, 중간 227.5, 끝 220.3MiB. 10분 표본으로 증가 없음을 입증하지 않는다.
+
+### 요약과 한계
+
+- 정적 검사 6종과 스모크 전부 통과, 제품 결함은 발견하지 못했다. 이 바이너리에서 pass는 01·04·06·07(CLI·로컬 CEF 범위)이고, 나머지는 pending 또는 blocked(11)다. 이 표로 독립 브라우저 완성을 선언하지 않는다.
+- 하지 않은 것: 네이티브 AppKit·접근성 확인(주소창, 세로 탭, 북마크·검색 UI, 중지 버튼, 사용자 소유 대화상자의 네이티브 패널 응답, 저장창), IME, 외부 사이트와 로그인, 60분 지속 사용, 렌더러 강제 종료, 08번의 미실행 항목(위 M8 대조표 참고).
+
 ## 2026-10-21 M8 추가 실행 (M7과 같은 앱 SHA-256 `e36b0dd5...0ff0`, 재빌드 없음)
 
 M7 번들(`dist/Light Browser.app`, `Contents/MacOS/light-browser` SHA-256 `e36b0dd51f1374fef002f6b6d6d50b9ed4d2cc335e25d17e321b1685b8860ff0`, 시작 전 해시 일치 확인)을 `NARU_MOCK_KEYCHAIN=1`과 앱이 직접 만든 새 프로필 `.local-data/e2e-m8-j14`(60분 실행), `.local-data/e2e-m8-main`(나머지)로 두 인스턴스 실행했다. 소스는 수정하지 않았고 하네스 변경은 없다. 네이티브 AppKit·AX 자동화는 권한이 없어 시도하지 않았다. 원본은 `artifacts/m8-e2e-20261020/`(`results.tsv`, `j13_report.json`, `j14/`)다. 실행한 구분은 CLI·로컬 CEF·파일 수준이며 네이티브 UI 확인이 아니다.

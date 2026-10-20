@@ -2547,3 +2547,27 @@ ad hoc 서명 빌드를 키체인 재승인 없이 검증 실행할 수 있도�
 ### 정리
 
 release 빌드 앱과 helper를 이 작업 경로로 식별해 종료했고(잔여 0) `/private/tmp/nrpe-m10` 프로필, 워크트리의 `dist`와 `target`을 삭제했다. 사용자 프로필과 메인 체크아웃은 건드리지 않았다.
+
+## 최종 통합 실행 (HEAD d5e14d6, release 빌드 1회)
+
+### 요청 범위와 변경
+- 요청: 정적 검사, release 빌드 1회, M7·M8의 자동화 가능한 스모크 전부와 j13·10분 j14형 실행을 같은 번들로 수행하고 문서에 기록. 제품 소스와 `tests/`는 수정하지 않았다(하네스 불일치 없음). 문서 변경: `docs/ego-parity-e2e.md`(최종 통합 실행 절), `docs/product-plan.md`(상단 상태), 이 항목.
+- 빌드: `NARU_MOCK_KEYCHAIN=1 ./scripts/dev.sh --release --build-only`. 앱 SHA-256 `55fb024b6c6140b6881299b592ae3347d0ed20a8a66b0b1215dd4d8f044e21e1`, CLI `25355d982ae6b4688a22464376c87aec7a70fac0a67c01f39c02690ba5dce828`(`artifacts/final-20261021/build-receipt.json`).
+
+### 검증
+| 구분 | 내용 | 결과 |
+|---|---|---|
+| 단위 테스트 | `cargo test --locked --lib` | 493 통과 |
+| 빌드 검사 | `cargo check --locked --bins`, `cargo fmt --all --check`, `git diff --check` | 모두 통과(기존 경고 1건) |
+| 모의 DOM·파이썬 | `node --test tests/` 162, `unittest discover` 31 | 모두 통과 |
+| 로컬 CEF 통합 | 스모크 24종(frame_crash 포함), restart_smoke, dialog `--quit-pid`, e2e_v17_j05 사본(24 PASS), j13 드라이버 | 전부 exit 0 |
+| 로컬 CEF 통합 | 10분 j14형(60초 주기 10회, 스크린샷 고유 경로) | 오류 0, 선택 불변, 종료 후 자원 카운터 0, 프로세스 6 |
+| 네이티브 UI, 외부 사이트, IME, 60분 실행, 렌더러 강제 종료 | 실행하지 않음(권한 없음 또는 범위 밖) | 해당 여정은 pending/blocked |
+
+### 알려진 한계, 남은 작업
+- 14개 여정 중 pass는 01·04·06·07(CLI·로컬 CEF 범위). 나머지 pending, 11 blocked. 완성 선언 불가.
+- j14 드라이버의 스크린샷 경로 결함(M8)은 `artifacts/final-20261021/j14_driver.py`에서 고유 경로로 고쳤고 30개가 모두 성공했다. 드라이버는 artifacts(추적 제외)에 있다.
+- 10분 표본의 RSS 합 639.6~709.0MiB는 고유 RAM이 아니며 증가 없음을 입증하지 않는다. 작업 15개는 M10 보관 한도(16) 미만이라 정리 동작은 관찰하지 못했다.
+
+### 정리
+앱 3인스턴스(main, j13, j14)를 PID로 종료(dialog `--quit-pid`는 SIGTERM 종료 확인), `pgrep` 잔여 0. `.local-data/e2e-final-*` 합성 프로필과 임시 j05 사본을 삭제했고 dev.sh가 Cargo 중간 산출물을 정리했다. `dist/` 번들은 다음 검증용으로 남겼다(추적 제외). 사용자 프로필은 건드리지 않았다.
