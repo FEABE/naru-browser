@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Targeted scroll fixture</title>
+  <style>
+    * { box-sizing: border-box; }
+    html { scroll-behavior: auto; }
+    body { margin: 8px; min-height: 1600px; font: 13px system-ui; }
+    h1 { margin: 0 0 4px; font-size: 16px; }
+    input, button { font: inherit; }
+    .benches, #frames { display: flex; gap: 12px; margin-top: 8px; }
+    .ancestor { width: 280px; height: 116px; overflow: auto; border: 2px solid #567; }
+    .canvas { width: 560px; height: 300px; padding: 8px; }
+    .list { width: 220px; height: 80px; overflow: auto; border: 2px solid #398; }
+    .content { width: 700px; height: 480px; background: repeating-linear-gradient(#edf7ff 0 23px, #bbcddd 24px); }
+    iframe { width: 360px; height: 230px; border: 2px solid #888; }
+    #move { margin-top: 8px; }
+    #spacer { height: 1100px; padding-top: 1000px; }
+  </style>
+</head>
+<body>
+  <h1 id="heading"></h1>
+  <input id="sentinel" type="text" value="focus-seed">
+  <div class="benches">
+    <div id="ancestor" class="ancestor">
+      <div class="canvas">
+        <div id="list" class="list"><div class="content">Scrollable list origin</div></div>
+      </div>
+    </div>
+    <div id="shadow"></div>
+  </div>
+  <div id="frames"></div>
+  <button id="move" type="button" hidden>Move ROOT list into SAME document</button>
+  <p id="moved"></p>
+  <div id="spacer">Document scroll destination</div>
+  <script>
+    const candidate = new URLSearchParams(location.search).get("name");
+    const name = ["ROOT", "SAME", "CROSS"].includes(candidate) ? candidate : "ROOT";
+    document.title = name + " targeted scroll";
+    document.getElementById("heading").textContent = name + "_SCROLL_DOCUMENT";
+    document.getElementById("sentinel").setAttribute("aria-label", name + " focus sentinel");
+    document.getElementById("ancestor").setAttribute("aria-label", name + " ancestor");
+    document.getElementById("list").setAttribute("aria-label", name + " list");
+    const shadow = document.getElementById("shadow").attachShadow({ mode: "open" });
+    shadow.innerHTML = `
+      <style>
+        * { box-sizing: border-box; }
+        .ancestor { width: 280px; height: 116px; overflow: auto; border: 2px solid #765; }
+        .canvas { width: 560px; height: 300px; padding: 8px; }
+        .list { width: 220px; height: 80px; overflow: auto; border: 2px solid #839; }
+        .content { width: 700px; height: 480px; background: repeating-linear-gradient(#fff0ed 0 23px, #ddc4bb 24px); }
+      </style>
+      <div class="ancestor" aria-label="${name} shadow ancestor"><div class="canvas">
+        <div class="list" aria-label="${name} shadow list"><div class="content">Shadow scroll origin</div></div>
+      </div></div>`;
+    if (name === "ROOT") {
+      for (const [label, origin] of [["SAME", "{{SAME}}"], ["CROSS", "{{CROSS}}"]]) {
+        const frame = document.createElement("iframe");
+        frame.id = label.toLowerCase() + "-frame";
+        frame.title = label + " scroll frame";
+        frame.src = origin + "/scroll-target.html?name=" + label;
+        document.getElementById("frames").append(frame);
+      }
+      const move = document.getElementById("move");
+      move.hidden = false;
+      move.addEventListener("click", () => {
+        const child = document.getElementById("same-frame").contentDocument;
+        const list = document.getElementById("list");
+        if (!child || !list) return;
+        child.body.append(child.adoptNode(list));
+        document.getElementById("moved").textContent = "ROOT_LIST_MOVED_TO_SAME_DOCUMENT " +
+          JSON.stringify({ x: list.scrollLeft, y: list.scrollTop });
+      });
+    }
+  </script>
+</body>
+</html>

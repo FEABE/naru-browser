@@ -113,6 +113,7 @@ export LIGHT_BROWSER_DATA_DIR="$PWD/.local-data"
 ./target/release/lightbrowser wait 3 dom 10000
 ./target/release/lightbrowser read 3
 ./target/release/lightbrowser scroll 3 0 600
+./target/release/lightbrowser scroll 3 '읽기 결과의 scrollable ref' 0 600
 ./target/release/lightbrowser fill 3 'read에서 받은 ref' '가벼운 브라우저'
 ./target/release/lightbrowser press 3 '같은 ref' Enter
 ./target/release/lightbrowser read 3
@@ -140,6 +141,8 @@ export LIGHT_BROWSER_DATA_DIR="$PWD/.local-data"
 `tabs`의 `canGoBack`과 `canGoForward`로 방문 기록 이동 가능 여부를 확인합니다. 기록이 없으면 `NO_HISTORY`, 아직 로딩 중이면 새 탐색 명령은 `NAVIGATION_BUSY`를 반환합니다. 중단하려면 `stop`을 호출하고 `tabs`의 `loading:false`를 확인한 뒤 새 주소로 이동합니다. 중지된 탐색의 `wait`는 `NAVIGATION_STOPPED`를 반환하며, 새 탐색을 시작하면 중지 상태가 초기화됩니다.
 
 `scroll TAB DX DY`는 상대 이동입니다. 각 축은 -10,000~10,000 CSS 픽셀 정수이며 결과의 `page.x`, `page.y`는 실제 이동 후 절대 위치입니다. `read.page.viewport`는 현재 스크롤 위치와 화면 크기를 반환합니다. 본문 읽기의 12,000자 제한은 스크롤 위치와 무관하게 문서 처음부터 적용합니다.
+
+후속 소스의 `scroll TAB REF DX DY`는 `read`, `read-frame`, `read-page`에서 `scroll` 메타데이터와 함께 받은 참조로 특정 목록이나 프레임 문서를 이동합니다. 같은 정수 범위를 사용하고 작업 범위에서도 실행할 수 있습니다. DOM 스크롤 직후의 `before`, `after`, `changed`를 반환하며 비동기 목록 로딩 완료나 휠 입력의 증거는 아닙니다. [참조 스크롤 계약](docs/targeted-scroll.md)에 대상 선택, 오류와 참조 수명, 검증 경계를 정리했습니다.
 
 `wait TAB [dom|load] [TIMEOUT_MS]`의 기본값은 `dom`, 10,000ms이며 1~30,000ms를 허용합니다. `dom`은 현재 문서의 `readyState`가 `interactive` 또는 `complete`인 상태, 즉 DOM 파싱 완료를 뜻합니다. DOMContentLoaded 이벤트나 웹앱의 비동기 데이터 준비까지 보장하지 않습니다. `load`는 메인 문서가 존재하고 브라우저 전체 로딩이 끝난 상태를 기다립니다.
 

@@ -546,6 +546,7 @@ impl Tab {
 #[derive(Clone)]
 enum ActionEvidence {
     Check,
+    Scroll,
     Fill(Shared<FillTarget>),
     Press(Shared<PressTarget>),
     Click(Shared<ClickTarget>),
@@ -555,6 +556,7 @@ impl ActionEvidence {
     fn for_command(command: &Command) -> Option<Self> {
         match command {
             Command::Check { .. } => Some(Self::Check),
+            Command::ScrollElement { .. } => Some(Self::Scroll),
             Command::Fill {
                 reference, text, ..
             }
@@ -595,6 +597,7 @@ impl ActionEvidence {
             }
             Self::Fill(target) if value["action"] == target.action() => &["attempted", "trusted"],
             Self::Press(_) if value["action"] == "press" => &["attempted"],
+            Self::Scroll if value["action"] == "scroll" => &["attempted", "outcomeUnknown"],
             _ => &[],
         }
     }
@@ -5347,6 +5350,7 @@ fn handle(command: &Command, reply: Reply) {
                 | Command::Forward { tab }
                 | Command::Reload { tab }
                 | Command::Stop { tab }
+                | Command::ScrollElement { tab, .. }
                 | Command::Scroll { tab, .. } => *tab,
                 _ => unreachable!(),
             };
@@ -5597,6 +5601,17 @@ fn handle(command: &Command, reply: Reply) {
                             epoch,
                             &reply,
                         ),
+                        Command::ScrollElement {
+                            reference, x, y, ..
+                        } => {
+                            let Some(reference) = action_reference(reference, epoch, &reply) else {
+                                return;
+                            };
+                            format!(
+                                "window.__lightBrowserBridge.act({})",
+                                json!({"action":"scroll","ref":reference,"x":x,"y":y})
+                            )
+                        }
                         Command::Scroll { x, y, .. } => {
                             if !(-10000..=10000).contains(x) || !(-10000..=10000).contains(y) {
                                 reply.error(
@@ -5857,22 +5872,7 @@ fn action_expression(
     epoch: u64,
     reply: &Reply,
 ) -> String {
-    if reference.is_empty() || reference.len() > 256 || reference.chars().any(char::is_control) {
-        reply.error(
-            "INVALID_REF",
-            "Use an element reference from the latest read response.",
-        );
-        return String::new();
-    }
-    let prefix = format!("{epoch}/");
-    let Some(reference) = reference
-        .strip_prefix(&prefix)
-        .filter(|value| !value.is_empty())
-    else {
-        reply.error(
-            "STALE_REF",
-            "Read the current page to obtain a new element ref.",
-        );
+    let Some(reference) = action_reference(reference, epoch, reply) else {
         return String::new();
     };
     let mut args = json!({"action":action,"ref":reference});
@@ -5883,6 +5883,28 @@ fn action_expression(
         };
     }
     format!("window.__lightBrowserBridge.act({args})")
+}
+
+fn action_reference<'a>(reference: &'a str, epoch: u64, reply: &Reply) -> Option<&'a str> {
+    if reference.is_empty() || reference.len() > 256 || reference.chars().any(char::is_control) {
+        reply.error(
+            "INVALID_REF",
+            "Use an element reference from the latest read response.",
+        );
+        return None;
+    }
+    let prefix = format!("{epoch}/");
+    let Some(reference) = reference
+        .strip_prefix(&prefix)
+        .filter(|value| !value.is_empty())
+    else {
+        reply.error(
+            "STALE_REF",
+            "Read the current page to obtain a new element ref.",
+        );
+        return None;
+    };
+    Some(reference)
 }
 
 fn valid_url(url: &str) -> bool {
@@ -8122,6 +8144,7 @@ fn command_reference(command: &Command) -> Option<&str> {
         | Command::Fill { reference, .. }
         | Command::Insert { reference, .. }
         | Command::Select { reference, .. }
+        | Command::ScrollElement { reference, .. }
         | Command::Press { reference, .. } => Some(reference),
         _ => None,
     }
@@ -8143,6 +8166,9 @@ fn frame_action_arguments(command: &Command, snapshot: &FrameSnapshot) -> Option
             json!({"action":"check","ref":reference,"checked":checked})
         }
         Command::Select { value, .. } => json!({"action":"select","ref":reference,"value":value}),
+        Command::ScrollElement { x, y, .. } => {
+            json!({"action":"scroll","ref":reference,"x":x,"y":y})
+        }
         _ => return None,
     })
 }
@@ -9204,7 +9230,7 @@ fn finish_page_read(pending: &Pending) {
             "documents":documents,"unread":unread,"frames":*inventory.frames.borrow(),
             "budget":{"limit":limit,"used":used,"remaining":remaining},
             "truncated":truncated || inventory.truncated.get(),"atomic":false,
-            "supportedActions":["click","hover","fill","insert","press","check","select"],
+            "supportedActions":["click","hover","fill","insert","press","check","select","scroll"],
             "pointerActionsSupported":true
         }),
     );
@@ -10063,7 +10089,7 @@ fn make_frame_snapshot(
             .filter(|reference| references.contains(reference))
     );
     page["supportedActions"] = json!([
-        "click", "hover", "fill", "insert", "press", "check", "select"
+        "click", "hover", "fill", "insert", "press", "check", "select", "scroll"
     ]);
     page["pointerActionsSupported"] = Json::Bool(true);
     Some(FrameSnapshot {
@@ -10280,7 +10306,7 @@ fn frame_read_result(pending: &Pending, result: &Json) {
             finish_frame_inventory_state(pending.tab, pending.reply.token);
             pending.reply.ok(json!({"tab":pending.tab,"epoch":pending.epoch,"documentEpoch":inventory.document_epoch,
                 "frame":read.frame,"page":page,"atomic":false,
-                "supportedActions":["click","hover","fill","insert","press","check","select"],"pointerActionsSupported":true}));
+                "supportedActions":["click","hover","fill","insert","press","check","select","scroll"],"pointerActionsSupported":true}));
             return;
         }
         _ => return,
@@ -10622,7 +10648,10 @@ fn dispatch(browser: &Browser, method: &str, mut params: Json, mut pending: Pend
         pending.evaluation,
         Evaluation::Page {
             evidence: Some(
-                ActionEvidence::Press(_) | ActionEvidence::Click(_) | ActionEvidence::Fill(_)
+                ActionEvidence::Press(_)
+                    | ActionEvidence::Click(_)
+                    | ActionEvidence::Fill(_)
+                    | ActionEvidence::Scroll
             ),
             ..
         }
@@ -17137,6 +17166,90 @@ mod tests {
         let expression = action_expression("click", "9/document:1:1", None, 9, &reply);
         assert!(expression.contains("\"ref\":\"document:1:1\""));
         assert!(!expression.contains("9/"));
+    }
+
+    #[test]
+    fn scroll_element_rejects_stale_refs_and_task_ownership_before_dispatch() {
+        let (pending, _browser, _receiver) = test_input_preparation();
+        let scope = pending.reply.scope.unwrap();
+        STATE.with(|slot| slot.borrow_mut().pending.clear());
+        let command = Command::ScrollElement {
+            tab: 7,
+            reference: "3/document:1:1".into(),
+            x: 0,
+            y: 500,
+        };
+        let (reply, receiver) = test_reply(1);
+        handle(&command, reply);
+        assert_eq!(receiver.try_recv().unwrap().error.unwrap().code, "TASK_REQUIRED");
+        for (reference, expected) in [
+            ("3/document:1:1", "STALE_REF"),
+            ("frame/4/99/document:1:1", "STALE_FRAME_SNAPSHOT"),
+        ] {
+            let scoped = Command::TaskRun {
+                task: scope.task.clone(),
+                revision: scope.revision,
+                command: Box::new(Command::ScrollElement {
+                    tab: 7,
+                    reference: reference.into(),
+                    x: 0,
+                    y: 500,
+                }),
+            };
+            let (reply, receiver) = test_reply(2);
+            handle(&scoped, reply);
+            assert_eq!(receiver.try_recv().unwrap().error.unwrap().code, expected);
+        }
+        STATE.with(|slot| {
+            let state = slot.borrow();
+            assert!(state.pending.is_empty());
+            assert!(state.focus_leases.is_empty());
+            assert_eq!(state.spaces.active_space(), USER_SPACE);
+            assert_eq!(state.spaces.active_tab(), Some(8));
+        });
+        clear();
+    }
+
+    #[test]
+    fn scroll_element_revalidates_control_without_native_focus_preparation() {
+        for (change, expected) in [
+            ("handoff", "TASK_STALE_REVISION"),
+            ("navigation", "PAGE_CHANGED"),
+            ("cancel", "COMMAND_CANCELED"),
+        ] {
+            let (mut pending, browser, _receiver) = test_input_preparation();
+            pending.evaluation = Evaluation::Page {
+                mutation: true,
+                evidence: Some(ActionEvidence::Scroll),
+            };
+            pending.step = Step::Frame(String::new());
+            assert!(!focus_preparation(&pending));
+            assert!(!pending.input_preparation());
+            pending.step = Step::Evaluate;
+            assert!(!focus_preparation(&pending));
+            assert!(!pending.input_preparation());
+            assert!(STATE.with(|slot| {
+                pending_input_failure(&slot.borrow(), &browser, &pending).is_none()
+            }));
+            STATE.with(|slot| {
+                let mut state = slot.borrow_mut();
+                match change {
+                    "handoff" => {
+                        state.tasks.handoff(pending.reply.scope.as_ref().unwrap()).unwrap();
+                    }
+                    "navigation" => state.tabs.get_mut(&7).unwrap().navigation.begin(None),
+                    "cancel" => pending.reply.active.store(false, Ordering::Release),
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    pending_input_failure(&state, &browser, &pending).unwrap().code,
+                    expected
+                );
+                assert!(state.focus_leases.is_empty());
+                assert_eq!(state.spaces.active_tab(), Some(8));
+            });
+        }
+        clear();
     }
 
     #[test]

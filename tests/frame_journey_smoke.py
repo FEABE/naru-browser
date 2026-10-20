@@ -181,7 +181,8 @@ def run(cli, origin, report):
             marks = set(re.findall(r"[A-Z]+_(?:DOC|SHADOW)_MARK", page["text"]))
             check(f"{name} read-frame returns only its document and open shadow", marks == {f"{name}_DOC_MARK", f"{name}_SHADOW_MARK"}, sorted(marks))
             check(f"{name} read-frame contract", result["atomic"] is False and result["pointerActionsSupported"] is True
-                  and len(result["supportedActions"]) == 7 and page["scope"] == "local-frame"
+                  and set(result["supportedActions"]) == {"click", "hover", "fill", "insert", "press", "check", "select", "scroll"}
+                  and page["scope"] == "local-frame"
                   and (page.get("focusedRef") is None or page["focusedRef"] in {i["ref"] for i in page["interactive"]}))
             first_ref = item(page, f"{name} other")["ref"]
             codes = [code(run_task("fill", tab, item(page, f"{name} text")["ref"], f"fill-{name}")),

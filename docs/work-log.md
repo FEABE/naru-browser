@@ -1,5 +1,40 @@
 # Naru 작업 기록
 
+## 2026-10-20, 대상 스크롤 구현과 우선 커밋
+
+사용자가 진행 중인 변경을 우선 커밋하고 푸시하라고 요청했다. `FEABE/naru-browser`의 비공개 상태를 GitHub에서 확인했고 기존 `codex/navigation-readiness` 브랜치를 사용한다. 원격 갱신 후 HEAD와 원격은 `9d32ee4`로 같았다. 아래 v18 다운로드 E2E 기록과 이번 대상 스크롤 소스를 함께 반영한다.
+
+`src/cli.rs`, `src/protocol.rs`에 `scroll TAB REF DX DY`와 `scroll_element` 명령을 추가했다. 기존 페이지 스크롤 형식은 유지하고 참조 길이, 탭과 이동량, 작업 범위를 검사한다. `src/browser.rs`는 메인 문서와 프레임 참조의 기존 라우팅에 연결하고 실행 직전 문서, 취소와 제어권을 다시 확인한다. 이 명령에 포커스 준비나 공간 전환을 추가하지 않았다.
+
+`src/dom_bridge.js`는 기존 읽기 예산 안에서 목록과 문서의 스크롤 좌표, 크기와 지원 축을 반환한다. 참조는 읽을 때의 스크롤 요소에 묶이며 DOM `scrollBy` 한 번과 동기 좌표 관찰로 끝낸다. 조상 이동이나 네이티브 휠 입력을 추가하지 않는다. 새 읽기의 오래된 참조와 원래 문서에서 이동한 요소를 거절하고, 호출 뒤 결과가 불확실하면 `attempted`와 `outcomeUnknown`을 전달한다. 추가 요소 연결에는 WeakRef를 사용한다.
+
+`tests/scroll_target_smoke.py`, `tests/fixtures/scroll-target.html`에 메인 목록, 열린 Shadow DOM, 동일 출처 프레임과 실제 OOPIF, 문서 이동과 제어권 변경을 위한 로컬 실행 목록을 준비했다. 기존 `tests/frame_journey_smoke.py`의 지원 행동 기대값도 scroll을 포함한 8개 이름으로 갱신했다. `README.md`, `docs/targeted-scroll.md`, 프레임 계약, 제품 계획과 E2E 체크리스트에 구현과 미실행 범위를 구분했다.
+
+검증 결과는 다음과 같다.
+
+- `cargo test --locked --lib scroll_element_`: 신규 Rust 단위 검사 6개 통과, 나머지 397개는 필터 제외. 기존 미사용 코드 경고 3건이 있었고 종료 코드는 0이다.
+- `node --test --test-name-pattern='referenced scroll' tests/dom_bridge.test.mjs`: 모의 DOM 검사 9개 통과, 128개 제외. 실제 CEF 결과가 아니다.
+- 새 러너와 수정한 프레임 러너의 Python AST, fixture의 inline JavaScript 구문, `git diff --check`를 확인했다. 읽기 검토에서 CLI, 프로토콜, 문서별 실행 경로의 연결을 확인했다.
+- 사용자 요청에 따라 새 앱 번들, 로컬 CEF 통합, 네이티브 UI와 외부 사이트 검증은 커밋 뒤로 남겼다. 전체 회귀 묶음을 실행하지 않았다. 아래 v18의 다운로드 검증은 이 스크롤 구현의 성공 근거가 아니다.
+
+문서의 body 참조는 문서 viewport를 대표하므로 body 자체의 독립 overflow 목록을 별도 대상으로 표현하지 않는다. DOM의 동기 이동은 후속 가상 목록 로딩이나 네이티브 휠 이벤트를 보장하지 않는다. 지원 축, 실제 위치, 포커스와 사용자 선택 보존은 다음 통합 빌드의 E2E에서 확인해야 한다. 독립 브라우저와 Preseller 내장 목표는 진행 중이다.
+
+이번 커밋 준비에서는 앱과 HTTP 서버를 실행하지 않았고 남아 있는 프로젝트 앱이나 검사 프로세스도 없었다. Cargo 중간 파일 2,299개, 명령 보고 기준 1.4GiB를 정리하고 기존 release 실행 파일을 보존했다. `target`은 3.9MiB, 단일 최신 앱이 있는 `dist`는 336MiB다. 검사 로그는 Git 제외 경로 `artifacts/e2e-v19-targeted-scroll-20261020/`에 남겼다. 바이너리, 프로필과 실행 자료를 커밋에 포함하지 않으며 사용자 데이터는 변경하지 않았다.
+
+## 2026-10-20, v18 통합 빌드와 다운로드 재요청 E2E
+
+직전 요청의 커밋 `9d32ee4`와 비공개 원격 푸시는 완료된 진전이다. goal을 재개해 같은 깨끗한 소스에서 release 앱을 한 번 빌드하고, 아직 확인하지 않았던 수동 다시 받기 사용자 여정을 실제 AppKit UI와 로컬 CEF에서 확인했다. 제품 코드는 추가 수정하지 않았다.
+
+`scripts/dev.sh --release --build-only`는 exit 0이었다. release 컴파일 44.90초와 기존 dead_code 경고 1건을 기록했다. 앱 SHA-256은 `0d8d2c5bd1db019768c2eda745b0e78d7177cb6fad90e777aac40a8e165fa450`, CLI는 `79e398f1a54b8254579d916adc242e1308964a596570d85f939f621bde0d0607`이며 실행 전후 제품 소스 manifest와 바이너리가 같았다. 별도 검증 프로필과 기존 mock keychain 모드로 실행해 반복 키체인 승인을 요청하지 않았다.
+
+실패 응답의 내부 재시도 6회 뒤 중단 UI를 확인하고 서버를 복구했다. 실제 다시 받기 버튼은 새 ID와 저장창으로 이어졌으며 이전 행의 버튼은 사라졌다. 새 저장창을 취소한 뒤 해당 취소 행에서 다시 요청하고 새 이름으로 저장했다. 파일은 131,072바이트와 fixture 원본 SHA-256이 일치했고 부분 파일은 없었다. 배경 AI 탭에서도 취소 후 재요청은 사용자 공간과 선택 탭 1, AI active revision 1을 유지했다. handoff revision 2는 새 저장 대기를 취소했으며 최종 작업은 finished revision 3, 다운로드와 저장 및 권한 대기는 모두 0이었다.
+
+전체 회귀 묶음과 단위 검사를 다시 실행하지 않았다. 별도 동적 포트의 독립 fixture HTTP 검사 19개는 제품 앱 검증과 구분한다. 모의 DOM, 외부 사이트, IME, 장시간 메모리, Finder의 실제 선택, 응답 없는 재요청 timeout과 탐색 초기 거절 안내는 미실행이다. 저장창에서 최신 AX 조회 뒤 옛 ID를 쓴 한 번의 도구 거절은 최신 ID로 해결했다. 앱 로그의 저장 전 파일 경로 조회 경고도 보존했다.
+
+`docs/native-e2e-2026-10-20.md`, `docs/ego-parity-e2e.md`, `docs/downloads-design.md`, `docs/product-plan.md`에 같은 바이너리의 확인 범위와 남은 항목을 반영했다. 읽기 검토에서 메인 창만 조작하는 현재 CLI 스크롤과 별도 목록 및 프레임 대상 스크롤의 차이를 확인해 다음 구현 후보로 기록했다. AI와 사용자 파일 선택 연결, 다운로드 외 권한 안내는 기능 누락이고 IME나 긴 탭 목록 조작은 기존 구현의 검증 범위라는 차이도 남겼다. 전체 독립 브라우저와 Preseller 내장 목표는 완료되지 않았다.
+
+앱과 두 fixture 서버는 모두 exit 0으로 종료했다. 검증 작업과 탭을 정리했고 프로젝트 앱 프로세스, 제어 소켓과 18765 포트가 남지 않았다. 이번 합성 프로필의 Chromium 데이터 135,205,025바이트와 빌드 중간 파일 1,271개, 명령 보고 기준 684.4MiB를 정리했다. 단일 최신 번들 336MiB, release 실행 파일을 남긴 target 3.9MiB와 Git 제외 증거 `artifacts/e2e-v18-download-restart-20261020/`만 보존했다. 사용자 프로필과 다른 프로젝트는 건드리지 않았다. 이번 후속 문서 변경은 커밋하거나 푸시하지 않았다.
+
 ## 2026-10-20, 수동 다시 받기 구현과 우선 커밋
 
 사용자가 진행 중인 변경을 우선 커밋하고 푸시하라고 요청했다. 대상은 GitHub에서 비공개를 확인한 `FEABE/naru-browser`의 기존 `codex/navigation-readiness` 브랜치다. 원격 갱신 시 HEAD `c40bf03`과 원격은 같았다. 새 통합 앱 빌드보다 현재 소스와 검증 범위의 기록을 먼저 반영한다.

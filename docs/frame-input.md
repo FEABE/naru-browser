@@ -1,6 +1,6 @@
 # 프레임 참조로 입력하기
 
-2026-10-18 후속 소스 기준이다. `read-frame TAB FRAME`은 선택한 프레임, `read-page TAB`은 공통 예산으로 읽은 여러 프레임의 본문과 함께 `click`, `hover`, `fill`, `insert`, `press`, `check`, `select`에 사용할 요소 참조를 반환한다. 교차 출처 프레임도 현재 탭의 DevTools session과 isolated context를 확인해 연결한다. 페이지의 동일 출처 정책을 해제하거나 부모 문서에서 교차 출처 `contentDocument`를 읽는 방식은 아니다.
+2026-10-18의 프레임 입력에 참조 스크롤을 더한 후속 소스 기준이다. `read-frame TAB FRAME`은 선택한 프레임, `read-page TAB`은 공통 예산으로 읽은 여러 프레임의 본문과 함께 `click`, `hover`, `fill`, `insert`, `press`, `check`, `select`, `scroll`에 사용할 요소 참조를 반환한다. 교차 출처 프레임도 현재 탭의 DevTools session과 isolated context를 확인해 연결한다. 페이지의 동일 출처 정책을 해제하거나 부모 문서에서 교차 출처 `contentDocument`를 읽는 방식은 아니다.
 
 이 문서는 [프레임 읽기](frame-read.md), [여러 프레임 읽기](page-read.md)와 함께 원 문서에 결합한 입력 계약을 설명한다. 기존 `read TAB`과 같은 출처 iframe 제어는 그대로 유지한다. 현재 소스의 구현 범위이며 실제 Naru CEF 입력, 네이티브 화면, 외부 사이트 검증을 통과했다는 뜻은 아니다.
 
@@ -18,13 +18,14 @@ lightbrowser task run ID REV insert TAB REF '선택 위치에 넣을 값'
 lightbrowser task run ID REV press TAB REF Enter
 lightbrowser task run ID REV check TAB REF true
 lightbrowser task run ID REV select TAB REF '정확한 옵션 값'
+lightbrowser task run ID REV scroll TAB REF 0 600
 ```
 
 여러 문서를 읽을 때는 위의 frames/read-frame 대신 `lightbrowser task run ID REV read-page TAB`을 사용하고 같은 묶음 안의 각 frame ref로 액션을 실행한다. 새 읽기를 수락하면 이전 묶음이 교체되므로 두 읽기의 ref를 섞지 않는다.
 
 위 명령은 사용 형태를 나타낸다. `ID`, `REV`, `TAB`, `FRAME`, `REF`를 실제 응답으로 바꾸며, 각 액션에 맞는 요소의 참조를 선택한다. 작업 소유가 없는 탭은 기존 권한 규칙에 따라 `task run ID REV` 없이 호출한다. frame ID는 요소 ref, 기존 `read`의 `page.frames[].id`, CEF Frame 식별자와 서로 교환하지 않는다.
 
-`read-frame` 성공 응답의 `result`는 `tab`, `epoch`, `documentEpoch`, `frame`, `page`, `atomic:false`를 포함한다. `result`와 `page`에 `supportedActions:["click","hover","fill","insert","press","check","select"]`, `pointerActionsSupported:true`를 넣는다. `page.scope`는 `local-frame`이다. 반환된 `focusedRef`는 같은 결과의 `interactive`에 포함된 참조이거나 `null`이다.
+`read-frame` 성공 응답의 `result`는 `tab`, `epoch`, `documentEpoch`, `frame`, `page`, `atomic:false`를 포함한다. `result`와 `page`에 `supportedActions:["click","hover","fill","insert","press","check","select","scroll"]`, `pointerActionsSupported:true`를 넣는다. `page.scope`는 `local-frame`이다. 반환된 `focusedRef`는 같은 결과의 `interactive`에 포함된 참조이거나 `null`이다.
 
 공개 ref는 read-frame에서 `frame/<epoch>/<request-token>/<DOM-ref>`, read-page에서 문서 index가 추가된 `frame/<epoch>/<request-token>/<document-index>/<DOM-ref>` 형태의 내부 식별자다. 이를 직접 조합하거나 일부를 떼어내지 않는다. 요청 token과 문서 index는 별도 CLI 인자가 아니다. Rust는 해당 탭의 최신 읽기 묶음에 실제로 등록된 ref만 받아들인다. read-page의 각 page도 `scope:local-frame`과 해당 문서의 focusedRef를 유지하며 합산 반환은 [별도 계약](page-read.md)을 따른다.
 
@@ -37,17 +38,18 @@ lightbrowser task run ID REV select TAB REF '정확한 옵션 값'
 | `press` | 기존 42개 지원 키의 포커스를 준비하고 같은 frame session으로 키 입력을 보낸다. 키다운 대상 관찰과 엔진 ACK의 의미를 구분한다. |
 | `check` | 기존 HTML checkbox, radio 정책에 따라 DOM 클릭과 상태 확인을 사용한다. 물리 입력이나 trusted click 보장은 아니다. |
 | `select` | 기존 HTML 단일 select 정책에 따라 정확한 옵션 값으로 설정한다. 합성 이벤트 경로와 옵션 상한을 유지한다. |
+| `scroll TAB REF DX DY` | `scroll` 메타데이터가 있는 목록이나 문서에 DOM `scrollBy`를 호출하고 직후 좌표를 반환한다. 포커스를 주거나 조상으로 이동을 넘기지 않는다. |
 | `click`, `hover` | 로컬 후보와 모든 부모의 좌표 변환, hit test를 확인해 root session으로 Chromium 포인터 입력을 보낸다. hover 뒤에는 처음 선택한 local 좌표와 root 좌표를 다시 검사한다. |
 
-포인터의 좌표, 부모 가림, 전송 단계와 제한은 [프레임 포인터 입력](frame-pointer.md)을 따른다. 나머지 입력 종류, 성공 필드와 실패 의미는 [fill](native-fill-control.md), [insert](insert-text.md), [키 입력](keyboard-input.md), [체크 상태](check-control.md), [단일 선택](select-control.md)의 기존 계약을 따른다. 각 문서의 과거 검증은 새 프레임 라우팅을 검증한 결과가 아니다. `scroll TAB DX DY`는 기존 페이지 명령이며 frame ref를 받는 프레임 전용 스크롤 명령으로 바뀌지 않는다.
+포인터의 좌표, 부모 가림, 전송 단계와 제한은 [프레임 포인터 입력](frame-pointer.md)을 따른다. 나머지 입력 종류, 성공 필드와 실패 의미는 [fill](native-fill-control.md), [insert](insert-text.md), [키 입력](keyboard-input.md), [체크 상태](check-control.md), [단일 선택](select-control.md)의 기존 계약을 따른다. 각 문서의 과거 검증은 새 프레임 라우팅을 검증한 결과가 아니다. `scroll TAB DX DY`는 기존 페이지 스크롤 명령으로 유지한다. 새 `scroll TAB REF DX DY`는 프레임의 목록이나 문서 참조를 사용하며 [참조 스크롤 계약](targeted-scroll.md)을 따른다. 동기적인 이동 관찰은 비동기 목록 로딩이나 네이티브 휠 입력의 증거가 아니다.
 
 ## 실행 대상과 부모 검사
 
 `src/browser.rs`의 `make_frame_snapshot`은 Browser, 탐색 epoch, 문서 epoch, 작업 소유자와 상태, frame ID, session ID, `uniqueContextId`, DOM의 `documentId`, 읽기 `generation`, 허용 ref 목록을 묶는다. 입력 시 `start_frame_action`은 최신 읽기 묶음에서 ref가 등록된 snapshot을 고르고 현재 frame tree를 다시 수집한다. 다른 frame이나 새 context로 대상을 바꾸지 않는다.
 
-입력 전에는 최대 32단계의 부모 연결을 확인한다. `fill`, `insert`, `press`, `check`, `select`의 부모 상태 검사는 다음과 같다. 각 부모의 isolated context에서 `DOM.getFrameOwner`, `DOM.resolveNode`, `Runtime.callFunctionOn`을 사용해 실제 iframe 요소를 검사한다. `inspectFrameOwner`는 연결된 HTML IFRAME 또는 FRAME인지, 해당 부모 문서에 속하는지, 열린 Shadow DOM과 slot을 포함한 조상에서 숨김, inert, disabled 상태인지 확인한다. `contentDocument`, 포커스와 스크롤은 건드리지 않는다. 임시 원격 객체는 object group 해제 ACK를 거쳐 정리한다.
+입력 전에는 최대 32단계의 부모 연결을 확인한다. `fill`, `insert`, `press`, `check`, `select`, `scroll`의 부모 상태 검사는 다음과 같다. 각 부모의 isolated context에서 `DOM.getFrameOwner`, `DOM.resolveNode`, `Runtime.callFunctionOn`을 사용해 실제 iframe 요소를 검사한다. `inspectFrameOwner`는 연결된 HTML IFRAME 또는 FRAME인지, 해당 부모 문서에 속하는지, 열린 Shadow DOM과 slot을 포함한 조상에서 숨김, inert, disabled 상태인지 확인한다. `contentDocument`, 포커스와 스크롤은 건드리지 않는다. 임시 원격 객체는 object group 해제 ACK를 거쳐 정리한다.
 
-이 다섯 액션의 검사는 부모가 레이아웃 박스를 갖고 숨겨지거나 비활성화되지 않았는지 확인하는 범위다. 다른 요소가 덮은 상태, clipping, 최상위 viewport 안에 있는지와 포인터 좌표는 확인하지 않는다. 각 부모 확인과 실제 입력 사이에 페이지가 바뀔 수도 있다. `click`, `hover`는 별도로 `inspectFramePointer`를 호출해 부모 content box, viewport, 배율과 정확한 owner hit test까지 확인한다.
+이 여섯 액션의 검사는 부모가 레이아웃 박스를 갖고 숨겨지거나 비활성화되지 않았는지 확인하는 범위다. 다른 요소가 덮은 상태, clipping, 최상위 viewport 안에 있는지와 포인터 좌표는 확인하지 않는다. 각 부모 확인과 실제 입력 사이에 페이지가 바뀔 수도 있다. `click`, `hover`는 별도로 `inspectFramePointer`를 호출해 부모 content box, viewport, 배율과 정확한 owner hit test까지 확인한다.
 
 대상 context를 다시 확인한 뒤 `frameAct(request, {documentId,generation})`를 호출한다. DOM bridge는 바인딩을 먼저 확인하므로 오래된 요청이 현재 입력 관찰자를 지우지 않는다. 약한 참조에서 현재 노드를 찾고 원문서, 읽기 세대, 연결과 편집 조건을 다시 검사한다. 일반 `act`로 프레임 바인딩을 우회할 수 없다.
 

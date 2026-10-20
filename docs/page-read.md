@@ -30,9 +30,11 @@ lightbrowser task run ID REV read-page TAB
 | `budget:{limit,used,remaining}` | 아래 여섯 공통 예산의 최초 한도·합산 사용량·남은 양 |
 | `truncated` | inventory·본문의 잘림이나 읽기 예산 제한을 알리는 합산 표시. 개별 page의 상세 잘림 정보도 유지 |
 | `atomic:false` | 여러 문서의 순차 관찰이며 원자적인 화면 snapshot이 아님 |
-| `supportedActions`, `pointerActionsSupported` | `click`, `hover`, `fill`, `insert`, `press`, `check`, `select`와 `true`. 실제 대상 조건은 action 시 다시 검사 |
+| `supportedActions`, `pointerActionsSupported` | `click`, `hover`, `fill`, `insert`, `press`, `check`, `select`, `scroll`의 8개 행동과 `true`. 실제 대상 조건은 action 시 다시 검사 |
 
 각 `page`의 URL·제목·본문·요소·viewport·scroll·focusedRef는 해당 frame 기준이다. focusedRef는 그 문서의 반환 ref 집합 안에 있거나 null이며 여러 문서의 값을 하나의 OS 포커스로 추정하지 않는다. 읽기에는 부모 표시·가림 검사가 없어 부모가 숨겨진 문서도 읽힐 수 있으며, 읽힌 요소를 최상위 창에서 보이는 것으로 판단하지 않는다. 부모 검사는 후속 action에 적용한다. password input value는 기존처럼 제외한다. 본문에 적힌 비밀값을 모두 식별하거나 신뢰할 수 있는 지시로 바꾸는 기능은 아니다.
+
+`scroll` 메타데이터가 있는 문서별 참조는 `scroll TAB REF DX DY`로 이동한다. 기존 `scroll TAB DX DY`는 유지하며 대상, 축과 동기 관찰의 의미는 [참조 스크롤 계약](targeted-scroll.md)을 따른다. 이 목록 갱신은 새 동작의 실제 앱 검증 결과가 아니다.
 
 ## 공통 예산
 

@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const USAGE: &str = "Usage: lightbrowser <command>\n\nCommands:\n  open URL                 Return a created tab immediately; navigation may still be loading\n  navigate TAB URL         Request navigation in an existing tab\n  back TAB                 Request backward navigation\n  forward TAB              Request forward navigation\n  reload TAB               Request a reload of the current page\n  stop TAB                 Request loading to stop; does not wait for load completion\n  tabs                     List tabs\n  wait TAB [dom|load] [TIMEOUT_MS]\n                           Wait for readiness (defaults: dom, 10000 ms; range: 1..30000)\n  read TAB                 Read page text and interactive element refs\n  read-page TAB            Read discovered frame documents under a shared budget\n  frames TAB               Inspect the tab frame tree, including discovered child sessions\n                           Inventory only; does not read or control child-frame content\n  read-frame TAB FRAME     Read one current frame, including cross-origin content\n                           Refs support click, hover, fill, insert, press, check and select\n  scroll TAB DX DY          Scroll the page by relative integer CSS pixels (-10000..10000)\n  click TAB REF            Dispatch a Chromium pointer click to a reference\n  hover TAB REF            Move the Chromium pointer to a reference without clicking\n  check TAB REF true|false Set a native checkbox/radio checked state\n  fill TAB REF TEXT        Replace an input, textarea or editable host with text\n  insert TAB REF TEXT      Insert text at the existing caret or selection\n  select TAB REF VALUE     Select one native HTML option by exact value\n  press TAB REF KEY        Dispatch a Chromium key pair from a focused reference\n  close TAB                Close a tab\n  screenshot TAB PATH      Save a screenshot to PATH\n  status                   Show browser status\n  panel                    Bring the browser window forward (compatibility alias)\n  help                     Show this help\n\nSpaces:\n  spaces                   List user and task spaces (also available in task run)\n  space show user|TASK_ID  Show a space without handing off control\n  space overview           Show the space overview\n                           show and overview are global UI controls; task run rejects them\n\nTasks:\n  task create NAME         Create a named task\n  task list                List tasks\n  task info ID             Inspect a task and its current revision\n  task handoff ID REV       Hand control to the user\n  task resume ID REV        Resume agent control\n  task adopt ID REV TAB     Attach an existing tab to a task\n  task release ID REV TAB   Release a tab from a task\n  task finish ID REV [--keep TAB ...]\n                           Finish a task, retaining only the listed tabs\n  task run ID REV COMMAND  Run an existing browser command in a task\n\nKeys:\n  Enter Tab Escape ArrowLeft ArrowUp ArrowRight ArrowDown\n  Home End PageUp PageDown Backspace Delete Space\n  Shift+ only with Enter, Tab, arrows, Home, End, PageUp or PageDown.\n  Meta+A Meta+Z Meta+Shift+Z Meta+Backspace\n  Meta+arrows Meta+Shift+arrows\n  Alt+ArrowLeft Alt+ArrowRight Alt+Shift+ArrowLeft Alt+Shift+ArrowRight\n  Alt+Backspace Alt+Delete\n  Key names are case-sensitive; only the listed combinations are supported.\n\nID uses 1..128 ASCII letters, digits, hyphens or underscores.\nSpace IDs use user or an existing task ID, at most 120 ASCII characters.\nREV is the positive revision returned by task info or a task update.\nNAME is trimmed, contains 1..120 characters, and has no control characters.\ntask run cannot contain task commands.\n\nNavigation commands return when the request is accepted; use wait for readiness.\nwait dom: document.readyState is interactive or complete.\nwait load: the browser's overall loading has ended.\nSpecify dom or load before TIMEOUT_MS. open and navigate accept HTTP(S) URLs.\nTAB is a positive integer. Quote arguments containing spaces.\nEvery command writes one JSON response to stdout. Errors also use stderr.\n";
+pub const USAGE: &str = "Usage: lightbrowser <command>\n\nCommands:\n  open URL                 Return a created tab immediately; navigation may still be loading\n  navigate TAB URL         Request navigation in an existing tab\n  back TAB                 Request backward navigation\n  forward TAB              Request forward navigation\n  reload TAB               Request a reload of the current page\n  stop TAB                 Request loading to stop; does not wait for load completion\n  tabs                     List tabs\n  wait TAB [dom|load] [TIMEOUT_MS]\n                           Wait for readiness (defaults: dom, 10000 ms; range: 1..30000)\n  read TAB                 Read page text and interactive element refs\n  read-page TAB            Read discovered frame documents under a shared budget\n  frames TAB               Inspect the tab frame tree, including discovered child sessions\n                           Inventory only; does not read or control child-frame content\n  read-frame TAB FRAME     Read one current frame, including cross-origin content\n                           Refs support click, hover, fill, insert, press, check, select and targeted scroll\n  scroll TAB DX DY          Scroll the page by relative integer CSS pixels (-10000..10000)\n  scroll TAB REF DX DY      Scroll a referenced list or document by the same CSS pixel deltas\n                           Use a scrollable ref from read, read-frame or read-page\n  click TAB REF            Dispatch a Chromium pointer click to a reference\n  hover TAB REF            Move the Chromium pointer to a reference without clicking\n  check TAB REF true|false Set a native checkbox/radio checked state\n  fill TAB REF TEXT        Replace an input, textarea or editable host with text\n  insert TAB REF TEXT      Insert text at the existing caret or selection\n  select TAB REF VALUE     Select one native HTML option by exact value\n  press TAB REF KEY        Dispatch a Chromium key pair from a focused reference\n  close TAB                Close a tab\n  screenshot TAB PATH      Save a screenshot to PATH\n  status                   Show browser status\n  panel                    Bring the browser window forward (compatibility alias)\n  help                     Show this help\n\nSpaces:\n  spaces                   List user and task spaces (also available in task run)\n  space show user|TASK_ID  Show a space without handing off control\n  space overview           Show the space overview\n                           show and overview are global UI controls; task run rejects them\n\nTasks:\n  task create NAME         Create a named task\n  task list                List tasks\n  task info ID             Inspect a task and its current revision\n  task handoff ID REV       Hand control to the user\n  task resume ID REV        Resume agent control\n  task adopt ID REV TAB     Attach an existing tab to a task\n  task release ID REV TAB   Release a tab from a task\n  task finish ID REV [--keep TAB ...]\n                           Finish a task, retaining only the listed tabs\n  task run ID REV COMMAND  Run an existing browser command in a task\n\nKeys:\n  Enter Tab Escape ArrowLeft ArrowUp ArrowRight ArrowDown\n  Home End PageUp PageDown Backspace Delete Space\n  Shift+ only with Enter, Tab, arrows, Home, End, PageUp or PageDown.\n  Meta+A Meta+Z Meta+Shift+Z Meta+Backspace\n  Meta+arrows Meta+Shift+arrows\n  Alt+ArrowLeft Alt+ArrowRight Alt+Shift+ArrowLeft Alt+Shift+ArrowRight\n  Alt+Backspace Alt+Delete\n  Key names are case-sensitive; only the listed combinations are supported.\n\nID uses 1..128 ASCII letters, digits, hyphens or underscores.\nSpace IDs use user or an existing task ID, at most 120 ASCII characters.\nREV is the positive revision returned by task info or a task update.\nNAME is trimmed, contains 1..120 characters, and has no control characters.\ntask run cannot contain task commands.\n\nNavigation commands return when the request is accepted; use wait for readiness.\nwait dom: document.readyState is interactive or complete.\nwait load: the browser's overall loading has ended.\nSpecify dom or load before TIMEOUT_MS. open and navigate accept HTTP(S) URLs.\nTAB is a positive integer. Quote arguments containing spaces.\nEvery command writes one JSON response to stdout. Errors also use stderr.\n";
 
 /// `args` excludes the executable name. The caller supplies the configured socket.
 pub fn run(args: &[String], socket: &Path) -> i32 {
@@ -129,6 +129,12 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         }),
         ["scroll", tab, x, y] => Ok(Command::Scroll {
             tab: parse_tab(tab)?,
+            x: parse_scroll_delta(x)?,
+            y: parse_scroll_delta(y)?,
+        }),
+        ["scroll", tab, reference, x, y] => Ok(Command::ScrollElement {
+            tab: parse_tab(tab)?,
+            reference: parse_ref(reference)?,
             x: parse_scroll_delta(x)?,
             y: parse_scroll_delta(y)?,
         }),
@@ -777,6 +783,63 @@ mod tests {
                 .is_err(),
                 "{frame:?}"
             );
+        }
+    }
+
+    #[test]
+    fn scroll_element_cli_preserves_references_and_task_scope() {
+        for reference in ["9/doc:1:1".to_owned(), "r".repeat(256), "가".repeat(85)] {
+            let command = Command::ScrollElement {
+                tab: 3,
+                reference: reference.clone(),
+                x: -10000,
+                y: 10000,
+            };
+            assert_eq!(
+                parse_command(&args(&["scroll", "3", &reference, "-10000", "10000"])).unwrap(),
+                command
+            );
+            assert_eq!(
+                parse_command(&args(&[
+                    "task", "run", "task-1", "2", "scroll", "3", &reference, "-10000", "10000"
+                ]))
+                .unwrap(),
+                Command::TaskRun {
+                    task: "task-1".into(),
+                    revision: 2,
+                    command: Box::new(command),
+                }
+            );
+        }
+        assert_eq!(
+            parse_command(&args(&["scroll", "3", "-10000", "10000"])).unwrap(),
+            Command::Scroll {
+                tab: 3,
+                x: -10000,
+                y: 10000
+            }
+        );
+    }
+
+    #[test]
+    fn scroll_element_cli_rejects_invalid_refs_axes_and_arity_in_each_scope() {
+        let mut invalid = vec![
+            args(&["scroll", "0", "9/doc:1:1", "0", "1"]),
+            args(&["scroll", "3", "9/doc:1:1", "0"]),
+            args(&["scroll", "3", "9/doc:1:1", "0", "1", "extra"]),
+        ];
+        for reference in ["".to_owned(), "r".repeat(257), "가".repeat(86)] {
+            invalid.push(args(&["scroll", "3", &reference, "0", "1"]));
+        }
+        for value in ["-10001", "10001", "2147483648", "1.5", "NaN", ""] {
+            invalid.push(args(&["scroll", "3", "9/doc:1:1", value, "0"]));
+            invalid.push(args(&["scroll", "3", "9/doc:1:1", "0", value]));
+        }
+        for command in invalid {
+            assert!(parse_command(&command).is_err(), "{command:?}");
+            let mut nested = args(&["task", "run", "task-1", "2"]);
+            nested.extend(command);
+            assert!(parse_command(&nested).is_err(), "{nested:?}");
         }
     }
 

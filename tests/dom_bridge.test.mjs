@@ -1190,6 +1190,203 @@ test("scroll rejects invalid offsets and snapshots report the resulting viewport
   assert.deepEqual({ ...f.bridge.read().viewport }, { x: 50, y: 500, width: 1280, height: 800 });
 });
 
+function scrollable(element, { x = false, y = true, rtl = false } = {}) {
+  Object.assign(element, {
+    clientWidth: 100, clientHeight: 100,
+    scrollWidth: x ? 400 : 100, scrollHeight: y ? 600 : 100, scrollLeft: 0, scrollTop: 0,
+    // This double only models synchronous position changes, not layout or wheel.
+    scrollBy({ left, top, behavior }) {
+      assert.equal(behavior, "instant");
+      this.scrollByCalls = (this.scrollByCalls || 0) + 1;
+      this.scrollLeft = Math.max(rtl ? -300 : 0, Math.min(rtl ? 0 : 300, this.scrollLeft + left));
+      this.scrollTop = Math.max(0, Math.min(500, this.scrollTop + top));
+      this.onScrollBy?.();
+    },
+  });
+  element.style.overflowX = x ? "auto" : "hidden";
+  element.style.overflowY = y ? "scroll" : "hidden";
+  return element;
+}
+
+function documentScroller(f) {
+  Object.assign(f.document.documentElement, {
+    scrollWidth: 1280, scrollHeight: 2400, isConnected: true, ownerDocument: f.document,
+  });
+  f.document.scrollingElement = f.document.documentElement;
+}
+
+test("referenced scroll discovers bounded document, overflow and open-shadow targets", () => {
+  const f = fixture();
+  documentScroller(f);
+  scrollable(f.add("DIV", { "aria-label": "Both axes" }), { x: true });
+  const hiddenOverflow = scrollable(f.add("DIV", { "aria-label": "Hidden overflow" }));
+  hiddenOverflow.style.overflowY = "hidden";
+  const visuallyHidden = scrollable(f.add("DIV", { "aria-label": "Hidden element" }));
+  visuallyHidden.hidden = true;
+  const shadow = f.add("DIV").attachShadow({ mode: "open" });
+  scrollable(f.add("DIV", { "aria-label": "Shadow scroller" }, shadow));
+  const page = f.bridge.read();
+  assert.deepEqual(Array.from(page.interactive, (item) => item.label), ["Document", "Both axes", "Shadow scroller"]);
+  assert.equal(page.interactive[0].role, "document");
+  assert.deepEqual(JSON.parse(JSON.stringify(page.interactive[0].scroll)), {
+    target: "document", axes: { x: false, y: true }, position: { x: 0, y: 0 },
+    extent: { width: 1280, height: 2400 }, viewport: { width: 1280, height: 800 },
+  });
+  assert.deepEqual({ ...page.interactive[1].scroll.axes }, { x: true, y: true });
+  assert.equal(f.window.scrollY, 0);
+});
+
+test("referenced scroll changes only its container, preserves focus and reports boundaries and RTL", () => {
+  const f = fixture();
+  const outer = scrollable(f.add("DIV", { "aria-label": "Outer" }));
+  const target = scrollable(f.add("DIV", { "aria-label": "Inner" }, outer), { x: true, rtl: true });
+  const input = f.add("INPUT");
+  input.focus();
+  target.focus = () => assert.fail("DOM scroll must not focus");
+  target.scrollIntoView = outer.scrollIntoView = () => assert.fail("DOM scroll must not scroll ancestors");
+  f.window.scrollBy = () => assert.fail("Element scroll must not scroll the document");
+  const ref = f.bridge.read().interactive.find((item) => item.label === "Inner").ref;
+  const first = f.bridge.act({ action: "scroll", ref, x: -20, y: 900 });
+  assert.deepEqual(JSON.parse(JSON.stringify(first)), {
+    ok: true, action: "scroll", input: "dom", target: "element",
+    before: { x: 0, y: 0 }, after: { x: -20, y: 500 }, changed: true, attempted: true,
+  });
+  const second = f.bridge.act({ action: "scroll", ref, x: 0, y: 100 });
+  assert.equal(second.ok, true);
+  assert.equal(second.changed, false);
+  assert.equal(outer.scrollTop, 0);
+  assert.equal(f.document.activeElement, input);
+  assert.equal(target.scrollByCalls, 2);
+});
+
+test("referenced scroll rejects malformed deltas and unsupported axes before dispatch", () => {
+  const f = fixture();
+  const target = scrollable(f.add("DIV"));
+  const ref = f.bridge.read().interactive[0].ref;
+  for (const offsets of [{ x: 0 }, { x: 0, y: 0.5 }, { x: NaN, y: 1 },
+    { x: 0, y: Infinity }, { x: 0, y: -10001 }, { x: "0", y: 1 }]) {
+    const result = f.bridge.act({ action: "scroll", ref, ...offsets });
+    assert.equal(result.error, "INVALID_SCROLL");
+    assert.equal(result.attempted, false);
+  }
+  assert.equal(f.bridge.act({ action: "scroll", ref, x: 1, y: 0 }).error, "UNSUPPORTED_SCROLL_AXIS");
+  assert.equal(f.bridge.act({ action: "scroll", ref: null, x: 0, y: 0 }).error, "STALE_REF");
+  assert.equal(target.scrollByCalls, undefined);
+});
+
+test("referenced scroll refuses hidden, inert, disabled, disconnected, replaced-document and stale refs", () => {
+  for (const [change, error] of [
+    [(f, node) => { node.hidden = true; }, "ELEMENT_UNAVAILABLE"],
+    [(f, node) => { node.inert = true; }, "ELEMENT_UNAVAILABLE"],
+    [(f, node) => { node.setAttribute("aria-disabled", "true"); }, "ELEMENT_UNAVAILABLE"],
+    [(f, node) => node.remove(), "STALE_REF"],
+    [(f, node) => { node.ownerDocument = fixture().document; }, "STALE_REF"],
+    [(f) => f.bridge.read(), "STALE_REF"],
+  ]) {
+    const f = fixture();
+    const target = scrollable(f.add("DIV"));
+    const ref = f.bridge.read().interactive[0].ref;
+    change(f, target);
+    const result = f.bridge.act({ action: "scroll", ref, x: 0, y: 100 });
+    assert.equal(result.error, error);
+    assert.equal(result.attempted, false);
+    assert.equal(target.scrollByCalls, undefined);
+  }
+});
+
+test("referenced scroll fixes document versus element identity and document scrollingElement at read time", () => {
+  for (const mutation of ["element-to-document", "document-to-element", "replace-scroller"]) {
+    const f = fixture();
+    scrollable(f.document.body);
+    if (mutation !== "element-to-document") documentScroller(f);
+    const ref = f.bridge.read().interactive[0].ref;
+    if (mutation === "element-to-document") documentScroller(f);
+    else if (mutation === "document-to-element") f.document.scrollingElement = null;
+    else f.document.scrollingElement = { ...f.document.documentElement };
+    const result = f.bridge.act({ action: "scroll", ref, x: 0, y: 100 });
+    assert.equal(result.error, "ELEMENT_UNAVAILABLE");
+    assert.equal(result.attempted, false);
+    assert.equal(f.window.scrollY, 0);
+    assert.equal(f.document.body.scrollByCalls, undefined);
+  }
+});
+
+test("referenced scroll validates finite metrics and reports post-dispatch target changes or exceptions", () => {
+  for (const invalid of [NaN, Infinity, -1, 2147483648]) {
+    const f = fixture();
+    const target = scrollable(f.add("DIV"));
+    const ref = f.bridge.read().interactive[0].ref;
+    target.scrollHeight = invalid;
+    const result = f.bridge.act({ action: "scroll", ref, x: 0, y: 100 });
+    assert.equal(result.error, "ELEMENT_NOT_SCROLLABLE");
+    assert.equal(result.attempted, false);
+  }
+  for (const dispatch of ["remove", "throw", "replace-method-getter"]) {
+    const f = fixture();
+    const target = scrollable(f.add("DIV"));
+    const ref = f.bridge.read().interactive[0].ref;
+    if (dispatch === "remove") target.onScrollBy = () => target.remove();
+    else if (dispatch === "throw") target.scrollBy = () => { throw new Error("private page detail"); };
+    else Object.defineProperty(target, "scrollBy", { get() { target.remove(); return () => assert.fail("Stale target dispatched"); } });
+    const result = f.bridge.act({ action: "scroll", ref, x: 0, y: 100 });
+    assert.equal(result.error, dispatch === "throw" ? "ACTION_FAILED" : "ELEMENT_UNAVAILABLE");
+    assert.equal(result.attempted, dispatch !== "replace-method-getter");
+    assert.equal(result.outcomeUnknown, dispatch !== "replace-method-getter" ? true : undefined);
+    assert.equal(JSON.stringify(result).includes("private page detail"), false);
+  }
+});
+
+test("referenced scroll uses exact frame bindings and only that frame document", () => {
+  const f = fixture();
+  const { child } = embed(f);
+  documentScroller(child);
+  const page = child.bridge.readFrameActions();
+  const ref = page.interactive[0].ref;
+  assert.equal(child.bridge.act({ action: "scroll", ref, x: 0, y: 120 }).error, "FRAME_BINDING_REQUIRED");
+  assert.equal(child.bridge.frameAct({ action: "scroll", ref, x: 0, y: 120 },
+    { documentId: page.documentId, generation: page.generation + 1 }).error, "STALE_FRAME_SNAPSHOT");
+  assert.equal(child.window.scrollY, 0);
+  const result = child.bridge.frameAct({ action: "scroll", ref, x: 0, y: 120 }, page);
+  assert.equal(result.ok, true);
+  assert.equal(result.target, "document");
+  assert.equal(result.after.y, 120);
+  assert.equal(f.window.scrollY, 0);
+  assert.equal(child.document.body.scrolls, undefined);
+  assert.equal(child.bridge.clearFrame(page).ok, true);
+  assert.equal(child.bridge.frameAct({ action: "scroll", ref, x: 0, y: 120 }, page).error, "STALE_FRAME_SNAPSHOT");
+});
+
+test("referenced scroll targets in child documents keep parent selection and scrolling untouched", () => {
+  const f = fixture();
+  const { child } = embed(f);
+  documentScroller(child);
+  const input = f.add("INPUT");
+  input.focus();
+  const page = f.bridge.read();
+  const item = page.interactive.find((entry) => entry.scroll?.target === "document");
+  assert.equal(item.frame, page.frames[0].id);
+  const result = f.bridge.act({ action: "scroll", ref: item.ref, x: 0, y: 80 });
+  assert.equal(result.ok, true);
+  assert.equal(child.window.scrollY, 80);
+  assert.equal(f.window.scrollY, 0);
+  assert.equal(f.document.activeElement, input);
+});
+
+test("referenced scroll discovery shares interactive and frame read budgets", () => {
+  const f = fixture();
+  documentScroller(f);
+  for (let i = 0; i < 125; i += 1) scrollable(f.add("DIV", { "aria-label": `Scroll ${i}` }));
+  const page = f.bridge.read();
+  assert.equal(page.interactive.length, 120);
+  assert.equal(page.truncated.interactive, true);
+  const frame = vm.runInContext('window.__lightBrowserBridge.readFrameActions({text:0,elements:3,nodes:20,roots:0,options:0,frames:0})', f.context);
+  assert.equal(frame.interactive.length, 3);
+  assert.equal(frame.budgetUsed.elements, 3);
+  assert.equal(frame.budgetUsed.nodes, 20);
+  assert.equal(frame.truncated.nodes, true);
+  assert.equal(frame.truncated.interactive, true);
+});
+
 test("open and nested shadow roots use root-local labels and preserve ref action semantics", () => {
   const f = fixture();
   f.add("SPAN", { id: "name" }).innerText = "Wrong document label";

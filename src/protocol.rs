@@ -132,6 +132,13 @@ pub enum Command {
         x: i32,
         y: i32,
     },
+    ScrollElement {
+        tab: i32,
+        #[serde(rename = "ref")]
+        reference: String,
+        x: i32,
+        y: i32,
+    },
     Click {
         tab: i32,
         #[serde(rename = "ref")]
@@ -197,6 +204,7 @@ impl Command {
             | Self::Frames { tab }
             | Self::ReadFrame { tab, .. }
             | Self::Scroll { tab, .. }
+            | Self::ScrollElement { tab, .. }
             | Self::Click { tab, .. }
             | Self::Hover { tab, .. }
             | Self::Check { tab, .. }
@@ -285,7 +293,12 @@ impl Command {
             Self::Wait { timeout_ms, .. } if !(1..=30000).contains(timeout_ms) => {
                 return Err(invalid("Wait timeout_ms must be between 1 and 30000."));
             }
-            Self::Scroll { x, y, .. }
+            Self::ScrollElement { reference, .. }
+                if reference.is_empty() || reference.len() > 256 =>
+            {
+                return Err(invalid("REF must contain 1 to 256 bytes."));
+            }
+            Self::Scroll { x, y, .. } | Self::ScrollElement { x, y, .. }
                 if !(-10000..=10000).contains(x) || !(-10000..=10000).contains(y) =>
             {
                 return Err(invalid(
@@ -930,6 +943,7 @@ fn validate_command_fields(value: &Value, allow_task: bool) -> Result<(), Protoc
                     | "read_page"
                     | "read_frame"
                     | "scroll"
+                    | "scroll_element"
                     | "click"
                     | "hover"
                     | "check"
@@ -1013,7 +1027,10 @@ pub fn call(socket: &Path, request: &Request) -> Result<Response, ProtocolError>
         // The server answers requests it rejects before execution with this id.
         if response.id == INVALID_REQUEST_ID {
             if let Some(error) = &response.error {
-                return Err(ProtocolError::new(error.code.clone(), error.message.clone()));
+                return Err(ProtocolError::new(
+                    error.code.clone(),
+                    error.message.clone(),
+                ));
             }
         }
         return Err(ProtocolError::new(
@@ -1574,6 +1591,101 @@ mod tests {
         );
         assert_eq!(Command::Tabs.tab_id(), None);
         assert_eq!(Command::Status.tab_id(), None);
+    }
+
+    #[test]
+    fn scroll_element_wire_round_trips_refs_axes_and_scope() {
+        for reference in ["9/doc:1:1".to_owned(), "r".repeat(256), "가".repeat(85)] {
+            for (x, y) in [(-10000, 10000), (10000, -10000), (0, 0)] {
+                let command = Command::ScrollElement {
+                    tab: 3,
+                    reference: reference.clone(),
+                    x,
+                    y,
+                };
+                let wire = json!({"type":"scroll_element","tab":3,"ref":reference,"x":x,"y":y});
+                assert_eq!(serde_json::to_value(&command).unwrap(), wire);
+                assert_eq!(
+                    request_from_command_value(wire.clone()).unwrap().command,
+                    command
+                );
+                assert_eq!(command.tab_id(), Some(3));
+                assert!(!command.is_task_command());
+                let nested = Command::TaskRun {
+                    task: "task-1".into(),
+                    revision: 2,
+                    command: Box::new(command),
+                };
+                assert_eq!(nested.tab_id(), Some(3));
+                assert_eq!(
+                    request_from_command_value(json!({
+                        "type":"task_run","task":"task-1","revision":2,"command":wire
+                    }))
+                    .unwrap()
+                    .command,
+                    nested
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scroll_element_wire_rejects_invalid_refs_axes_and_fields_in_each_scope() {
+        let base = json!({"type":"scroll_element","tab":3,"ref":"9/doc:1:1","x":0,"y":0});
+        let mut invalid = Vec::new();
+        for reference in [
+            json!(""),
+            json!("r".repeat(257)),
+            json!("가".repeat(86)),
+            Value::Null,
+            json!(3),
+        ] {
+            let mut command = base.clone();
+            command["ref"] = reference;
+            invalid.push(command);
+        }
+        for delta in [
+            json!(-10001),
+            json!(10001),
+            json!(2147483648_i64),
+            json!(1.5),
+            json!("1"),
+            Value::Null,
+        ] {
+            for axis in ["x", "y"] {
+                let mut command = base.clone();
+                command[axis] = delta.clone();
+                invalid.push(command);
+            }
+        }
+        for field in ["tab", "ref", "x", "y"] {
+            let mut command = base.clone();
+            command.as_object_mut().unwrap().remove(field);
+            invalid.push(command);
+        }
+        let mut extra = base.clone();
+        extra["frame"] = json!("untrusted-frame");
+        invalid.push(extra);
+        let mut invalid_tab = base.clone();
+        invalid_tab["tab"] = json!(0);
+        invalid.push(invalid_tab);
+        for command in invalid {
+            assert_eq!(
+                request_from_command_value(command.clone())
+                    .unwrap_err()
+                    .code,
+                "INVALID_REQUEST",
+                "{command}"
+            );
+            assert_eq!(
+                request_from_command_value(json!({
+                    "type":"task_run","task":"task-1","revision":2,"command":command
+                }))
+                .unwrap_err()
+                .code,
+                "INVALID_REQUEST"
+            );
+        }
     }
 
     #[test]
