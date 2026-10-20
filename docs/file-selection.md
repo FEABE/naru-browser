@@ -75,7 +75,11 @@ Chromium은 업로드할 폴더의 열거가 끝나면 파일 목록을 바로 �
 
 CDP `DOM.setFileInputFiles`로 바꿔도 폴더 지원이 해결되는 것은 아니다. Blink의 `webkitdirectory` 분기는 전달받은 경로를 다시 디렉터리 열거로 보내며 Alloy에는 그 열거를 완료하는 구현이 없어 기본 취소 경로에 도달한다. Chromium 기본 `WebContentsDelegate::EnumerateDirectory`도 취소한다. CDP 호출 성공만으로 폴더 이벤트나 파일 전달이 완료됐다고 볼 수 없다. [CDP 입력 구현](https://github.com/chromium/chromium/blob/156.0.8078.17/third_party/blink/renderer/core/inspector/inspector_dom_agent.cc#L1793-L1814), [폴더 입력 분기](https://github.com/chromium/chromium/blob/156.0.8078.17/third_party/blink/renderer/core/html/forms/file_input_type.cc#L533-L542), [기본 열거 취소](https://github.com/chromium/chromium/blob/156.0.8078.17/content/public/browser/web_contents_delegate.cc#L288-L293)
 
-폴더 지원을 완성하려면 현재 AppKit 창 구성에서 가능한 CEF 모달 호스트와 디렉터리 열거 연결을 설계하고, 원래 요청의 수명과 취소 검증을 유지한 채 실제 페이지 이벤트까지 확인해야 한다. 현재의 즉시 취소와 안내는 이 작업을 대신하지 않는다.
+2026-10-20 후속 원문 조사에서는 일반 파일 선택의 폴더 열거가 이미 `FileSelected → StartNewEnumeration → OnListDone`으로 연결됨을 확인했다. 현재 chooser의 확인창 제약과 별도 디렉터리 재열거의 미구현을 구분한다. `gfx::NativeView`는 NSView 포인터를 받을 수 있지만 Chromium 모달 부모 조회는 `NativeWidgetMacNSWindow` 호스트를 요구한다. 따라서 `GetHostView`에서 Naru의 NSView를 반환하는 수정만으로는 기존 NSWindow에 확인창을 붙일 수 없다. [Chromium의 실제 부모 조회](https://github.com/chromium/chromium/blob/156.0.8078.17/ui/views/cocoa/native_widget_mac_ns_window_host.mm#L266-L296)를 따른다.
+
+현재 공개 CEF API에는 열거 후 폴더 업로드 확인을 앱에 위임하는 callback이 없다. 후속 후보는 그 지점에 비동기 확인 hook을 추가하고 기존 Naru 창의 AppKit sheet에서 사용자 결정을 받아 원래 열거 결과 전달이나 취소로 이어가는 엔진 패치다. 선택창 이후 열거와 확인까지 같은 요청 토큰으로 인계, 탐색, 탭 종료를 처리해야 한다. 확인을 생략하거나 파일 경로를 자동 승인하는 대안으로 바꾸지 않는다.
+
+이 후보는 아직 구현하거나 빌드하지 않았다. 고정 CEF와 Chromium 재빌드 및 필요 시 Rust 바인딩 갱신이 필요하며 전체 디스크와 시간 비용도 미측정이다. 큰 엔진 checkout이나 별도 작업창을 만들지 않았다. [후속 조사 기록](../artifacts/folder-upload-host-investigation-20261020.json)에 근거를 보관한다. 실제 폴더 확인, 취소, trusted 이벤트와 메모리 검증까지 남아 있으며 현재의 즉시 취소와 안내는 이 작업을 대신하지 않는다.
 
 ## 정적 검증 페이지
 

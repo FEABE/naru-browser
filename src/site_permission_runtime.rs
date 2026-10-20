@@ -18,6 +18,13 @@ impl Callback {
         }
     }
 
+    fn dismiss(self) {
+        match self {
+            Self::Generic(callback) => callback.cont(PermissionRequestResult::DISMISS),
+            Self::Media(callback) => callback.cancel(),
+        }
+    }
+
     fn allow(self, kind: &Kind) {
         match (self, kind) {
             (Self::Generic(callback), Kind::Generic { .. }) => {
@@ -279,8 +286,12 @@ pub fn decide(token: u64, allow: bool) -> Result<(), String> {
             ))
         })
         .ok_or_else(|| "사이트 권한 요청이 만료되었습니다.".to_owned())?;
-    if allow && valid.is_ok() && callback.1 {
-        callback.0.allow(&request.kind);
+    if valid.is_ok() && callback.1 {
+        if allow {
+            callback.0.allow(&request.kind);
+        } else {
+            callback.0.dismiss();
+        }
     } else {
         callback.0.cancel();
     }
@@ -615,7 +626,27 @@ mod tests {
         );
         assert_eq!(pending_count(), 0);
         assert!(decide(token, true).is_err());
+        assert!(decide(token, false).is_err());
         assert_eq!(calls.borrow().len(), 1);
+        let mut object = unsafe { std::mem::zeroed::<sys::_cef_permission_prompt_callback_t>() };
+        object.cont = Some(generic_result);
+        let raw = cef::rc::RcImpl::new(
+            object,
+            Recorder {
+                calls: calls.clone(),
+            },
+        );
+        let callback = cef::rc::ConvertReturnValue::wrap_result(
+            raw.cast::<sys::_cef_permission_prompt_callback_t>(),
+        );
+        Callback::Generic(callback).dismiss();
+        assert_eq!(
+            &*calls.borrow(),
+            &[
+                PermissionRequestResult::IGNORE.get_raw(),
+                PermissionRequestResult::DISMISS.get_raw(),
+            ]
+        );
         let mut object = unsafe { std::mem::zeroed::<sys::_cef_media_access_callback_t>() };
         object.cont = Some(media_result);
         object.cancel = Some(media_cancel);
@@ -631,7 +662,11 @@ mod tests {
         Callback::Media(callback).allow(&Kind::media(3, "frame".into()).unwrap());
         assert_eq!(
             &*calls.borrow(),
-            &[PermissionRequestResult::IGNORE.get_raw(), 3]
+            &[
+                PermissionRequestResult::IGNORE.get_raw(),
+                PermissionRequestResult::DISMISS.get_raw(),
+                3,
+            ]
         );
         clear();
     }

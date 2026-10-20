@@ -1239,6 +1239,79 @@ fn is_native_tab_event(event: &NSEvent) -> bool {
         )
 }
 
+fn site_permissions_cover_content(window: &NSWindow, content: &NSView) -> bool {
+    SHELL.with(|slot| {
+        slot.try_borrow().ok().is_some_and(|slot| {
+            slot.as_ref().is_some_and(|shell| {
+                shell.page_is_covered_by_site_permissions()
+                    && std::ptr::eq(&*shell.window, window)
+                    && std::ptr::eq(&*shell.content, content)
+            })
+        })
+    })
+}
+
+fn restore_site_permission_close_after_tab(
+    event: &NSEvent,
+    marker: MainThreadMarker,
+    window: &NSWindow,
+    content: &NSView,
+    previous: &NSView,
+) {
+    let controls = SHELL.with(|slot| {
+        let slot = slot.try_borrow().ok()?;
+        let shell = slot.as_ref().filter(|shell| {
+            shell.page_is_covered_by_site_permissions()
+                && std::ptr::eq(&*shell.window, window)
+                && std::ptr::eq(&*shell.content, content)
+        })?;
+        Some((
+            shell.site_permissions.surface.clone(),
+            shell.site_permissions.close.clone(),
+        ))
+    });
+    let Some((surface, close)) = controls else {
+        return;
+    };
+    if !window.isKeyWindow()
+        || !window.isVisible()
+        || window.isMiniaturized()
+        || event.window(marker).as_deref() != Some(window)
+        || surface.window().as_deref() != Some(window)
+        || surface.isHiddenOrHasHiddenAncestor()
+        || close.window().as_deref() != Some(window)
+        || close.isHiddenOrHasHiddenAncestor()
+        || !close.isDescendantOf(&surface)
+        || !close.isEnabled()
+    {
+        return;
+    }
+    let still_covered_cef = window.firstResponder().is_some_and(|responder| {
+        responder.downcast_ref::<NSView>().is_some_and(|current| {
+            std::ptr::eq(current, previous) && current.isDescendantOf(content)
+        })
+    });
+    if !still_covered_cef {
+        return;
+    }
+    // Native getters may reenter. Keep a newer responder or replacement panel,
+    // and never use an approval button as the fallback keyboard destination.
+    let current = SHELL.with(|slot| {
+        slot.try_borrow().ok().is_some_and(|slot| {
+            slot.as_ref().is_some_and(|shell| {
+                shell.page_is_covered_by_site_permissions()
+                    && std::ptr::eq(&*shell.window, window)
+                    && std::ptr::eq(&*shell.content, content)
+                    && std::ptr::eq(&*shell.site_permissions.surface, &*surface)
+                    && std::ptr::eq(&*shell.site_permissions.close, &*close)
+            })
+        })
+    });
+    if current {
+        window.makeFirstResponder(Some(&close));
+    }
+}
+
 pub(crate) fn correct_hidden_cef_tab_focus(event: &NSEvent) {
     if !is_native_tab_event(event) {
         return;
@@ -1263,12 +1336,15 @@ pub(crate) fn correct_hidden_cef_tab_focus(event: &NSEvent) {
     let Some(first_view) = first.downcast_ref::<NSView>() else {
         return;
     };
-    if !first_view.isDescendantOf(&content) || !first_view.isHiddenOrHasHiddenAncestor() {
+    if !first_view.isDescendantOf(&content)
+        || (!first_view.isHiddenOrHasHiddenAncestor()
+            && !site_permissions_cover_content(&window, &content))
+    {
         return;
     }
     let backwards = event.modifierFlags().contains(NSEventModifierFlags::Shift);
-    // Chromium's canBecomeKeyView ignores hidden ancestors. Follow AppKit's
-    // actual candidates after Tab dispatch, retaining its control/FKA policy.
+    // Chromium's canBecomeKeyView ignores hidden ancestors. Covered permission
+    // pages are visible to Blink but remain excluded from native Tab traversal.
     let next = |view: &NSView| unsafe {
         if backwards {
             view.previousValidKeyView()
@@ -1281,37 +1357,47 @@ pub(crate) fn correct_hidden_cef_tab_focus(event: &NSEvent) {
     // Human tabs have no fixed count limit. Bound malformed/oversized loops to
     // 512 candidates and at most 4 KiB of temporary retained references on arm64.
     for _ in 0..512 {
-        let Some(view) = candidate else { return };
+        let Some(view) = candidate else { break };
         if std::ptr::eq(&*view, first_view)
             || visited.iter().any(|seen| std::ptr::eq(&**seen, &*view))
             || view.window().as_deref() != Some(&*window)
         {
-            return;
+            break;
         }
-        if !view.isHiddenOrHasHiddenAncestor() && view.canBecomeKeyView() {
+        if !view.isHiddenOrHasHiddenAncestor()
+            && view.canBecomeKeyView()
+            && !(view.isDescendantOf(&content) && site_permissions_cover_content(&window, &content))
+        {
             // Native queries may re-enter. Never replace a newer responder or
             // move focus after the original event window stops being key.
-            let still_hidden_cef = window.firstResponder().is_some_and(|responder| {
+            let still_blocked_cef = window.firstResponder().is_some_and(|responder| {
                 responder.downcast_ref::<NSView>().is_some_and(|current| {
                     std::ptr::eq(current, first_view)
                         && current.isDescendantOf(&content)
-                        && current.isHiddenOrHasHiddenAncestor()
+                        && (current.isHiddenOrHasHiddenAncestor()
+                            || site_permissions_cover_content(&window, &content))
                 })
             });
             if window.isKeyWindow()
                 && event.window(marker).as_deref() == Some(&*window)
-                && still_hidden_cef
+                && still_blocked_cef
                 && view.window().as_deref() == Some(&*window)
                 && !view.isHiddenOrHasHiddenAncestor()
                 && view.canBecomeKeyView()
+                && !(view.isDescendantOf(&content)
+                    && site_permissions_cover_content(&window, &content))
             {
                 window.makeFirstResponder(Some(&view));
             }
-            return;
+            break;
         }
         candidate = next(&view);
         visited.push(view);
     }
+    // FKA may exclude every native button from next/previousValidKeyView.
+    // All unsuccessful traversal exits converge here; successful traversal has
+    // already changed the responder and the fallback leaves it untouched.
+    restore_site_permission_close_after_tab(event, marker, &window, &content, first_view);
 }
 
 pub(crate) fn begin_focus_tab_trace(event: &NSEvent) -> Option<Option<u32>> {
@@ -3445,6 +3531,14 @@ impl Shell {
             || self.site_permissions.open
     }
 
+    fn page_is_covered_by_site_permissions(&self) -> bool {
+        self.site_permissions.open
+            && !self.overview
+            && !self.search.open
+            && !self.bookmarks.state.open
+            && !self.downloads.open
+    }
+
     fn rebuild_search_results(
         &mut self,
         bookmarks: Option<crate::bookmark_runtime::Snapshot>,
@@ -5142,9 +5236,16 @@ fn open_site_permissions() {
             shell.site_permissions.notice = None;
         }
         shell.site_permissions.open = true;
-        Some((shell.window.clone(), shell.site_permissions.close.clone()))
+        Some((
+            shell.window.clone(),
+            shell.site_permissions.close.clone(),
+            shell.content.clone(),
+        ))
     });
-    if let Some((window, close)) = controls {
+    if let Some((window, close, content)) = controls {
+        // The covered CEF view stays visible to Blink. Release its native input
+        // destination before sync can reenter CEF, then focus chrome after layout.
+        clear_view_responders(&content);
         sync();
         // Opening the panel is explicit; never preselect an approval button.
         window.makeFirstResponder(Some(&close));
@@ -7375,7 +7476,9 @@ fn apply_selection(focus: bool) {
         slot.borrow().as_ref().map(|shell| {
             (
                 shell.window.clone(),
-                if shell.overview || shell.overlay_is_open() {
+                if shell.overview
+                    || (shell.overlay_is_open() && !shell.page_is_covered_by_site_permissions())
+                {
                     None
                 } else {
                     shell.active
@@ -7482,12 +7585,21 @@ fn layout() {
     let main_width = (size.width - side).max(1.0);
     let toolbar_bottom = (size.height - TOOLBAR_HEIGHT).max(1.0);
     let overlay_open = search_open || bookmarks_open || downloads_open || site_permissions_open;
+    // Permission decisions must reach a still-visible document. The opaque
+    // sibling permission surface covers CEF without Blink's hidden/unhidden
+    // transition; every other overlay keeps the previous hiding behavior.
+    let permission_covers_page = site_permissions_open
+        && !overview
+        && !search_open
+        && !bookmarks_open
+        && !downloads_open;
     let find_visible = find_open && !overview && !overlay_open;
     let recovery_visible = recovery_open && !overview && !overlay_open;
     let start_page_visible = start_page_open && !overview && !overlay_open;
+    let content_hidden = overview || (overlay_open && !permission_covers_page) || start_page_visible;
     let visibility_changed = sidebar.isHidden() != overlay_open
         || toolbar.isHidden() != overlay_open
-        || content.isHidden() != (overview || overlay_open || start_page_visible)
+        || content.isHidden() != content_hidden
         || overview_scroll.isHidden() != (!overview || overlay_open)
         || find_surface.isHidden() == find_visible
         || recovery_surface.isHidden() == recovery_visible
@@ -7518,7 +7630,7 @@ fn layout() {
     toolbar.setHidden(overlay_open);
     content.setFrame(rect(side, 0.0, main_width, page_height));
     overview_scroll.setFrame(rect(side, 0.0, main_width, page_height));
-    content.setHidden(overview || overlay_open || start_page_visible);
+    content.setHidden(content_hidden);
     start_page_surface.setFrame(rect(side, 0.0, main_width, page_height));
     if !start_page_visible {
         clear_start_page_responder(&start_page_surface, &start_page_input);
