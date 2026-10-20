@@ -39,11 +39,71 @@ pub struct TaskScope {
     pub revision: u64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum WaitUntil {
     Dom,
     Load,
+    /// Main-frame URL (native, not page JS) starts with `prefix`.
+    Url {
+        prefix: String,
+    },
+    /// Visible text of the main document contains `substring` (case-sensitive).
+    Text {
+        substring: String,
+    },
+}
+
+pub const WAIT_NEEDLE_MAX_BYTES: usize = 4096;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DialogAction {
+    /// `text` is the prompt answer; only a prompt dialog accepts it.
+    Accept {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+    },
+    Dismiss {},
+}
+
+impl WaitUntil {
+    pub fn mode(&self) -> &'static str {
+        match self {
+            Self::Dom => "dom",
+            Self::Load => "load",
+            Self::Url { .. } => "url",
+            Self::Text { .. } => "text",
+        }
+    }
+
+    pub fn expected(&self) -> Option<&str> {
+        match self {
+            Self::Url { prefix } => Some(prefix),
+            Self::Text { substring } => Some(substring),
+            _ => None,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        let Some(value) = self.expected() else {
+            return Ok(());
+        };
+        // JS `\s` also matches U+FEFF; a text needle that collapses to nothing can never be searched.
+        let blank_text = matches!(self, Self::Text { .. })
+            && value.chars().all(|c| c.is_whitespace() || c == '\u{FEFF}');
+        if value.is_empty()
+            || value.len() > WAIT_NEEDLE_MAX_BYTES
+            || value.contains('\0')
+            || blank_text
+        {
+            return Err(ProtocolError::new(
+                "INVALID_REQUEST",
+                "Wait url/text value must be 1 to 4096 bytes, contain no NUL, and text must have a non-whitespace character.",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -63,6 +123,16 @@ pub enum Command {
     TaskResume {
         task: String,
         revision: u64,
+    },
+    /// Block until the task's state or revision changes (no revision needed:
+    /// the baseline is the task state when the request is admitted).
+    TaskWait {
+        task: String,
+        timeout_ms: u64,
+        /// Last revision the caller knows; a different current revision
+        /// returns immediately instead of waiting for another change.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<u64>,
     },
     TaskAdopt {
         task: String,
@@ -182,6 +252,11 @@ pub enum Command {
     Close {
         tab: i32,
     },
+    /// Answer the JavaScript dialog queued for an AI-owned tab (task run only).
+    Dialog {
+        tab: i32,
+        action: DialogAction,
+    },
     Screenshot {
         tab: i32,
         path: String,
@@ -213,6 +288,7 @@ impl Command {
             | Self::Select { tab, .. }
             | Self::Press { tab, .. }
             | Self::Close { tab }
+            | Self::Dialog { tab, .. }
             | Self::Screenshot { tab, .. }
             | Self::TaskAdopt { tab, .. }
             | Self::TaskRelease { tab, .. } => Some(*tab),
@@ -229,6 +305,7 @@ impl Command {
                 | Self::TaskInfo { .. }
                 | Self::TaskHandoff { .. }
                 | Self::TaskResume { .. }
+                | Self::TaskWait { .. }
                 | Self::TaskAdopt { .. }
                 | Self::TaskRelease { .. }
                 | Self::TaskFinish { .. }
@@ -279,6 +356,19 @@ impl Command {
                 }
             }
             Self::TaskInfo { task } => validate_task_id(task)?,
+            Self::TaskWait {
+                task,
+                timeout_ms,
+                since,
+            } => {
+                validate_task_id(task)?;
+                if *since == Some(0) {
+                    return Err(invalid("REV must be a positive 64-bit integer."));
+                }
+                if !(1..=30000).contains(timeout_ms) {
+                    return Err(invalid("Task wait timeout_ms must be between 1 and 30000."));
+                }
+            }
             Self::TaskHandoff { task, revision }
             | Self::TaskResume { task, revision }
             | Self::TaskAdopt { task, revision, .. }
@@ -292,6 +382,15 @@ impl Command {
             }
             Self::Wait { timeout_ms, .. } if !(1..=30000).contains(timeout_ms) => {
                 return Err(invalid("Wait timeout_ms must be between 1 and 30000."));
+            }
+            Self::Wait { until, .. } => until.validate()?,
+            Self::Dialog {
+                action: DialogAction::Accept { text: Some(text) },
+                ..
+            } if !crate::dialogs::text_is_valid(text) => {
+                return Err(invalid(
+                    "Dialog TEXT must be at most 4096 bytes and contain no NUL.",
+                ));
             }
             Self::ScrollElement { reference, .. }
                 if reference.is_empty() || reference.len() > 256 =>
@@ -952,6 +1051,7 @@ fn validate_command_fields(value: &Value, allow_task: bool) -> Result<(), Protoc
                     | "select"
                     | "press"
                     | "close"
+                    | "dialog"
                     | "screenshot"
                     | "status"
                     | "panel"
@@ -1094,6 +1194,186 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn dialog_command_round_trips_and_validates_text() {
+        for (action, value) in [
+            (
+                DialogAction::Accept { text: None },
+                json!({"type":"accept"}),
+            ),
+            (
+                DialogAction::Accept {
+                    text: Some("값".into()),
+                },
+                json!({"type":"accept","text":"값"}),
+            ),
+            (DialogAction::Dismiss {}, json!({"type":"dismiss"})),
+        ] {
+            let command = Command::Dialog { tab: 3, action };
+            let wire = json!({"type":"dialog","tab":3,"action":value});
+            assert_eq!(serde_json::to_value(&command).unwrap(), wire);
+            assert_eq!(serde_json::from_value::<Command>(wire).unwrap(), command);
+            assert!(command.validate().is_ok());
+            assert_eq!(command.tab_id(), Some(3));
+            assert!(!command.is_task_command());
+        }
+        let accept = |text: String| Command::Dialog {
+            tab: 3,
+            action: DialogAction::Accept { text: Some(text) },
+        };
+        assert!(accept("a".repeat(4096)).validate().is_ok());
+        assert!(accept("a".repeat(4097)).validate().is_err());
+        assert!(accept("a\0b".into()).validate().is_err());
+        assert!(
+            Command::Dialog {
+                tab: 0,
+                action: DialogAction::Dismiss {}
+            }
+            .validate()
+            .is_err()
+        );
+        let scoped = Command::TaskRun {
+            task: "t".into(),
+            revision: 1,
+            command: Box::new(accept("a\0".into())),
+        };
+        assert!(scoped.validate().is_err());
+        assert!(
+            serde_json::from_value::<Command>(
+                json!({"type":"dialog","tab":3,"action":{"type":"dismiss","text":"x"}})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn task_run_field_allowlist_accepts_dialog() {
+        let wire = json!({"type":"task_run","task":"t","revision":1,
+            "command":{"type":"dialog","tab":3,"action":{"type":"accept","text":"x"}}});
+        assert!(validate_command_fields(&wire, true).is_ok());
+        let command: Command = serde_json::from_value(wire).unwrap();
+        assert!(command.validate().is_ok());
+        let nested = json!({"type":"task_run","task":"t","revision":1,
+            "command":{"type":"task_run","task":"t","revision":1,"command":{"type":"dialog","tab":3,"action":{"type":"dismiss"}}}});
+        assert!(validate_command_fields(&nested, true).is_err());
+    }
+
+    #[test]
+    fn url_and_text_waits_round_trip_and_validate_value() {
+        for (until, value) in [
+            (
+                WaitUntil::Url {
+                    prefix: "https://a.test/".into(),
+                },
+                json!({"url":{"prefix":"https://a.test/"}}),
+            ),
+            (
+                WaitUntil::Text {
+                    substring: "완료".into(),
+                },
+                json!({"text":{"substring":"완료"}}),
+            ),
+        ] {
+            let command = Command::Wait {
+                tab: 3,
+                until,
+                timeout_ms: 500,
+            };
+            let wire = json!({"type":"wait","tab":3,"until":value,"timeout_ms":500});
+            assert_eq!(serde_json::to_value(&command).unwrap(), wire);
+            assert_eq!(serde_json::from_value::<Command>(wire).unwrap(), command);
+            assert!(command.validate().is_ok());
+        }
+        let edge = "a".repeat(WAIT_NEEDLE_MAX_BYTES);
+        let long = "a".repeat(WAIT_NEEDLE_MAX_BYTES + 1);
+        for (value, ok) in [
+            ("", false),
+            ("a\0b", false),
+            (long.as_str(), false),
+            (edge.as_str(), true),
+        ] {
+            for until in [
+                WaitUntil::Url {
+                    prefix: value.into(),
+                },
+                WaitUntil::Text {
+                    substring: value.into(),
+                },
+            ] {
+                let command = Command::Wait {
+                    tab: 1,
+                    until,
+                    timeout_ms: 10,
+                };
+                assert_eq!(command.validate().is_ok(), ok, "{}", value.len());
+                if !ok {
+                    assert_eq!(command.validate().unwrap_err().code, "INVALID_REQUEST");
+                }
+            }
+        }
+        for blank in [" ", "\n\t", "\u{FEFF}", "\u{3000} "] {
+            let text = Command::Wait {
+                tab: 1,
+                until: WaitUntil::Text {
+                    substring: blank.into(),
+                },
+                timeout_ms: 10,
+            };
+            assert_eq!(
+                text.validate().unwrap_err().code,
+                "INVALID_REQUEST",
+                "{blank:?}"
+            );
+        }
+        // A url prefix is compared literally, so whitespace alone is not rejected here.
+        assert!(
+            Command::Wait {
+                tab: 1,
+                until: WaitUntil::Text {
+                    substring: " a ".into()
+                },
+                timeout_ms: 10,
+            }
+            .validate()
+            .is_ok()
+        );
+        // Multi-byte values are bounded by bytes, not characters.
+        let wide = Command::Wait {
+            tab: 1,
+            until: WaitUntil::Text {
+                substring: "가".repeat(1366),
+            },
+            timeout_ms: 10,
+        };
+        assert!(wide.validate().is_err());
+        for bad in [
+            json!({"url":{}}),
+            json!({"url":{"prefix":"x","extra":1}}),
+            json!({"text":"x"}),
+            json!({"selector":{"css":"x"}}),
+        ] {
+            assert!(
+                serde_json::from_value::<Command>(
+                    json!({"type":"wait","tab":3,"until":bad,"timeout_ms":10})
+                )
+                .is_err()
+            );
+        }
+        // Nested task commands are validated too.
+        let nested = Command::TaskRun {
+            task: "task-1".into(),
+            revision: 1,
+            command: Box::new(Command::Wait {
+                tab: 1,
+                until: WaitUntil::Url {
+                    prefix: String::new(),
+                },
+                timeout_ms: 10,
+            }),
+        };
+        assert!(nested.validate().is_err());
     }
 
     #[test]
@@ -1337,6 +1617,45 @@ mod tests {
     }
 
     #[test]
+    fn task_wait_validates_timeout_and_task_id_and_cannot_nest() {
+        let wait = |task: &str, timeout_ms| Command::TaskWait {
+            task: task.into(),
+            timeout_ms,
+            since: None,
+        };
+        let since = |value| Command::TaskWait {
+            task: "task-1".into(),
+            timeout_ms: 10,
+            since: Some(value),
+        };
+        assert!(since(1).validate().is_ok());
+        assert!(since(u64::MAX).validate().is_ok());
+        assert_eq!(since(0).validate().unwrap_err().code, "INVALID_REQUEST");
+        assert_eq!(
+            serde_json::to_value(since(3)).unwrap(),
+            json!({"type":"task_wait","task":"task-1","timeout_ms":10,"since":3})
+        );
+        assert_eq!(
+            serde_json::from_value::<Command>(
+                json!({"type":"task_wait","task":"task-1","timeout_ms":10})
+            )
+            .unwrap(),
+            wait("task-1", 10)
+        );
+        assert!(wait("task-1", 1).validate().is_ok());
+        assert!(wait("task-1", 30000).validate().is_ok());
+        for invalid in [wait("task-1", 0), wait("task-1", 30001), wait("bad id", 10)] {
+            assert_eq!(invalid.validate().unwrap_err().code, "INVALID_REQUEST");
+        }
+        let nested = Command::TaskRun {
+            task: "task-1".into(),
+            revision: 1,
+            command: Box::new(wait("task-1", 10)),
+        };
+        assert_eq!(nested.validate().unwrap_err().code, "INVALID_REQUEST");
+    }
+
+    #[test]
     fn task_commands_and_scope_round_trip() {
         let task = "task-abc_123";
         for (command, value) in [
@@ -1364,6 +1683,14 @@ mod tests {
                     revision: 2,
                 },
                 json!({"type":"task_resume","task":task,"revision":2}),
+            ),
+            (
+                Command::TaskWait {
+                    task: task.into(),
+                    timeout_ms: 2500,
+                    since: None,
+                },
+                json!({"type":"task_wait","task":task,"timeout_ms":2500}),
             ),
             (
                 Command::TaskAdopt {

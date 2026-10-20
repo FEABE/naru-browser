@@ -98,3 +98,9 @@ v1은 Rust 194개·전체 타깃·format 검사와 release 빌드를 통과했�
 - [start_page.rs](../src/start_page.rs): 탭·공간·epoch로 구성한 일시적 대상.
 - [address.rs](../src/address.rs): 기존 주소·검색어 해석 및 입력 제한.
 - [start-page.html](../tests/fixtures/start-page.html), [preview_fixture.py](../tests/preview_fixture.py): 로컬 탐색 목적지와 본문이 있는 `about:blank` 팝업 fixture. fixture 작성 자체는 실제 CEF 통과 증거가 아니다.
+
+## M5 점검: 주소창과 시작 화면 Tab 순서, 사이드바 모서리 잘림
+
+Tab 순서: 숨긴 CEF 뷰가 키 뷰 후보가 되는 원인은 native-focus-v1에서 확인됐고 `correct_hidden_cef_tab_focus`(원래 이벤트 처리 뒤 숨긴 후보를 건너뛰고 보이는 후보로 이동)와 키 뷰 목록 재계산(`recalculateKeyViewLoop`을 최초 배치와 가시성 전환 뒤 호출)이 이미 소스에 있다. native-focus-v2·v3의 진단 OFF 실행에서 주소창과 중앙 입력 사이 네 방향 이동이 확인됐다. 위 ui-focus-v3 단락의 "남았다"는 그 이전 빌드에 대한 서술이며 이후 보정으로 닫혔다. M5에서 새로 드러난 증거가 없고 현재 소스의 키 뷰 연쇄는 AppKit 질의에 의존해 순수 단위 테스트로 만들 수 없어 소스를 바꾸지 않았다. 현재 바이너리의 네이티브 Tab·Shift+Tab 확인은 미실행이다.
+
+사이드바 모서리 잘림: `layout_chrome`은 검색과 새 탭 배경 `SurfaceView`(자체 layer, `masksToBounds`)의 frame을 갱신하고 변경 시 `setNeedsDisplay`만 한다. 증거(v2 진단 ON에서만 정상, v3 이후 일부 실행에서 재현·재실행에서 정상)는 소스에서 원인을 특정하지 못하고, 좌표 조회가 현상을 가리는 상태다. 원인이 소스에서 명확하지 않아 수정하지 않았다. 항목은 열려 있고 재현 조건 확보와 네이티브 확인이 필요하다(미실행).

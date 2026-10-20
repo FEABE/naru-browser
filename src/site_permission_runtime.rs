@@ -1,6 +1,8 @@
 //! Permission callbacks and live media flags, retained only on the UI thread.
 
-use crate::site_permissions::{Kind, MAX_ORIGIN_BYTES, Model, Request, exact_origin};
+use crate::site_permissions::{
+    HiddenCancelGuard, Kind, MAX_ORIGIN_BYTES, Model, Request, exact_origin,
+};
 pub use crate::site_permissions::{Row, SiteSetting};
 use cef::*;
 use std::{cell::RefCell, collections::BTreeMap};
@@ -48,6 +50,7 @@ struct Runtime {
     model: Model,
     callbacks: BTreeMap<u64, Callback>,
     media: BTreeMap<i32, MediaRow>,
+    hidden_cancel: HiddenCancelGuard,
     notice: Option<String>,
     shutting_down: bool,
 }
@@ -119,7 +122,13 @@ pub(crate) fn media_changed(tab: i32, audio: bool, video: bool) {
 }
 
 pub(crate) fn media_stopped(tab: i32) {
-    let changed = RUNTIME.with(|slot| slot.borrow_mut().media.remove(&tab).is_some());
+    // Also the tab-end hook (close, renderer exit): a new document or tab never
+    // inherits the hidden-cancel memory.
+    let changed = RUNTIME.with(|slot| {
+        let mut state = slot.borrow_mut();
+        state.hidden_cancel.forget(tab);
+        state.media.remove(&tab).is_some()
+    });
     if changed {
         crate::browser::notify_panel();
     }
@@ -205,9 +214,59 @@ pub(crate) fn show(
     })();
     let callback = Callback::Generic(callback.clone());
     match prepared {
-        Ok((context, kind, origin)) => queue(context, kind, origin, callback),
+        Ok((context, kind, origin)) => {
+            if repeats_hidden_cancel(&context, &kind, &origin) {
+                // The same location call was already cancelled while the page
+                // was hidden; Blink restarted it on becoming visible. Dismiss
+                // once so that the page's call ends with PERMISSION_DENIED.
+                callback.dismiss();
+                return true;
+            }
+            queue(context, kind, origin, callback)
+        }
         Err(error) => reject(callback, error),
     }
+}
+
+fn repeats_hidden_cancel(
+    context: &crate::browser::SitePermissionContext,
+    kind: &Kind,
+    origin: &str,
+) -> bool {
+    let Kind::Generic { mask, .. } = kind else {
+        return false;
+    };
+    RUNTIME.with(|slot| {
+        slot.borrow_mut().hidden_cancel.take_match(
+            context.target.source.tab,
+            context.target.source.document_epoch,
+            origin,
+            *mask,
+        )
+    })
+}
+
+/// A card cancelled while its tab is hidden leaves Blink's request pending.
+/// The tab state is read before the runtime borrow; no CEF call happens here.
+fn remember_hidden_cancel(request: &Request) {
+    let Kind::Generic { mask, .. } = &request.kind else {
+        return;
+    };
+    let tab = request.target.source.tab;
+    if !crate::browser::site_permission_tab_hidden(tab) {
+        return;
+    }
+    RUNTIME.with(|slot| {
+        let mut state = slot.borrow_mut();
+        if !state.shutting_down {
+            state.hidden_cancel.record(
+                tab,
+                request.target.source.document_epoch,
+                &request.row.origin,
+                *mask,
+            );
+        }
+    });
 }
 
 pub(crate) fn show_media(
@@ -290,6 +349,7 @@ pub fn decide(token: u64, allow: bool) -> Result<(), String> {
         if allow {
             callback.0.allow(&request.kind);
         } else {
+            remember_hidden_cancel(&request);
             callback.0.dismiss();
         }
     } else {
@@ -321,14 +381,17 @@ pub fn reveal_source(token: u64) -> Result<i32, String> {
     crate::browser::reveal_download_source(&request.target.source)
 }
 
-fn take_matching(matches: impl Fn(&Request) -> bool) -> Vec<Callback> {
+fn take_matching(matches: impl Fn(&Request) -> bool) -> Vec<(Request, Callback)> {
     RUNTIME.with(|slot| {
         let mut state = slot.borrow_mut();
         state
             .model
             .take_matching(matches)
             .into_iter()
-            .filter_map(|request| state.callbacks.remove(&request.row.token))
+            .filter_map(|request| {
+                let callback = state.callbacks.remove(&request.row.token)?;
+                Some((request, callback))
+            })
             .collect()
     })
 }
@@ -336,7 +399,8 @@ fn take_matching(matches: impl Fn(&Request) -> bool) -> Vec<Callback> {
 fn cancel_matching(matches: impl Fn(&Request) -> bool) -> bool {
     let callbacks = take_matching(matches);
     let changed = !callbacks.is_empty();
-    for callback in callbacks {
+    for (request, callback) in callbacks {
+        remember_hidden_cancel(&request);
         callback.cancel();
     }
     if changed {

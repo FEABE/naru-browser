@@ -1,11 +1,11 @@
 use crate::keyboard::{KeyPress, UNSUPPORTED_KEY_MESSAGE};
-use crate::protocol::{self, Command, Request, Response, WaitUntil};
+use crate::protocol::{self, Command, DialogAction, Request, Response, WaitUntil};
 use serde_json::json;
 use std::io::{self, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const USAGE: &str = "Usage: lightbrowser <command>\n\nCommands:\n  open URL                 Return a created tab immediately; navigation may still be loading\n  navigate TAB URL         Request navigation in an existing tab\n  back TAB                 Request backward navigation\n  forward TAB              Request forward navigation\n  reload TAB               Request a reload of the current page\n  stop TAB                 Request loading to stop; does not wait for load completion\n  tabs                     List tabs\n  wait TAB [dom|load] [TIMEOUT_MS]\n                           Wait for readiness (defaults: dom, 10000 ms; range: 1..30000)\n  read TAB                 Read page text and interactive element refs\n  read-page TAB            Read discovered frame documents under a shared budget\n  frames TAB               Inspect the tab frame tree, including discovered child sessions\n                           Inventory only; does not read or control child-frame content\n  read-frame TAB FRAME     Read one current frame, including cross-origin content\n                           Refs support click, hover, fill, insert, press, check, select and targeted scroll\n  scroll TAB DX DY          Scroll the page by relative integer CSS pixels (-10000..10000)\n  scroll TAB REF DX DY      Scroll a referenced list or document by the same CSS pixel deltas\n                           Use a scrollable ref from read, read-frame or read-page\n  click TAB REF            Dispatch a Chromium pointer click to a reference\n  hover TAB REF            Move the Chromium pointer to a reference without clicking\n  check TAB REF true|false Set a native checkbox/radio checked state\n  fill TAB REF TEXT        Replace an input, textarea or editable host with text\n  insert TAB REF TEXT      Insert text at the existing caret or selection\n  select TAB REF VALUE     Select one native HTML option by exact value\n  press TAB REF KEY        Dispatch a Chromium key pair from a focused reference\n  close TAB                Close a tab\n  screenshot TAB PATH      Save a screenshot to PATH\n  status                   Show browser status\n  panel                    Bring the browser window forward (compatibility alias)\n  help                     Show this help\n\nSpaces:\n  spaces                   List user and task spaces (also available in task run)\n  space show user|TASK_ID  Show a space without handing off control\n  space overview           Show the space overview\n                           show and overview are global UI controls; task run rejects them\n\nTasks:\n  task create NAME         Create a named task\n  task list                List tasks\n  task info ID             Inspect a task and its current revision\n  task handoff ID REV       Hand control to the user\n  task resume ID REV        Resume agent control\n  task adopt ID REV TAB     Attach an existing tab to a task\n  task release ID REV TAB   Release a tab from a task\n  task finish ID REV [--keep TAB ...]\n                           Finish a task, retaining only the listed tabs\n  task run ID REV COMMAND  Run an existing browser command in a task\n\nKeys:\n  Enter Tab Escape ArrowLeft ArrowUp ArrowRight ArrowDown\n  Home End PageUp PageDown Backspace Delete Space\n  Shift+ only with Enter, Tab, arrows, Home, End, PageUp or PageDown.\n  Meta+A Meta+Z Meta+Shift+Z Meta+Backspace\n  Meta+arrows Meta+Shift+arrows\n  Alt+ArrowLeft Alt+ArrowRight Alt+Shift+ArrowLeft Alt+Shift+ArrowRight\n  Alt+Backspace Alt+Delete\n  Key names are case-sensitive; only the listed combinations are supported.\n\nID uses 1..128 ASCII letters, digits, hyphens or underscores.\nSpace IDs use user or an existing task ID, at most 120 ASCII characters.\nREV is the positive revision returned by task info or a task update.\nNAME is trimmed, contains 1..120 characters, and has no control characters.\ntask run cannot contain task commands.\n\nNavigation commands return when the request is accepted; use wait for readiness.\nwait dom: document.readyState is interactive or complete.\nwait load: the browser's overall loading has ended.\nSpecify dom or load before TIMEOUT_MS. open and navigate accept HTTP(S) URLs.\nTAB is a positive integer. Quote arguments containing spaces.\nEvery command writes one JSON response to stdout. Errors also use stderr.\n";
+pub const USAGE: &str = "Usage: lightbrowser <command>\n\nCommands:\n  open URL                 Return a created tab immediately; navigation may still be loading\n  navigate TAB URL         Request navigation in an existing tab\n  back TAB                 Request backward navigation\n  forward TAB              Request forward navigation\n  reload TAB               Request a reload of the current page\n  stop TAB                 Request loading to stop; does not wait for load completion\n  tabs                     List tabs\n  wait TAB [dom|load] [TIMEOUT_MS]\n                           Wait for readiness (defaults: dom, 10000 ms; range: 1..30000)\n  wait TAB url PREFIX [TIMEOUT_MS]\n                           Wait until the main-frame URL starts with PREFIX (1..4096 bytes)\n  wait TAB text SUBSTR [TIMEOUT_MS]\n                           Wait until visible text of the main document, open shadow roots and accessible same-origin iframes contains SUBSTR (case-sensitive, 1..4096 bytes)\n  read TAB                 Read page text and interactive element refs\n  read-page TAB            Read discovered frame documents under a shared budget\n  frames TAB               Inspect the tab frame tree, including discovered child sessions\n                           Inventory only; does not read or control child-frame content\n  read-frame TAB FRAME     Read one current frame, including cross-origin content\n                           Refs support click, hover, fill, insert, press, check, select and targeted scroll\n  scroll TAB DX DY          Scroll the page by relative integer CSS pixels (-10000..10000)\n  scroll TAB REF DX DY      Scroll a referenced list or document by the same CSS pixel deltas\n                           Use a scrollable ref from read, read-frame or read-page\n  click TAB REF            Dispatch a Chromium pointer click to a reference\n  hover TAB REF            Move the Chromium pointer to a reference without clicking\n  check TAB REF true|false Set a native checkbox/radio checked state\n  fill TAB REF TEXT        Replace an input, textarea or editable host with text\n  insert TAB REF TEXT      Insert text at the existing caret or selection\n  select TAB REF VALUE     Select one native HTML option by exact value\n  press TAB REF KEY        Dispatch a Chromium key pair from a focused reference\n  close TAB                Close a tab\n  dialog TAB accept [TEXT] Accept the pending JavaScript dialog of an AI-owned tab (task run only)\n                           TEXT only for prompt (0..4096 bytes, no NUL); omitted TEXT uses the prompt default\n  dialog TAB dismiss       Dismiss it: cancel for confirm/prompt, stay on the page for beforeunload\n  screenshot TAB PATH      Save a screenshot to PATH\n  status                   Show browser status\n  panel                    Bring the browser window forward (compatibility alias)\n  skill                    Print the agent usage guide (works without the app running)\n  help                     Show this help\n\nSpaces:\n  spaces                   List user and task spaces (also available in task run)\n  space show user|TASK_ID  Show a space without handing off control\n  space overview           Show the space overview\n                           show and overview are global UI controls; task run rejects them\n\nTasks:\n  task create NAME         Create a named task, or return the live task with that name (resumed: true)\n  task list                List tasks\n  task info ID             Inspect a task and its current revision\n  task handoff ID REV       Hand control to the user\n  task resume ID REV        Resume agent control\n  task wait ID [TIMEOUT_MS] [--since REV]\n                           Block until the task state changes (default 10000 ms; range: 1..30000)\n                           --since REV returns at once if the current revision differs from REV\n                           A paused task wakes when the user presses the native resume button (AI에게 돌려주기)\n                           or a task tab closes (tab loss does not change the revision)\n  task adopt ID REV TAB     Attach an existing tab to a task\n  task release ID REV TAB   Release a tab from a task\n  task finish ID REV [--keep TAB ...]\n                           Finish a task, retaining only the listed tabs\n  task run ID REV COMMAND  Run an existing browser command in a task\n\nKeys:\n  Enter Tab Escape ArrowLeft ArrowUp ArrowRight ArrowDown\n  Home End PageUp PageDown Backspace Delete Space\n  Shift+ only with Enter, Tab, arrows, Home, End, PageUp or PageDown.\n  Meta+A Meta+Z Meta+Shift+Z Meta+Backspace\n  Meta+arrows Meta+Shift+arrows\n  Alt+ArrowLeft Alt+ArrowRight Alt+Shift+ArrowLeft Alt+Shift+ArrowRight\n  Alt+Backspace Alt+Delete\n  Key names are case-sensitive; only the listed combinations are supported.\n\nID uses 1..128 ASCII letters, digits, hyphens or underscores.\nSpace IDs use user or an existing task ID, at most 120 ASCII characters.\nREV is the positive revision returned by task info or a task update.\nNAME is trimmed, contains 1..120 characters, and has no control characters.\ntask run cannot contain task commands.\n\nNavigation commands return when the request is accepted; use wait for readiness.\nwait dom: document.readyState is interactive or complete.\nwait load: the browser's overall loading has ended.\nwait url: native main-frame URL prefix match; returns at once if already matching.\nwait text: bounded read-only check of the main document, open shadow roots and accessible same-origin iframes; restarts on a new document.\nTimeout returns WAIT_TIMEOUT and never cancels navigation.\nSpecify dom or load before TIMEOUT_MS. open and navigate accept HTTP(S) URLs.\nTAB is a positive integer. Quote arguments containing spaces.\nEvery command writes one JSON response to stdout. Errors also use stderr.\n";
 
 /// `args` excludes the executable name. The caller supplies the configured socket.
 pub fn run(args: &[String], socket: &Path) -> i32 {
@@ -13,6 +13,9 @@ pub fn run(args: &[String], socket: &Path) -> i32 {
     if args.is_empty() || (args.len() == 1 && matches!(args[0].as_str(), "help" | "--help" | "-h"))
     {
         return emit(&Response::success(id, json!({ "usage": USAGE })), 0);
+    }
+    if args.len() == 1 && args[0] == "skill" {
+        return print_guide();
     }
     let command = match parse_command(args) {
         Ok(command) => command,
@@ -38,6 +41,24 @@ pub fn run(args: &[String], socket: &Path) -> i32 {
             let response = Response::error(id, error.code, error.message)
                 .with_details(json!({ "outcomeUnknown": error.outcome_unknown }));
             emit(&response, 1)
+        }
+    }
+}
+
+/// Agent-facing guide; plain Markdown on stdout, no app connection needed.
+pub const GUIDE: &str = include_str!("../docs/agent-cli-guide.md");
+
+fn print_guide() -> i32 {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    match output
+        .write_all(GUIDE.as_bytes())
+        .and_then(|_| output.flush())
+    {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("OUTPUT_ERROR: {error}");
+            1
         }
     }
 }
@@ -94,15 +115,38 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         }),
         ["space", "overview"] => Ok(Command::SpaceOverview),
         ["panel"] => Ok(Command::Panel),
-        ["wait", tab, options @ ..] if options.len() <= 2 => {
-            let until = match options.first().copied().unwrap_or("dom") {
-                "dom" => WaitUntil::Dom,
-                "load" => WaitUntil::Load,
-                _ => return Err("Wait mode must be dom or load.".into()),
+        ["wait", tab, options @ ..] if options.len() <= 3 => {
+            let (until, timeout_arg) = match options {
+                ["url", prefix, rest @ ..] if rest.len() <= 1 => (
+                    WaitUntil::Url {
+                        prefix: (*prefix).into(),
+                    },
+                    rest.first().copied(),
+                ),
+                ["text", substring, rest @ ..] if rest.len() <= 1 => (
+                    WaitUntil::Text {
+                        substring: (*substring).into(),
+                    },
+                    rest.first().copied(),
+                ),
+                ["url" | "text"] => {
+                    return Err("Wait url and text require a non-empty value.".into());
+                }
+                [mode, rest @ ..] if rest.len() <= 1 => {
+                    let until = match *mode {
+                        "dom" => WaitUntil::Dom,
+                        "load" => WaitUntil::Load,
+                        _ => return Err("Wait mode must be dom, load, url or text.".into()),
+                    };
+                    (until, rest.first().copied())
+                }
+                [] => (WaitUntil::Dom, None),
+                _ => return Err("Wait mode must be dom, load, url or text.".into()),
             };
-            let timeout_ms = options
-                .get(1)
-                .copied()
+            until
+                .validate()
+                .map_err(|error| error.message.to_string())?;
+            let timeout_ms = timeout_arg
                 .unwrap_or("10000")
                 .parse::<u64>()
                 .ok()
@@ -183,6 +227,20 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
         ["close", tab] => Ok(Command::Close {
             tab: parse_tab(tab)?,
         }),
+        ["dialog", tab, "accept"] => Ok(Command::Dialog {
+            tab: parse_tab(tab)?,
+            action: DialogAction::Accept { text: None },
+        }),
+        ["dialog", tab, "accept", text] => Ok(Command::Dialog {
+            tab: parse_tab(tab)?,
+            action: DialogAction::Accept {
+                text: Some((*text).into()),
+            },
+        }),
+        ["dialog", tab, "dismiss"] => Ok(Command::Dialog {
+            tab: parse_tab(tab)?,
+            action: DialogAction::Dismiss {},
+        }),
         ["screenshot", tab, path] => {
             if path.is_empty() {
                 return Err("PATH must not be empty.".into());
@@ -231,6 +289,7 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
                     | "select"
                     | "press"
                     | "close"
+                    | "dialog"
                     | "screenshot"
                     | "status"
             ) =>
@@ -264,6 +323,7 @@ fn parse_task_command(args: &[&str]) -> Result<Command, String> {
             task: (*task).into(),
             revision: parse_revision(revision)?,
         }),
+        ["wait", task, options @ ..] => parse_task_wait(task, options),
         ["adopt", task, revision, tab] => Ok(Command::TaskAdopt {
             task: (*task).into(),
             revision: parse_revision(revision)?,
@@ -318,6 +378,7 @@ fn parse_task_command(args: &[&str]) -> Result<Command, String> {
                     | "info"
                     | "handoff"
                     | "resume"
+                    | "wait"
                     | "adopt"
                     | "release"
                     | "finish"
@@ -329,6 +390,40 @@ fn parse_task_command(args: &[&str]) -> Result<Command, String> {
         [name, ..] => Err(format!("Unknown task command: {name}")),
         [] => Err("A task command is required.".into()),
     }
+}
+
+fn parse_task_wait(task: &str, options: &[&str]) -> Result<Command, String> {
+    let usage = "Use task wait ID [TIMEOUT_MS] [--since REV].";
+    let mut timeout_ms = None;
+    let mut since = None;
+    let mut index = 0;
+    while index < options.len() {
+        match options[index] {
+            "--since" => {
+                let value = options.get(index + 1).ok_or(usage)?;
+                if since.replace(parse_revision(value)?).is_some() {
+                    return Err(usage.into());
+                }
+                index += 2;
+            }
+            value => {
+                let parsed = value
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|timeout| (1..=30000).contains(timeout))
+                    .ok_or("TIMEOUT_MS must be an integer between 1 and 30000.")?;
+                if timeout_ms.replace(parsed).is_some() {
+                    return Err(usage.into());
+                }
+                index += 1;
+            }
+        }
+    }
+    Ok(Command::TaskWait {
+        task: task.into(),
+        timeout_ms: timeout_ms.unwrap_or(10000),
+        since,
+    })
 }
 
 fn parse_revision(value: &str) -> Result<u64, String> {
@@ -516,6 +611,74 @@ mod tests {
                 revision: u64::MAX
             },
         );
+    }
+
+    #[test]
+    fn task_wait_parses_default_and_bounded_timeouts() {
+        assert_eq!(
+            parse_command(&args(&["task", "wait", "task-1"])).unwrap(),
+            Command::TaskWait {
+                task: "task-1".into(),
+                timeout_ms: 10000,
+                since: None
+            }
+        );
+        assert_eq!(
+            parse_command(&args(&["task", "wait", "task-1", "30000"])).unwrap(),
+            Command::TaskWait {
+                task: "task-1".into(),
+                timeout_ms: 30000,
+                since: None
+            }
+        );
+        for args_in in [
+            vec!["task", "wait", "task-1", "--since", "7", "500"],
+            vec!["task", "wait", "task-1", "500", "--since", "7"],
+            vec!["task", "wait", "task-1", "--since", "7"],
+        ] {
+            let Command::TaskWait {
+                timeout_ms, since, ..
+            } = parse_command(&args(&args_in)).unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(since, Some(7));
+            assert_eq!(
+                timeout_ms,
+                if args_in.contains(&"500") { 500 } else { 10000 }
+            );
+        }
+        for invalid in [
+            vec!["task", "wait"],
+            vec!["task", "wait", "task-1", "0"],
+            vec!["task", "wait", "task-1", "30001"],
+            vec!["task", "wait", "task-1", "abc"],
+            vec!["task", "wait", "task-1", "5", "6"],
+            vec!["task", "wait", "task-1", "--since"],
+            vec!["task", "wait", "task-1", "--since", "0"],
+            vec!["task", "wait", "task-1", "--since", "x"],
+            vec!["task", "wait", "task-1", "--since", "1", "--since", "2"],
+            vec!["task", "wait", "bad id"],
+            vec!["task", "run", "task-1", "1", "task", "wait", "task-1"],
+        ] {
+            assert!(parse_command(&args(&invalid)).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn guide_is_embedded_complete_and_documents_every_task_command() {
+        assert!(GUIDE.trim_end().ends_with("end of guide"));
+        for needle in [
+            "task create",
+            "task wait",
+            "task handoff",
+            "task finish",
+            "WAIT_TIMEOUT",
+        ] {
+            assert!(GUIDE.contains(needle), "{needle}");
+        }
+        assert!(USAGE.contains("skill"));
+        assert!(USAGE.contains("task wait"));
     }
 
     #[test]
@@ -887,6 +1050,57 @@ mod tests {
     }
 
     #[test]
+    fn dialog_accept_and_dismiss_parse_and_validate() {
+        assert_eq!(
+            parse_command(&args(&["dialog", "4", "accept"])).unwrap(),
+            Command::Dialog {
+                tab: 4,
+                action: DialogAction::Accept { text: None }
+            }
+        );
+        assert_eq!(
+            parse_command(&args(&["dialog", "4", "accept", "안녕 world"])).unwrap(),
+            Command::Dialog {
+                tab: 4,
+                action: DialogAction::Accept {
+                    text: Some("안녕 world".into())
+                }
+            }
+        );
+        assert_eq!(
+            parse_command(&args(&["dialog", "4", "dismiss"])).unwrap(),
+            Command::Dialog {
+                tab: 4,
+                action: DialogAction::Dismiss {}
+            }
+        );
+        let scoped = parse_command(&args(&[
+            "task", "run", "task-1", "2", "dialog", "4", "dismiss",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            scoped,
+            Command::TaskRun { command, .. } if matches!(*command, Command::Dialog { tab: 4, .. })
+        ));
+        for bad in [
+            vec!["dialog"],
+            vec!["dialog", "4"],
+            vec!["dialog", "4", "maybe"],
+            vec!["dialog", "4", "dismiss", "text"],
+            vec!["dialog", "0", "dismiss"],
+            vec!["dialog", "x", "accept"],
+            vec!["dialog", "4", "accept", "a", "b"],
+        ] {
+            assert!(parse_command(&args(&bad)).is_err(), "{bad:?}");
+        }
+        let long = "a".repeat(4097);
+        assert!(parse_command(&args(&["dialog", "4", "accept", &long])).is_err());
+        assert!(parse_command(&args(&["dialog", "4", "accept", "a\0b"])).is_err());
+        assert!(USAGE.contains("dialog TAB accept"));
+        assert!(USAGE.contains("dialog TAB dismiss"));
+    }
+
+    #[test]
     fn wait_defaults_and_explicit_modes() {
         assert_eq!(
             parse_command(&args(&["wait", "3"])).unwrap(),
@@ -906,6 +1120,59 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn wait_url_and_text_parse_value_and_optional_timeout() {
+        for (mode, make) in [
+            (
+                "url",
+                (|v: &str| WaitUntil::Url { prefix: v.into() }) as fn(&str) -> WaitUntil,
+            ),
+            ("text", |v: &str| WaitUntil::Text {
+                substring: v.into(),
+            }),
+        ] {
+            assert_eq!(
+                parse_command(&args(&["wait", "3", mode, "a b"])).unwrap(),
+                Command::Wait {
+                    tab: 3,
+                    until: make("a b"),
+                    timeout_ms: 10000
+                }
+            );
+            assert_eq!(
+                parse_command(&args(&["wait", "3", mode, "500", "30000"])).unwrap(),
+                Command::Wait {
+                    tab: 3,
+                    until: make("500"),
+                    timeout_ms: 30000
+                }
+            );
+            assert_eq!(
+                parse_command(&args(&["wait", "3", mode, "load", "1"])).unwrap(),
+                Command::Wait {
+                    tab: 3,
+                    until: make("load"),
+                    timeout_ms: 1
+                }
+            );
+            let long = "a".repeat(4097);
+            for invalid in [
+                vec!["wait", "3", mode],
+                vec!["wait", "3", mode, ""],
+                vec!["wait", "3", mode, long.as_str()],
+                vec!["wait", "3", mode, "x", "0"],
+                vec!["wait", "3", mode, "x", "30001"],
+                vec!["wait", "3", mode, "x", "5", "extra"],
+                vec!["wait", "3", mode, "a\0b"],
+                vec!["wait", "3", "text", " "],
+                vec!["wait", "3", "text", "\n\t"],
+            ] {
+                assert!(parse_command(&args(&invalid)).is_err(), "{invalid:?}");
+            }
+        }
+        assert!(parse_command(&args(&["wait", "3", "network"])).is_err());
     }
 
     #[test]

@@ -222,6 +222,45 @@ impl Model {
     }
 }
 
+/// One-shot memory of a location card that was cancelled while its tab was hidden.
+///
+/// Blink stops a hidden page's geolocation connection but keeps the JavaScript
+/// request. Cancelling the card cannot reach that connection, so showing the tab
+/// again starts a fresh browser request for the same call. The next identical
+/// request of the same document is therefore answered as dismissed once, which
+/// completes the page's call with PERMISSION_DENIED. It is not a document-wide
+/// deny cache: it holds one entry per tab and is consumed by the first request.
+#[derive(Default)]
+pub(crate) struct HiddenCancelGuard {
+    entries: BTreeMap<i32, (u64, String)>,
+}
+
+impl HiddenCancelGuard {
+    pub fn record(&mut self, tab: i32, document_epoch: u64, origin: &str, mask: u32) {
+        if mask == GEOLOCATION {
+            self.entries
+                .insert(tab, (document_epoch, origin.to_owned()));
+        }
+    }
+
+    /// Consumes the entry of `tab` whatever the outcome; true only for the same
+    /// document, origin and a location-only request.
+    pub fn take_match(&mut self, tab: i32, document_epoch: u64, origin: &str, mask: u32) -> bool {
+        self.entries.remove(&tab).is_some_and(|(epoch, saved)| {
+            mask == GEOLOCATION && epoch == document_epoch && saved == origin
+        })
+    }
+
+    pub fn forget(&mut self, tab: i32) {
+        self.entries.remove(&tab);
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,5 +329,34 @@ mod tests {
         assert!(next > first);
         assert!(model.get(first).is_none());
         assert_eq!(model.rows()[0].allow_label, "이 사이트 허용");
+    }
+
+    #[test]
+    fn hidden_cancel_guard_answers_one_identical_location_request_only() {
+        let mut guard = HiddenCancelGuard::default();
+        guard.record(3, 7, "https://a.test", NOTIFICATIONS);
+        assert_eq!(guard.len(), 0, "only location cancels are remembered");
+        guard.record(3, 7, "https://a.test", GEOLOCATION);
+        guard.record(4, 7, "https://a.test", GEOLOCATION);
+        assert!(guard.take_match(3, 7, "https://a.test", GEOLOCATION));
+        assert!(
+            !guard.take_match(3, 7, "https://a.test", GEOLOCATION),
+            "one shot"
+        );
+        // A different document, origin, mask or tab never matches, and the
+        // failed attempt still clears that tab's entry.
+        for (epoch, origin, mask) in [
+            (8, "https://a.test", GEOLOCATION),
+            (7, "https://b.test", GEOLOCATION),
+            (7, "https://a.test", GEOLOCATION | NOTIFICATIONS),
+        ] {
+            guard.record(3, 7, "https://a.test", GEOLOCATION);
+            assert!(!guard.take_match(3, epoch, origin, mask));
+            assert!(!guard.take_match(3, 7, "https://a.test", GEOLOCATION));
+        }
+        assert_eq!(guard.len(), 1);
+        guard.forget(4);
+        assert_eq!(guard.len(), 0);
+        assert!(!guard.take_match(5, 7, "https://a.test", GEOLOCATION));
     }
 }

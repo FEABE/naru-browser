@@ -49,6 +49,8 @@ pub struct ShellTab {
     pub failure: Option<PageFailure>,
     pub start_page: bool,
     pub task_status: String,
+    /// A JavaScript dialog is queued for the AI to answer through the CLI.
+    pub dialog_pending: bool,
     pub stop_scope: Option<TaskScope>,
     pub space: String,
     pub navigation_epoch: u64,
@@ -66,6 +68,8 @@ pub enum ShellAction {
     SelectSpace(String),
     ShowOverview(bool),
     StopSpace(TaskScope),
+    /// Native "AI에게 돌려주기" for a paused task; same path as `task resume`.
+    ResumeSpace(TaskScope),
 }
 
 const PREVIEW_LIMIT: usize = 8;
@@ -481,6 +485,7 @@ struct TabRow {
     space: String,
     button: Retained<NSButton>,
     drag: Retained<TabDragRecognizer>,
+    mute: Retained<NSButton>,
     close: Retained<NSButton>,
     icon: Retained<NSImageView>,
     title: Retained<NSTextField>,
@@ -660,8 +665,10 @@ fn tab_rows_signature(
                 &tab.url,
                 tab.loading,
                 tab.audio_muted,
+                tab.crashed,
                 tab.failure,
                 &tab.task_status,
+                tab.dialog_pending,
                 tab.stop_scope.is_some()
             ))
             .collect::<Vec<_>>()
@@ -689,8 +696,13 @@ fn tab_status_symbol(
 
 fn tab_status_description(tab: &ShellTab) -> String {
     format!(
-        "{}{}{}{}",
+        "{}{}{}{}{}",
         tab.task_status,
+        if tab.dialog_pending {
+            ", 대화상자 응답 대기"
+        } else {
+            ""
+        },
         match tab.failure {
             Some(PageFailure::Load { .. }) => ", 페이지를 열지 못했습니다",
             Some(PageFailure::Renderer) => ", 페이지가 종료됐습니다",
@@ -711,6 +723,7 @@ fn tab_status_description(tab: &ShellTab) -> String {
 
 struct TabRowFrames {
     selection: NSRect,
+    mute: NSRect,
     close: NSRect,
     icon: NSRect,
     title: NSRect,
@@ -738,13 +751,17 @@ fn toolbar_frames(width: f64, show_stop: bool) -> ToolbarFrames {
 
 fn tab_row_frames(width: f64, collapsed: bool, y: f64) -> TabRowFrames {
     let available = (width - 4.0).max(0.0);
-    let gap = available.min(if collapsed { 2.0 } else { 4.0 });
-    let close_width = ((available - gap) / 2.0).min(if collapsed { 22.0 } else { 24.0 });
-    let selection_width = available - gap - close_width;
+    let controls = if collapsed { 1.0 } else { 2.0 };
+    let gap = (available / controls).min(if collapsed { 2.0 } else { 4.0 });
+    let close_width = ((available - gap * controls) / (controls + 1.0))
+        .min(if collapsed { 22.0 } else { 24.0 });
+    let mute_width = if collapsed { 0.0 } else { close_width };
+    let selection_width = available - gap * controls - close_width - mute_width;
     let icon_width = selection_width.min(16.0);
     TabRowFrames {
         selection: rect(2.0, y, selection_width, 36.0),
-        close: rect(2.0 + selection_width + gap, y + 2.0, close_width, 32.0),
+        mute: rect(2.0 + selection_width + gap, y + 2.0, mute_width, 32.0),
+        close: rect(2.0 + available - close_width, y + 2.0, close_width, 32.0),
         icon: rect(
             if collapsed {
                 2.0 + (selection_width - icon_width) / 2.0
@@ -1959,6 +1976,8 @@ define_class!(
         fn close_tab_row(&self, sender: &NSButton) {
             tab_row_action(sender, true);
         }
+        #[unsafe(method(toggleTabRowAudio:))]
+        fn toggle_tab_row_audio(&self, sender: &NSButton) { toggle_tab_row_audio(sender); }
         #[unsafe(method(selectSpace:))]
         fn select_space(&self, sender: &NSButton) {
             let index: isize = unsafe { msg_send![sender, tag] };
@@ -1977,6 +1996,18 @@ define_class!(
                 let card = shell.cards.get(usize::try_from(index).ok()?)?;
                 shell.spaces.iter().find(|space| space.id == card.space)
                     .and_then(space_stop_scope).map(ShellAction::StopSpace)
+            });
+            run_action(action);
+        }
+        #[unsafe(method(resumeSpace:))]
+        fn resume_space(&self, sender: &NSButton) {
+            let index: isize = unsafe { msg_send![sender, tag] };
+            let action = SHELL.with(|slot| {
+                let slot = slot.borrow();
+                let shell = slot.as_ref()?;
+                let card = shell.cards.get(usize::try_from(index).ok()?)?;
+                shell.spaces.iter().find(|space| space.id == card.space)
+                    .and_then(space_resume_scope).map(ShellAction::ResumeSpace)
             });
             run_action(action);
         }
@@ -2099,6 +2130,7 @@ define_class!(
                 }
             });
             layout();
+            restore_hidden_tab_mute_focus();
             trace_sidebar_surface_geometry();
             probe_sidebar_surface_getter();
         }
@@ -2172,6 +2204,16 @@ define_class!(
         #[unsafe(method(closeTab:))]
         fn close_tab(&self, _sender: Option<&AnyObject>) {
             run_action(active_tab().map(ShellAction::CloseTab));
+        }
+        #[unsafe(method(resumeTask:))]
+        fn resume_task(&self, _sender: Option<&AnyObject>) {
+            let action = SHELL.with(|slot| {
+                let slot = slot.borrow();
+                let shell = slot.as_ref()?;
+                shell.spaces.iter().find(|space| space.id == shell.active_space)
+                    .and_then(space_resume_scope).map(ShellAction::ResumeSpace)
+            });
+            run_action(action);
         }
         #[unsafe(method(stopTask:))]
         fn stop_task(&self, _sender: Option<&AnyObject>) {
@@ -4407,12 +4449,37 @@ impl Shell {
             .iter()
             .find(|space| space.id == self.active_space);
         let can_stop = !self.overview && space.and_then(space_stop_scope).is_some();
-        self.stop.setEnabled(can_stop);
-        self.stop.setHidden(!can_stop);
+        let can_resume =
+            !self.overview && !can_stop && space.and_then(space_resume_scope).is_some();
+        // The one toolbar button stops an active task or, once paused, returns
+        // it to the AI. The tag records which role it currently has.
+        let resume_role: isize = unsafe { msg_send![&*self.stop, tag] };
+        if can_resume != (resume_role == 1) {
+            if can_resume {
+                set_symbol(&self.stop, "play.fill", "", "재개", "AI에게 돌려주기");
+                unsafe { self.stop.setAction(Some(sel!(resumeTask:))) };
+            } else {
+                set_symbol(
+                    &self.stop,
+                    "stop.fill",
+                    "중지",
+                    "중지",
+                    "현재 공간의 AI 작업 중지",
+                );
+                unsafe { self.stop.setAction(Some(sel!(stopTask:))) };
+            }
+            unsafe {
+                let _: () = msg_send![&*self.stop, setTag: isize::from(can_resume)];
+            }
+        }
+        self.stop.setEnabled(can_stop || can_resume);
+        self.stop.setHidden(!(can_stop || can_resume));
         let text = if let Some(notice) = &self.notice {
             compact(notice, 100)
         } else if self.overview {
             "공간 보기".into()
+        } else if tab.is_some_and(|tab| tab.dialog_pending) {
+            "대화상자 대기".into()
         } else if can_stop {
             "AI 제어 중".into()
         } else if let Some(tab) = tab {
@@ -4696,12 +4763,16 @@ impl Shell {
         for (index, tab) in visible.into_iter().enumerate() {
             let name = tab_search::display_title(&tab.title, &tab.url);
             let selected = Some(tab.id) == self.active;
-            let symbol = tab_status_symbol(
-                tab.failure,
-                tab.audio_muted,
-                tab.stop_scope.is_some(),
-                tab.loading,
-            );
+            let symbol = if tab.dialog_pending {
+                "exclamationmark.bubble"
+            } else {
+                tab_status_symbol(
+                    tab.failure,
+                    tab.audio_muted,
+                    tab.stop_scope.is_some(),
+                    tab.loading,
+                )
+            };
             let status = tab_status_description(tab);
             let row = previous
                 .get(&tab.id)
@@ -4724,6 +4795,14 @@ impl Shell {
                     // fails. A plain click still uses selectTab: unchanged.
                     drag.setDelaysPrimaryMouseButtonEvents(true);
                     select_button.addGestureRecognizer(&drag);
+                    let mute = button(
+                        &self.tab_document,
+                        "",
+                        &self.target,
+                        sel!(toggleTabRowAudio:),
+                        "",
+                        marker,
+                    );
                     let close = button(
                         &self.tab_document,
                         "",
@@ -4735,6 +4814,7 @@ impl Shell {
                     set_symbol(&close, "xmark", "", "×", "탭 닫기");
                     unsafe {
                         let _: () = msg_send![&*select_button, setTag: tab.id as isize];
+                        let _: () = msg_send![&*mute, setTag: tab.id as isize];
                         let _: () = msg_send![&*close, setTag: tab.id as isize];
                     }
                     TabRow {
@@ -4742,6 +4822,7 @@ impl Shell {
                         space: tab.space.clone(),
                         button: select_button,
                         drag,
+                        mute,
                         close,
                         icon,
                         title,
@@ -4773,7 +4854,32 @@ impl Shell {
                 },
             ));
             row.button.setEnabled(!overlay_open);
+            row.mute.setHidden(self.sidebar_collapsed);
+            row.mute
+                .setEnabled(!overlay_open && !self.overview && !tab.crashed);
             row.close.setEnabled(!overlay_open && !self.overview);
+            let (mute_action, mute_state) = match tab.audio_muted {
+                Some(true) => ("음소거 해제", "음소거 설정됨"),
+                Some(false) => ("음소거", "음소거 설정 안 됨"),
+                None => ("음소거 설정 전환", "현재 설정 확인 전"),
+            };
+            set_symbol(
+                &row.mute,
+                if tab.audio_muted == Some(true) {
+                    "speaker.slash"
+                } else {
+                    "speaker"
+                },
+                "",
+                if tab.audio_muted == Some(true) { "음" } else { "소리" },
+                mute_action,
+            );
+            let mute_color = if tab.audio_muted == Some(true) {
+                accent_color()
+            } else {
+                NSColor::secondaryLabelColor()
+            };
+            row.mute.setContentTintColor(Some(&mute_color));
             for (control, hint, accessible) in [
                 (
                     &row.button,
@@ -4783,6 +4889,13 @@ impl Shell {
                         index + 1,
                         if selected { ", 선택됨" } else { "" },
                     ),
+                ),
+                (
+                    &row.mute,
+                    format!(
+                        "{mute_action}: {name}\n{mute_state}\n현재 설정을 확인한 뒤 전환합니다. 탭 선택과 AI 제어권을 유지합니다."
+                    ),
+                    format!("{}번째 탭 {mute_action}: {name}, {mute_state}", index + 1),
                 ),
                 (
                     &row.close,
@@ -4804,11 +4917,14 @@ impl Shell {
             .and_then(|responder| responder.downcast_ref::<NSView>())
             .is_some_and(|responder| {
                 previous.values().any(|row| {
-                    responder.isDescendantOf(&row.button) || responder.isDescendantOf(&row.close)
+                    responder.isDescendantOf(&row.button)
+                        || responder.isDescendantOf(&row.mute)
+                        || responder.isDescendantOf(&row.close)
                 })
             });
         for row in previous.into_values() {
             row.button.removeFromSuperview();
+            row.mute.removeFromSuperview();
             row.close.removeFromSuperview();
             row.icon.removeFromSuperview();
             row.title.removeFromSuperview();
@@ -4842,6 +4958,11 @@ impl Shell {
                     space.selected_tab,
                     space.active,
                     space.revision,
+                    space
+                        .tabs
+                        .iter()
+                        .filter(|id| self.tabs.iter().any(|tab| tab.id == **id && tab.dialog_pending))
+                        .count(),
                     space
                         .selected_tab
                         .or_else(|| space.tabs.first().copied())
@@ -4904,9 +5025,17 @@ impl Shell {
                     .filter(|title| {
                         !title.is_empty() && *title != space.name && *title != "about:blank"
                     });
-            let detail_text = representative_title
+            let dialogs = space
+                .tabs
+                .iter()
+                .filter(|id| self.tabs.iter().any(|tab| tab.id == **id && tab.dialog_pending))
+                .count();
+            let mut detail_text = representative_title
                 .map(|title| format!("탭 {}개, {}", space.tabs.len(), compact(title, 48)))
                 .unwrap_or_else(|| format!("탭 {}개", space.tabs.len()));
+            if dialogs > 0 {
+                detail_text.push_str(&format!(" · 대화상자 대기 {dialogs}"));
+            }
             let detail = label(&container, &detail_text, 11.0, false, marker);
             detail.setTextColor(Some(&NSColor::secondaryLabelColor()));
             let badge = surface_child(
@@ -4974,7 +5103,19 @@ impl Shell {
             );
             stop.setContentTintColor(Some(&accent_color()));
             stop.setFont(Some(&NSFont::systemFontOfSize(10.5)));
-            stop.setHidden(space_stop_scope(space).is_none());
+            if space_resume_scope(space).is_some() {
+                set_symbol(
+                    &stop,
+                    "play.fill",
+                    "",
+                    "재개",
+                    &format!("{} AI에게 돌려주기", space.name),
+                );
+                unsafe { stop.setAction(Some(sel!(resumeSpace:))) };
+                stop.setHidden(false);
+            } else {
+                stop.setHidden(space_stop_scope(space).is_none());
+            }
             unsafe {
                 let _: () = msg_send![&*open, setTag: index as isize];
                 let _: () = msg_send![&*preview_button, setTag: index as isize];
@@ -7799,6 +7940,7 @@ impl Shell {
             let y = 4.0 + index as f64 * TAB_ROW_HEIGHT;
             let frames = tab_row_frames(width, self.sidebar_collapsed, y);
             row.button.setFrame(frames.selection);
+            row.mute.setFrame(frames.mute);
             row.close.setFrame(frames.close);
             row.icon.setFrame(frames.icon);
             row.title.setFrame(frames.title);
@@ -9840,6 +9982,154 @@ fn tab_audio_target_is_current(target: &crate::browser::TabAudioTarget) -> bool 
     })
 }
 
+fn tab_audio_row_page(shell: &Shell, sender: &NSButton, id: i32) -> Option<(i32, String, u64)> {
+    if shell.sidebar_collapsed || shell.overview || shell.overlay_is_open() {
+        return None;
+    }
+    let row = shell
+        .tab_buttons
+        .iter()
+        .find(|row| row.id == id && std::ptr::eq(&*row.mute, sender))?;
+    if row.space != shell.active_space {
+        return None;
+    }
+    let tab = shell
+        .tabs
+        .iter()
+        .find(|tab| tab.id == row.id && tab.space == row.space && !tab.crashed)?;
+    Some((tab.id, tab.space.clone(), tab.navigation_epoch))
+}
+
+fn tab_audio_row_ui(sender: &NSButton) -> Option<(i32, String, u64)> {
+    let tag: isize = unsafe { msg_send![sender, tag] };
+    let id = i32::try_from(tag).ok()?;
+    let (page, selected, window, document) = SHELL.with(|slot| {
+        let slot = slot.try_borrow().ok()?;
+        let shell = slot.as_ref()?;
+        Some((
+            tab_audio_row_page(shell, sender, id)?,
+            shell.active,
+            shell.window.clone(),
+            shell.tab_document.clone(),
+        ))
+    })?;
+    if !window.isKeyWindow()
+        || !window.isVisible()
+        || window.isMiniaturized()
+        || !sender.isEnabled()
+        || sender.isHiddenOrHasHiddenAncestor()
+        || sender.window().as_deref() != Some(&*window)
+        || document.window().as_deref() != Some(&*window)
+        || !sender.isDescendantOf(&document)
+        || page_find_has_marked_text()
+    {
+        return None;
+    }
+    // The page itself may be hidden: only its current visible sidebar control
+    // grants this action. Recheck identity after the AppKit getters can reenter.
+    SHELL.with(|slot| {
+        let slot = slot.try_borrow().ok()?;
+        let shell = slot.as_ref()?;
+        (std::ptr::eq(&*shell.window, &*window)
+            && std::ptr::eq(&*shell.tab_document, &*document)
+            && shell.active == selected
+            && tab_audio_row_page(shell, sender, id).as_ref() == Some(&page))
+        .then_some(page)
+    })
+}
+
+fn tab_audio_row_target_is_current(
+    sender: &NSButton,
+    target: &crate::browser::TabAudioTarget,
+) -> bool {
+    tab_audio_row_ui(sender).is_some_and(|(tab, space, epoch)| {
+        tab == target.tab
+            && space == target.space
+            && epoch == target.navigation_epoch
+            && crate::browser::capture_tab_audio_row_target(tab, &space, epoch).as_ref()
+                == Ok(target)
+    })
+}
+
+fn toggle_tab_row_audio(sender: &NSButton) {
+    if TAB_AUDIO_QUERYING.with(|busy| busy.replace(true)) {
+        return;
+    }
+    let result = (|| {
+        let sender = SHELL.with(|slot| {
+            let slot = slot.try_borrow().ok()?;
+            slot.as_ref()?
+                .tab_buttons
+                .iter()
+                .find(|row| std::ptr::eq(&*row.mute, sender))
+                .map(|row| row.mute.clone())
+        })?;
+        let (tab, space, epoch) = tab_audio_row_ui(&sender)?;
+        let result = (|| {
+            let target = crate::browser::capture_tab_audio_row_target(tab, &space, epoch)?;
+            // A mouse action can finish address editing before it arrives.
+            // Preserve that draft before the getter's coalesced cache update.
+            preserve_address_for_overlay();
+            let expected = crate::browser::read_tab_audio(&target)?;
+            crate::browser::set_tab_audio_muted(&target, expected, !expected, || {
+                tab_audio_row_target_is_current(&sender, &target)
+            })
+        })();
+        Some(result)
+    })();
+    if let Some(Err(error)) = result {
+        SHELL.with(|slot| {
+            if let Ok(mut slot) = slot.try_borrow_mut() {
+                if let Some(shell) = slot.as_mut() {
+                    shell.notice = Some(error);
+                }
+            }
+        });
+        crate::browser::notify_panel();
+    }
+    // No tab selection, page focus, navigation or AI handoff is performed.
+    TAB_AUDIO_QUERYING.with(|busy| busy.set(false));
+}
+
+fn restore_hidden_tab_mute_focus() {
+    let window = SHELL.with(|slot| slot.borrow().as_ref().map(|shell| shell.window.clone()));
+    let Some(window) = window else {
+        return;
+    };
+    let Some(responder) = window.firstResponder() else {
+        return;
+    };
+    let Some(button) = responder.downcast_ref::<NSButton>() else {
+        return;
+    };
+    let fallback = SHELL.with(|slot| {
+        let slot = slot.try_borrow().ok()?;
+        let shell = slot.as_ref()?;
+        (std::ptr::eq(&*shell.window, &*window)
+            && shell.sidebar_collapsed
+            && !shell.overview
+            && !shell.overlay_is_open()
+            && shell
+                .tab_buttons
+                .iter()
+                .any(|row| std::ptr::eq(&*row.mute, button)))
+        .then(|| shell.sidebar_toggle.clone())
+    });
+    if let Some(fallback) = fallback {
+        if window.isKeyWindow()
+            && window.isVisible()
+            && !window.isMiniaturized()
+            && fallback.window().as_deref() == Some(&*window)
+            && window.firstResponder().as_deref() == Some(&*responder)
+            && button.isHiddenOrHasHiddenAncestor()
+            && !fallback.isHiddenOrHasHiddenAncestor()
+            && fallback.isEnabled()
+        {
+            window.makeFirstResponder(Some(&fallback));
+        }
+    }
+}
+
 fn prepare_tab_audio_menu(item: Retained<NSMenuItem>) {
     if TAB_AUDIO_QUERYING.with(|busy| busy.replace(true)) {
         return;
@@ -11302,6 +11592,13 @@ fn space_stop_scope(space: &crate::spaces::SpaceView) -> Option<TaskScope> {
     })
 }
 
+fn space_resume_scope(space: &crate::spaces::SpaceView) -> Option<TaskScope> {
+    (space.kind == "task" && space.status == "paused").then(|| TaskScope {
+        task: space.id.clone(),
+        revision: space.revision,
+    })
+}
+
 fn space_status(kind: &str, status: &str) -> &'static str {
     if kind == "user" {
         return "직접 탐색";
@@ -11350,6 +11647,7 @@ mod tests {
             failure: None,
             start_page: false,
             task_status: String::new(),
+            dialog_pending: false,
             stop_scope: None,
             space: space.into(),
             navigation_epoch: 1,
@@ -11421,10 +11719,12 @@ mod tests {
         tab.failure = Some(PageFailure::Renderer);
         assert_ne!(signature(&tab), healthy);
         assert_ne!(signature(&tab), failed_load);
-        // Recovery can retain renderer_exit while its projected failure is
-        // suppressed. The row follows that projection, not the raw crash flag.
+        // Recovery can suppress the failure icon while renderer_exit remains.
+        // The row still needs to disable its audio control for that renderer.
         tab.crashed = true;
         tab.failure = None;
+        assert_ne!(signature(&tab), healthy);
+        tab.crashed = false;
         assert_eq!(signature(&tab), healthy);
     }
 
@@ -11469,6 +11769,22 @@ mod tests {
         tab.loading = false;
         tab.audio_muted = Some(false);
         assert_eq!(tab_status_description(&tab), "직접 사용 중");
+    }
+
+    #[test]
+    fn pending_dialog_is_described_without_changing_other_status() {
+        let mut tab = numbered_tab_fixture(2, "task-1");
+        tab.task_status = "자료 조사, AI 제어 중".into();
+        tab.dialog_pending = true;
+        assert_eq!(
+            tab_status_description(&tab),
+            "자료 조사, AI 제어 중, 대화상자 응답 대기"
+        );
+        tab.loading = true;
+        assert_eq!(
+            tab_status_description(&tab),
+            "자료 조사, AI 제어 중, 대화상자 응답 대기, 불러오는 중"
+        );
     }
 
     #[test]
@@ -11683,6 +11999,7 @@ mod tests {
             failure: None,
             start_page: true,
             task_status: String::new(),
+            dialog_pending: false,
             stop_scope: None,
             space: "user".into(),
             navigation_epoch: 3,
@@ -11760,6 +12077,7 @@ mod tests {
             failure: Some(PageFailure::Load { code: -102 }),
             start_page: false,
             task_status: String::new(),
+            dialog_pending: false,
             stop_scope: None,
             space: "task-1".into(),
             navigation_epoch: 5,
@@ -12182,6 +12500,7 @@ mod tests {
                 failure: None,
                 start_page: false,
                 task_status: String::new(),
+                dialog_pending: false,
                 stop_scope: None,
                 space: handoff.space.clone(),
                 navigation_epoch: 5,
@@ -12575,6 +12894,7 @@ mod tests {
             failure: None,
             start_page: false,
             task_status: String::new(),
+            dialog_pending: false,
             stop_scope: None,
             space: "user".into(),
             navigation_epoch: 1,
@@ -12608,8 +12928,15 @@ mod tests {
                     <= frames.selection.origin.x + frames.selection.size.width
             );
             if !collapsed {
+                assert!(
+                    frames.selection.origin.x + frames.selection.size.width < frames.mute.origin.x
+                );
+                assert!(frames.mute.origin.x + frames.mute.size.width < frames.close.origin.x);
+                assert!(frames.mute.size.width >= 19.0);
                 assert!(frames.title.size.width > 0.0);
-                assert!(frames.title.origin.x + frames.title.size.width < frames.close.origin.x);
+                assert!(frames.title.origin.x + frames.title.size.width < frames.mute.origin.x);
+            } else {
+                assert_eq!(frames.mute.size.width, 0.0);
             }
         }
         let narrow = tab_row_frames(1.0, true, 0.0);
@@ -13219,6 +13546,7 @@ mod tests {
             sel!(revealDownloadSource:),
             sel!(revealPermissionSource:),
             sel!(toggleTabAudio:),
+            sel!(toggleTabRowAudio:),
             sel!(terminate:),
         ] {
             assert!(!is_page_edit_action(action));

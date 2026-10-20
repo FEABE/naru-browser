@@ -363,7 +363,7 @@ def run(args):
         require(node_page["truncated"].get("nodes") is True and "NODE_BOUNDARY_UNSEEN" not in json.dumps(node_page),
                 "Visited-node bound did not stop before the late shadow sentinel")
         roots_page = navigate(origin + "/caps/roots")
-        require(roots_page["truncated"].get("shadowRoots") is True and len(roots_page["interactive"]) <= 64,
+        require(roots_page["truncated"].get("shadowRoots") is True and len([item for item in roots_page["interactive"] if item.get("role") != "document"]) <= 64,
                 "Open shadow root bound did not stop after at most 64 roots")
         depth_page = navigate(origin + "/caps/depth")
         require(depth_page["truncated"].get("depth") is True and "DEPTH_BOUNDARY_UNSEEN" not in json.dumps(depth_page),

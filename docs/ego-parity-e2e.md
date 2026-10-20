@@ -4,7 +4,42 @@
 
 참고 기준은 [2026-10-11 실제 앱 비교](browser-comparison-2026-10-11.md)다. 당시 ego lite `0.5.1.13`에서 별도 AI 공간, 사용자 선택 유지, 작업 표시, 로컬 페이지 클릭과 입력을 관찰했다. Aside에서는 새 탭, 세로 탭, 북마크, 통합 검색과 중지 UI를 관찰했다. 당시 확인하지 않은 로그인, 모든 중지 경합, 전체 웹 호환성과 메모리 우열을 동등성 기준에 추가하지 않는다. 아래 항목은 그 관찰과 Naru의 제품 목표를 합친 지원 범위이며, 최신 ego lite의 전체 기능 목록을 복제한 표가 아니다.
 
-## 2026-10-20 v24 권한 취소와 포커스 보완, 최종 E2E 대기
+## 2026-10-20 M7 최종 통합 검증 (release 빌드 1회, 앱 SHA-256 `e36b0dd5...0ff0`)
+
+이 절은 M0~M5 미커밋 트리에서 `NARU_MOCK_KEYCHAIN=1 scripts/dev.sh --release --build-only`로 한 번 만든 번들의 결과다. 앱 `Contents/MacOS/light-browser` SHA-256은 `e36b0dd51f1374fef002f6b6d6d50b9ed4d2cc335e25d17e321b1685b8860ff0`, 번들 CLI는 `1b0a53d515853483e7bcb7ed9a7264d014aff648c4b6dc27ff33d7887373f5fc`다([빌드 기록](../artifacts/m7-20261020/build-receipt.json)). 아래 모든 실행은 이 번들과 새 mock-keychain 프로필(`.local-data/e2e-m7-run`)로 했고 재빌드는 없었다. 이전 바이너리(v14~v24, M5 빌드)의 통과는 옮기지 않았다. 외부 사이트, 실제 프로필과 로그인은 사용하지 않았다. 결과 원본은 `artifacts/m7-20261020/`다.
+
+정적 검사: `cargo test --locked --lib` 451개 통과, `cargo check --locked --bins` 통과(기존 경고 1개), `git diff --check` 통과, `lightbrowser skill` 출력 끝이 `[lightbrowser:skill] end of guide`. `node --test tests/dom_bridge.test.mjs`는 146개 중 119 통과, 27 실패이며 실패 이름 27개는 HEAD의 코드·테스트로 돌린 기준선(137개 중 110 통과, 27 실패)과 동일하고 새 실패 이름은 없다(`node-failing-tests*.txt`).
+
+로컬 CEF 스모크(모두 위 바이너리, exit 0): single_window, spaces, tasks, navigation, navigation_recovery, wait, dialog(마지막에 `--quit-pid`로 SIGTERM 종료 확인), stop, geolocation_hidden(`--expect-fixed`), native_click, native_fill, native_press, select, check, insert_text, contenteditable, scroll_target, frame_journey, download_permissions, resources, restart(앱 2회 실행, 정상 종료). `shadow_smoke`는 첫 실행에서 `interactive <= 64` 단언이 실패했다. 원인은 v19부터 읽기 결과에 들어간 `document` 스크롤 대상 1개를 세는 하네스 단언이었고(65개 = document 1 + 루트 버튼 64, `truncated.shadowRoots`는 true) 제품 결함이 아니라 `document` 역할을 제외하도록 하네스를 고쳐 같은 바이너리에서 재실행해 통과했다. `e2e_v17_j05`는 프로필 경로가 하드코딩돼 있어 경로만 바꾼 임시 사본으로 같은 바이너리에서 실행해 전 단계 통과했다. `e2e_v17_j09`(네이티브 저장창 필요), `j11`(외부 사이트), `j13`(하드코딩된 v17 프로필·앱 직접 실행; restart_smoke로 일부 대체)과 `frame_crash_smoke`는 실행하지 않았다.
+
+| 여정 | 이 바이너리에서 실행한 것 | 판정 | 남은 일 |
+| --- | --- | --- | --- |
+| 01 시작과 사람 공간 보존 | single_window, spaces, tasks 스모크: 공간·선택·단일 창 메타데이터, 배경 열기 중 사용자 선택 유지 | pass (CLI·로컬 CEF 범위) | 실제 네이티브 창 개수, 마우스 선택, 팝업은 네이티브 확인 미실행 |
+| 02 주소 입력부터 탐색과 중지 | navigation, navigation_recovery, stop 스모크(open 직후 stop, 부분 본문 stop, 작업 탭 stop, 이어진 navigate) | pending | 주소창 입력, 일반 검색어, 도구 막대 중지 버튼 클릭, 뒤로·앞으로는 네이티브 미실행 |
+| 03 탭·검색·북마크·방문 기록 | 실행 안 함 | pending | 네이티브 UI 필요 |
+| 04 두 AI 작업의 배경 탐색 | tasks, spaces, wait, resources 스모크: 작업별 탭 분리, open·wait·read·screenshot, 사용자 선택 유지, wait 시간 초과는 오류 | pass (CLI·로컬 CEF 범위) | 두 작업 동시 대규모 부하는 14번에서 |
+| 05 사람의 인계와 AI 중지 | e2e_v17_j05 사본(CLI 반쪽): 인계·재개 revision 보호, 진행 중 wait의 TASK_CONTROL_LOST, B 계속 동작, 사용자 상태 불변. tasks·dialog 스모크의 handoff 정리 | pending | 본문 직접 입력으로 인한 A만 중지, UI 중지 버튼은 네이티브 미실행 |
+| 06 클릭과 폼 값 변경 | native_click, native_fill, select, check, insert_text, contenteditable 스모크 | pass (CLI·로컬 CEF 범위) | 보이는 사용자 탭 대상의 실제 포인터 확인, IME는 미실행 |
+| 07 키 이동과 다음 대상 읽기 | native_press 스모크(42개 키 형식, SelectAll·단어·줄 이동·삭제, preventDefault, Undo·Redo) | pass (CLI·로컬 CEF 범위) | 실제 키보드 포커스·IME는 미실행 |
+| 08 iframe과 Shadow DOM | frame_journey, shadow(하네스 수정 후), scroll_target 스모크 | pending | 이 문서의 08 목록 중 이번에 개별 확인하지 않은 항목(read-page 통합 예산, OOPIF 한계 등) 대조가 남음. 위 스모크 자체는 통과 |
+| 09 파일 다운로드·선택·저장 | download_permissions 스모크(권한 수명, 은닉 요청, 인계·이동·종료 정리) | pending | 네이티브 저장창·파일 선택창·Finder 표시, 오류 후 다시 받기 UI 미실행 |
+| 10 한국어 입력과 화면 사용성 | 실행 안 함 | pending | 네이티브 UI, IME 필요 |
+| 11 공개 사이트와 로그인 서비스 | 실행 안 함(외부 사이트·로그인 금지) | blocked | 사용자가 직접 로그인할 서비스 필요 |
+| 12 실패한 페이지 복구 | navigation_recovery, stop 스모크(실패 안내, 명시적 reload, 배경 AI 실패, 선택 보존) | pending | 지연 로딩 안내와 식별 가능한 렌더러 종료(frame_crash_smoke 미실행) 확인이 남음 |
+| 13 종료와 재시작 | restart_smoke(같은 바이너리 2회 실행, 쿠키·localStorage 보존, 정상 종료), dialog `--quit-pid` SIGTERM 종료 | pending | 북마크·방문 기록 보존, 무한 종료 대기 부재의 반복(j13)은 미실행 |
+| 14 지속 사용과 정리 | `measure-memory.py` 5회 표본(약 8초), 모든 스모크 뒤 자원 카운터 복귀 | pending | 60분 연속 사용은 실행하지 않음. 짧은 표본의 RSS 합 748MiB는 고유 RAM이 아니며 증가 여부를 판단할 수 없다 |
+
+이 표로 독립 브라우저 완성을 선언하지 않는다. pass는 CLI와 로컬 CEF 자동화 범위이며, P0 중 02·05·08·09·12·13·14는 pending, 11은 blocked다. 네이티브 AppKit 확인, 외부 사이트, IME, 장시간 메모리는 이 실행에서 하지 않았다.
+
+## 2026-10-20 M5 일상 결함 점검 (v24 이후 미커밋 트리의 별도 빌드)
+
+이 절은 v24 바이너리의 결과가 아니라 M0~M3 미커밋 변경을 포함한 새 release 빌드(해시는 `artifacts/m5-20261020/binary-sha256.txt`)의 로컬 CEF 결과다. 위 v22~v24 결과와 합산하지 않는다.
+
+- 숨긴 AI 탭의 위치 재요청: 보완 전 바이너리에서 재요청 1건을 재현했고(`geolocation-baseline-before-fix.json`), 보완 뒤 재요청 0건과 페이지 error-code-1을 확인했다(`geolocation-after-fix.json`). 보이는 탭에서 취소한 뒤 의도적 재요청은 카드가 다시 뜬다. 사용자 DISMISS 버튼과 네이티브 패널은 CLI로 누를 수 없어 IGNORE 취소 경로로 확인했다. 원인과 한계는 [사이트 권한](site-permissions.md).
+- 첫 로딩 중지의 NAVIGATION_BUSY: CLI 경로(`open` 직후 `stop`, 초기 탭 `navigate` 직후 `stop`, 부분 본문, 작업 소유 탭)에서 재현하지 못했다. 네이티브 도구 막대 중지 버튼은 이 환경에서 누르지 못해 미실행이며 항목은 열려 있다. [새로고침과 로딩 중지](reload-stop.md).
+- 주소창과 시작 화면 사이 Tab 순서, 사이드바 모서리 잘림: 소스 조사만 했고 네이티브 확인은 미실행이다. [새 탭 화면](start-page-design.md).
+
+## 2026-10-20 v24 권한 취소와 포커스 보완
 
 v22 후속 실행은 알림 취소의 default 반환, 허용의 granted 반환과 새 문서의 저장 상태, 초기화 뒤 default를 확인했다. 실제 알림은 발송하지 않았다. 배경 AI 요청의 사용자 선택 보존, 명시적 요청 탭 보기, 인계와 재개, 문서 이동, 미디어 취소, 같은 출처 프레임 이동과 제거, 실제 대기 4개와 초과 거절, 탭과 작업 종료의 정리도 확인했다. 검색 패널 전환 뒤 주소 초안은 유지됐다. 보이는 페이지의 위치 취소는 실패했으며 패널을 닫으면 같은 JavaScript 조회에서 새 토큰이 왔다.
 
@@ -12,13 +47,14 @@ v23은 권한 패널 뒤 CEF의 가시성을 유지했다. 보이는 사용자 �
 
 v24는 Tab 후보를 찾지 못할 때 같은 패널과 responder를 재확인하고 닫기로 복귀하도록 보완했다. 좁은 콜백 단위 검사 1개와 v23, v24 release 빌드는 통과했다. [v24 빌드 기록](../artifacts/e2e-v24-site-permissions-20261020/build-receipt.json)의 앱 SHA-256은 `d85545bfbfbc6596b2b7e6a8fac94342369b50394e40f15a594fc977a73833cc`, CLI는 `43cf93734ff8020416472b90f5ce760ac2d15e184ec4759f4adf7a2ff714caba`다. 제품과 빌드 파일 103개 및 바이너리 해시는 빌드와 정리 시 같았다.
 
-v24에서 자체 HTTP 페이지 열기와 위치 pending 1, 사용자 공간과 선택 탭 1, 활성 미디어 없음을 확인했다. 사용자 요청으로 커밋을 우선하며 앱과 fixture 서버를 정상 종료했다. 다음 항목은 **v24에서 미실행**이다.
+v24 최초 실행에서는 자체 HTTP 페이지 열기와 위치 pending 1까지만 확인하고 커밋을 우선했다. `56e8ce4` 푸시 뒤 같은 바이너리를 별도 합성 프로필로 실행해 다음 항목을 추가 확인했다. 제품과 빌드 파일 103개도 검사 완료까지 같았다.
 
-- 권한 패널의 Tab과 Shift-Tab 이후 포커스, 패널 뒤 페이지의 포인터 차단.
-- 보이는 페이지의 위치 취소 결과와 패널을 닫은 뒤 재접수 여부.
-- 변경한 패널에서 알림 허용과 초기화, 미디어 취소의 페이지 결과.
+- 권한 패널의 Tab과 Shift-Tab 각 6회에서 닫기 포커스를 유지했다. AX와 네이티브 로그 12개 모두 페이지가 입력 대상이 아님을 확인했다.
+- 패널 뒤 알림 상태 버튼과 겹치는 한 위치를 클릭해도 페이지 이벤트가 없었다.
+- 새 문서의 위치 요청 취소는 error-code-1, pending 0이었다. 패널을 닫아도 재접수되지 않았다. 앞선 포커스 검사 중 발생한 fixture의 15초 시간 초과는 이 성공에 포함하지 않았다.
+- 알림 허용은 granted, 초기화 뒤 상태 조회는 default였다. 실제 알림은 발송하지 않았다. 카메라와 마이크 취소는 NotAllowedError, 활성 미디어 없음, pending 0이었다.
 
-숨긴 AI 탭의 원래 위치 조회 종료는 구현상 미해결이다. 실제 OS 기기 권한과 미디어, 외부 사이트, IME와 장시간 메모리도 미검증이다. 전체 회귀와 모의 DOM 검사는 반복하지 않았다. 09번 여정과 전체 목표는 pending이며 [작업 기록](work-log.md)에 바이너리별 결과와 정리를 남겼다.
+원문은 `artifacts/e2e-v24-permissions-followup-20261020/`에 있다. 숨긴 AI 탭의 원래 위치 조회 종료는 구현상 미해결이다. 실제 OS 기기 권한과 미디어, 외부 사이트, IME와 장시간 메모리도 미검증이다. 전체 회귀와 모의 DOM 검사는 반복하지 않았다. 09번 여정과 전체 목표는 pending이며 [작업 기록](work-log.md)에 바이너리별 결과와 정리를 남겼다.
 
 ## 2026-10-20 v22 사이트 권한 구현과 부분 확인
 

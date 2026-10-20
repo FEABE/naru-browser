@@ -64,7 +64,11 @@ flowchart LR
 
 | 명령 | 의미 |
 | --- | --- |
-| `task create NAME` | revision 1인 active 작업 생성 |
+| `task create NAME` | revision 1인 active 작업 생성. 같은 이름의 active/paused 작업이 있으면 새로 만들지 않고 그 작업을 `resumed:true`로 반환(paused는 상태·revision 변경 없이 반환하므로 제어권을 가져가지 않으며 `task resume`을 따로 호출). finishing/finished는 이어받지 않음 |
+| `task wait ID [TIMEOUT_MS] [--since REV]` | 호출 시점의 작업 상태(상태, revision, 소유 탭, 닫는 중인 탭)가 바뀔 때까지 대기(기본 10000, 1..30000ms). `--since REV`는 현재 revision이 다르면 기다리지 않고 즉시 `changed:true`. 바뀌면 `{task,changed:true}`, 제한 시간이면 `WAIT_TIMEOUT`(details.task), finished는 즉시 `changed:false`. 탭 소실은 revision을 바꾸지 않으므로 대기 중일 때만 감지. 50ms UI tick은 대기가 있는 동안만 쓰며 대기 하나가 연결 worker 슬롯(16개) 하나를 제한 시간까지 차지한다. 슬롯 초과 연결은 응답 없이 끊겨 클라이언트는 `INCOMPLETE_FRAME`(outcomeUnknown)을 받고, 끊긴 클라이언트의 대기는 자기 제한 시간까지 남는다 |
+| 네이티브 "AI에게 돌려주기" | paused 작업의 공간 카드와 해당 공간 도구 모음의 버튼(`ShellAction::ResumeSpace`). 렌더 시점의 revision으로 `task resume`과 같은 경로를 호출하며 오래된 revision은 `TASK_STALE_REVISION`으로 거부. 사용자의 현재 공간·선택은 바꾸지 않음. 중지 버튼 동작은 그대로 |
+| `skill` | `docs/agent-cli-guide.md`를 `include_str!`로 내장해 출력. 앱 없이 동작하며 마지막 줄은 `[lightbrowser:skill] end of guide` |
+| `wait TAB url PREFIX\|text SUBSTR [TIMEOUT_MS]` | 기존 탭 `wait`의 확장(`WaitUntil::Url{prefix}`, `Text{substring}`; 값은 1..4096바이트, NUL 불가). 같은 `Waiter`, 50ms 틱, 절대 기한을 쓰며 새 상주 타이머가 없다. `url`은 CDP 없이 네이티브 메인 프레임 URL(`frame.url()`)을 commit된 문서(`committed && !provisional`)에서 접두사 비교하며 기한과 같은 틱이면 일치가 우선한다. `text`는 `dom`과 같은 단일 in-flight 프로브(`getFrameTree`→격리 world→`Runtime.evaluate`)로 `dom_bridge.js`의 읽기 전용 `containsText`를 실행해 `found`일 때만 완료하고 `absent`·`loading`·예외·검사 실패는 프로브만 풀어 기한까지 재시도한다. 프로브 중 문서 epoch가 바뀌면 `PAGE_CHANGED`로 프로브만 버리고 새 문서를 다시 검사한다. 성공 응답에 `matched:"url"\|"text"`, 시간 초과는 `WAIT_TIMEOUT`(details.until/expected/navigationContinues). `task run` 소유권 검사와 `TASK_CONTROL_LOST`는 기존 wait와 같다 |
 | `task list`, `task info ID` | 앱에 남아 있는 작업 상태 조회 |
 | `task run ID REV COMMAND...` | 해당 작업의 현재 제어권으로 기존 명령 실행 |
 | `task adopt ID REV TAB` | 기존 탭을 borrowed로 연결 |
@@ -169,7 +173,7 @@ CEF clip은 최대 240×150 포인트를 목표로 축소 요청한다. 수신 P
 
 네이티브 파일 메뉴의 `현재 주소를 내 공간 새 탭에서 열기`는 현재 보이는 탭의 식별자, 공간, 탐색 세대와 주소를 대상으로 잡는다. 런타임은 실제 main frame 주소와 상태를 재검증하고 사용자 탭을 배경에 생성한 뒤 성공 시 선택한다. 원본 AI 작업을 handoff하거나 페이지 문서를 복제하지 않는다. 생성 중 화면 또는 소유권이 바뀌면 오래된 선택을 실행하지 않고, 정리 대상은 이번에 만든 아직 소유되지 않은 사용자 탭으로 제한한다. 메뉴와 런타임 경계, 실제 검증의 남은 범위는 [동작 계약](open-current-page.md)을 따른다.
 
-`open`과 탐색 명령은 요청 수락을 반환한다. `wait dom`은 현재 문서의 파싱 상태를, `wait load`는 전체 로딩 완료를 확인한다. 네트워크 실패, 204 응답, 명시적 stop을 이전 문서의 준비 상태와 구분한다. 시간 초과는 탐색이나 탭을 자동으로 취소하지 않는다.
+`open`과 탐색 명령은 요청 수락을 반환한다. `wait dom`은 현재 문서의 파싱 상태를, `wait load`는 전체 로딩 완료를, `wait url`은 네이티브 메인 프레임 주소 접두사를, `wait text`는 `read`와 같은 예산의 보이는 본문 텍스트 포함 여부를 확인한다. 네트워크 실패, 204 응답, 명시적 stop을 이전 문서의 준비 상태와 구분한다. 시간 초과는 탐색이나 탭을 자동으로 취소하지 않는다.
 
 [CLI 상태 관측](cli-state-observation.md)은 native 값의 조회와 JSON 조립을 분리한다. 실제 main-frame URL을 유지하며 조회 전후의 Browser, 문서, 로딩 세대와 작업 권한을 확인한다. 탭 목록은 부분 결과를 성공으로 반환하지 않고 대기는 원래 마감 시간을 유지한다. 생성 후 조회 실패는 생성된 탭 ID를 명시하며, 대기 만료 때 상태 관측을 확정하지 못하면 `stateUnavailable:true`로 구분한다.
 
@@ -206,6 +210,12 @@ read는 메인 문서와 열린 Shadow DOM의 본문, 조작 가능한 요소와
 후속 포인터 경로는 로컬 요소와 부모별 content box·viewport를 교차해 clip을 구한 뒤 최대 9개 후보를 부모의 hit-test로 거른다. leaf의 특정 위치와 루트 전송 위치를 분리하며 mouseMoved 뒤 원 local point, 모든 부모와 같은 root point를 다시 확인한 다음 hover를 끝내거나 click 두 이벤트를 보낸다. 후보를 찾지 못하면 leaf scrollIntoView 한 번 후 전체 기하를 다시 측정하며 이동 후 스크롤·후보 재선택·입력 재시도는 없다. 각 부모의 객체를 순차 해제하고 원 target으로 돌아올 때 Runtime replay로 unique context를 재확인한다. `src/frame_pointer.rs`는 유한 수치·공유 clip·후보 부분집합을 검증한다. 이 순차 검사는 레이아웃과 입력을 원자적으로 묶지 않으며 지연 focus 경합도 예방하지 않는다. 회전·skew·perspective·pinch는 미지원이다. 단일 문서 상한과 read-page 공통 예산을 구분하며 약한 refs의 world별 메타데이터는 world 수명까지 남을 수 있다. [입력 계약](frame-input.md)과 [고정 엔진 조사](../artifacts/frame-input-v1-sources.json)에 범위를 기록한다. 실제 Naru CEF·외부 사이트·E2E는 실행하지 않았으며 최신 빌드 근거는 [체크리스트](ego-parity-e2e.md)를 따른다.
 
 접근 가능한 iframe은 최대 16개 문서 슬롯과 중첩 8단계에서 contentDocument 조회 전에 제한한다. 기존 노드, 텍스트, 참조와 옵션 예산은 전체 문서가 공유한다. ref에는 원래 소속 문서와 부모 iframe 연결을 묶고 focus, keydown 뒤에도 문서 identity와 가용성을 확인한다. document별 isolated realm과 자원 경계, 미검증 범위는 [iframe 관찰과 입력](iframe-control.md)에 기록한다.
+
+## JavaScript 대화상자
+
+CEF `JsdialogHandler`(`src/dialog_runtime.rs`)가 `alert`, `confirm`, `prompt`와 `beforeunload`를 소유권으로 분기한다. 작업이 Active로 소유한 탭은 콜백을 UI 스레드의 대기열(`src/dialogs.rs`, 탭당 1개, 전체 4개)에 보관해 네이티브 대화상자를 만들지 않는다. 사용자 공간 탭과 중지된(사용자 제어) 작업 탭은 `false`를 반환해 CEF 기본 대화상자를 쓴다. 마무리 중인 작업 탭은 닫기가 멈추지 않도록 즉시 처리한다. 상세 계약과 한계는 [dialog-control.md](dialog-control.md)를 따른다.
+
+대화상자가 열린 탭은 렌더러가 멈추므로 `handle`이 `Close`와 `Stop` 외의 탭 명령을 `DIALOG_PENDING`으로 즉시 거절하고, 대기열에 넣는 순간 그 탭의 진행 중 요청과 `wait`도 같은 코드로 끝낸다. 콜백 `cont`는 공유 상태나 AppKit 호출을 잡은 채 실행하지 않는다. 사이드바 행과 공간 카드는 `ShellTab.dialog_pending`으로 대기 표시를 그리며 공간이나 선택은 바꾸지 않는다.
 
 ## 임시 페이지 포커스와 입력 수명
 

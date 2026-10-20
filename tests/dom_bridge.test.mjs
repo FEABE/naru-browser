@@ -3051,3 +3051,132 @@ test("Chromium fill cannot verify an unchanged matching value after focus moves 
   assert.equal(f.document.activeElement, other);
   assert.deepEqual(input.events, []);
 });
+
+// containsText backs `wait TAB text SUBSTR`: a read-only, budgeted membership
+// check over the same visible text that `read` would return.
+function bodyOf(f) {
+  f.document.body.textContent = "";
+  return f;
+}
+
+test("containsText matches visible whitespace-collapsed text across nodes and is case-sensitive", () => {
+  const f = bodyOf(fixture());
+  f.add("DIV").textContent = "  Order   confirmed ";
+  f.add("DIV").textContent = "Thank you";
+  const found = (needle) => f.bridge.containsText(needle);
+  assert.deepEqual({ ...found("Order confirmed") }, { ok: true, found: true, truncated: false });
+  assert.deepEqual({ ...found("nothing here") }, { ok: true, found: false, truncated: false },
+    "a complete scan that finds nothing is not reported as truncated");
+  assert.equal(found("Order   confirmed").found, true, "needle whitespace is collapsed like read text");
+  assert.equal(found("confirmed Thank").found, true, "adjacent nodes join with one space like read");
+  assert.equal(found("order confirmed").found, false, "case-sensitive");
+  assert.equal(found("missing").found, false);
+  assert.equal(f.bridge.read().text.includes("confirmed Thank"), true);
+});
+
+test("containsText rejects non-string and blank needles without reading the page", () => {
+  const f = bodyOf(fixture());
+  f.add("DIV").textContent = "hello";
+  for (const needle of [undefined, null, 5, {}, "", "   \n\t"]) {
+    const result = f.bridge.containsText(needle);
+    assert.equal(result.ok, false);
+    assert.equal(result.error, "INVALID_TEXT");
+  }
+});
+
+test("containsText ignores hidden, inert-like and non-text content", () => {
+  const f = bodyOf(fixture());
+  const hiddenProp = f.add("DIV"); hiddenProp.hidden = true; hiddenProp.textContent = "HIDDEN_ATTR";
+  f.add("DIV", { "aria-hidden": "true" }).textContent = "ARIA_HIDDEN";
+  const none = f.add("DIV"); none.style.display = "none"; none.textContent = "DISPLAY_NONE";
+  const invisible = f.add("DIV"); invisible.style.visibility = "hidden"; invisible.textContent = "VISIBILITY_HIDDEN";
+  const host = f.add("DIV");
+  f.add("BUTTON", {}, host.attachShadow({ mode: "closed" })).innerText = "CLOSED_ROOT";
+  for (const tag of ["SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE", "CANVAS"]) f.add(tag).textContent = `TAG_${tag}`;
+  f.add("DIV").textContent = "VISIBLE_ONE";
+  for (const needle of ["HIDDEN_ATTR", "ARIA_HIDDEN", "DISPLAY_NONE", "VISIBILITY_HIDDEN", "CLOSED_ROOT", "TAG_"]) {
+    assert.equal(f.bridge.containsText(needle).found, false, needle);
+  }
+  assert.equal(f.bridge.containsText("VISIBLE_ONE").found, true);
+});
+
+test("containsText searches open shadow roots and accessible same-origin frames only", () => {
+  const f = bodyOf(fixture());
+  f.text("MAIN_TEXT");
+  const root = f.add("DIV").attachShadow({ mode: "open" });
+  f.text("OPEN_SHADOW_TEXT", root);
+  const { child } = embed(f);
+  child.text("CHILD_FRAME_TEXT");
+  const blocked = f.add("IFRAME", { title: "blocked" });
+  Object.defineProperty(blocked, "contentDocument", { get() { throw new Error("BLOCKED_SENTINEL"); } });
+  for (const needle of ["MAIN_TEXT", "OPEN_SHADOW_TEXT", "CHILD_FRAME_TEXT"]) {
+    assert.equal(f.bridge.containsText(needle).found, true, needle);
+  }
+  const result = f.bridge.containsText("BLOCKED_SENTINEL");
+  assert.equal(result.ok, true);
+  assert.equal(result.found, false);
+  assert.ok(!JSON.stringify(result).includes("BLOCKED_SENTINEL"));
+});
+
+test("containsText keeps the read text budget and reports truncation", () => {
+  const f = bodyOf(fixture());
+  f.text("x".repeat(11975));
+  f.text("tail-inside");
+  f.text("beyond-budget-marker");
+  const inside = f.bridge.containsText("tail-inside");
+  assert.equal(inside.found, true);
+  const outside = f.bridge.containsText("beyond-budget-marker");
+  assert.equal(outside.ok, true);
+  assert.equal(outside.found, false, "text past the 12000 unit read budget is not searched");
+  assert.equal(outside.truncated, true);
+  assert.equal(f.bridge.read().text.includes("beyond-budget-marker"), false);
+});
+
+test("containsText stops at the node-visit budget", () => {
+  const f = bodyOf(fixture());
+  for (let index = 0; index < 10005; index += 1) f.add("SPAN").textContent = "";
+  f.add("SPAN").textContent = "AFTER_NODE_BUDGET";
+  const result = f.bridge.containsText("AFTER_NODE_BUDGET");
+  assert.equal(result.ok, true);
+  assert.equal(result.found, false);
+  assert.equal(result.truncated, true);
+});
+
+test("containsText finds a needle that straddles incremental scan boundaries", () => {
+  const f = bodyOf(fixture());
+  for (const part of ["ab", "cd", "ef", "gh"]) f.text(part);
+  assert.equal(f.bridge.containsText("cd ef").found, true);
+  assert.equal(f.bridge.containsText("ab cd ef gh").found, true);
+  assert.equal(f.bridge.containsText("abcd").found, false);
+});
+
+test("containsText leaves refs, generation and page state untouched", () => {
+  const f = bodyOf(fixture());
+  const button = f.add("BUTTON", { "aria-label": "Go" });
+  f.text("hello");
+  const page = f.bridge.read();
+  assert.equal(f.bridge.containsText("hello").found, true);
+  assert.equal(f.bridge.containsText("hello").found, true);
+  assert.equal(f.bridge.read().generation, page.generation + 1, "containsText performs no read generation bump");
+  const again = f.bridge.read();
+  const result = f.bridge.act({ action: "click", ref: again.interactive[0].ref, inspectOnly: true });
+  assert.notEqual(result.error, "STALE_REF");
+  assert.deepEqual(button.events, []);
+  assert.equal(Object.isFrozen(f.bridge), true);
+});
+
+test("containsText contains getter failures without echoing page exception text", () => {
+  const f = bodyOf(fixture());
+  const node = f.add("DIV");
+  node.textContent = "text";
+  const getAttribute = node.getAttribute;
+  node.getAttribute = () => { throw new Error("ATTRIBUTE_GETTER_SENTINEL"); };
+  const result = f.bridge.containsText("text");
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "TEXT_CHECK_FAILED");
+  assert.ok(!JSON.stringify(result).includes("SENTINEL"));
+  // The failed check restores context state: a later read still works.
+  node.getAttribute = getAttribute;
+  assert.equal(f.bridge.read().text.includes("text"), true);
+  assert.equal(f.bridge.containsText("text").found, true);
+});

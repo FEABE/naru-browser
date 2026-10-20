@@ -7,7 +7,7 @@ use crate::protocol::{self, Command, Request, Response, TaskScope, WaitUntil};
 use crate::resources::{MAX_AUTOMATION_TABS, ResourceBudget};
 use crate::spaces::{Spaces, USER_SPACE};
 use crate::start_page::StartPageTarget;
-use crate::tasks::{Origin, Registry, Status, TaskError};
+use crate::tasks::{Origin, Registry, Status, TaskError, TaskView};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use cef::*;
 use serde_json::{Value as Json, json};
@@ -1227,6 +1227,23 @@ struct Waiter {
     timeout_ms: u64,
     started: Instant,
     probe_in_flight: bool,
+    /// Last text probe found nothing but the bridge hit a read budget.
+    text_truncated: bool,
+    reply: Reply,
+}
+
+/// `task wait`: compares the task against the view captured at admission.
+/// It holds no timer while idle; a 50 ms UI tick exists only while a wait is
+/// outstanding. Each wait occupies one of the 16 connection worker slots until
+/// it ends or times out; connections beyond the cap are dropped without a
+/// response (the client sees INCOMPLETE_FRAME with an unknown outcome). A
+/// disconnected client's waiter stays until its own timeout.
+#[derive(Clone)]
+struct TaskWaiter {
+    task: String,
+    baseline: TaskView,
+    timeout_ms: u64,
+    started: Instant,
     reply: Reply,
 }
 
@@ -1482,6 +1499,7 @@ struct State {
     captures: BTreeMap<i32, i32>,
     creations: ResourceBudget,
     waits: BTreeMap<u64, Waiter>,
+    task_waits: BTreeMap<u64, TaskWaiter>,
     next_message: i32,
 }
 impl State {
@@ -1494,6 +1512,7 @@ impl State {
 thread_local! { static STATE: RefCell<State> = RefCell::new(State::default()); }
 
 pub fn clear() {
+    crate::dialog_runtime::clear();
     crate::site_permission_runtime::clear();
     crate::file_selection_runtime::clear();
     crate::download_permission_runtime::clear();
@@ -1518,6 +1537,132 @@ pub(crate) struct FileSelectionContext {
     pub scope: TaskScope,
     pub generation: u64,
     pub source: String,
+}
+
+/// Route a JavaScript dialog by tab ownership. Only an Active task tab queues
+/// the dialog for the CLI; user tabs and paused (user-controlled) tabs keep
+/// CEF's native dialog, and finishing tabs never block their close.
+pub(crate) fn dialog_disposition(tab: i32) -> crate::dialog_runtime::Disposition {
+    use crate::dialog_runtime::Disposition;
+    let closing = crate::dialog_runtime::is_closing(tab);
+    STATE.with(|slot| {
+        let state = slot.borrow();
+        let Some(page) = state.tabs.get(&tab) else {
+            return Disposition::Default;
+        };
+        if page.rejected_creation {
+            return Disposition::AutoClose;
+        }
+        let task = state
+            .tasks
+            .owner(tab)
+            .and_then(|(task, _)| state.tasks.info(&task).ok());
+        match task.map(|task| task.status) {
+            None => Disposition::Default,
+            Some(Status::Active) if closing => Disposition::AutoClose,
+            Some(Status::Active) => Disposition::Queue,
+            Some(Status::Paused) => Disposition::Default,
+            Some(Status::Finishing | Status::Finished) => Disposition::AutoClose,
+        }
+    })
+}
+
+/// A dialog was queued: the blocked renderer can no longer answer requests that
+/// were already in flight for this tab, so fail them now instead of hanging.
+pub(crate) fn dialog_opened(tab: i32, dialog: Json) {
+    // The blocked renderer cannot acknowledge input or focus cleanup until the
+    // dialog is answered. Answer the CLI now so it can call dialog, then let the
+    // lease finish its cleanup after the renderer resumes (focus_timeout waits
+    // while a dialog is pending). Its later deferred reply is a no-op.
+    let lease = STATE.with(|slot| {
+        slot.borrow().focus_leases.get(&tab).map(|lease| {
+            (
+                lease.reply.clone(),
+                Response::error(
+                    &lease.reply.id,
+                    "DIALOG_PENDING",
+                    "A JavaScript dialog opened during input; answer it with dialog before continuing.",
+                )
+                .with_details(json!({
+                    "tab":tab,"dialog":dialog.clone(),
+                    "attempted":lease.attempted(),"outcomeUnknown":lease.attempted(),
+                    "focusCleanup":"pending"
+                })),
+            )
+        })
+    });
+    if let Some((reply, response)) = lease {
+        reply.send_final(response);
+    }
+    abort_focus_lease(
+        tab,
+        "DIALOG_PENDING",
+        "A JavaScript dialog opened during input; answer it with dialog before continuing.",
+        true,
+    );
+    stop_frame_tracking(tab, None);
+    let (pending, waits) = STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let pending_ids = state
+            .pending
+            .iter()
+            .filter_map(|(id, request)| (request.tab == tab).then_some(*id))
+            .collect::<Vec<_>>();
+        let wait_ids = state
+            .waits
+            .iter()
+            .filter_map(|(id, waiter)| (waiter.tab == tab).then_some(*id))
+            .collect::<Vec<_>>();
+        let pending = pending_ids
+            .into_iter()
+            .filter_map(|id| state.pending.remove(&id))
+            .collect::<Vec<_>>();
+        let waits = wait_ids
+            .into_iter()
+            .filter_map(|id| state.waits.remove(&id))
+            .collect::<Vec<_>>();
+        (pending, waits)
+    });
+    for request in pending {
+        if matches!(request.step, Step::FrameInventory { .. }) {
+            stop_frame_tracking(request.tab, Some(request.reply.token));
+        }
+        let mut details = request.outcome_details();
+        details["tab"] = json!(tab);
+        details["dialog"] = dialog.clone();
+        request.reply.error_details(
+            "DIALOG_PENDING",
+            "A JavaScript dialog is blocking the page. Answer it with dialog accept|dismiss.",
+            details,
+        );
+    }
+    for waiter in waits {
+        waiter.reply.error_details(
+            "DIALOG_PENDING",
+            "A JavaScript dialog is blocking the page. Answer it with dialog accept|dismiss.",
+            json!({"tab":tab,"dialog":dialog,"outcomeUnknown":false}),
+        );
+    }
+}
+
+fn answer_dialog(tab: i32, action: &crate::protocol::DialogAction, reply: Reply) {
+    // The dialog is answered only inside the task that owns the tab; access
+    // (revision, ownership, status) was already checked by handle.
+    if reply.scope.is_none() {
+        reply.error(
+            "TASK_REQUIRED",
+            "dialog is available only under task run for an AI-owned tab.",
+        );
+        return;
+    }
+    if !STATE.with(|state| state.borrow().tabs.contains_key(&tab)) {
+        reply.error("TAB_NOT_FOUND", "No browser tab has that ID.");
+        return;
+    }
+    match crate::dialog_runtime::answer(tab, action) {
+        Ok(result) => reply.ok(result),
+        Err(error) => reply.error(error.code, error.message),
+    }
 }
 
 fn invalidate_file_selection(tab: i32) {
@@ -1545,6 +1690,17 @@ pub(crate) fn site_permission_tab_available(tab: i32) -> bool {
             .tabs
             .get(&tab)
             .is_some_and(|page| !page.rejected_creation && page.navigation.renderer_exit.is_none())
+    })
+}
+
+/// True when Blink sees the tab's page as hidden: not the selected tab, or the
+/// space overview covers the content. The permission panel itself keeps the
+/// page visible (see docs/site-permissions.md).
+pub(crate) fn site_permission_tab_hidden(tab: i32) -> bool {
+    STATE.with(|slot| {
+        let state = slot.borrow();
+        state.tabs.contains_key(&tab)
+            && (state.spaces.overview() || state.spaces.active_tab() != Some(tab))
     })
 }
 
@@ -1885,28 +2041,41 @@ pub(crate) fn reveal_download_source(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+enum TabAudioControl {
+    Selected,
+    VisibleRow,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TabAudioTarget {
     pub tab: i32,
     pub space: String,
     pub navigation_epoch: u64,
     owner: Option<(TaskScope, Status)>,
+    control: TabAudioControl,
+    selected: Option<i32>,
+    // Compare the original stored CEF wrapper without invoking is_same while
+    // STATE is borrowed. Tab IDs are not reused; this address is never dereferenced.
+    browser_identity: usize,
 }
 
 fn validate_tab_audio_state(state: &State, target: &TabAudioTarget) -> Result<(), String> {
     let current = !state.spaces.overview()
-        && state.spaces.active_tab() == Some(target.tab)
+        && state.spaces.active_tab() == target.selected
+        && (target.control == TabAudioControl::VisibleRow || target.selected == Some(target.tab))
         && state.spaces.active_space() == target.space
         && state.spaces.tab_space(target.tab) == Some(target.space.as_str())
         && link_owner(&state.tasks, target.tab) == target.owner
         && state.tabs.get(&target.tab).is_some_and(|tab| {
             !tab.rejected_creation
+                && tab.browser.get_raw() as usize == target.browser_identity
                 && tab.navigation.renderer_exit.is_none()
                 && tab.navigation.epoch == target.navigation_epoch
         });
     if current {
         Ok(())
     } else {
-        Err("음소거할 탭이나 페이지의 제어권이 바뀌었습니다. 메뉴를 다시 열어 주세요.".into())
+        Err("음소거할 탭이나 페이지의 제어권이 바뀌었습니다. 다시 시도해 주세요.".into())
     }
 }
 
@@ -1915,13 +2084,39 @@ pub(crate) fn capture_tab_audio_target(
     space: &str,
     navigation_epoch: u64,
 ) -> Result<TabAudioTarget, String> {
+    capture_tab_audio_target_for(tab, space, navigation_epoch, TabAudioControl::Selected)
+}
+
+pub(crate) fn capture_tab_audio_row_target(
+    tab: i32,
+    space: &str,
+    navigation_epoch: u64,
+) -> Result<TabAudioTarget, String> {
+    capture_tab_audio_target_for(tab, space, navigation_epoch, TabAudioControl::VisibleRow)
+}
+
+fn capture_tab_audio_target_for(
+    tab: i32,
+    space: &str,
+    navigation_epoch: u64,
+    control: TabAudioControl,
+) -> Result<TabAudioTarget, String> {
     STATE.with(|slot| {
         let state = slot.borrow();
+        let browser_identity = state
+            .tabs
+            .get(&tab)
+            .ok_or_else(|| "음소거할 탭이 닫혔습니다.".to_owned())?
+            .browser
+            .get_raw() as usize;
         let target = TabAudioTarget {
             tab,
             space: space.to_owned(),
             navigation_epoch,
             owner: link_owner(&state.tasks, tab),
+            control,
+            selected: state.spaces.active_tab(),
+            browser_identity,
         };
         validate_tab_audio_state(&state, &target)?;
         Ok(target)
@@ -1974,7 +2169,7 @@ pub(crate) fn set_tab_audio_muted(
     muted: bool,
     still_current: impl Fn() -> bool,
 ) -> Result<bool, String> {
-    let ui_changed = || "음소거 메뉴의 대상이 바뀌었습니다. 메뉴를 다시 열어 주세요.".to_owned();
+    let ui_changed = || "음소거 대상이 바뀌었습니다. 다시 시도해 주세요.".to_owned();
     if !still_current() {
         return Err(ui_changed());
     }
@@ -1982,7 +2177,7 @@ pub(crate) fn set_tab_audio_muted(
     let before = host.is_audio_muted() != 0;
     record_tab_audio(target, before)?;
     if before != expected {
-        return Err("탭의 음소거 상태가 바뀌었습니다. 메뉴를 다시 열어 주세요.".into());
+        return Err("탭의 음소거 상태가 바뀌었습니다. 다시 시도해 주세요.".into());
     }
     if !still_current() {
         return Err(ui_changed());
@@ -2163,6 +2358,7 @@ fn shell_snapshot_with(
                 return None;
             }
             let spaces = state.spaces.views();
+            let dialog_tabs = crate::dialog_runtime::pending_tabs();
             Some(ShellSnapshot {
                 active_space: state.spaces.active_space().to_owned(),
                 active_tab: state.spaces.active_tab(),
@@ -2216,6 +2412,7 @@ fn shell_snapshot_with(
                             failure: tab.navigation.page_failure(loading),
                             start_page: tab.start_page_ready(loading),
                             task_status,
+                            dialog_pending: dialog_tabs.contains(id),
                             stop_scope,
                         }
                     })
@@ -2304,6 +2501,21 @@ fn handoff_native(scope: TaskScope) -> Result<(), String> {
     let (reply, receiver) = native_reply();
     handle(
         &Command::TaskHandoff {
+            task: scope.task,
+            revision: scope.revision,
+        },
+        reply,
+    );
+    native_result(receiver)
+}
+
+/// Native "AI에게 돌려주기": the same path as `task resume ID REV`, with the
+/// revision captured when the control was rendered. It never selects a space
+/// or tab, so the user's current view is unchanged.
+fn resume_native(scope: TaskScope) -> Result<(), String> {
+    let (reply, receiver) = native_reply();
+    handle(
+        &Command::TaskResume {
             task: scope.task,
             revision: scope.revision,
         },
@@ -4046,6 +4258,7 @@ pub fn shell_action(action: ShellAction) -> Result<(), String> {
             return Ok(());
         }
         ShellAction::StopSpace(scope) => return handoff_native(scope.clone()),
+        ShellAction::ResumeSpace(scope) => return resume_native(scope.clone()),
         ShellAction::Stop(tab, scope) => {
             STATE
                 .with(|state| state.borrow().tasks.check_tab(Some(scope), *tab))
@@ -4097,6 +4310,9 @@ pub fn shell_action(action: ShellAction) -> Result<(), String> {
     // must not prevent its user from browsing. CLI authorization stays in handle.
     if matches!(command, Command::Close { .. }) {
         invalidate_file_selection(id);
+        // The task (if any) was handed off above, so this settles nothing for
+        // user tabs but guarantees no queued dialog outlives the close.
+        crate::dialog_runtime::settle_tabs([id], false);
         browser
             .host()
             .ok_or("The tab has no host.")?
@@ -4144,14 +4360,18 @@ impl Drop for PanelRefresh {
 }
 
 pub fn close_all() {
-    let browsers = STATE.with(|state| {
+    let (ids, browsers): (Vec<i32>, Vec<Browser>) = STATE.with(|state| {
         state
             .borrow()
             .tabs
-            .values()
-            .map(|tab| tab.browser.clone())
-            .collect::<Vec<_>>()
+            .iter()
+            .map(|(id, tab)| (*id, tab.browser.clone()))
+            .unzip()
     });
+    // Quit is an explicit close of every tab: settle queued dialogs (beforeunload
+    // accepted) and mark AI tabs closing so a new one cannot block the exit.
+    // User tabs keep the native beforeunload prompt (Disposition::Default).
+    crate::dialog_runtime::settle_tabs(ids, true);
     // OnBeforeClose of the last tab quits; without tabs nothing else will.
     if browsers.is_empty() {
         quit_message_loop();
@@ -4331,6 +4551,7 @@ fn tab_info(id: i32, tab: &Tab, observed: &TabObservation) -> Json {
     "url":observed.url,"loading":observed.sample.loading,
     "canGoBack":observed.sample.back,"canGoForward":observed.sample.forward,
     "renderer":{"status":tab.navigation.renderer_status(),"error":tab.navigation.renderer_exit},
+    "dialog":crate::dialog_runtime::tab_json(id),"dialogOverflow":crate::dialog_runtime::tab_overflow(id),
     "navigation": {
         "epoch":tab.navigation.epoch,"requestedUrl":tab.navigation.requested_url,
         "provisional":tab.navigation.provisional,"committed":tab.navigation.committed,
@@ -4603,6 +4824,12 @@ wrap_task! {
     }
 }
 wrap_task! {
+    struct TaskWaitTick { token: u64 }
+    impl Task {
+        fn execute(&self) { poll_task_wait(self.token); }
+    }
+}
+wrap_task! {
     struct CancelTask { token: u64 }
     impl Task {
         fn execute(&self) { remove_wait(self.token); }
@@ -4634,6 +4861,115 @@ wrap_task! {
             notify_panel();
         }
     }
+}
+
+enum TaskWaitStep {
+    Done,
+    Continue,
+}
+
+/// Decide a task wait without holding STATE across the reply or scheduling.
+fn step_task_wait(token: u64) -> TaskWaitStep {
+    let Some(waiter) = STATE.with(|slot| slot.borrow().task_waits.get(&token).cloned()) else {
+        return TaskWaitStep::Done;
+    };
+    let finish = |outcome: Result<TaskView, (&'static str, &'static str, Option<TaskView>)>| {
+        let removed = STATE.with(|slot| slot.borrow_mut().task_waits.remove(&token));
+        if removed.is_none() {
+            return;
+        }
+        match outcome {
+            Ok(view) => waiter.reply.ok(json!({"task":view,"changed":true})),
+            Err((code, message, view)) => match view {
+                Some(view) => waiter.reply.error_details(
+                    code,
+                    message,
+                    json!({"task":view,"timeoutMs":waiter.timeout_ms,"outcomeUnknown":false}),
+                ),
+                None => waiter.reply.error(code, message),
+            },
+        }
+    };
+    if !waiter.reply.active.load(Ordering::Acquire) {
+        STATE.with(|slot| slot.borrow_mut().task_waits.remove(&token));
+        return TaskWaitStep::Done;
+    }
+    let current = STATE.with(|slot| slot.borrow().tasks.info(&waiter.task));
+    match current {
+        Err(error) => finish(Err((error.code, error.message, None))),
+        Ok(view) if view != waiter.baseline => finish(Ok(view)),
+        Ok(view) if waiter.started.elapsed() >= Duration::from_millis(waiter.timeout_ms) => {
+            finish(Err((
+                "WAIT_TIMEOUT",
+                "The task state did not change before the timeout.",
+                Some(view),
+            )))
+        }
+        Ok(_) => return TaskWaitStep::Continue,
+    }
+    TaskWaitStep::Done
+}
+
+fn poll_task_wait(token: u64) {
+    if matches!(step_task_wait(token), TaskWaitStep::Continue) {
+        let mut task = TaskWaitTick::new(token);
+        if post_delayed_task(ThreadId::UI, Some(&mut task), 50) == 0 {
+            let removed = STATE.with(|slot| slot.borrow_mut().task_waits.remove(&token));
+            if let Some(waiter) = removed {
+                waiter
+                    .reply
+                    .error("APP_STOPPING", "The browser cannot continue waiting.");
+            }
+        }
+    }
+}
+
+fn start_task_wait(task: &str, timeout_ms: u64, since: Option<u64>, reply: Reply) {
+    if let Some(token) = admit_task_wait(task, timeout_ms, since, reply) {
+        poll_task_wait(token);
+    }
+}
+
+/// Validate and register a wait; returns its token only when it must block.
+fn admit_task_wait(task: &str, timeout_ms: u64, since: Option<u64>, reply: Reply) -> Option<u64> {
+    if !(1..=30_000).contains(&timeout_ms) {
+        reply.error(
+            "INVALID_ARGUMENTS",
+            "Task wait timeout must be 1 to 30000 milliseconds.",
+        );
+        return None;
+    }
+    let baseline = match STATE.with(|slot| slot.borrow().tasks.info(task)) {
+        Ok(view) => view,
+        Err(error) => {
+            reply.error(error.code, error.message);
+            return None;
+        }
+    };
+    if since.is_some_and(|revision| baseline.revision != revision) {
+        // The caller's last known revision is already out of date.
+        reply.ok(json!({"task":baseline,"changed":true}));
+        return None;
+    }
+    if baseline.status == Status::Finished {
+        // Terminal state: nothing can change, so do not block.
+        reply.ok(json!({"task":baseline,"changed":false}));
+        return None;
+    }
+    let token = reply.token;
+    STATE.with(|slot| {
+        slot.borrow_mut().task_waits.insert(
+            token,
+            TaskWaiter {
+                task: task.to_owned(),
+                baseline,
+                timeout_ms,
+                started: Instant::now(),
+                reply,
+            },
+        );
+    });
+    Some(token)
 }
 
 fn remove_wait(token: u64) -> Option<Waiter> {
@@ -4769,11 +5105,31 @@ fn poll_wait_with(
             );
             return None;
         }
+        // The native URL is committed-document state; a pending provisional
+        // navigation never satisfies a url wait. A match wins over a deadline
+        // that expires in the same tick.
+        if let WaitUntil::Url { prefix } = &waiter.until {
+            if tab.navigation.committed
+                && !tab.navigation.provisional
+                && stable.is_some_and(|observation| observation.url.starts_with(prefix.as_str()))
+            {
+                let mut info = info.unwrap();
+                info["matched"] = json!("url");
+                waiter.reply.ok(info);
+                return None;
+            }
+        }
         if waiter.started.elapsed() >= Duration::from_millis(waiter.timeout_ms) {
-            details["until"] = json!(waiter.until);
+            details["until"] = json!(waiter.until.mode());
+            if let Some(expected) = waiter.until.expected() {
+                details["expected"] = json!(expected);
+            }
             details["timeoutMs"] = json!(waiter.timeout_ms);
             details["elapsedMs"] = json!(waiter.started.elapsed().as_millis());
             details["navigationContinues"] = json!(true);
+            if waiter.text_truncated && matches!(waiter.until, WaitUntil::Text { .. }) {
+                details["textTruncated"] = json!(true);
+            }
             waiter.reply.error_details(
                 "WAIT_TIMEOUT",
                 "The requested page readiness was not reached.",
@@ -4789,7 +5145,11 @@ fn poll_wait_with(
             waiter.reply.ok(info.unwrap());
             return None;
         }
-        if usable && waiter.until == WaitUntil::Dom && !waiter.probe_in_flight {
+        if usable
+            && matches!(waiter.until, WaitUntil::Dom | WaitUntil::Text { .. })
+            && !waiter.probe_in_flight
+        {
+            let expression = wait_probe_expression(&waiter.until);
             let browser = observation.sample.browser.clone();
             let pending = Pending {
                 frame: None,
@@ -4800,7 +5160,7 @@ fn poll_wait_with(
                     started: waiter.started,
                 },
                 reply: waiter.reply.clone(),
-                step: Step::Frame("document.readyState".into()),
+                step: Step::Frame(expression),
             };
             state.waits.get_mut(&token).unwrap().probe_in_flight = true;
             Some((browser, pending))
@@ -4808,6 +5168,20 @@ fn poll_wait_with(
             None
         }
     })
+}
+
+/// Probe evaluated in the control world for dom/text waits. Text probes are
+/// read-only and bounded by the bridge's own node, shadow-root and text limits.
+fn wait_probe_expression(until: &WaitUntil) -> String {
+    match until {
+        WaitUntil::Text { substring } => {
+            let needle = serde_json::to_string(substring).unwrap_or_else(|_| "\"\"".into());
+            format!(
+                "(()=>{{if(!document.body)return 'loading';{DOM_BRIDGE}\nconst r=window.__lightBrowserBridge.containsText({needle});return r&&r.ok===true?(r.found===true?'found':(r.truncated===true?'absent-truncated':'absent')):'error';}})()"
+            )
+        }
+        _ => "document.readyState".into(),
+    }
 }
 
 fn remove_matching_wait(token: u64, captured: &Waiter) -> Option<Waiter> {
@@ -4955,7 +5329,11 @@ fn finish_dom_wait_with(
             return None;
         };
         let mut info = tab_info(waiter.tab, &state.tabs[&waiter.tab], observation);
-        info["readyState"] = ready.clone();
+        if matches!(waiter.until, WaitUntil::Text { .. }) {
+            info["matched"] = json!("text");
+        } else {
+            info["readyState"] = ready.clone();
+        }
         let waiter = state.waits.remove(&token).unwrap();
         state
             .pending
@@ -5042,6 +5420,7 @@ fn control_detached(tab: i32) {
 }
 
 fn renderer_terminated(tab: i32, reason: Json) {
+    crate::dialog_runtime::reset_tab(tab);
     invalidate_file_selection(tab);
     crate::download_permission_runtime::cancel_tab(tab);
     abort_focus_lease(
@@ -5236,16 +5615,23 @@ fn expire_tab_refs(tabs: impl IntoIterator<Item = i32>) {
 
 fn handle_task(command: &Command, reply: Reply) {
     match command {
-        Command::TaskCreate { name } => task_result(
-            STATE.with(|state| state.borrow_mut().tasks.create(name)),
-            &reply,
-        ),
+        Command::TaskCreate { name } => {
+            match STATE.with(|state| state.borrow_mut().tasks.create_or_resume(name)) {
+                Ok((task, resumed)) => reply.ok(json!({"task":task,"resumed":resumed})),
+                Err(error) => reply.error(error.code, error.message),
+            }
+        }
         Command::TaskList => {
             reply.ok(STATE.with(|state| json!({"tasks":state.borrow().tasks.list()})))
         }
         Command::TaskInfo { task } => {
             task_result(STATE.with(|state| state.borrow().tasks.info(task)), &reply)
         }
+        Command::TaskWait {
+            task,
+            timeout_ms,
+            since,
+        } => start_task_wait(task, *timeout_ms, *since, reply),
         Command::TaskRun {
             task,
             revision,
@@ -5275,6 +5661,9 @@ fn handle_task(command: &Command, reply: Reply) {
             if let Ok(view) = &result {
                 expire_tab_refs(view.tabs.iter().map(|tab| tab.tab));
                 revoke_task_requests(task, None);
+                // Control returns to the user; do not leave a renderer blocked
+                // on a dialog nobody can answer. Dismiss = stay on the page.
+                crate::dialog_runtime::settle_tabs(view.tabs.iter().map(|tab| tab.tab), false);
             }
             task_result(result, &reply);
         }
@@ -5350,6 +5739,8 @@ fn handle_task(command: &Command, reply: Reply) {
                 STATE.with(|state| state.borrow_mut().spaces.release(*tab));
                 expire_tab_refs([*tab]);
                 revoke_task_requests(task, Some(*tab));
+                crate::dialog_runtime::settle_tabs([*tab], false);
+                crate::dialog_runtime::unmark_closing(*tab);
             }
             task_result(result, &reply);
         }
@@ -5377,7 +5768,12 @@ fn handle_task(command: &Command, reply: Reply) {
                                 keep,
                             )
                         });
-                        expire_tab_refs(tabs.into_iter().map(|tab| tab.tab));
+                        expire_tab_refs(tabs.iter().map(|tab| tab.tab));
+                        // Closing tabs accept beforeunload; kept tabs return to the user.
+                        for tab in &tabs {
+                            let closing = plan.close.contains(&tab.tab);
+                            crate::dialog_runtime::settle_tabs([tab.tab], closing);
+                        }
                     }
                     revoke_task_requests(task, None);
                     let browsers = STATE.with(|state| {
@@ -5430,9 +5826,10 @@ fn status_json() -> Json {
         .collect::<Vec<_>>();
     STATE.with(|state| {
         let state = state.borrow();
-        json!({"app":"Light Browser","engine":"CEF/Chromium","cef":String::from_utf8_lossy(&sys::CEF_VERSION[..sys::CEF_VERSION.len()-1]),"cefApi":sys::CEF_API_VERSION_LAST,"version":env!("CARGO_PKG_VERSION"),"tabs":state.tabs.len(),"pendingWaits":state.waits.len(),"sandbox":true,"externalDebugPort":false,"controlPanel":"embedded","windowMode":"single","activeTab":state.spaces.active_tab(),"activeSpace":state.spaces.active_space(),"overview":state.spaces.overview(),
+        json!({"app":"Light Browser","engine":"CEF/Chromium","cef":String::from_utf8_lossy(&sys::CEF_VERSION[..sys::CEF_VERSION.len()-1]),"cefApi":sys::CEF_API_VERSION_LAST,"version":env!("CARGO_PKG_VERSION"),"tabs":state.tabs.len(),"pendingWaits":state.waits.len()+state.task_waits.len(),"sandbox":true,"externalDebugPort":false,"controlPanel":"embedded","windowMode":"single","activeTab":state.spaces.active_tab(),"activeSpace":state.spaces.active_space(),"overview":state.spaces.overview(),
             "downloads":{"active":active_downloads,"awaitingSave":awaiting_save,"awaitingPermission":awaiting_permission},
             "fileSelection":{"pending":file_selections.len(),"choosing":choosing_files,"requests":file_selections},
+            "dialogs":crate::dialog_runtime::status_json(),
             "sitePermissions":{"pending":site_permissions.len(),"requests":site_permissions,"activeMedia":active_media},
             "resources":{"automationTabLimit":MAX_AUTOMATION_TABS,"taskTabLimit":crate::tasks::MAX_TASK_TABS,"pendingTabCreations":state.creations.len(),"captureLimit":1,"capturesInFlight":state.captures.len(),"focusLeases":state.focus_leases.len(),"focusCleanupFailed":state.focus_leases.values().filter(|lease| lease.phase == FocusPhase::Failed).count()}})
     })
@@ -5462,11 +5859,14 @@ fn handle(command: &Command, reply: Reply) {
             | Command::ReadPage { .. }
             | Command::TaskList
             | Command::TaskInfo { .. }
+            | Command::TaskWait { .. }
     ));
     if command.is_task_command() {
         handle_task(command, reply);
-        update_space_tasks();
-        sync_shell();
+        if !matches!(command, Command::TaskWait { .. }) {
+            update_space_tasks();
+            sync_shell();
+        }
         return;
     }
     let access = STATE.with(|state| {
@@ -5531,6 +5931,7 @@ fn handle(command: &Command, reply: Reply) {
             reply.ok(json!({"panel":"embedded","shown":true,"windowMode":"single"}));
         }
         Command::Status => reply.ok(status_json()),
+        Command::Dialog { tab, action } => answer_dialog(*tab, action, reply),
         Command::Tabs => match tabs_info_with(&reply, observe_tab) {
             Ok(info) => reply.ok(info),
             Err(error) => observation_error(&reply, error),
@@ -5596,6 +5997,18 @@ fn handle(command: &Command, reply: Reply) {
                 reply.error("TAB_NOT_FOUND", "No browser tab has that ID.");
                 return;
             };
+            // A queued JavaScript dialog blocks the renderer: page commands would
+            // hang, so fail fast. Close and Stop do not need the renderer.
+            if !matches!(other, Command::Close { .. } | Command::Stop { .. }) {
+                if let Some(dialog) = crate::dialog_runtime::tab_json(tab_id) {
+                    reply.error_details(
+                        "DIALOG_PENDING",
+                        "A JavaScript dialog is blocking the page. Answer it with dialog accept|dismiss.",
+                        json!({"tab":tab_id,"dialog":dialog,"outcomeUnknown":false}),
+                    );
+                    return;
+                }
+            }
             let focus_pending = STATE.with(|slot| slot.borrow().focus_leases.contains_key(&tab_id));
             if !matches!(
                 other,
@@ -5707,10 +6120,11 @@ fn handle(command: &Command, reply: Reply) {
                             token,
                             Waiter {
                                 tab: tab_id,
-                                until: *until,
+                                until: until.clone(),
                                 timeout_ms: *timeout_ms,
                                 started: Instant::now(),
                                 probe_in_flight: false,
+                                text_truncated: false,
                                 reply,
                             },
                         );
@@ -5719,6 +6133,8 @@ fn handle(command: &Command, reply: Reply) {
                 }
                 Command::Close { .. } => {
                     invalidate_file_selection(tab_id);
+                    // An explicit close accepts a pending beforeunload so it cannot hang.
+                    crate::dialog_runtime::settle_tabs([tab_id], true);
                     reply.ok(json!({"tab":tab_id,"closeRequested":true}));
                     if let Some(host) = browser.host() {
                         host.close_browser(0);
@@ -7418,6 +7834,14 @@ fn focus_timeout(tab: i32, token: u64, id: i32, enabled: bool) {
     });
     if !current {
         return;
+    }
+    // A queued JavaScript dialog blocks the renderer, so no acknowledgement can
+    // arrive. Keep waiting; answering, handoff or close resolves the dialog.
+    if crate::dialog_runtime::focus_grace_active(tab) {
+        let mut task = FocusTimeoutTask::new(tab, token, id, enabled);
+        if post_delayed_task(ThreadId::UI, Some(&mut task), FOCUS_ACK_TIMEOUT_MS) != 0 {
+            return;
+        }
     }
     if enabled {
         abort_focus_lease(
@@ -11366,10 +11790,35 @@ fn devtools_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) {
                     pending_error(&pending, "PAGE_LOADING", "The DOM is not ready.");
                     return;
                 }
-                let ready = matches!(value.as_str(), Some("interactive" | "complete"));
+                let text_wait = STATE.with(|state| {
+                    state
+                        .borrow()
+                        .waits
+                        .get(&token)
+                        .is_some_and(|waiter| matches!(waiter.until, WaitUntil::Text { .. }))
+                });
+                let ready = if text_wait {
+                    value.as_str() == Some("found")
+                } else {
+                    matches!(value.as_str(), Some("interactive" | "complete"))
+                };
                 if ready {
                     finish_dom_wait_with(browser, &pending, token, value, observe_tab);
                 } else {
+                    if text_wait {
+                        let truncated = value.as_str() == Some("absent-truncated");
+                        STATE.with(|state| {
+                            if let Some(waiter) = state
+                                .borrow_mut()
+                                .waits
+                                .get_mut(&token)
+                                .filter(|waiter| pending_matches_waiter(&pending, waiter))
+                            {
+                                waiter.text_truncated = truncated;
+                            }
+                        });
+                    }
+                    // Not ready / text not yet present: release only this probe.
                     pending_error(&pending, "PAGE_LOADING", "The DOM is still parsing.");
                 }
                 return;
@@ -11479,6 +11928,7 @@ wrap_client! {
         fn download_handler(&self) -> Option<DownloadHandler> { Some(FileDownloadHandler::new()) }
         fn permission_handler(&self) -> Option<PermissionHandler> { Some(FilePermissionHandler::new()) }
         fn dialog_handler(&self) -> Option<DialogHandler> { Some(FileSelectionHandler::new()) }
+        fn jsdialog_handler(&self) -> Option<JsdialogHandler> { Some(crate::dialog_runtime::TabDialogHandler::new()) }
         fn frame_handler(&self) -> Option<FrameHandler> { Some(FileSelectionFrameHandler::new()) }
         fn context_menu_handler(&self) -> Option<ContextMenuHandler> { Some(PageContextMenuHandler::new()) }
     }
@@ -11682,6 +12132,7 @@ wrap_life_span_handler! {
         fn on_before_close(&self, browser: Option<&mut Browser>) {
             let Some(browser)=browser else{return;};
             let id=browser.identifier();
+            crate::dialog_runtime::forget_tab(id);
             crate::site_permission_runtime::media_stopped(id);
             invalidate_file_selection(id);
             crate::download_permission_runtime::cancel_tab(id);
@@ -12162,6 +12613,7 @@ mod tests {
             timeout_ms: 1_000,
             started: Instant::now(),
             probe_in_flight: false,
+            text_truncated: false,
             reply,
         };
         STATE.with(|slot| {
@@ -12436,6 +12888,7 @@ mod tests {
             let replacement = Waiter {
                 reply: replacement_reply,
                 probe_in_flight: true,
+                text_truncated: false,
                 ..old.clone()
             };
             let replace = || {
@@ -12555,6 +13008,207 @@ mod tests {
         clear();
     }
 
+    fn url_observation(
+        url: &'static str,
+    ) -> impl FnMut(i32, &Reply, ObservationAccess) -> Result<TabObservation, TaskError> {
+        move |tab, reply, access| {
+            observe_tab_with(
+                tab,
+                reply,
+                access,
+                |_| Some(inert_frame()),
+                |_| url.to_string(),
+                |_, _| false,
+            )
+        }
+    }
+
+    #[test]
+    fn url_wait_matches_native_prefix_immediately_and_never_probes_the_page() {
+        let url = || WaitUntil::Url {
+            prefix: "https://example.test/done".into(),
+        };
+        context_menu_fixture(false);
+        let (reply, receiver) = test_reply(17);
+        install_wait(reply, url());
+        assert!(poll_wait_with(17, url_observation("https://example.test/done?x=1#y")).is_none());
+        let info = receiver.try_recv().unwrap().result.unwrap();
+        assert_eq!(info["matched"], "url");
+        assert_eq!(info["url"], "https://example.test/done?x=1#y");
+        clear();
+
+        // A non-matching URL keeps waiting without a probe; the prefix is not a substring match.
+        context_menu_fixture(false);
+        let (reply, receiver) = test_reply(17);
+        install_wait(reply, url());
+        assert!(
+            poll_wait_with(
+                17,
+                url_observation("https://other.test/https://example.test/done")
+            )
+            .is_none()
+        );
+        assert!(receiver.try_recv().is_err());
+        STATE.with(|slot| assert!(slot.borrow().waits.contains_key(&17)));
+
+        // A provisional navigation never satisfies the wait, even if the old URL matches.
+        STATE.with(|slot| {
+            slot.borrow_mut()
+                .tabs
+                .get_mut(&7)
+                .unwrap()
+                .navigation
+                .provisional = true
+        });
+        assert!(poll_wait_with(17, url_observation("https://example.test/done")).is_none());
+        assert!(receiver.try_recv().is_err());
+        STATE.with(|slot| {
+            slot.borrow_mut()
+                .tabs
+                .get_mut(&7)
+                .unwrap()
+                .navigation
+                .provisional = false
+        });
+
+        // Match wins over a deadline expiring in the same tick; a miss times out
+        // with WAIT_TIMEOUT and the expected value, leaving navigation alone.
+        STATE.with(|slot| slot.borrow_mut().waits.get_mut(&17).unwrap().timeout_ms = 0);
+        assert!(poll_wait_with(17, url_observation("https://nope.test/")).is_none());
+        let error = receiver.try_recv().unwrap().error.unwrap();
+        assert_eq!(error.code, "WAIT_TIMEOUT");
+        let details = error.details.unwrap();
+        assert_eq!(details["until"], "url");
+        assert_eq!(details["expected"], "https://example.test/done");
+        assert_eq!(details["navigationContinues"], true);
+        clear();
+
+        context_menu_fixture(false);
+        let (reply, receiver) = test_reply(17);
+        install_wait(reply, url());
+        STATE.with(|slot| slot.borrow_mut().waits.get_mut(&17).unwrap().timeout_ms = 0);
+        assert!(poll_wait_with(17, url_observation("https://example.test/done")).is_none());
+        assert_eq!(
+            receiver.try_recv().unwrap().result.unwrap()["matched"],
+            "url"
+        );
+        clear();
+    }
+
+    #[test]
+    fn text_wait_uses_one_bounded_probe_and_completes_only_on_found() {
+        let text = || WaitUntil::Text {
+            substring: "Done \"quoted\"".into(),
+        };
+        context_menu_fixture(false);
+        let (reply, receiver) = test_reply(17);
+        let old = install_wait(reply, text());
+        let (browser, pending) = poll_wait_with(17, test_observation).unwrap();
+        let Step::Frame(expression) = &pending.step else {
+            panic!("text probe starts with the frame lookup");
+        };
+        assert!(expression.contains("containsText(\"Done \\\"quoted\\\"\")"));
+        assert!(
+            poll_wait_with(17, test_observation).is_none(),
+            "one probe only"
+        );
+        // Absent text releases only the probe and keeps the original deadline.
+        STATE.with(|slot| {
+            slot.borrow_mut().pending.insert(
+                42,
+                Pending {
+                    step: Step::Evaluate,
+                    ..pending.clone()
+                },
+            );
+        });
+        devtools_result(&browser, 42, true, br#"{"result":{"value":"absent"}}"#);
+        assert!(receiver.try_recv().is_err());
+        STATE.with(|slot| assert!(!slot.borrow().waits[&17].text_truncated));
+        STATE.with(|slot| {
+            let state = slot.borrow();
+            assert_eq!(state.waits[&17].started, old.started);
+            assert!(!state.waits[&17].probe_in_flight);
+        });
+        // A script exception also only releases the probe.
+        let (browser, pending) = poll_wait_with(17, test_observation).unwrap();
+        STATE.with(|slot| {
+            slot.borrow_mut().pending.insert(
+                43,
+                Pending {
+                    step: Step::Evaluate,
+                    ..pending
+                },
+            );
+        });
+        devtools_result(&browser, 43, true, br#"{"exceptionDetails":{"text":"x"}}"#);
+        assert!(receiver.try_recv().is_err());
+        STATE.with(|slot| assert!(!slot.borrow().waits[&17].probe_in_flight));
+        // Found completes with the tab state and no readyState field.
+        let (browser, pending) = poll_wait_with(17, test_observation).unwrap();
+        STATE.with(|slot| {
+            slot.borrow_mut().pending.insert(
+                44,
+                Pending {
+                    step: Step::Evaluate,
+                    ..pending
+                },
+            );
+        });
+        devtools_result(&browser, 44, true, br#"{"result":{"value":"found"}}"#);
+        let info = receiver.try_recv().unwrap().result.unwrap();
+        assert_eq!(info["matched"], "text");
+        assert!(info.get("readyState").is_none());
+        STATE.with(|slot| assert!(!slot.borrow().waits.contains_key(&17)));
+        clear();
+
+        // A navigation during the wait invalidates the old-epoch probe; the next
+        // poll probes the new document instead of failing.
+        context_menu_fixture(false);
+        let (reply, receiver) = test_reply(17);
+        install_wait(reply, text());
+        let (browser, pending) = poll_wait_with(17, test_observation).unwrap();
+        STATE.with(|slot| slot.borrow_mut().tabs.get_mut(&7).unwrap().navigation.epoch += 1);
+        finish_dom_wait_with(&browser, &pending, 17, &json!("found"), test_observation);
+        assert!(receiver.try_recv().is_err());
+        STATE.with(|slot| assert!(!slot.borrow().waits[&17].probe_in_flight));
+        let (_, fresh) = poll_wait_with(17, test_observation).unwrap();
+        assert_eq!(fresh.epoch, pending.epoch + 1);
+        clear();
+
+        // Timeout reports the expected text and never cancels navigation.
+        context_menu_fixture(false);
+        let (reply, receiver) = test_reply(17);
+        install_wait(reply, text());
+        STATE.with(|slot| slot.borrow_mut().waits.get_mut(&17).unwrap().timeout_ms = 0);
+        assert!(poll_wait_with(17, test_observation).is_none());
+        let error = receiver.try_recv().unwrap().error.unwrap();
+        assert_eq!(error.code, "WAIT_TIMEOUT");
+        let details = error.details.unwrap();
+        assert_eq!(details["until"], "text");
+        assert!(details.get("textTruncated").is_none());
+        clear();
+
+        // A probe that hit a read budget marks the timeout as possibly incomplete.
+        context_menu_fixture(false);
+        let (reply, receiver) = test_reply(17);
+        install_wait(reply, text());
+        let (browser, pending) = poll_wait_with(17, test_observation).unwrap();
+        STATE.with(|slot| {
+            slot.borrow_mut().pending.insert(45, Pending { step: Step::Evaluate, ..pending });
+        });
+        devtools_result(&browser, 45, true, br#"{"result":{"value":"absent-truncated"}}"#);
+        STATE.with(|slot| {
+            let mut state = slot.borrow_mut();
+            assert!(state.waits[&17].text_truncated);
+            state.waits.get_mut(&17).unwrap().timeout_ms = 0;
+        });
+        assert!(poll_wait_with(17, test_observation).is_none());
+        let details = receiver.try_recv().unwrap().error.unwrap().details.unwrap();
+        assert_eq!(details["textTruncated"], true);
+        clear();
+    }
+
     #[test]
     fn readiness_dispatch_revalidates_native_preparation_and_releases_only_its_waiter() {
         for boundary in 0..2 {
@@ -12567,6 +13221,7 @@ mod tests {
                 let replacement = Waiter {
                     reply: replacement_reply,
                     probe_in_flight: true,
+                    text_truncated: false,
                     ..old.clone()
                 };
                 let mutate = || {
@@ -14364,6 +15019,134 @@ mod tests {
         (fixture, target)
     }
 
+    fn setup_audio_row(
+        ai: bool,
+    ) -> (
+        std::rc::Rc<AudioFixture>,
+        std::rc::Rc<AudioFixture>,
+        TabAudioTarget,
+    ) {
+        let (fixture, _) = setup_audio();
+        let selected = std::rc::Rc::new(AudioFixture::default());
+        let space = STATE.with(|slot| {
+            let mut state = slot.borrow_mut();
+            state.tabs.insert(8, audio_tab(&selected));
+            state.spaces.insert(8, USER_SPACE, false);
+            let space = if ai {
+                let task = state.tasks.create("background audio").unwrap();
+                let scope = TaskScope {
+                    task: task.id.clone(),
+                    revision: task.revision,
+                };
+                for tab in [7, 8] {
+                    state.tasks.attach(&scope, tab, Origin::Borrowed).unwrap();
+                }
+                let tasks = state.tasks.list();
+                state.spaces.update_tasks(&tasks);
+                state.spaces.adopt(7, &task.id);
+                state.spaces.adopt(8, &task.id);
+                assert!(state.spaces.show(&task.id));
+                task.id
+            } else {
+                USER_SPACE.to_owned()
+            };
+            assert!(state.spaces.select_tab(8));
+            space
+        });
+        let target = capture_tab_audio_row_target(7, &space, 4).unwrap();
+        (fixture, selected, target)
+    }
+
+    #[test]
+    fn tab_audio_row_mutes_background_without_selection_or_ai_changes() {
+        for ai in [false, true] {
+            let (fixture, selected, target) = setup_audio_row(ai);
+            let snapshot = || {
+                STATE.with(|slot| {
+                    let state = slot.borrow();
+                    json!({"tasks": state.tasks.list(), "spaces": state.spaces.views(),
+                    "active": state.spaces.active_space(), "selected": state.spaces.active_tab(),
+                    "epoch": state.tabs[&7].navigation.epoch,
+                    "url": state.tabs[&7].navigation.requested_url})
+                })
+            };
+            let before = snapshot();
+            // The new row route must not weaken the existing menu's selected-only rule.
+            assert!(capture_tab_audio_target(7, &target.space, 4).is_err());
+            assert!(!read_tab_audio(&target).unwrap());
+            assert!(set_tab_audio_muted(&target, false, true, || true).unwrap());
+            assert!(!set_tab_audio_muted(&target, true, false, || true).unwrap());
+            assert_eq!(*fixture.writes.borrow(), [true, false]);
+            assert_eq!(selected.reads.get(), 0);
+            assert!(selected.writes.borrow().is_empty());
+            assert_eq!(snapshot(), before);
+        }
+        clear();
+    }
+
+    #[test]
+    fn tab_audio_row_rejects_changed_selection_scope_owner_and_browser() {
+        let changes: [fn(&mut State); 8] = [
+            |state| {
+                assert!(state.spaces.select_tab(7));
+            },
+            |state| {
+                assert!(state.spaces.show(USER_SPACE));
+            },
+            |state| state.spaces.set_overview(true),
+            |state| state.spaces.insert(7, USER_SPACE, false),
+            |state| {
+                let (scope, _) = link_owner(&state.tasks, 7).unwrap();
+                state.tasks.handoff(&scope).unwrap();
+            },
+            |state| state.tabs.get_mut(&7).unwrap().navigation.epoch += 1,
+            |state| {
+                let replacement = std::rc::Rc::new(AudioFixture::default());
+                state.tabs.insert(7, audio_tab(&replacement));
+            },
+            |state| {
+                state.tabs.remove(&7);
+            },
+        ];
+        for change in changes {
+            let (fixture, selected, target) = setup_audio_row(true);
+            STATE.with(|slot| change(&mut slot.borrow_mut()));
+            assert!(read_tab_audio(&target).is_err());
+            assert!(set_tab_audio_muted(&target, false, true, || true).is_err());
+            assert_eq!(fixture.reads.get(), 0);
+            assert!(fixture.writes.borrow().is_empty());
+            assert_eq!(selected.reads.get(), 0);
+        }
+        let (fixture, _, target) = setup_audio_row(true);
+        STATE.with(|slot| assert!(slot.borrow_mut().spaces.show(USER_SPACE)));
+        assert!(capture_tab_audio_row_target(7, &target.space, 4).is_err());
+        assert_eq!(fixture.reads.get(), 0);
+        clear();
+    }
+
+    #[test]
+    fn tab_audio_row_revalidates_native_read_and_write() {
+        let (fixture, _, target) = setup_audio_row(false);
+        fixture.on_read.set(Some(|| {
+            STATE.with(|slot| assert!(slot.borrow_mut().spaces.select_tab(7)));
+        }));
+        assert!(set_tab_audio_muted(&target, false, true, || true).is_err());
+        assert!(fixture.writes.borrow().is_empty());
+
+        let (fixture, _, target) = setup_audio_row(false);
+        fixture.on_write.set(Some(|| {
+            STATE.with(|slot| {
+                let replacement = std::rc::Rc::new(AudioFixture::default());
+                slot.borrow_mut().tabs.insert(7, audio_tab(&replacement));
+            });
+        }));
+        let error = set_tab_audio_muted(&target, false, true, || true).unwrap_err();
+        assert!(error.contains("요청했지만 탭이 바뀌어"));
+        assert_eq!(*fixture.writes.borrow(), [true]);
+        assert_eq!(fixture.reads.get(), 1);
+        clear();
+    }
+
     #[test]
     fn tab_audio_changes_only_selected_webcontents_without_ai_handoff() {
         let (fixture, _) = setup_audio();
@@ -14451,10 +15234,12 @@ mod tests {
             assert_eq!(fixture.reads.get(), 0);
             assert!(fixture.writes.borrow().is_empty());
         }
-        let (_, target) = setup_audio();
+        let (_, old_target) = setup_audio();
         STATE.with(|slot| {
             slot.borrow_mut().tabs.insert(7, native_blank_tab());
         });
+        assert!(read_tab_audio(&old_target).is_err());
+        let target = capture_tab_audio_target(7, USER_SPACE, 4).unwrap();
         assert!(
             read_tab_audio(&target)
                 .unwrap_err()
@@ -15909,6 +16694,7 @@ mod tests {
                     timeout_ms: 1000,
                     started: Instant::now(),
                     probe_in_flight: false,
+                    text_truncated: false,
                     reply: waiting,
                 },
             );
@@ -17155,6 +17941,7 @@ mod tests {
                     timeout_ms: 1000,
                     started: Instant::now(),
                     probe_in_flight: false,
+                    text_truncated: false,
                     reply,
                 },
             )
@@ -19436,6 +20223,7 @@ mod tests {
                         timeout_ms: 1_000,
                         started,
                         probe_in_flight: true,
+                        text_truncated: false,
                         reply,
                     },
                 );
@@ -19501,6 +20289,198 @@ mod tests {
     }
 
     #[test]
+    fn task_wait_returns_on_change_times_out_without_side_effects() {
+        clear();
+        let task = STATE.with(|state| state.borrow_mut().tasks.create("wait test").unwrap());
+        let start = |token: u64, timeout_ms: u64| {
+            let (reply, receiver) = test_reply(token);
+            let baseline = task.clone();
+            STATE.with(|state| {
+                state.borrow_mut().task_waits.insert(
+                    token,
+                    TaskWaiter {
+                        task: task.id.clone(),
+                        baseline,
+                        timeout_ms,
+                        started: Instant::now(),
+                        reply,
+                    },
+                );
+            });
+            receiver
+        };
+        // Unchanged and not expired: keep waiting, nothing is sent.
+        let pending = start(1, 60_000);
+        assert!(matches!(step_task_wait(1), TaskWaitStep::Continue));
+        assert!(pending.try_recv().is_err());
+        // Handoff changes state and revision: wait returns the new view once.
+        let paused = STATE
+            .with(|state| {
+                state.borrow_mut().tasks.handoff(&TaskScope {
+                    task: task.id.clone(),
+                    revision: task.revision,
+                })
+            })
+            .unwrap();
+        assert!(matches!(step_task_wait(1), TaskWaitStep::Done));
+        let response = pending.try_recv().unwrap();
+        assert!(response.ok);
+        let result = response.result.unwrap();
+        assert_eq!(result["task"]["status"], "paused");
+        assert_eq!(result["task"]["revision"], paused.revision);
+        assert_eq!(result["changed"], true);
+        assert!(pending.try_recv().is_err());
+        // Timeout leaves the task untouched and reports the current view.
+        let expired = start(2, 1);
+        std::thread::sleep(Duration::from_millis(5));
+        let before = STATE.with(|state| state.borrow().tasks.info(&task.id).unwrap());
+        // The helper's baseline is the original (pre-handoff) view, so use the paused one.
+        STATE.with(|state| {
+            state.borrow_mut().task_waits.get_mut(&2).unwrap().baseline = before.clone()
+        });
+        assert!(matches!(step_task_wait(2), TaskWaitStep::Done));
+        let error = expired.try_recv().unwrap().error.unwrap();
+        assert_eq!(error.code, "WAIT_TIMEOUT");
+        assert_eq!(
+            STATE.with(|state| state.borrow().tasks.info(&task.id).unwrap()),
+            before
+        );
+        STATE.with(|state| assert!(state.borrow().task_waits.is_empty()));
+        // A pruned/unknown task and a dropped client both end the wait.
+        let (reply, receiver) = test_reply(3);
+        STATE.with(|state| {
+            state.borrow_mut().task_waits.insert(
+                3,
+                TaskWaiter {
+                    task: "task-missing".into(),
+                    baseline: before.clone(),
+                    timeout_ms: 1000,
+                    started: Instant::now(),
+                    reply,
+                },
+            );
+        });
+        assert!(matches!(step_task_wait(3), TaskWaitStep::Done));
+        assert_eq!(
+            receiver.try_recv().unwrap().error.unwrap().code,
+            "TASK_NOT_FOUND"
+        );
+        let gone = start(4, 60_000);
+        STATE.with(|state| {
+            state.borrow().task_waits[&4]
+                .reply
+                .active
+                .store(false, Ordering::Release)
+        });
+        assert!(matches!(step_task_wait(4), TaskWaitStep::Done));
+        assert!(gone.try_recv().is_err());
+        STATE.with(|state| assert!(state.borrow().task_waits.is_empty()));
+        clear();
+    }
+
+    #[test]
+    fn task_wait_since_returns_at_once_on_revision_mismatch_and_zero_is_invalid() {
+        clear();
+        let task = STATE.with(|state| state.borrow_mut().tasks.create("since test").unwrap());
+        let scope = TaskScope {
+            task: task.id.clone(),
+            revision: task.revision,
+        };
+        STATE
+            .with(|state| state.borrow_mut().tasks.handoff(&scope))
+            .unwrap();
+        // Stale revision: immediate answer with the current view, nothing registered.
+        let (reply, receiver) = test_reply(1);
+        assert!(admit_task_wait(&task.id, 5000, Some(task.revision), reply).is_none());
+        let result = receiver.try_recv().unwrap().result.unwrap();
+        assert_eq!(result["changed"], true);
+        assert_eq!(result["task"]["status"], "paused");
+        // Matching revision registers a blocking wait.
+        let (reply, receiver) = test_reply(2);
+        assert_eq!(
+            admit_task_wait(&task.id, 5000, Some(task.revision + 1), reply),
+            Some(2)
+        );
+        assert!(receiver.try_recv().is_err());
+        STATE.with(|state| assert_eq!(state.borrow().task_waits.len(), 1));
+        // Even a finished task reports the mismatch as a change.
+        let (reply, receiver) = test_reply(3);
+        assert!(admit_task_wait(&task.id, 5000, Some(1), reply).is_none());
+        assert_eq!(
+            receiver.try_recv().unwrap().result.unwrap()["changed"],
+            true
+        );
+        clear();
+    }
+
+    #[test]
+    fn native_resume_requires_current_revision_and_unfinished_task() {
+        clear();
+        let task = STATE.with(|state| state.borrow_mut().tasks.create("resume test").unwrap());
+        let scope = TaskScope {
+            task: task.id.clone(),
+            revision: task.revision,
+        };
+        // Active task: not paused.
+        assert!(
+            resume_native(scope.clone())
+                .unwrap_err()
+                .contains("TASK_NOT_PAUSED")
+        );
+        handoff_native(scope.clone()).unwrap();
+        // Revision captured before the stop is stale.
+        assert!(
+            resume_native(scope.clone())
+                .unwrap_err()
+                .contains("TASK_STALE_REVISION")
+        );
+        // Unknown task.
+        let unknown = TaskScope {
+            task: "task-missing".into(),
+            revision: 1,
+        };
+        assert!(
+            resume_native(unknown)
+                .unwrap_err()
+                .contains("TASK_NOT_FOUND")
+        );
+        let current = TaskScope {
+            task: task.id.clone(),
+            revision: task.revision + 1,
+        };
+        shell_action(ShellAction::ResumeSpace(current.clone())).unwrap();
+        let view = STATE.with(|state| state.borrow().tasks.info(&task.id).unwrap());
+        assert_eq!(view.status, Status::Active);
+        assert_eq!(view.revision, current.revision + 1);
+        // The same control is stale after it has been used.
+        assert!(
+            resume_native(current)
+                .unwrap_err()
+                .contains("TASK_STALE_REVISION")
+        );
+        // A finished task cannot be resumed.
+        let live = TaskScope {
+            task: task.id.clone(),
+            revision: view.revision,
+        };
+        STATE
+            .with(|state| state.borrow_mut().tasks.finish(&live, &[]))
+            .unwrap();
+        let finished = TaskScope {
+            task: task.id.clone(),
+            revision: view.revision + 1,
+        };
+        assert!(
+            resume_native(finished)
+                .unwrap_err()
+                .contains("TASK_FINISHED")
+        );
+        // Resume does not touch the user's current space.
+        STATE.with(|state| assert_eq!(state.borrow().spaces.active_space(), USER_SPACE));
+        clear();
+    }
+
+    #[test]
     fn task_handoff_cancels_preparation_waits_and_reports_dispatched_effects() {
         clear();
         let scope = TaskScope {
@@ -19544,6 +20524,7 @@ mod tests {
                     timeout_ms: 1000,
                     started: Instant::now(),
                     probe_in_flight: true,
+                    text_truncated: false,
                     reply: waiting.clone(),
                 },
             );
@@ -19666,6 +20647,7 @@ mod tests {
                     timeout_ms: 1000,
                     started: Instant::now(),
                     probe_in_flight: true,
+                    text_truncated: false,
                     reply: wait_reply.clone(),
                 },
             );
@@ -19723,5 +20705,276 @@ mod tests {
         }
         assert!(valid_url("https://www.naver.com/"));
         assert!(valid_url("http://127.0.0.1:8123/"));
+    }
+
+    // --- JavaScript dialog control ---------------------------------------
+
+    fn dialog_fixture() -> (TaskScope, mpsc::Receiver<Response>, Reply) {
+        clear();
+        let (mut reply, receiver) = test_reply(901);
+        let scope = STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let task = state.tasks.create("Dialog test").unwrap();
+            let scope = TaskScope {
+                task: task.id,
+                revision: task.revision,
+            };
+            state.tasks.attach(&scope, 7, Origin::Created).unwrap();
+            let tasks = state.tasks.list();
+            state.spaces.update_tasks(&tasks);
+            state.spaces.insert(8, USER_SPACE, true);
+            state.spaces.insert(7, &scope.task, false);
+            state.tabs.insert(8, native_blank_tab());
+            state.tabs.insert(7, native_blank_tab());
+            scope
+        });
+        reply.scope = Some(scope.clone());
+        (scope, receiver, reply)
+    }
+
+    fn run_scoped(scope: &TaskScope, command: Command, token: u64) -> Response {
+        let (mut reply, receiver) = test_reply(token);
+        reply.scope = Some(scope.clone());
+        handle(&command, reply);
+        receiver.try_recv().expect("dialog commands reply synchronously")
+    }
+
+    #[test]
+    fn dialog_disposition_follows_ownership_and_task_status() {
+        use crate::dialog_runtime::Disposition;
+        let (scope, _receiver, _reply) = dialog_fixture();
+        assert_eq!(dialog_disposition(8), Disposition::Default, "user tab");
+        assert_eq!(dialog_disposition(99), Disposition::Default, "unknown tab");
+        assert_eq!(dialog_disposition(7), Disposition::Queue, "active task tab");
+        crate::dialog_runtime::settle_tabs([7], true);
+        assert_eq!(dialog_disposition(7), Disposition::AutoClose, "explicitly closing tab");
+        crate::dialog_runtime::unmark_closing(7);
+        assert_eq!(dialog_disposition(7), Disposition::Queue);
+        STATE.with(|state| state.borrow_mut().tasks.handoff(&scope).unwrap());
+        assert_eq!(dialog_disposition(7), Disposition::Default, "paused task tab belongs to the user");
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let resumed = TaskScope { task: scope.task.clone(), revision: scope.revision + 1 };
+            state.tasks.resume(&resumed).unwrap();
+            let finished = TaskScope { task: scope.task.clone(), revision: scope.revision + 2 };
+            state.tasks.finish(&finished, &[]).unwrap();
+        });
+        assert_eq!(dialog_disposition(7), Disposition::AutoClose, "finishing task never blocks close");
+        STATE.with(|state| state.borrow_mut().tabs.get_mut(&8).unwrap().rejected_creation = true);
+        assert_eq!(dialog_disposition(8), Disposition::AutoClose, "rejected tab");
+        crate::dialog_runtime::forget_tab(7);
+        clear();
+    }
+
+    #[test]
+    fn dialog_command_checks_scope_text_and_pending_state() {
+        use crate::dialogs::Kind;
+        let (scope, _receiver, _reply) = dialog_fixture();
+        let dialog = |action| Command::Dialog { tab: 7, action };
+        let accept = |text: Option<&str>| dialog(crate::protocol::DialogAction::Accept { text: text.map(Into::into) });
+        // Unscoped use is refused even for a user tab.
+        let (reply, receiver) = test_reply(1);
+        handle(&accept(None), reply);
+        assert_eq!(receiver.try_recv().unwrap().error.unwrap().code, "TASK_REQUIRED");
+        // No dialog yet.
+        let response = run_scoped(&scope, accept(None), 2);
+        assert_eq!(response.error.unwrap().code, "NO_DIALOG");
+        // TEXT is only for prompt and does not consume the dialog.
+        assert!(crate::dialog_runtime::test_insert(7, Kind::Confirm, "sure?", ""));
+        let response = run_scoped(&scope, accept(Some("x")), 3);
+        assert_eq!(response.error.unwrap().code, "DIALOG_TEXT_NOT_ALLOWED");
+        assert!(crate::dialog_runtime::tab_json(7).is_some());
+        // A foreign task cannot answer.
+        let other = STATE.with(|state| state.borrow_mut().tasks.create("Other dialog task").unwrap());
+        let foreign = TaskScope { task: other.id, revision: other.revision };
+        assert_eq!(run_scoped(&foreign, accept(None), 4).error.unwrap().code, "TASK_TAB_MISMATCH");
+        // A stale revision cannot answer.
+        let stale = TaskScope { task: scope.task.clone(), revision: scope.revision + 3 };
+        assert!(run_scoped(&stale, accept(None), 5).error.is_some());
+        assert!(crate::dialog_runtime::tab_json(7).is_some());
+        // Page commands fail fast while the dialog is pending; Close does not.
+        let response = run_scoped(&scope, Command::Read { tab: 7 }, 6);
+        let error = response.error.unwrap();
+        assert_eq!(error.code, "DIALOG_PENDING");
+        assert_eq!(error.details.as_ref().unwrap()["dialog"]["type"], "confirm");
+        let wait = Command::Wait { tab: 7, until: crate::protocol::WaitUntil::Dom, timeout_ms: 1000 };
+        assert_eq!(run_scoped(&scope, wait, 7).error.unwrap().code, "DIALOG_PENDING");
+        // Answering clears it and a second answer is NO_DIALOG.
+        let answered = run_scoped(&scope, dialog(crate::protocol::DialogAction::Dismiss {}), 8);
+        let result = answered.result.unwrap();
+        assert_eq!(result["action"], "dismiss");
+        assert_eq!(result["dialog"]["type"], "confirm");
+        assert!(crate::dialog_runtime::tab_json(7).is_none());
+        let response = run_scoped(&scope, dialog(crate::protocol::DialogAction::Dismiss {}), 9);
+        assert_eq!(response.error.unwrap().code, "NO_DIALOG");
+        // A prompt echoes the accepted text; omitted TEXT uses the default.
+        assert!(crate::dialog_runtime::test_insert(7, Kind::Prompt, "name?", "anon"));
+        let result = run_scoped(&scope, accept(None), 10).result.unwrap();
+        assert_eq!(result["text"], "anon");
+        assert!(crate::dialog_runtime::test_insert(7, Kind::Prompt, "name?", "anon"));
+        let result = run_scoped(&scope, accept(Some("bob")), 11).result.unwrap();
+        assert_eq!(result["text"], "bob");
+        clear();
+    }
+
+    #[test]
+    fn handoff_release_and_close_settle_queued_dialogs() {
+        use crate::dialogs::Kind;
+        let (scope, _receiver, _reply) = dialog_fixture();
+        // Handoff dismisses.
+        assert!(crate::dialog_runtime::test_insert(7, Kind::Alert, "a", ""));
+        let handed = run_task_command(Command::TaskHandoff { task: scope.task.clone(), revision: scope.revision }, 20);
+        assert!(handed.ok, "{handed:?}");
+        assert!(crate::dialog_runtime::tab_json(7).is_none());
+        let resumed = run_task_command(Command::TaskResume { task: scope.task.clone(), revision: scope.revision + 1 }, 21);
+        assert!(resumed.ok, "{resumed:?}");
+        let scope = TaskScope { task: scope.task, revision: scope.revision + 2 };
+        // Release dismisses.
+        assert!(crate::dialog_runtime::test_insert(7, Kind::BeforeUnload, "leave?", ""));
+        let released = run_task_command(Command::TaskRelease { task: scope.task.clone(), revision: scope.revision, tab: 7 }, 22);
+        assert!(released.ok, "{released:?}");
+        assert!(crate::dialog_runtime::tab_json(7).is_none());
+        // Re-adopt, then an explicit close settles and marks the tab closing.
+        let adopted = run_task_command(Command::TaskAdopt { task: scope.task.clone(), revision: scope.revision, tab: 7 }, 23);
+        assert!(adopted.ok, "{adopted:?}");
+        assert!(crate::dialog_runtime::test_insert(7, Kind::BeforeUnload, "leave?", ""));
+        let closed = run_scoped(&scope, Command::Close { tab: 7 }, 24);
+        assert!(closed.ok, "{closed:?}");
+        assert!(crate::dialog_runtime::tab_json(7).is_none());
+        assert!(crate::dialog_runtime::is_closing(7));
+        // Finish settles the remaining task tabs.
+        crate::dialog_runtime::unmark_closing(7);
+        assert!(crate::dialog_runtime::test_insert(7, Kind::Alert, "a", ""));
+        let finished = run_task_command(Command::TaskFinish { task: scope.task.clone(), revision: scope.revision, keep: vec![] }, 25);
+        assert!(finished.ok, "{finished:?}");
+        assert!(crate::dialog_runtime::tab_json(7).is_none());
+        assert_eq!(crate::dialog_runtime::pending_count(), 0);
+        // OnBeforeClose forgets the close flag.
+        crate::dialog_runtime::forget_tab(7);
+        assert!(!crate::dialog_runtime::is_closing(7));
+        clear();
+    }
+
+    #[test]
+    fn close_all_settles_queued_dialogs_and_marks_tabs_closing() {
+        use crate::dialog_runtime::Disposition;
+        use crate::dialogs::Kind;
+        let (_scope, _receiver, _reply) = dialog_fixture();
+        assert!(crate::dialog_runtime::test_insert(7, Kind::BeforeUnload, "leave?", ""));
+        assert_eq!(crate::dialog_runtime::pending_count(), 1);
+        close_all();
+        assert_eq!(crate::dialog_runtime::pending_count(), 0);
+        assert!(crate::dialog_runtime::is_closing(7));
+        assert_eq!(dialog_disposition(7), Disposition::AutoClose);
+        // The user tab still gets the native prompt.
+        assert_eq!(dialog_disposition(8), Disposition::Default);
+        clear();
+    }
+
+    #[test]
+    fn reentrant_reset_during_overflow_keeps_the_queued_dialog() {
+        use crate::dialogs::Kind;
+        let (_scope, _receiver, _reply) = dialog_fixture();
+        assert!(crate::dialog_runtime::test_insert(7, Kind::Confirm, "first", ""));
+        // A second dialog on the same tab overflows (model refuses it).
+        assert!(!crate::dialog_runtime::test_insert(7, Kind::Alert, "second", ""));
+        crate::dialog_runtime::test_reset_during_guard(7);
+        assert_eq!(crate::dialog_runtime::tab_json(7).unwrap()["message"], "first");
+        // Outside the guard a CEF reset removes it.
+        crate::dialog_runtime::reset_tab(7);
+        assert!(crate::dialog_runtime::tab_json(7).is_none());
+        clear();
+    }
+
+    #[test]
+    fn focus_grace_covers_pending_and_recently_answered_dialogs() {
+        use crate::dialogs::Kind;
+        let (_scope, _receiver, _reply) = dialog_fixture();
+        assert!(!crate::dialog_runtime::focus_grace_active(7));
+        assert!(crate::dialog_runtime::test_insert(7, Kind::Alert, "a", ""));
+        assert!(crate::dialog_runtime::focus_grace_active(7));
+        crate::dialog_runtime::settle_tabs([7], false);
+        assert!(crate::dialog_runtime::focus_grace_active(7), "one grace period after resume");
+        crate::dialog_runtime::forget_tab(7);
+        assert!(!crate::dialog_runtime::focus_grace_active(7));
+        clear();
+    }
+
+    fn run_task_command(command: Command, token: u64) -> Response {
+        let (reply, receiver) = test_reply(token);
+        handle(&command, reply);
+        receiver.try_recv().expect("task commands reply synchronously")
+    }
+
+    #[test]
+    fn queued_dialog_fails_in_flight_requests_and_waits_with_the_dialog() {
+        use crate::dialogs::Kind;
+        let (scope, _receiver, mut reply) = dialog_fixture();
+        let (pending_reply, pending_receiver) = test_reply(31);
+        let (wait_reply, wait_receiver) = test_reply(32);
+        let mut pending_reply = pending_reply;
+        pending_reply.scope = Some(scope.clone());
+        reply.token = 33;
+        let (other_reply, other_receiver) = test_reply(34);
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.pending.insert(
+                42,
+                Pending {
+                    frame: None,
+                    tab: 7,
+                    epoch: 4,
+                    evaluation: Evaluation::Page { mutation: true, evidence: None },
+                    reply: pending_reply,
+                    step: Step::Evaluate,
+                },
+            );
+            state.pending.insert(
+                43,
+                Pending {
+                    frame: None,
+                    tab: 8,
+                    epoch: 4,
+                    evaluation: Evaluation::Page { mutation: false, evidence: None },
+                    reply: other_reply,
+                    step: Step::Evaluate,
+                },
+            );
+            state.waits.insert(
+                44,
+                Waiter {
+                    tab: 7,
+                    until: crate::protocol::WaitUntil::Dom,
+                    timeout_ms: 5000,
+                    started: Instant::now(),
+                    probe_in_flight: false,
+                    text_truncated: false,
+                    reply: wait_reply,
+                },
+            );
+        });
+        assert!(crate::dialog_runtime::test_insert(7, Kind::Alert, "hello", ""));
+        let dialog = crate::dialog_runtime::tab_json(7).unwrap();
+        dialog_opened(7, dialog);
+        let error = pending_receiver.try_recv().unwrap().error.unwrap();
+        assert_eq!(error.code, "DIALOG_PENDING");
+        let details = error.details.unwrap();
+        assert_eq!(details["outcomeUnknown"], true);
+        assert_eq!(details["dialog"]["message"], "hello");
+        let error = wait_receiver.try_recv().unwrap().error.unwrap();
+        assert_eq!(error.code, "DIALOG_PENDING");
+        // Requests on other tabs are untouched.
+        assert!(other_receiver.try_recv().is_err());
+        STATE.with(|state| {
+            let state = state.borrow();
+            assert!(state.waits.is_empty());
+            assert_eq!(state.pending.len(), 1);
+        });
+        // Status and tab listings expose the dialog.
+        let status = crate::dialog_runtime::status_json();
+        assert_eq!(status["pending"], 1);
+        assert_eq!(status["requests"][0]["type"], "alert");
+        assert_eq!(crate::dialog_runtime::pending_tabs(), [7].into_iter().collect());
+        clear();
     }
 }

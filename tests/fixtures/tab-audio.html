@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="ko">
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; form-action 'none'; base-uri 'none'">
+<title>Naru 탭 음소거 확인</title>
+<style>
+  body { margin: 28px; max-width: 820px; font: 17px system-ui; color: #263747; background: #f5f7fb; }
+  button { font: inherit; padding: 10px 14px; margin: 4px 8px 8px 0; }
+  section { padding: 18px; margin-bottom: 18px; background: white; border-radius: 14px; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; }
+</style>
+<h1>탭 음소거 확인</h1>
+<p>출력 gain을 항상 0으로 고정한 Web Audio 그래프입니다. 시작 버튼을 직접 누를 때만 오디오 컨텍스트를 만듭니다. 외부 파일, 마이크와 네트워크를 사용하지 않습니다.</p>
+<section>
+  <button type="button" id="start">무음 그래프 시작</button>
+  <button type="button" id="sample">현재 상태 기록</button>
+  <button type="button" id="stop" disabled>그래프 종료</button>
+  <p id="summary">아직 시작하지 않았습니다.</p>
+</section>
+<section>
+  <h2>검사 범위</h2>
+  <p>상태 기록 버튼으로 컨텍스트 시계의 진행을 비교합니다. 백그라운드에서는 브라우저가 실행을 늦추거나 일시 정지할 수 있습니다.</p>
+  <p>페이지의 gain과 컨텍스트 상태는 브라우저 탭의 음소거 설정과 다릅니다. 이 페이지는 네이티브 음소거 값을 읽을 수 없습니다. 메뉴 체크와 탭 아이콘은 별도로 확인해야 합니다.</p>
+  <p>이 검사는 실제 스피커 출력, 들리는 소리의 유무, 오디오 데이터 전달을 입증하지 않습니다. 자동 반복 관찰은 하지 않습니다.</p>
+</section>
+<pre id="receipt" aria-label="탭 오디오 관찰 기록"></pre>
+<script>
+  const startButton = document.querySelector('#start');
+  const stopButton = document.querySelector('#stop');
+  const events = [];
+  const samples = [];
+  let session = null;
+  let generation = 0;
+  let phase = 'idle';
+  let lastContextState = null;
+  let lastContextTime = null;
+  let startActions = 0;
+  let lastStartTrusted = null;
+  let lastStartActivation = null;
+
+  function current() {
+    return {
+      generation,
+      phase,
+      contextState: session?.context.state ?? lastContextState,
+      contextTimeSeconds: session?.context.currentTime ?? lastContextTime,
+      sourceStarted: session?.started ?? false,
+      pageOutputGain: session?.gain.gain.value ?? null,
+      configuredGain: 0,
+      visibility: document.visibilityState,
+      hasFocus: document.hasFocus(),
+      nativeHostMuted: null,
+      nativeHostMuteObservableFromPage: false,
+      startActions,
+      lastStartTrusted,
+      lastStartActivation,
+    };
+  }
+
+  function show() {
+    const state = current();
+    const receipt = { ...state, samples, events };
+    document.querySelector('#summary').textContent =
+      `단계: ${state.phase}, 컨텍스트: ${state.contextState ?? '없음'}, 시계: ${state.contextTimeSeconds ?? '없음'}, 화면: ${state.visibility}`;
+    document.querySelector('#receipt').textContent =
+      `TAB_AUDIO_STATE_BEGIN ${encodeURIComponent(JSON.stringify(receipt))} TAB_AUDIO_STATE_END`;
+  }
+
+  function record(kind, details = {}) {
+    events.push({ kind, ...details, phase, visibility: document.visibilityState });
+    if (events.length > 12) events.shift();
+    show();
+  }
+
+  function sample(reason, event) {
+    const state = current();
+    const previous = samples.at(-1);
+    const comparable = previous?.generation === generation
+      && previous?.contextTimeSeconds !== null
+      && state.contextTimeSeconds !== null;
+    samples.push({
+      reason,
+      generation,
+      contextState: state.contextState,
+      contextTimeSeconds: state.contextTimeSeconds,
+      deltaSeconds: comparable ? state.contextTimeSeconds - previous.contextTimeSeconds : null,
+      visibility: state.visibility,
+      trusted: event?.isTrusted ?? null,
+    });
+    if (samples.length > 8) samples.shift();
+    show();
+  }
+
+  async function closeSession(reason) {
+    if (!session || phase === 'stopping') return;
+    const closing = session;
+    phase = 'stopping';
+    startButton.disabled = true;
+    stopButton.disabled = true;
+    lastContextTime = closing.context.currentTime;
+    closing.context.onstatechange = null;
+    if (closing.started) closing.source.stop();
+    closing.source.disconnect();
+    closing.gain.disconnect();
+    try {
+      await closing.context.close();
+      lastContextState = closing.context.state;
+      phase = 'stopped';
+    } catch (error) {
+      lastContextState = closing.context.state;
+      phase = 'error';
+      record('close-error', { name: String(error.name || 'Error').slice(0, 80) });
+    } finally {
+      if (session === closing) session = null;
+      startButton.disabled = false;
+      record(reason);
+    }
+  }
+
+  startButton.addEventListener('click', async event => {
+    startActions += 1;
+    lastStartTrusted = event.isTrusted;
+    lastStartActivation = navigator.userActivation.isActive;
+    if (!lastStartTrusted || !lastStartActivation) {
+      record('start-rejected-no-user-gesture');
+      return;
+    }
+    if (session || phase === 'starting' || phase === 'stopping') return;
+    generation += 1;
+    phase = 'starting';
+    lastContextState = null;
+    lastContextTime = null;
+    startButton.disabled = true;
+    record('start-requested');
+    let created = null;
+    try {
+      const context = new AudioContext();
+      const gain = context.createGain();
+      gain.gain.value = 0;
+      const source = context.createOscillator();
+      created = { context, gain, source, started: false };
+      session = created;
+      // The only destination path crosses this fixed zero gain. No UI can raise it.
+      source.connect(gain);
+      gain.connect(context.destination);
+      context.onstatechange = () => {
+        if (session === created) record('context-statechange', { state: context.state });
+      };
+      source.start();
+      created.started = true;
+      stopButton.disabled = false;
+      await context.resume();
+      if (session !== created || phase === 'stopping') return;
+      phase = context.state === 'running' ? 'running' : 'waiting';
+      sample('start-completed', event);
+    } catch (error) {
+      if (created && (session !== created || phase === 'stopping')) return;
+      record('start-error', { name: String(error.name || 'Error').slice(0, 80) });
+      if (session && phase !== 'stopping') {
+        await closeSession('error-cleanup');
+      } else if (!session) {
+        phase = 'error';
+        startButton.disabled = false;
+        show();
+      }
+    }
+  });
+  document.querySelector('#sample').addEventListener('click', event => sample('manual', event));
+  stopButton.addEventListener('click', () => closeSession('user-stopped'));
+  document.addEventListener('visibilitychange', () => sample('visibilitychange'));
+  addEventListener('pagehide', () => closeSession('pagehide'));
+  show();
+</script>
+</html>

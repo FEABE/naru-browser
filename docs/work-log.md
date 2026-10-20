@@ -1,5 +1,268 @@
 # Naru 작업 기록
 
+## 2026-10-20, M7 최종 통합 검증 (release 빌드 1회, 로컬 CEF 자동화)
+
+### 요청 범위와 변경
+
+- M0~M5 미커밋 트리를 한 번만 release 빌드하고 그 번들로 정적 검사, 로컬 CEF 스모크와 14개 여정 매핑을 정리했다. 제품 소스 변경 없음. 하네스 변경 1건: `tests/shadow_smoke.py`의 루트 상한 단언이 v19부터 읽기 결과에 포함되는 `document` 스크롤 대상(역할 `document`) 1개를 세어 65개로 실패하던 것을, `document` 역할을 제외하고 64 이하를 확인하도록 고쳤다(제품 동작은 `truncated.shadowRoots: true`, 루트 버튼 64개로 정상).
+- 문서: `docs/ego-parity-e2e.md`(M7 절), `docs/product-plan.md`(상단 상태).
+- 빌드: 앱 `light-browser` SHA-256 `e36b0dd51f1374fef002f6b6d6d50b9ed4d2cc335e25d17e321b1685b8860ff0`, 번들 CLI `1b0a53d515853483e7bcb7ed9a7264d014aff648c4b6dc27ff33d7887373f5fc`(`artifacts/m7-20261020/build-receipt.json`).
+
+### 검증
+
+| 구분 | 내용 | 결과 |
+| --- | --- | --- |
+| 단위 | `cargo test --locked --lib` | 451개 통과 |
+| 컴파일·형식 | `cargo check --locked --bins`, `git diff --check` | 통과(기존 경고 1개) / 통과 |
+| 모의 DOM | `node --test tests/dom_bridge.test.mjs` | 146개 중 119 통과, 27 실패. HEAD 코드·테스트 기준선(137개 중 110 통과, 27 실패)과 실패 이름 27개 동일, 새 실패 없음 |
+| 가이드 | `lightbrowser skill` | 끝줄 `[lightbrowser:skill] end of guide` 확인 |
+| 로컬 CEF (이 바이너리, 새 mock-keychain 프로필) | single_window, spaces, tasks, navigation, navigation_recovery, wait, dialog, stop, geolocation_hidden(`--expect-fixed`), native_click, native_fill, native_press, select, check, insert_text, contenteditable, scroll_target, frame_journey, download_permissions, resources | 모두 exit 0, ok true |
+| 로컬 CEF | shadow_smoke | 첫 실행 exit 1(위 하네스 단언 불일치), 하네스 수정 후 같은 바이너리에서 exit 0 |
+| 로컬 CEF | restart_smoke(앱 2회 실행, 별도 프로필) | exit 0, 쿠키·localStorage 보존, 정상 종료 |
+| 로컬 CEF | e2e_v17_j05(프로필·출력 경로만 바꾼 임시 사본) | 전 단계 통과, 사용자 공간·선택 불변 |
+| 로컬 CEF | dialog_smoke `--quit-pid`(맨 끝) | exit 0, 대기 중 대화상자와 beforeunload가 있는 상태에서 SIGTERM 종료 확인 |
+| 측정 | `scripts/measure-memory.py --samples 5 --interval 2` | RSS 합 약 748MiB(프로세스 6개, 고유 RAM 아님). 60분 실행은 하지 않음 |
+| 실행하지 못함 | 네이티브 AppKit 확인 전체(주소창, 도구 막대 중지, 탭·북마크·검색, 사용자 DISMISS, Tab 순서, 사이드바 모서리 잘림, 저장창·파일 선택창), 외부 사이트·로그인(j11), IME, e2e_v17 j09·j13(하드코딩된 프로필·네이티브 저장창), frame_crash_smoke, controls_smoke, 60분 지속 사용 | 미실행 |
+
+결과 원본은 `artifacts/m7-20261020/`(스모크별 `*.json`, `results.tsv`, `shadow_smoke.first-fail.json`, `j05/`, `memory-short.json`, `node-failing-tests*.txt`)이다.
+
+### 알려진 한계, 남은 작업
+
+- 14개 여정: 01·04·06·07은 CLI·로컬 CEF 범위 pass. 02·03·05·08·09·10·12·13·14 pending, 11 blocked. 독립 브라우저 완성을 선언하지 않는다.
+- 제품 결함은 발견하지 못했다. 하네스 불일치 1건(shadow_smoke)은 위와 같이 수정했다. `e2e_v17_*` 스크립트는 v17 프로필 경로가 고정돼 있어 재사용성이 낮다.
+- 스모크가 통과해도 네이티브 포인터·포커스·IME와 장시간 메모리는 확인하지 않았다.
+
+### 정리
+
+앱은 `dialog_smoke --quit-pid`의 SIGTERM으로 종료했고 restart_smoke의 앱 2개는 스크립트가 종료했다. 픽스처 서버는 PID로 종료했다. `pgrep`으로 프로젝트 프로세스가 없음을 확인했다. 합성 프로필 `.local-data/e2e-m7-run`, `.local-data/e2e-m7-restart`를 삭제했다. 빌드 중간 산출물은 `dev.sh`의 `cleanup-build.py`가 정리했고(4321개 파일 2.7GiB) `target`은 release 실행 파일만 남아 4.3MiB, `dist/Light Browser.app`(337MiB)은 보존했다. 사용자 프로필은 건드리지 않았다. 커밋·푸시 없음.
+
+## 2026-10-20, M5 일상 결함 점검 (위치 재요청, 첫 로딩 중지, Tab 순서, 사이드바 잘림)
+
+### 요청 범위와 변경
+
+- (a) 숨긴 AI 탭의 위치 권한 재요청: 로컬 CEF로 재현(보완 전 바이너리에서 재요청 1건)하고 원인을 확인한 뒤 보완했다. 원인은 Blink가 숨겨진 페이지의 위치 연결을 끊고 JS 호출은 유지하는 동작이라, 숨긴 탭의 카드를 취소하면 응답이 닿지 않고 다시 표시될 때 같은 호출이 새 요청으로 시작되는 것이다. 보완은 숨긴 탭의 위치 카드 취소 시 탭당 1개(문서 epoch+origin)를 기록하고 같은 문서·origin의 다음 위치 요청 하나를 카드 없이 DISMISS로 응답해 페이지가 error-code-1을 받게 하는 것이다. 문서 전체 거절 캐시나 차단 설정은 아니다. 관련 파일: `src/site_permissions.rs`(`HiddenCancelGuard`와 단위 테스트), `src/site_permission_runtime.rs`(`remember_hidden_cancel`, `repeats_hidden_cancel`, `take_matching`이 요청도 반환, `media_stopped`가 기록 삭제), `src/browser.rs`(`site_permission_tab_hidden`), `tests/geolocation_hidden_smoke.py`(새 파일), `docs/site-permissions.md`.
+- (c) 첫 로딩 중지 후 NAVIGATION_BUSY: CLI 경로 전부에서 재현하지 못했다. 소스 변경 없음, 항목은 열려 있다(`docs/reload-stop.md`의 M5 절). `tests/stop_smoke.py`(새 파일)를 회귀 검사로 추가했다.
+- (b) 주소창과 시작 화면 Tab 순서: 이미 `correct_hidden_cef_tab_focus`와 키 뷰 재계산이 있고 이전 빌드에서 네 방향 이동이 확인돼 있다. 새 증거가 없고 키 뷰 연쇄가 AppKit 질의라 단위 테스트가 불가능해 소스를 바꾸지 않았다.
+- (d) 사이드바 모서리 잘림: 소스에서 원인이 명확하지 않아(진단 ON에서 가려지는 비결정 증상) 수정하지 않았다. 열려 있다.
+- 문서: `docs/site-permissions.md`, `docs/reload-stop.md`, `docs/start-page-design.md`, `docs/ego-parity-e2e.md`, `docs/product-plan.md`.
+
+### 검증
+
+| 구분 | 내용 | 결과 |
+| --- | --- | --- |
+| 단위 | `cargo test --locked --lib` | 451개 통과(M3 후 450개 + `hidden_cancel_guard_answers_one_identical_location_request_only`) |
+| 컴파일 | `cargo check --locked --bins` | 통과(기존 dead_code 경고 1개) |
+| 릴리스 빌드 | `NARU_MOCK_KEYCHAIN=1 scripts/dev.sh --release --build-only` 1회 | 통과, 중간 산출물 4321개 파일 2.7GiB 정리. 해시 `artifacts/m5-20261020/binary-sha256.txt` |
+| 로컬 CEF (a) 보완 전 | 이전 빌드(dist, M3 상태)에서 `tests/geolocation_hidden_smoke.py`: 표시 상태에서 위치 요청→사용자 공간으로 숨김→`task run stop`으로 카드 취소→AI 공간 표시 | 재요청 1건(새 토큰) 재현 |
+| 로컬 CEF (a) 보완 후 | 새 빌드, 새 mock-keychain 프로필, `--expect-fixed` | 재요청 0건, 페이지 error-code-1, 사용자 공간·선택 불변, 보이는 탭의 취소 뒤 의도적 재요청은 카드가 다시 뜸 |
+| 로컬 CEF (c) | 보완 전·후 `stop_repro.py`와 새 빌드의 `tests/stop_smoke.py`(open→stop→navigate 3경로) | 모두 stop 수 ms, loading false, 이어진 navigate 성공. NAVIGATION_BUSY 재현 안 됨 |
+| 로컬 CEF 회귀 | 새 빌드에서 `navigation_smoke.py`, `tasks_smoke.py`, `dialog_smoke.py`, `wait_smoke.py` | 모두 exit 0 |
+| 실행하지 못함 | 네이티브 AppKit: 사용자 DISMISS 버튼으로 숨긴 탭 위치 카드 취소(CLI로 누를 수 없어 IGNORE 경로로 대체), 도구 막대 중지 클릭의 첫 로딩 재현, 주소창↔시작 화면 Tab·Shift+Tab, 사이드바 모서리 잘림. 외부 사이트 검증 없음. `node --test`, 전체 형식 검사도 이번에 실행하지 않음(내 hunk 외 기존 rustfmt 차이는 그대로) | 미실행 |
+
+증거: `artifacts/m5-20261020/`(`geolocation-baseline-before-fix.json`, `geolocation-after-fix.json`, `stop-repro-baseline.txt`, `stop_repro.py`, `stop_smoke.json`, `navigation_smoke.json`, `tasks_smoke.json`, `dialog_smoke.json`, `wait_smoke.json`, `binary-sha256.txt`, `build.log`, `app.log`).
+
+### 알려진 한계, 남은 작업
+
+- (a) 숨긴 동안 같은 문서가 의도적으로 낸 새 위치 호출의 첫 요청도 표시될 때 한 번 거절된다. 알림과 미디어는 대상이 아니다. 네이티브 DISMISS 확인 필요.
+- (c) 네이티브 중지 클릭 경로의 표시-클릭 epoch 불일치 가설은 미확인이다.
+- (b), (d) 네이티브 확인과 (d)의 재현 조건 확보가 남았다.
+
+### 정리
+
+앱은 PID로 종료하고 `pgrep`으로 프로젝트 프로세스가 없음을 확인했다. `scripts/cleanup-build.py --profile release`를 실행했고(`target`은 release 실행 파일만 4.3MiB) 내 합성 프로필 `.local-data/m5-*`를 삭제했다. 사용자 프로필은 건드리지 않았다. 커밋·푸시 없음.
+
+## 2026-10-20, M3 JavaScript 대화상자 CLI 제어
+
+### 요청 범위와 변경
+
+- AI 작업이 Active로 소유한 탭의 `alert`/`confirm`/`prompt`/`beforeunload`를 네이티브 대화상자 대신 대기열에 보관하고 CLI로 응답한다. 사용자 공간 탭과 Paused 작업 탭은 CEF 기본 동작이다. 설계·CEF 계약·한계는 `docs/dialog-control.md`.
+- CEF `JsdialogHandler`(`src/dialog_runtime.rs`, `Client::jsdialog_handler`)와 순수 모델 `src/dialogs.rs`(탭당 1개, 전체 4개, 초과는 `cont(false)` 자동 취소와 overflow 계수, 메시지 2048자 절단).
+- 프로토콜·CLI: `Command::Dialog{tab, action: Accept{text?}|Dismiss{}}`, `dialog TAB accept [TEXT]`, `dialog TAB dismiss`. TEXT는 0..4096바이트·NUL 불가. 오류 코드 `NO_DIALOG`, `DIALOG_TEXT_NOT_ALLOWED`, `DIALOG_PENDING`, 작업 밖 사용은 `TASK_REQUIRED`. 소켓 경로의 `task_run` 필드 허용 목록(`validate_command_fields`)에 `dialog`를 추가했다. 처음에는 이 목록을 빠뜨려 실제 CLI에서 거절됐고 단위 테스트가 놓쳤다(허용 목록 테스트 추가).
+- 관찰: `tabs[].dialog`(`{type,message,defaultPrompt,origin}` 또는 null), `tabs[].dialogOverflow`, `status.dialogs{pending,overflow,requests}`. 대화상자가 열린 탭은 `Close`/`Stop`/`dialog` 외 명령이 렌더러에 닿기 전에 `DIALOG_PENDING`(details.dialog 포함)으로 즉시 실패한다. 대기열에 넣는 순간 그 탭의 진행 중 요청·wait도 같은 코드로 끝낸다(변경 명령은 `outcomeUnknown:true`).
+- 포커스 lease: 클릭이 대화상자를 열면 렌더러가 멈춰 임시 포커스 정리 ack가 오지 않아 처음 구현에서 `FOCUS_CLEANUP_FAILED`와 탭 격리가 났다(실측). 그래서 CLI에는 먼저 `DIALOG_PENDING`으로 답하고 lease 정리는 유지하며, `focus_timeout`은 대화상자 대기 중 5초마다 재무장한다.
+- 정리: handoff·release·`--keep` finish는 취소(beforeunload는 페이지에 남음), `close`·finish로 닫히는 탭은 beforeunload 허용(떠나기)이라 닫기가 멈추지 않는다. `OnResetDialogState`/`OnDialogClosed`는 항목만 제거, `OnBeforeClose`·렌더러 종료는 항목과 닫는 중 표시를 지운다.
+- 네이티브 UI: `ShellTab.dialog_pending`으로 사이드바 행 아이콘(`exclamationmark.bubble`)·접근성 설명, 상태 배지 "대화상자 대기", 공간 카드 "대화상자 대기 N". 공간·선택은 바꾸지 않는다.
+- 관련 파일: `src/dialogs.rs`, `src/dialog_runtime.rs`(새 파일), `src/protocol.rs`, `src/cli.rs`, `src/browser.rs`, `src/control_panel.rs`, `src/lib.rs`, `tests/dialog_smoke.py`, `tests/fixtures/dialogs.html`(새 파일), `docs/dialog-control.md`(새 문서), `docs/agent-cli-guide.md`, `docs/architecture.md`.
+
+### 검증
+
+| 구분 | 내용 | 결과 |
+| --- | --- | --- |
+| 단위 테스트 | `cargo test --locked --lib` (`CEF_PATH=$PWD/.cache/cef`) | 최초 447개, 리뷰 반영 뒤 450개 통과. 새 테스트: 큐 한도·overflow·절단·TEXT 규칙(`dialogs`), 프로토콜 왕복·검증·허용 목록, CLI 파싱, 소유권·Paused/Finishing 분기, 범위·revision·TEXT·`DIALOG_PENDING`·`NO_DIALOG`, handoff/release/close/finish 정리, 진행 중 요청·wait 전환, 행 설명 |
+| 모의 DOM | `node --test tests/dom_bridge.test.mjs` | 146개 중 119 통과/27 실패. M2와 같은 수치이고 이번에 dom_bridge를 바꾸지 않았다 |
+| 로컬 CEF 통합 | `tests/dialog_smoke.py` (release 빌드, `NARU_MOCK_KEYCHAIN=1`, 새 `.local-data` 프로필, 앱 SHA-256 `7400eac2…`) | 통과. AI 탭 alert 대기·tabs/status 노출·선택 불변, read/click/wait/fill/reload의 `DIALOG_PENDING` 즉시 실패, 소유자·revision·TEXT 검사, accept 뒤 DOM `timer-alert-done`, 클릭이 연 alert의 0.02초 반환, confirm false/true, prompt TEXT/기본값/null, navigate 중 beforeunload dismiss·accept, `close`가 beforeunload·alert 대기 중에도 완료, handoff가 alert를 취소해 페이지 계속, 전역 4개 한도와 5번째 자동 취소(overflow 기록), alert·armed beforeunload 대기 중 `task finish` 완료, 사용자 탭 alert는 대기열에 안 들어감 |
+| 로컬 CEF 회귀 | `tests/tasks_smoke.py`, `tests/wait_smoke.py` 같은 앱 | 둘 다 통과 |
+| 실행하지 못함 | 네이티브 AppKit 확인(사이드바 아이콘·상태 배지·카드 문구가 실제로 그려지는지), 사용자 탭 네이티브 대화상자의 실제 표시와 사용자 클릭 처리, 사용자가 네이티브 닫기 버튼으로 AI 탭을 닫을 때의 흐름, 하위 프레임·팝업 탭의 대화상자, 외부 사이트 | 사용자 클릭·화면 관찰이 필요하다. 사용자 탭은 "대기열에 안 들어감"과 닫기 요청 성공(`userTabClosed:true`)만 확인했다 |
+
+증거: `artifacts/m3-20261020/`(`dialog_smoke.json`, `tasks_smoke.json`, `wait_smoke.json`, `binary-sha256.txt`, `app.log`, `build*.log`).
+
+### 알려진 한계, 남은 작업
+
+- 위 "실행하지 못함" 항목, 특히 네이티브 표시 확인.
+- 대기열은 메모리에만 있다. handoff는 대화상자를 네이티브로 다시 띄우지 않고 취소한다(검토 요청).
+- 클릭이 대화상자를 연 경우 `click`은 오류(`DIALOG_PENDING`, `outcomeUnknown:true`)로 반환한다. 성공 영수증에 `dialog`를 싣는 ego 방식과 다르다.
+- 응답 직후 짧게 `TAB_BUSY`가 날 수 있다(포커스 정리 ack 대기). 스모크는 재시도한다.
+
+### 리뷰 반영
+
+- 앱 종료: `close_all`(종료 메뉴·종료 신호·창 닫기)이 대기 항목을 정리하고 탭을 닫는 중으로 표시한 뒤 `close_browser`를 호출한다. 이전에는 Active 작업 탭의 beforeunload가 대기열에 들어가 종료가 멈출 수 있었다. 단위 테스트 추가. CEF 통합: `dialog_smoke.py --quit-pid`로 armed beforeunload 탭과 대기 alert 탭을 두고 SIGTERM을 보내 10초 안에 종료함을 확인했다(종료 신호 경로의 `close_all`만 실행. 종료 메뉴와 창 닫기 경로의 실제 호출은 실행하지 못함).
+- 탭당 한도 초과(overflow)와 즉시 처리의 `cont`가 동기로 부르는 `OnDialogClosed`/`OnResetDialogState`가 이미 대기 중인 같은 탭의 대화상자를 지우던 문제: `self_continuing` 보호 집합을 추가하고 `OnDialogClosed`는 패널 갱신만 한다. 단위 테스트로 재진입 reset 중에도 항목이 유지됨을 확인했다. 실제 CEF에서 같은 탭 두 번째 대화상자를 만드는 것은 불가능해(렌더러가 멈춤) 통합 검사로는 재현하지 못했다.
+- 포커스 lease 경합: 응답·정리 뒤 5초 유예(`focus_grace_active`) 동안 `focus_timeout`을 재무장한다. 단위 테스트 추가. 실제 경합은 재현하지 못했다.
+- prompt 기본값: 표시는 2048자, TEXT 없는 accept는 원본(64KiB 한도)을 쓰고 `defaultPromptTruncated:true`를 노출한다.
+- 문서: 네이티브 대화상자가 뜬 Paused/adopt 탭의 한계, 대화상자 메시지는 신뢰할 수 없는 텍스트라는 안내, 앱 종료 행, handoff 시 네이티브 패널로 보여 주는 후속 과제를 추가했다.
+- 검증: `cargo test --locked --lib` 450개 통과, `cargo check --locked --bins` 통과, 증분 릴리스 빌드(앱 SHA-256 앞 16자 `artifacts/m3-20261020/binary-sha256.txt`) 뒤 새 mock-keychain 프로필에서 `tasks_smoke.py`, `wait_smoke.py`, `dialog_smoke.py --quit-pid` 모두 통과.
+
+### 정리
+
+앱은 PID로 종료해 `pgrep` 빈 결과를 확인했고 합성 프로필 `.local-data/m3-dialog-*`를 삭제했다. 빌드 뒤 `scripts/cleanup-build.py`로 Cargo 중간 산출물을 정리했다(마지막 4082개 파일, 2.5GiB). 최신 릴리스 실행 파일과 `dist` 번들은 보존했다. 커밋과 푸시는 하지 않았다.
+
+## 2026-10-20, M2 wait url/text 확장
+
+### 요청 범위와 변경
+
+- `wait TAB url PREFIX [TIMEOUT_MS]`, `wait TAB text SUBSTR [TIMEOUT_MS]`를 기존 `wait TAB [dom|load]`에 추가했다. dom/load 동작과 타임아웃, 소유권 검사 경로는 바꾸지 않았다.
+- 프로토콜: `WaitUntil`에 `Url{prefix}`, `Text{substring}`을 추가했다(`Copy`가 사라지고 `deny_unknown_fields`). 값은 비어 있지 않은 1..4096바이트이고 NUL을 허용하지 않으며 `Command::validate`(중첩 `task run` 포함)와 CLI 파서가 같은 `WaitUntil::validate`를 쓴다. CLI는 `wait TAB url|text VALUE [ms]`를 파싱하고 USAGE를 갱신했다. 값이 숫자여도 모드 다음 인자는 값이다.
+- `url`: 새 CDP 호출 없이 `poll_wait_with`의 네이티브 관찰값(`frame.url()`)을 `committed && !provisional`일 때 접두사 비교한다. 이미 일치하면 첫 폴링에서 즉시 반환하고, 같은 틱에 기한이 지나도 일치가 우선한다. 응답에 `matched:"url"`.
+- `text`: `dom` 대기와 같은 단일 in-flight 프로브 경로(`Evaluation::ReadyState`, `getFrameTree`→격리 world→`Runtime.evaluate`)를 재사용하고 표현식만 `containsText(needle)`로 바꿨다. `found`일 때만 완료(`matched:"text"`, `readyState` 없음)하고 `absent`, 본문 없음, 스크립트 예외, 검사 실패는 프로브만 풀고 기한까지 재시도한다. 문서 epoch가 바뀌면 기존대로 `PAGE_CHANGED`로 프로브만 버리고 다음 틱에 새 문서를 검사한다. 새 상주 타이머는 없다.
+- `src/dom_bridge.js`: 읽기 전용 `containsText(needle)`. `read`와 같은 순회·가시성·텍스트 예산(12000 UTF-16, 노드 10000, shadow root 64, iframe 16, 깊이 8)을 쓰고, 열린 shadow root와 접근 가능한 same-origin iframe을 포함한다. 대소문자 구분, 공백 정규화(찾는 값 포함). refs, generation, `contexts`를 건드리지 않고(검사 전용 `contexts`를 쓰고 finally에서 복원) 페이지 예외 문구를 반환하지 않는다. 증분 검색이라 경계에 걸친 일치도 찾는다.
+- 타임아웃: `WAIT_TIMEOUT` details의 `until`은 모드 문자열이고 `url`/`text`에는 `expected`가 추가된다. `navigationContinues:true`는 그대로다.
+- 관련 파일: `src/protocol.rs`, `src/cli.rs`, `src/browser.rs`, `src/dom_bridge.js`, `tests/dom_bridge.test.mjs`, `tests/wait_smoke.py`(새 파일), `docs/agent-cli-guide.md`, `docs/architecture.md`.
+
+### 검증
+
+| 구분 | 내용 | 결과 |
+|---|---|---|
+| 단위 | `cargo test --locked --lib` 전체. 새 테스트 4개: protocol `url_and_text_waits_round_trip_and_validate_value`, cli `wait_url_and_text_parse_value_and_optional_timeout`, browser `url_wait_matches_native_prefix_immediately_and_never_probes_the_page`, `text_wait_uses_one_bounded_probe_and_completes_only_on_found`(문서 이동 시 새 epoch 프로브 포함) | 432개 통과(M1 후 428개), 0개 실패 |
+| 모의 DOM | `node --test tests/dom_bridge.test.mjs`: 이전 137개 중 110 통과/27 실패, 이후 146개 중 119 통과/27 실패. 새 테스트 9개(대소문자·공백, 잘못된 입력, 숨김/비텍스트, shadow·iframe, 텍스트 예산, 노드 예산, 경계 일치, ref/generation 불변, 예외) 모두 통과. 기존 27개 실패는 그대로이며 늘지 않았다 | 새 실패 0 |
+| 형식 | 새 hunk의 rustfmt. protocol.rs, cli.rs는 파일 전체, browser.rs는 13000행 이전만 적용 | 내 hunk 차이 없음. 저장소에 이미 있던 browser.rs 후반부 차이는 그대로 |
+| 릴리스 빌드 | `NARU_MOCK_KEYCHAIN=1 scripts/dev.sh --release --build-only` | 통과, 중간 산출물 7393개 파일 4.3GiB 정리 |
+| 로컬 CEF | 같은 빌드를 `NARU_MOCK_KEYCHAIN=1`, 새 `LIGHT_BROWSER_DATA_DIR=.local-data/m2-20261020-2102`로 실행. `python3 tests/wait_smoke.py`: 지연 redirect에서 url 반환(0.4초 이상 대기), 이미 일치하면 즉시, 접두사 비교(부분 문자열 불일치)와 WAIT_TIMEOUT(tab 유지), 지연 삽입 텍스트 반환·숨김 텍스트 미일치·대소문자 구분, 대기 중 페이지 이동 후 새 문서에서 반환, `pendingWaits` 기준선 복귀, `task run` 소유 탭에서 url/text 성공·무범위 `TASK_REQUIRED`·타 탭 `TASK_TAB_MISMATCH`, 등록된 text 대기를 handoff가 `TASK_CONTROL_LOST`로 취소 | 통과(7개 항목) |
+| 로컬 CEF | 회귀: `tests/navigation_smoke.py`, `tests/tasks_smoke.py` | 둘 다 통과 |
+| 로컬 CEF | CLI 인자 검증(빈 값, 값 누락, 잘못된 모드) | 종료 코드 2와 사용법 출력 |
+| 외부 사이트 | 없음 | 해당 없음 |
+
+증거: `artifacts/m2-20261020/`(`wait_smoke.json`, `navigation_smoke.json`, `tasks_smoke.json`, `cargo-test-lib.log`, `dom_bridge-before.txt`, `dom_bridge-after.log`, `app.log`).
+
+### 미실행 검사
+
+- 네이티브 AppKit 화면 확인과 중지 버튼 클릭이 text 대기를 취소하는지: 미실행(CLI handoff 경로로만 확인).
+- cross-origin iframe 안의 텍스트, 렌더러 종료·탐색 실패 중의 text 대기, 12000자 예산 초과 페이지의 실제 CEF 동작: 모의 DOM 또는 코드 경로만 확인했고 CEF에서는 미실행.
+- 최종 `cargo build` 이후 rustfmt만 적용한 상태의 재빌드와 CEF 재실행: 미실행(서식만 바뀐 코드이며 단위 테스트는 그 뒤 432개 통과).
+- 외부 사이트 검증과 `wait` 동시 16개 슬롯 포화: 미실행.
+
+### 알려진 한계와 남은 작업
+
+- `text`는 `read`가 돌려주는 정규화 본문과 같은 범위만 본다. 12000 UTF-16 단위, 노드 10000개를 넘는 위치의 텍스트, 입력 필드 값, 접근 불가 cross-origin iframe, 닫힌 shadow root, 캔버스는 찾지 못하고 시간 초과가 된다. 대소문자를 구분하며 정규식·셀렉터·함수 대기는 없다.
+- `text` 프로브는 대기 중 매 50ms 틱마다(프로브 하나가 끝난 뒤) 격리 world 생성과 평가를 반복한다. `dom` 대기가 쓰는 비용과 같은 구조이며 최대 30초다.
+- `url`은 commit된 문서의 네이티브 주소만 보므로 아직 commit되지 않은 탐색(provisional)의 목표 주소는 일치로 보지 않는다. 탐색 실패/중지 오류는 기존 wait처럼 일치보다 먼저 반환된다.
+
+### 리뷰 반영 (Opus 승인, 수정 4건)
+
+- text 대기의 `SUBSTR`가 공백(`char::is_whitespace`, U+FEFF)만이면 `INVALID_REQUEST`로 거부한다(`WaitUntil::validate`, CLI와 서버 동일 메시지). protocol·cli 테스트에 `" "`, `"\n\t"` 등을 추가했다.
+- 가이드: url 접두사 비교가 호스트·경로 경계를 보지 않는다는 경고(`https://a.com`이 `https://a.com.evil.test`와 일치)와 끝 `/`·완전한 세그먼트 권고를 넣고 예시를 고쳤다. 공백 전용 값 거부와 `textTruncated`도 문서화했다.
+- USAGE 두 곳의 text 범위를 "메인 문서, 열린 shadow root, 접근 가능한 same-origin iframe"으로 고쳤다.
+- 잘림 전파: `containsText`가 `truncated`를 보고하면 프로브가 `absent-truncated`를 돌려주고 `Waiter.text_truncated`에 기록한다. `WAIT_TIMEOUT` details에 `textTruncated:true`가 붙는다(완전 검사 후 없음이면 붙지 않음). 단위 테스트와 모의 DOM 테스트(완전 스캔은 `truncated:false`)를 추가했다.
+- 검증(이번 라운드에는 단위·모의 DOM·`cargo check`만 실행): `cargo check --locked --bins` 통과, `cargo test --locked --lib` 432개 통과, `node --test tests/dom_bridge.test.mjs` 146개 중 119 통과/27 실패(기존 27개 그대로).
+- **CEF 실제 실행은 이 변경 이후 다시 하지 않았다.** 릴리스 빌드와 앱 실행은 하지 않았고 최종 M7 빌드에서 확인한다. debug 중간 산출물은 `cleanup-build.py`로 정리했다.
+
+### 정리
+
+앱은 PID로 종료했고 `pgrep`으로 프로세스가 없음을 확인했다. 합성 데이터 `.local-data/m2-20261020-2102`를 삭제했다. 릴리스 빌드 중간 산출물은 `dev.sh`의 `cleanup-build.py`가 정리했고, 이후 단위 테스트가 만든 debug 중간 산출물은 `python3 scripts/cleanup-build.py --target-dir "$PWD/target" --profile release`로 정리했다(target 1.7GiB에서 축소). 사용자 프로필은 건드리지 않았다. 커밋은 하지 않았다.
+
+## 2026-10-20, M1 에이전트 가이드, 이름 이어받기, task wait
+
+### 요청 범위와 변경
+
+- `lightbrowser skill`: `docs/agent-cli-guide.md`(작업 수명주기, 명령, ref와 revision, 오류 복구, 사용자 공간 안전 규칙, 인계와 종료)를 `include_str!`로 내장해 stdout에 그대로 출력한다. 앱 연결 없이 동작하고 마지막 줄은 `[lightbrowser:skill] end of guide`다. 가이드의 명령과 오류 코드는 `src/cli.rs`, `src/protocol.rs`, `src/browser.rs`의 실제 코드와 대조해 작성했다.
+- `task create NAME`: 같은 이름의 active/paused 작업이 있으면 새로 만들지 않고 그 작업을 `resumed:true`로 반환한다. paused는 상태와 revision을 바꾸지 않고 그대로 반환하므로 사용자에게서 제어권을 가져가지 않고, 이후 명시적 `task resume`을 쓴다. finishing/finished는 이어받지 않고 새로 만든다. 응답은 `{task, resumed}`다.
+- `task wait ID [TIMEOUT_MS]`(기본 10000, 1..30000): 호출 시점의 작업 보기(상태, revision, 소유 탭, 닫는 중인 탭)가 바뀌면 새 보기를 `changed:true`로, 제한 시간이면 `WAIT_TIMEOUT`(details.task, timeoutMs)로 반환한다. finished는 즉시 `changed:false`, 모르는 ID는 `TASK_NOT_FOUND`다. 새 `task_waits` 맵과 `TaskWaitTick`(50ms UI 지연 작업)을 사용하며 대기가 있는 동안에만 tick이 있고 유휴 상태에는 타이머가 없다. 대기 하나는 연결 worker 슬롯(16개) 하나를 제한 시간까지 차지하고 `status.pendingWaits`에 합산된다. 슬롯 초과 연결은 응답 없이 끊겨 클라이언트는 `INCOMPLETE_FRAME`(outcomeUnknown)을 받는다(`APP_BUSY`가 아님). 끊긴 클라이언트의 대기는 자기 제한 시간까지 남는다. `task run` 안에서는 거부된다.
+- 관련 파일: `src/tasks.rs`(`create_or_resume`), `src/protocol.rs`(`TaskWait` 열거형과 검증), `src/cli.rs`(파서, USAGE, `skill`, 가이드 내장), `src/browser.rs`(`TaskWaiter`, `step_task_wait`, `handle_task`), `docs/agent-cli-guide.md`, `docs/architecture.md`, `tests/tasks_smoke.py`.
+
+### 검증
+
+| 구분 | 내용 | 결과 |
+|---|---|---|
+| 단위 | `cargo test --locked --lib` 전체. 새 테스트: tasks 이름 이어받기 3개, protocol 1개, cli 2개, browser `task_wait_returns_on_change_times_out_without_side_effects` 1개 | 426개 통과, 0개 실패 |
+| 빌드 검사 | `cargo check --locked --bins` | 통과, 기존 경고 1건 |
+| 형식 | 새로 추가한 hunk에 대한 `cargo fmt --check` 차이 | 없음. 저장소에 이미 있던 다른 hunk는 일괄 포맷하지 않음 |
+| 릴리스 빌드 | `./scripts/dev.sh --release --build-only`(PATH에 `.cache/bin`) | 통과, 약 50초. `cleanup-build.py`가 중간 산출물 7676개 파일, 4.7GiB를 제거 |
+| 로컬 CEF | 앱 없이 `lightbrowser skill`: 종료 코드 0, `docs/agent-cli-guide.md`와 바이트 동일(`cmp`), 마지막 줄 확인. 앱 없이 `status`는 `APP_NOT_RUNNING` | 확인 |
+| 로컬 CEF | 앱을 `NARU_MOCK_KEYCHAIN=1`, `LIGHT_BROWSER_DATA_DIR=.local-data/m1-1020`으로 실행해 `tests/tasks_smoke.py` 실행 | 통과(9개 항목: 기존 5개 + 이름 이어받기, paused 비탈취, task wait 3종 묶음, 정리). 첫 두 실행은 테스트 코드의 기대값 오류(이전 탭 목록 비교, 완료된 동명 작업 포함 개수)로 실패해 테스트를 고친 뒤 통과 |
+| 로컬 CEF | 수동 CLI: 생성, 같은 이름 재호출 `resumed:true`, `task wait 300` 타임아웃(`WAIT_TIMEOUT`), handoff 후 재호출 시 paused/revision 2 그대로 반환, `pendingWaits` 0 | `artifacts/m1-20261020/manual-cli.txt` |
+| 외부 사이트 | 없음 | 해당 없음 |
+
+증거: `artifacts/m1-20261020/`(`build.log`, `tasks-smoke.json`, `skill-output.md`, `manual-cli.txt`, `app.log`).
+
+### 미실행 검사
+
+- 화면의 중지 버튼(네이티브 UI 클릭)이 `task wait`를 깨우는지: 미실행(네이티브 조작 필요). 중지 버튼은 같은 `TaskHandoff` 경로이며 CLI의 handoff로 깨우는 것만 확인했다.
+- 사용자가 탭을 직접 닫는 UI 조작: 미실행. CLI `task run close`로 탭 소실을 확인했다.
+- 동시 대기 16개 상한(`APP_BUSY`) 실제 포화 검사: 미실행.
+
+### 알려진 한계와 남은 작업
+
+- `task wait`의 기본 기준은 호출 시점의 상태이며 `--since REV`(리뷰 반영)로 마지막으로 아는 revision을 지정할 수 있다. 탭 소실은 revision을 바꾸지 않아 `--since`로는 잡히지 않는다.
+- 작업은 앱 메모리에만 있으므로 앱 재시작 후에는 이름 이어받기도 할 수 없다.
+- finishing 상태의 같은 이름 작업은 이어받지 않아 같은 이름의 새 작업이 생길 수 있다.
+
+### 리뷰 반영 라운드 (Opus 리뷰, 수정 필요 판정)
+
+- 네이티브 "AI에게 돌려주기": `ShellAction::ResumeSpace(TaskScope)`와 `resume_native`(`task resume`과 같은 경로, 렌더 시점 revision 사용). paused 작업의 공간 카드 버튼(`resumeSpace:`)과, 그 공간을 볼 때 도구 모음의 기존 중지 버튼 자리(역할 전환, `resumeTask:`)로 노출한다. 활성 작업의 중지 동작은 그대로다. 공간·탭 선택은 바꾸지 않는다. 파일: `src/control_panel.rs`, `src/browser.rs`.
+- `task wait --since REV`: 프로토콜 `since: Option<u64>`(0은 거부), CLI는 `[TIMEOUT_MS] [--since REV]`를 위치 무관하게 받으며 중복·값 누락·0은 오류. 현재 revision이 다르면 즉시 `changed:true`(finished 조기 반환보다 먼저). 가이드는 항상 마지막 REV를 `--since`로 넘기도록 안내한다.
+- 자원 설명 정정(코드 주석, architecture.md, 이 문서, 가이드), 가이드의 `INCOMPLETE_FRAME` 항목, 고유 작업 이름 안내와 예시, 종료 코드 설명 정정.
+- 검증: `cargo test --locked --lib` 428개 통과(추가: protocol since, cli since/위치/오류, browser `task_wait_since...`, `native_resume_requires_current_revision_and_unfinished_task`). `cargo check --locked --bins` 통과. 새 hunk 형식 차이 없음. 릴리스 빌드 통과(약 51초, 중간 산출물 정리 실행). 새 앱(mock keychain, `.local-data/m1-1020b`)에서 `tests/tasks_smoke.py` 통과(`--since` 오래된 revision 즉시 반환 포함, `tasks-smoke2.json`). 수동 CLI `task wait ID 30000 --since 1`은 즉시 `changed:true`, `--since 0`은 `INVALID_ARGUMENTS`(`manual-since.txt`).
+- 미실행: 네이티브 "AI에게 돌려주기" 버튼의 실제 AppKit 클릭과 표시/레이아웃, 그 클릭이 `task wait`를 깨우는지. 브라우저 쪽 resume 경로만 단위 테스트했다. 슬롯 16개 포화 시 `INCOMPLETE_FRAME` 실측도 하지 않았다(리뷰어 설명을 문서에 반영).
+- 정리: 앱 PID로 종료, pgrep 없음, `.local-data/m1-1020b` 삭제, `dev.sh`가 중간 산출물 정리.
+
+### 정리
+
+앱은 PID로 종료했고 `pgrep`으로 프로세스가 없음을 확인했다. 합성 데이터 `.local-data/m1-1020`을 삭제했다. 빌드 중간 산출물은 `dev.sh`의 `cleanup-build.py`가 정리했다. 사용자 프로필은 건드리지 않았다. 커밋은 하지 않았다.
+
+## 2026-10-20, M0 탭 음소거 미커밋 변경 마무리 검증
+
+### 요청 범위와 변경
+
+미커밋 상태인 탭 음소거 작업(펼친 사이드바 행의 음소거 버튼, `src/browser.rs`, `src/control_panel.rs`, `tests/fixtures/tab-audio.html`, 관련 문서)을 마무리 검증했다. 이번 단계에서 제품 소스는 수정하지 않았고 결함도 발견하지 못했다. `docs/tab-audio.md`에는 검증 상태 절을 추가했다.
+
+### 검증
+
+| 구분 | 내용 | 결과 |
+|---|---|---|
+| 단위 | `cargo test --locked --lib` 전체 | 419개 통과, 0개 실패 |
+| 빌드 검사 | `cargo check --locked --bins` | 통과, 기존 경고 1건 |
+| 형식 | `git diff --check` | 통과 |
+| 형식 | `cargo fmt --check` | 실패 44개 hunk(browser.rs 9, control_panel.rs 16, file_selection_native.rs 15, frame_sessions.rs 1, site_permission_runtime.rs 3). 이번 변경에서 만든 차이가 아니라 저장소에 이미 있던 형식 차이로 보고 일괄 포맷하지 않았다. 목록은 `artifacts/m0-tab-audio-20261020/fmt-diff-files.txt` |
+| 로컬 CEF | v25 번들(해시가 build-receipt와 같고 소스보다 새로움)을 mock keychain과 합성 프로필로 실행. 사용자 탭 2개, 무음 그래프 시작 후 새 사용자 탭 열기, 첫 탭이 숨김 상태에서 컨텍스트 시계 2.11초에서 5.66초로 진행 | 확인(확인 6의 페이지 실행 부분만) |
+| 로컬 CEF | 작업 공간 생성 후 `task run open`으로 AI 배경 탭 생성 | 사용자 공간과 선택 탭 2, revision 1 유지, 탭 수 2에서 3 |
+| 네이티브 | v25 번들에서 확인 1(배경 행 음소거, 선택 유지, AX 표시)은 `artifacts/e2e-v25-tab-audio-20261020/`에 이미 기록됨 | 이번에 재실행하지 않음 |
+
+### 미실행 검사
+
+- 확인 2(같은 origin 다른 탭 무변경과 재클릭 해제): 미실행(네이티브 조작 필요). CLI에는 음소거 명령이 없고 행 버튼 클릭은 AppKit 조작이다.
+- 확인 3(AI 공간 배경 행 음소거와 작업 상태): 미실행(네이티브 조작 필요). AI 탭 생성 시 선택과 revision 유지만 CLI로 확인했다.
+- 확인 4(접힌 사이드바): 미실행(네이티브 조작 필요).
+- 확인 5(보기 메뉴 현재 탭 음소거): 미실행(네이티브 조작 필요).
+- 확인 6의 음소거 상태에서의 시계 비교: 음소거를 적용하지 못했으므로 미실행. 위 표의 시계 진행은 음소거 없는 기준 관찰이다.
+- 실제 스피커 출력과 장시간 RAM은 측정하지 않았다.
+
+### 한계와 정리
+
+- CLI 시계 관찰은 페이지 실행이 이어짐만 보이며 네이티브 음소거 설정이나 출력 무음을 입증하지 않는다.
+- 새 빌드는 하지 않았다. 따라서 빌드 중간물 정리는 해당 없음. 근거는 `artifacts/m0-tab-audio-20261020/`(CLI 원문 `cli.jsonl`, `user-space-run.json`, `ai-space.txt`)이다.
+- 앱 프로세스(메인 PID 91142와 헬퍼)를 종료했고 `pgrep`으로 남은 프로세스가 없음을 확인했다. 자체 HTTP 서버도 종료했다. 합성 프로필 `.local-data/m0-audio-*`와 `.local-data/e2e-v25-audio`를 삭제했고 실제 프로필은 열지 않았다. 커밋, 푸시는 하지 않았다.
+
+## 2026-10-20, 커밋된 v24의 권한 패널 후속 E2E
+
+`56e8ce4`를 푸시한 뒤 기존 v24 바이너리로 남은 권한 패널 동작을 확인했다. 새 빌드와 전체 회귀는 실행하지 않았다. 시작과 검사 완료 때 제품 및 빌드 파일 103개가 v24 manifest와 같았고 앱과 CLI 해시도 앞선 기록과 일치했다.
+
+실제 AppKit에서 Tab과 Shift-Tab을 각각 6회 눌렀다. 모든 AX 관찰은 닫기 버튼을 가리켰고 네이티브 진단 12개도 `first=NSButton`, `cef=false`였다. 패널 뒤 페이지의 알림 상태 버튼과 겹치는 위치를 클릭해도 해당 페이지 이벤트는 생기지 않았다. 이 확인은 한 클릭 위치와 현재 macOS 키보드 설정의 결과이며 모든 입력 경계의 증명은 아니다.
+
+처음 위치 요청은 포커스 검사 중 fixture의 15초 제한으로 error-code-3이 됐다. 이를 취소 성공으로 세지 않았다. 새 문서에서 다시 요청하고 즉시 네이티브 취소를 누르자 error-code-1과 pending 0을 확인했다. 패널을 닫은 뒤에도 재요청은 없었다. 알림 허용은 페이지에서 granted, 저장 설정 초기화 뒤 상태 확인은 default였다. 실제 알림은 보내지 않았다. 카메라와 마이크 요청은 취소 후 NotAllowedError, 활성 미디어 없음, pending 0으로 끝났다.
+
+근거는 `artifacts/e2e-v24-permissions-followup-20261020/`의 CLI 원문, AX, 화면과 `12-final.json`이다. 단위 검사와 모의 DOM은 반복하지 않았다. 숨긴 AI 탭의 위치 조회 종료, 실제 OS 기기 허용과 스피커 출력, 외부 사이트, IME와 장시간 메모리는 이번 검증에 포함하지 않았다. 공개 CEF와 Chromium 조사에서도 숨김으로 연결이 끊긴 원래 위치 조회만 식별해 취소하는 API를 확인하지 못했다. 전체 브라우저 목표는 진행 중이다.
+
+앱 PID 66069와 자체 HTTP 서버 PID 65973은 각각 exit 0으로 종료했다. mock keychain 합성 프로필 78,041,131바이트를 삭제했고 실제 프로필은 열지 않았다. 최신 번들은 유지했으며 이 단계에서 빌드 중간물은 새로 만들지 않았다. 이후 배경 탭 음소거 구현은 이 v24 결과와 별도로 기록한다.
+
 ## 2026-10-20, 권한 취소와 패널 포커스 보완, v24 우선 커밋
 
 사용자가 현재 변경을 우선 커밋하고 푸시하라고 요청했다. `FEABE/naru-browser`의 PRIVATE 상태를 다시 확인했고 `codex/navigation-readiness`의 HEAD와 원격은 `dbe23b1`로 같았다. 제품 소스 두 파일과 관련 문서만 포함한다. 바이너리, 합성 프로필과 실행 자료는 Git 제외 상태로 유지한다.

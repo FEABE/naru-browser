@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Naru JavaScript dialog fixture</title>
+  <style>
+    body { margin: 24px; font: 16px system-ui; }
+    button { display: block; margin: 8px 0; padding: 6px 12px; font: inherit; }
+    pre { white-space: pre-wrap; background: #eef; padding: 8px; }
+  </style>
+</head>
+<body>
+  <h1>Dialog fixture</h1>
+  <p>Synthetic local page. Every dialog writes its result into the DOM after it is answered.</p>
+  <button id="alert-now" onclick="out('alert-start');alert('ALERT_MESSAGE');out('alert-done')">Alert now</button>
+  <button id="alert-timer" onclick="out('timer-armed');setTimeout(()=>{alert('TIMER_ALERT');out('timer-alert-done')},150)">Alert in timer</button>
+  <button id="confirm" onclick="out('confirm-start');const r=confirm('CONFIRM_MESSAGE');out('confirm:'+r)">Confirm</button>
+  <button id="prompt" onclick="out('prompt-start');const v=prompt('PROMPT_MESSAGE','DEFAULT_VALUE');out('prompt:'+v)">Prompt</button>
+  <button id="unload-on" onclick="window.onbeforeunload=e=>{e.preventDefault();e.returnValue='';return ''};out('unload-armed')">Arm beforeunload</button>
+  <button id="unload-off" onclick="window.onbeforeunload=null;out('unload-disarmed')">Disarm beforeunload</button>
+  <button id="plain" onclick="out('plain-clicked')">Plain button</button>
+  <pre id="result">idle</pre>
+  <script>
+    function out(text) { document.getElementById('result').textContent = 'RESULT ' + text; }
+  </script>
+</body>
+</html>

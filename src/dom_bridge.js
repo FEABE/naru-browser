@@ -1908,7 +1908,45 @@
     }
   }
 
-  const bridge = Object.freeze({ read, readFrame, readFrameActions, frameAct, clearFrame, inspectFrameOwner, inspectFramePointer, act });
+  // Read-only visible-text membership check for `wait TAB text SUBSTR`. It uses
+  // the same traversal, visibility rules and text budget as `read` (12000
+  // normalized UTF-16 code units, 10000 node visits, 64 open shadow roots),
+  // including accessible same-origin iframes. Matching is case-sensitive over
+  // whitespace-collapsed text, so a needle must be written as `read` shows it.
+  // It never touches refs, generation or other read state, and page exceptions
+  // are not echoed.
+  function containsText(needle) {
+    if (typeof needle !== "string") return failure("containsText", "INVALID_TEXT", "Text must be a string.");
+    const wanted = needle.replace(/\s+/g, " ").trim();
+    if (!wanted) return failure("containsText", "INVALID_TEXT", "Text must contain a visible character.");
+    const savedContexts = contexts;
+    try {
+      contexts = new WeakMap();
+      contexts.set(document, { id: "main", document, view: window, parent: null, depth: 0 });
+      const budget = { localFrame: false, limits: defaultReadLimits, visits: 0, rootCount: 0, options: 0, roots: new WeakSet(),
+        states: new WeakMap(), styles: new WeakMap(), ranges: new WeakMap(), frames: [],
+        truncated: { nodes: false, shadowRoots: false, depth: false, frames: false, frameDepth: false } };
+      const collector = textCollector(defaultReadLimits.text, budget);
+      let scanned = 0;
+      let found = false;
+      for (const node of walk(document.body, budget, true)) {
+        collector.add(node);
+        const current = collector.result().text;
+        if (current.length === scanned) continue;
+        // Only the unscanned tail plus a needle-sized overlap can contain a new match.
+        if (current.indexOf(wanted, Math.max(0, scanned - wanted.length + 1)) !== -1) { found = true; break; }
+        scanned = current.length;
+      }
+      const result = collector.result();
+      return { ok: true, found, truncated: result.truncated || Object.values(budget.truncated).some(Boolean) };
+    } catch (_error) {
+      return failure("containsText", "TEXT_CHECK_FAILED", "The page text could not be inspected.");
+    } finally {
+      contexts = savedContexts;
+    }
+  }
+
+  const bridge = Object.freeze({ read, containsText, readFrame, readFrameActions, frameAct, clearFrame, inspectFrameOwner, inspectFramePointer, act });
   Object.defineProperty(window, bridgeName, { value: bridge, writable: false, configurable: false });
   return bridge;
 })();

@@ -164,6 +164,21 @@ impl Registry {
         Ok(view)
     }
 
+    /// Resume-by-name: return the live task that already uses `name` instead of
+    /// creating a duplicate. The boolean is true when an existing task was
+    /// returned. A paused task is returned as paused with its current revision;
+    /// this never changes ownership or revision, so the agent must use the
+    /// explicit `task resume` and cannot silently take control back from the
+    /// user. Finishing and finished tasks are never resumed (a new task is made).
+    pub fn create_or_resume(&mut self, name: &str) -> Result<(TaskView, bool), TaskError> {
+        if let Some(task) = self.records.iter().rev().find(|task| {
+            task.name == name && matches!(task.status, Status::Active | Status::Paused)
+        }) {
+            return Ok((task.view(), true));
+        }
+        Ok((self.create(name)?, false))
+    }
+
     pub fn list(&self) -> Vec<TaskView> {
         self.records.iter().map(TaskRecord::view).collect()
     }
@@ -416,6 +431,59 @@ mod tests {
         assert_eq!(first.status, Status::Active);
         assert_eq!(first.revision, 1);
         assert_eq!(registry.list(), vec![first, second]);
+    }
+
+    #[test]
+    fn create_or_resume_returns_live_task_with_same_name() {
+        let mut registry = Registry::default();
+        let (first, resumed) = registry.create_or_resume("research").unwrap();
+        assert!(!resumed);
+        let (again, resumed) = registry.create_or_resume("research").unwrap();
+        assert!(resumed);
+        assert_eq!(again, first);
+        assert_eq!(registry.list().len(), 1);
+        let (other, resumed) = registry.create_or_resume("other").unwrap();
+        assert!(!resumed);
+        assert_ne!(other.id, first.id);
+        assert_eq!(
+            registry.create_or_resume("  ").unwrap_err().code,
+            "INVALID_TASK_NAME"
+        );
+    }
+
+    #[test]
+    fn create_or_resume_never_steals_control_from_a_paused_task() {
+        let mut registry = Registry::default();
+        let (first, _) = registry.create_or_resume("handoff").unwrap();
+        let paused = registry.handoff(&scope(&first)).unwrap();
+        let (again, resumed) = registry.create_or_resume("handoff").unwrap();
+        assert!(resumed);
+        assert_eq!(again, paused);
+        assert_eq!(again.status, Status::Paused);
+        assert_eq!(again.revision, paused.revision);
+        assert_eq!(
+            registry.check(&scope(&again)).unwrap_err().code,
+            "TASK_PAUSED"
+        );
+    }
+
+    #[test]
+    fn create_or_resume_skips_finishing_and_finished_tasks() {
+        let mut registry = Registry::default();
+        let (done, _) = registry.create_or_resume("job").unwrap();
+        registry.finish(&scope(&done), &[]).unwrap();
+        let (fresh, resumed) = registry.create_or_resume("job").unwrap();
+        assert!(!resumed);
+        assert_ne!(fresh.id, done.id);
+        registry.attach(&scope(&fresh), 5, Origin::Created).unwrap();
+        let finishing = registry.finish(&scope(&fresh), &[]).unwrap().task;
+        assert_eq!(finishing.status, Status::Finishing);
+        let (third, resumed) = registry.create_or_resume("job").unwrap();
+        assert!(!resumed);
+        assert_ne!(third.id, finishing.id);
+        let (again, resumed) = registry.create_or_resume("job").unwrap();
+        assert!(resumed);
+        assert_eq!(again.id, third.id);
     }
 
     #[test]

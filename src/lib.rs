@@ -3,6 +3,7 @@ pub mod bookmarks;
 pub mod cli;
 pub mod closed_pages;
 pub mod config;
+pub mod dialogs;
 pub mod download_permissions;
 pub mod downloads;
 pub mod file_selection;
@@ -28,6 +29,8 @@ pub mod capture;
 pub mod control_panel;
 #[cfg(feature = "browser")]
 mod devtools_wire;
+#[cfg(feature = "browser")]
+pub mod dialog_runtime;
 #[cfg(feature = "browser")]
 pub mod download_permission_runtime;
 #[cfg(feature = "browser")]

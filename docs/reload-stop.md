@@ -33,3 +33,11 @@ AI 인계가 끝난 뒤 창 포커스가 바뀌어 중지나 새로고침이 전
 소스 검사는 완료 직전 중지, 중복 중지, 새 로딩 중 새로고침 거절, 오래된 탭과 소유권, 네이티브 조회 중 재진입, 인계 후 문서 변경, 주소 초안의 보존과 만료를 구분한다. 실행 결과와 관련 파일은 [작업 기록](work-log.md)에 남긴다.
 
 실제 Naru에서 느린 HTTP 응답의 중지, 메뉴가 열린 동안 로딩 완료, 주소 편집 중 버튼 클릭, AI 인계와 배경 공간 보존, 한글 조합, 렌더러 복구는 후속 검증이다. 단위 검사나 독립 Chromium의 결과를 이 검증의 완료로 대신하지 않는다.
+
+## M5 첫 로딩 중지 후 NAVIGATION_BUSY 점검
+
+[네이티브 점검](native-e2e-2026-10-20.md)에서 첫 로딩의 중지 시도가 효과 없이 보였고 이어서 제출한 검색이 `NAVIGATION_BUSY`로 거절됐다. 이 오류는 `navigate`/`back`/`forward`/`reload`만 반환하며(`navigation_available`: provisional, intent_pending 또는 CEF 로딩 중) `stop`은 반환하지 않는다.
+
+M5에서 로컬 CEF로 `open` 직후 `stop`(대기 0, 0.05, 0.3초), 초기 탭의 `navigate` 직후 `stop`, 헤더 뒤 본문이 멈춘 응답, 작업 소유 탭 경로를 확인했다. 모두 `stop`은 수 ms에 접수되고 곧바로 `loading:false`, `provisional:false`, `stopped:true`가 되며 뒤따른 `navigate`는 성공했다(`tests/stop_smoke.py`, `artifacts/m5-20261020/stop_smoke.json`, 기준 기록 `stop-repro-baseline.txt`). 따라서 CLI 경로의 결함은 재현되지 않았고 소스 변경도 하지 않았다.
+
+미확정: 원래 관찰은 네이티브 도구 막대의 중지 클릭이다. 이 경로는 표시 당시의 탭·epoch·소유권을 클릭 시점에 다시 검사해 달라졌으면 명령을 보내지 않고 거절한다(`navigation_control_matches`). 첫 로딩은 시작·commit 등으로 epoch가 빠르게 바뀌므로 표시와 클릭 사이의 불일치로 중지가 거절됐을 가능성이 있으나, 클릭을 이 환경에서 구동하지 못해 확인하지 못했다. 추측으로 검사를 느슨하게 하지 않았다. 네이티브 확인(첫 로딩 중지 클릭 직후 상태와 거절 시 사용자 표시)이 남아 있다.

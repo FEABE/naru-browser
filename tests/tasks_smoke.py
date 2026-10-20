@@ -109,7 +109,9 @@ def run(args):
         server_thread.start()
         origin = f"http://127.0.0.1:{server.server_port}"
         for name in ("Task fixture A", "Task fixture B"):
-            task = call("task", "create", name)["task"]
+            created = call("task", "create", name)
+            task = created["task"]
+            require(created.get("resumed") is False, "A fresh task name must not report resumed")
             require(task["status"] == "active" and task["revision"] == 1 and not task["tabs"],
                     "New task must be active with no tabs and revision 1")
             tasks[task["id"]] = task
@@ -122,10 +124,23 @@ def run(args):
         command(b, "read", tab_a, expected="TASK_TAB_MISMATCH")
         report["checks"].append("task state survives CLI exit; scoped tabs and foreign/unscoped access checks")
 
+        a = info(a)
+        again = call("task", "create", a["name"])
+        require(again["resumed"] is True and again["task"] == a and len(
+            [t for t in call("task", "list")["tasks"] if t["name"] == a["name"] and t["status"] != "finished"]) == 1,
+            "Creating a live task name must return that task without a duplicate")
+        report["checks"].append("task create with a live name resumes the same task (resumed:true, no duplicate)")
+
         old_a = a.copy()
         reference = element(command(a, "read", tab_a)["page"], "Task action")["ref"]
         a, _ = manage("handoff", a)
         command(a, "read", tab_a, expected="TASK_PAUSED")
+        paused_again = call("task", "create", a["name"])
+        require(paused_again["resumed"] is True and paused_again["task"] == a
+                and paused_again["task"]["status"] == "paused",
+                "Resume-by-name must return a paused task unchanged, not take control")
+        command(a, "read", tab_a, expected="TASK_PAUSED")
+        report["checks"].append("task create by name does not resume a handed-off task")
         a, _ = manage("resume", a)
         command(old_a, "read", tab_a, expected="TASK_STALE_REVISION")
         # Before another read, so the native control revision must expire this ref.
@@ -134,6 +149,46 @@ def run(args):
         command(a, "click", tab_a, fresh)
         element(command(a, "read", tab_a)["page"], "Clicked")
         report["checks"].append("handoff/resume rejects old revision and refs; fresh observation permits action")
+
+        # task wait: timeout leaves the task untouched; handoff and tab loss wake it.
+        before_wait = info(a)
+        started = time.monotonic()
+        timeout = call("task", "wait", a["id"], 300, expected="WAIT_TIMEOUT")
+        require(time.monotonic() - started >= 0.25, "task wait returned before its timeout")
+        require(timeout["error"]["details"]["task"] == before_wait and info(a) == before_wait,
+                "task wait timeout changed or misreported the task")
+        call("task", "wait", a["id"], 0, expected="INVALID_ARGUMENTS")
+        call("task", "wait", a["id"], 30001, expected="INVALID_ARGUMENTS")
+        call("task", "wait", "task-missing", 100, expected="TASK_NOT_FOUND")
+        pool = ThreadPoolExecutor(max_workers=2)
+        try:
+            idle_waits = call("status")["pendingWaits"]
+            waiting = pool.submit(cli.request, "task", "wait", a["id"], 15000)
+            poll(lambda: call("status")["pendingWaits"], lambda count: count > idle_waits,
+                 "task wait was not registered")
+            old_revision = a["revision"]
+            a, _ = manage("handoff", a)
+            woke = waiting.result(timeout=5)
+            require(woke["ok"] and woke["result"]["changed"] is True
+                    and woke["result"]["task"] == a, "task wait did not return the handed-off task")
+            poll(lambda: call("status")["pendingWaits"], lambda count: count == idle_waits,
+                 "task wait left a registered waiter")
+            since = call("task", "wait", a["id"], 30000, "--since", old_revision)
+            require(since["changed"] is True and since["task"] == a,
+                    "task wait --since with an old revision must return the current task immediately")
+            a, _ = manage("resume", a)
+            lost_tab = open_tab(origin + "/waitclose", a)
+            waiting = pool.submit(cli.request, "task", "wait", a["id"], 15000)
+            poll(lambda: call("status")["pendingWaits"], lambda count: count > idle_waits,
+                 "second task wait was not registered")
+            command(a, "close", lost_tab)
+            woke = waiting.result(timeout=5)
+            require(woke["ok"] and all(t["tab"] != lost_tab for t in woke["result"]["task"]["tabs"])
+                    and woke["result"]["task"]["revision"] == a["revision"],
+                    "task wait did not report tab loss without a revision change")
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+        report["checks"].append("task wait: WAIT_TIMEOUT without side effects, arg/id errors, wakes on handoff and tab loss, no waiter leak")
 
         borrowed = open_tab(origin + "/borrowed")
         a, _ = manage("adopt", a, borrowed)
@@ -175,6 +230,9 @@ def run(args):
         require(tab_b not in tab_ids(), "Finished task retained a created tab")
         repeated = call("task", "finish", b["id"], b["revision"])
         require(repeated["task"]["revision"] == b["revision"] and not repeated["closeRequested"], "Repeated finish changed a completed plan")
+        immediate = call("task", "wait", b["id"], 30000)
+        require(immediate["changed"] is False and immediate["task"]["status"] == "finished",
+                "task wait on a finished task must return immediately")
         report["checks"].append("finish preserves borrowed/keep tabs and completes only after created tabs close")
         report["ok"] = True
     except (CheckFailed, OSError, KeyError, TypeError, TimeoutError) as error:
