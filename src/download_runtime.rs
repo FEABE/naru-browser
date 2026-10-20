@@ -766,6 +766,9 @@ pub(crate) fn updated(
 }
 
 pub fn choose_path(id: u32) -> Result<(), String> {
+    if crate::file_selection_runtime::is_choosing() {
+        return Err("파일 선택 창을 먼저 닫아 주세요.".into());
+    }
     let entry = RUNTIME.with(|slot| {
         let state = slot.borrow();
         if state.shutting_down || state.dialog.is_some() {
@@ -791,6 +794,11 @@ pub fn choose_path(id: u32) -> Result<(), String> {
     let filters_ptr: *const cef::sys::_cef_string_list_t = (&filters).into();
     if filters_ptr.is_null() {
         return Err("저장 위치 선택 창을 준비하지 못했습니다.".to_owned());
+    }
+    // Resolving the CEF host above can reenter UI work. Reserve the save dialog
+    // only if a file-selection sheet has not occupied the shared native slot.
+    if crate::file_selection_runtime::is_choosing() {
+        return Err("파일 선택 창을 먼저 닫아 주세요.".into());
     }
     let dialog = RUNTIME.with(|slot| {
         let mut state = slot.borrow_mut();

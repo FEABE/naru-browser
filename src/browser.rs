@@ -260,6 +260,8 @@ struct Navigation {
     // Explicit navigation/control changes invalidate a file's source link;
     // provisional attachment requests must not hide earlier source links.
     download_source_generation: u64,
+    // Any frame change invalidates a file request, including before it is queued.
+    file_selection_generation: u64,
     download_restart_provenance_blocked: Option<(u64, u64)>,
     download_permission_provenance: crate::download_permissions::Provenance,
     requested_url: String,
@@ -1487,6 +1489,7 @@ impl State {
 thread_local! { static STATE: RefCell<State> = RefCell::new(State::default()); }
 
 pub fn clear() {
+    crate::file_selection_runtime::clear();
     crate::download_permission_runtime::clear();
     crate::download_runtime::clear();
     STATE.with(|state| *state.borrow_mut() = State::default());
@@ -1501,6 +1504,74 @@ pub(crate) struct DownloadContext {
 pub(crate) struct DownloadPermissionContext {
     pub target: crate::download_permissions::Target,
     pub source: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct FileSelectionContext {
+    pub target: crate::downloads::SourceTarget,
+    pub scope: TaskScope,
+    pub generation: u64,
+    pub source: String,
+}
+
+fn invalidate_file_selection(tab: i32) {
+    STATE.with(|slot| {
+        if let Some(page) = slot.borrow_mut().tabs.get_mut(&tab) {
+            page.navigation.file_selection_generation =
+                page.navigation.file_selection_generation.saturating_add(1);
+        }
+    });
+    // Callback cancellation can reenter CEF; never hold STATE here.
+    crate::file_selection_runtime::cancel_tab(tab);
+}
+
+pub(crate) fn file_selection_context(tab: i32) -> Result<Option<FileSelectionContext>, String> {
+    let context = download_context(tab)
+        .map_err(|_| "파일을 요청한 탭의 제어권을 확인할 수 없습니다.".to_owned())?;
+    let Some(scope) = context.scope else {
+        // Human-controlled pages keep Chromium's ordinary file chooser.
+        return Ok(None);
+    };
+    let generation = STATE.with(|slot| {
+        slot.borrow()
+            .tabs
+            .get(&tab)
+            .map(|page| page.navigation.file_selection_generation)
+            .ok_or_else(|| "파일을 요청한 탭이 닫혔습니다.".to_owned())
+    })?;
+    let context = FileSelectionContext {
+        target: context.source_target,
+        scope,
+        generation,
+        source: context.source,
+    };
+    validate_file_selection(&context)?;
+    Ok(Some(context))
+}
+
+pub(crate) fn validate_file_selection(context: &FileSelectionContext) -> Result<(), String> {
+    validate_download_source(&context.target)
+        .map_err(|_| "파일을 요청한 문서나 작업의 제어권이 변경되었습니다.".to_owned())?;
+    STATE.with(|slot| {
+        let state = slot.borrow();
+        let current = state.tabs.get(&context.target.tab).is_some_and(|tab| {
+            tab.navigation.document_available
+                && tab.navigation.renderer_exit.is_none()
+                && context.generation != u64::MAX
+                && tab.navigation.file_selection_generation == context.generation
+        }) && state.tasks.info(&context.scope.task).is_ok_and(|task| {
+            task.status == Status::Active
+                && task.revision == context.scope.revision
+                && state.tasks.owner(context.target.tab).is_some_and(|(owner, _)| {
+                    owner == context.scope.task
+                })
+        });
+        if current {
+            Ok(())
+        } else {
+            Err("파일을 요청한 페이지나 AI 작업이 더 이상 활성 상태가 아닙니다.".into())
+        }
+    })
 }
 
 pub(crate) fn download_permission_context(tab: i32) -> Result<DownloadPermissionContext, String> {
@@ -3611,6 +3682,7 @@ fn clear_navigation_controls(
     );
     navigation_control_current(guard, still_current)?;
     revoke_download_permission_provenance(guard.tab);
+    invalidate_file_selection(guard.tab);
     crate::download_permission_runtime::cancel_tab(guard.tab);
     navigation_control_current(guard, still_current)?;
     invalidate_page_find(guard.tab);
@@ -3910,6 +3982,7 @@ pub fn shell_action(action: ShellAction) -> Result<(), String> {
     // These are explicit human actions in trusted native chrome. A paused task
     // must not prevent its user from browsing. CLI authorization stays in handle.
     if matches!(command, Command::Close { .. }) {
+        invalidate_file_selection(id);
         browser
             .host()
             .ok_or("The tab has no host.")?
@@ -3970,6 +4043,7 @@ pub fn close_all() {
         quit_message_loop();
     }
     for browser in browsers {
+        invalidate_file_selection(browser.identifier());
         if let Some(host) = browser.host() {
             host.close_browser(0);
         }
@@ -4807,6 +4881,7 @@ fn pending_error(pending: &Pending, code: &str, message: &str) {
 }
 
 fn control_detached(tab: i32) {
+    invalidate_file_selection(tab);
     let (pending, focus) = STATE.with(|state| {
         let mut state = state.borrow_mut();
         state.frame_controls.remove(&tab);
@@ -4853,6 +4928,7 @@ fn control_detached(tab: i32) {
 }
 
 fn renderer_terminated(tab: i32, reason: Json) {
+    invalidate_file_selection(tab);
     crate::download_permission_runtime::cancel_tab(tab);
     abort_focus_lease(
         tab,
@@ -4933,6 +5009,7 @@ fn task_result<T: serde::Serialize>(result: Result<T, TaskError>, reply: &Reply)
 // Revoke work on the UI thread before allowing another controller to resume.
 // A dispatched mutation cannot be undone, so its reply records an unknown outcome.
 fn revoke_task_requests(task: &str, only_tab: Option<i32>) {
+    crate::file_selection_runtime::cancel_task(task, only_tab);
     crate::download_permission_runtime::cancel_task(task, only_tab);
     crate::download_runtime::cancel_task(task, only_tab);
     let matches = |reply: &Reply, tab: i32| {
@@ -5021,6 +5098,7 @@ fn expire_tab_refs(tabs: impl IntoIterator<Item = i32>) {
         stopped
     });
     for id in tabs {
+        invalidate_file_selection(id);
         crate::download_permission_runtime::cancel_tab(id);
     }
     if let Some(host) = stopped.and_then(|browser| browser.host()) {
@@ -5199,10 +5277,24 @@ fn handle_task(command: &Command, reply: Reply) {
 fn status_json() -> Json {
     let (active_downloads, awaiting_save) = crate::download_runtime::activity();
     let awaiting_permission = crate::download_permission_runtime::pending_count();
+    let file_selections = crate::file_selection_runtime::snapshot()
+        .into_iter()
+        .map(|row| json!({
+            "token":row.token,"tab":row.tab,
+            "state":if row.choosing {"choosing"} else {"pending"},
+            "mode":match row.mode {
+                crate::file_selection::Mode::Open => "open",
+                crate::file_selection::Mode::Multiple => "multiple",
+                crate::file_selection::Mode::Folder => "folder",
+            }
+        }))
+        .collect::<Vec<_>>();
+    let choosing_files = crate::file_selection_runtime::is_choosing();
     STATE.with(|state| {
         let state = state.borrow();
         json!({"app":"Light Browser","engine":"CEF/Chromium","cef":String::from_utf8_lossy(&sys::CEF_VERSION[..sys::CEF_VERSION.len()-1]),"cefApi":sys::CEF_API_VERSION_LAST,"version":env!("CARGO_PKG_VERSION"),"tabs":state.tabs.len(),"pendingWaits":state.waits.len(),"sandbox":true,"externalDebugPort":false,"controlPanel":"embedded","windowMode":"single","activeTab":state.spaces.active_tab(),"activeSpace":state.spaces.active_space(),"overview":state.spaces.overview(),
             "downloads":{"active":active_downloads,"awaitingSave":awaiting_save,"awaitingPermission":awaiting_permission},
+            "fileSelection":{"pending":file_selections.len(),"choosing":choosing_files,"requests":file_selections},
             "resources":{"automationTabLimit":MAX_AUTOMATION_TABS,"taskTabLimit":crate::tasks::MAX_TASK_TABS,"pendingTabCreations":state.creations.len(),"captureLimit":1,"capturesInFlight":state.captures.len(),"focusLeases":state.focus_leases.len(),"focusCleanupFailed":state.focus_leases.values().filter(|lease| lease.phase == FocusPhase::Failed).count()}})
     })
 }
@@ -5487,6 +5579,7 @@ fn handle(command: &Command, reply: Reply) {
                     poll_wait(token);
                 }
                 Command::Close { .. } => {
+                    invalidate_file_selection(tab_id);
                     reply.ok(json!({"tab":tab_id,"closeRequested":true}));
                     if let Some(host) = browser.host() {
                         host.close_browser(0);
@@ -11245,7 +11338,34 @@ wrap_client! {
         fn find_handler(&self) -> Option<FindHandler> { Some(PageFindHandler::new()) }
         fn download_handler(&self) -> Option<DownloadHandler> { Some(FileDownloadHandler::new()) }
         fn permission_handler(&self) -> Option<PermissionHandler> { Some(FilePermissionHandler::new()) }
+        fn dialog_handler(&self) -> Option<DialogHandler> { Some(FileSelectionHandler::new()) }
+        fn frame_handler(&self) -> Option<FrameHandler> { Some(FileSelectionFrameHandler::new()) }
         fn context_menu_handler(&self) -> Option<ContextMenuHandler> { Some(PageContextMenuHandler::new()) }
+    }
+}
+wrap_dialog_handler! {
+    struct FileSelectionHandler;
+    impl DialogHandler {
+        fn on_file_dialog(&self, browser:Option<&mut Browser>, mode:FileDialogMode,
+            _title:Option<&CefString>, _default_file_path:Option<&CefString>,
+            accept_filters:Option<&mut CefStringList>, accept_extensions:Option<&mut CefStringList>,
+            _accept_descriptions:Option<&mut CefStringList>, callback:Option<&mut FileDialogCallback>) -> i32 {
+            let (Some(browser), Some(callback)) = (browser, callback) else { return 0; };
+            i32::from(crate::file_selection_runtime::show(browser.identifier(), mode,
+                accept_filters, accept_extensions, callback))
+        }
+    }
+}
+wrap_frame_handler! {
+    struct FileSelectionFrameHandler;
+    impl FrameHandler {
+        fn on_frame_detached(&self, browser:Option<&mut Browser>, _frame:Option<&mut Frame>) {
+            // OnFileDialog does not identify its originating frame. A detached
+            // child therefore invalidates this tab's pending chooser as well.
+            if let Some(browser) = browser {
+                invalidate_file_selection(browser.identifier());
+            }
+        }
     }
 }
 wrap_context_menu_handler! {
@@ -11398,6 +11518,7 @@ wrap_life_span_handler! {
                 // answers its pending requests fail re-validation and do nothing.
                 let devtools = STATE.with(|state| state.borrow_mut().tabs.get_mut(&browser.identifier()).and_then(|tab| tab._devtools.take()));
                 drop(devtools);
+                invalidate_file_selection(browser.identifier());
                 crate::download_permission_runtime::cancel_tab(browser.identifier());
                 crate::download_runtime::cancel_tab(browser.identifier());
                 invalidate_page_find(browser.identifier());
@@ -11420,6 +11541,7 @@ wrap_life_span_handler! {
         fn on_before_close(&self, browser: Option<&mut Browser>) {
             let Some(browser)=browser else{return;};
             let id=browser.identifier();
+            invalidate_file_selection(id);
             crate::download_permission_runtime::cancel_tab(id);
             crate::download_runtime::cancel_tab(id);
             // The main frame is valid until this callback returns (CEF 156).
@@ -11536,6 +11658,7 @@ wrap_display_handler! {
     struct TitleHandler;
     impl DisplayHandler {
         fn on_address_change(&self,browser:Option<&mut Browser>,frame:Option<&mut Frame>,url:Option<&CefString>) {
+            if let Some(browser) = browser.as_ref() { invalidate_file_selection(browser.identifier()); }
             if frame.is_none_or(|frame| frame.is_main()==0) { return; }
             if let Some(browser) = browser { revoke_download_permission_provenance(browser.identifier()); crate::download_permission_runtime::cancel_tab(browser.identifier()); invalidate_page_find(browser.identifier()); STATE.with(|state| {
                 if let Some(tab) = state.borrow_mut().tabs.get_mut(&browser.identifier()) {
@@ -11619,6 +11742,7 @@ wrap_request_handler! {
             }
         }
         fn on_before_browse(&self,browser:Option<&mut Browser>,frame:Option<&mut Frame>,request:Option<&mut cef::Request>,user_gesture:i32,is_redirect:i32) -> i32 {
+            if let Some(browser) = browser.as_ref() { invalidate_file_selection(browser.identifier()); }
             // A subframe can replace its document without changing the main
             // navigation epoch. Cancel the whole tab's menu conservatively.
             if let Some(browser) = browser.as_ref() { dismiss_context_menu(browser.identifier()); }
@@ -11671,6 +11795,7 @@ wrap_load_handler! {
             notify_panel();
         }
         fn on_load_start(&self,browser:Option<&mut Browser>,frame:Option<&mut Frame>,_transition_type:TransitionType) {
+            if let Some(browser) = browser.as_ref() { invalidate_file_selection(browser.identifier()); }
             // Restored documents may commit without OnBeforeBrowse.
             if let Some(browser) = browser.as_ref() { dismiss_context_menu(browser.identifier()); }
             let Some(frame) = frame.filter(|frame| frame.is_main()!=0) else { return; };
@@ -17208,6 +17333,59 @@ mod tests {
             assert_eq!(state.spaces.active_tab(), Some(8));
         });
         clear();
+    }
+
+    #[test]
+    fn file_selection_context_keeps_human_pages_on_the_default_chooser() {
+        let (pending, _browser, _receiver) = test_input_preparation();
+        let scope = pending.reply.scope.unwrap();
+        assert!(file_selection_context(8).unwrap().is_none());
+        let context = file_selection_context(7).unwrap().unwrap();
+        assert_eq!(context.scope, scope);
+        assert!(validate_file_selection(&context).is_ok());
+        STATE.with(|slot| {
+            slot.borrow_mut().tasks.handoff(&scope).unwrap();
+        });
+        assert!(file_selection_context(7).unwrap().is_none());
+        assert!(validate_file_selection(&context).is_err());
+        STATE.with(|slot| {
+            let state = slot.borrow();
+            assert_eq!(state.spaces.active_space(), USER_SPACE);
+            assert_eq!(state.spaces.active_tab(), Some(8));
+        });
+        clear();
+    }
+
+    #[test]
+    fn file_selection_context_expires_with_document_renderer_and_owner() {
+        for change in ["document", "generation", "file-generation", "renderer", "unavailable", "closed"] {
+            let (_pending, _browser, _receiver) = test_input_preparation();
+            let context = file_selection_context(7).unwrap().unwrap();
+            STATE.with(|slot| {
+                let mut state = slot.borrow_mut();
+                match change {
+                    "document" => state.tabs.get_mut(&7).unwrap().navigation.document_epoch += 1,
+                    "generation" => {
+                        state.tabs.get_mut(&7).unwrap().navigation.download_source_generation += 1
+                    }
+                    "file-generation" => {
+                        state.tabs.get_mut(&7).unwrap().navigation.file_selection_generation += 1
+                    }
+                    "renderer" => {
+                        state.tabs.get_mut(&7).unwrap().navigation.renderer_exit = Some(json!({}))
+                    }
+                    "unavailable" => {
+                        state.tabs.get_mut(&7).unwrap().navigation.document_available = false
+                    }
+                    "closed" => {
+                        state.tabs.remove(&7);
+                    }
+                    _ => unreachable!(),
+                }
+            });
+            assert!(validate_file_selection(&context).is_err(), "{change}");
+            clear();
+        }
     }
 
     #[test]

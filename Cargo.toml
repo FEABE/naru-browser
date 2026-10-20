@@ -6,7 +6,7 @@ publish = false
 
 [features]
 default = ["browser"]
-browser = ["dep:cef", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation", "dep:base64"]
+browser = ["dep:cef", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation", "dep:base64", "dep:block2"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -18,7 +18,8 @@ base64 = { version = "0.22", optional = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6.3", optional = true }
 objc2-foundation = { version = "0.3.2", optional = true }
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["objc2-core-foundation", "NSAppearance", "NSCell", "NSFontDescriptor", "NSColor", "NSFont", "NSScrollView", "NSClipView", "NSImage", "NSImageView", "NSApplication", "NSEvent", "NSResponder", "NSRunningApplication", "NSButton", "NSControl", "NSGraphics", "NSGestureRecognizer", "NSMenu", "NSMenuItem", "NSPopUpButton", "NSTextField", "NSView", "NSWindow", "NSWorkspace"], optional = true }
+block2 = { version = "0.6.2", optional = true }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["objc2-core-foundation", "block2", "NSOpenPanel", "NSSavePanel", "NSPanel", "NSAppearance", "NSCell", "NSFontDescriptor", "NSColor", "NSFont", "NSScrollView", "NSClipView", "NSImage", "NSImageView", "NSApplication", "NSEvent", "NSResponder", "NSRunningApplication", "NSButton", "NSControl", "NSGraphics", "NSGestureRecognizer", "NSMenu", "NSMenuItem", "NSPopUpButton", "NSTextField", "NSView", "NSWindow", "NSWorkspace"], optional = true }
 
 [[bin]]
 name = "light-browser"

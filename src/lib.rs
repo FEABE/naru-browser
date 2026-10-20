@@ -5,6 +5,7 @@ pub mod closed_pages;
 pub mod config;
 pub mod download_permissions;
 pub mod downloads;
+pub mod file_selection;
 pub mod history;
 pub mod keyboard;
 pub mod page_find;
@@ -30,6 +31,10 @@ mod devtools_wire;
 pub mod download_permission_runtime;
 #[cfg(feature = "browser")]
 pub mod download_runtime;
+#[cfg(feature = "browser")]
+pub mod file_selection_runtime;
+#[cfg(all(feature = "browser", target_os = "macos"))]
+pub mod file_selection_native;
 #[cfg(feature = "browser")]
 mod frame_pointer;
 #[cfg(feature = "browser")]

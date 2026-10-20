@@ -975,6 +975,19 @@ struct DownloadPermissionRow {
     reveal: Retained<NSButton>,
 }
 
+struct FileSelectionRow {
+    token: u64,
+    choosing: bool,
+    surface: Retained<SurfaceView>,
+    title: Retained<NSTextField>,
+    source: Retained<NSTextField>,
+    detail: Retained<NSTextField>,
+    delivery_hint: Retained<NSTextField>,
+    upload_hint: Retained<NSTextField>,
+    choose: Retained<NSButton>,
+    cancel: Retained<NSButton>,
+}
+
 struct DownloadSiteCard {
     surface: Retained<SurfaceView>,
     title: Retained<NSTextField>,
@@ -1026,6 +1039,7 @@ struct DownloadPanel {
     scroll: Retained<NSScrollView>,
     document: Retained<TopDownView>,
     site: DownloadSiteCard,
+    file_selections: Vec<FileSelectionRow>,
     permissions: Vec<DownloadPermissionRow>,
     rows: Vec<DownloadRow>,
 }
@@ -1062,6 +1076,7 @@ struct Shell {
     downloads: DownloadPanel,
     download_activity: (usize, usize),
     download_permission_count: usize,
+    file_selection_count: usize,
     find: FindBar,
     recovery: PageRecoveryBar,
     start_page: StartPage,
@@ -1858,6 +1873,10 @@ define_class!(
         fn reveal_download_file(&self, sender: &NSButton) { reveal_download_file(sender); }
         #[unsafe(method(restartDownload:))]
         fn restart_download(&self, sender: &NSButton) { restart_download(sender); }
+        #[unsafe(method(chooseRequestedFiles:))]
+        fn choose_requested_files(&self, sender: &NSButton) { file_selection_action(sender, true); }
+        #[unsafe(method(cancelFileSelection:))]
+        fn cancel_file_selection(&self, sender: &NSButton) { file_selection_action(sender, false); }
         #[unsafe(method(allowMultipleDownloads:))]
         fn allow_multiple_downloads(&self, sender: &NSButton) { download_permission_action(sender, true); }
         #[unsafe(method(cancelMultipleDownloadsRequest:))]
@@ -2473,6 +2492,7 @@ impl DownloadPanel {
             scroll,
             document,
             site,
+            file_selections: Vec::new(),
             permissions: Vec::new(),
             rows: Vec::new(),
         }
@@ -2480,6 +2500,9 @@ impl DownloadPanel {
 
     fn clear_rows(&mut self) {
         self.site.current = None;
+        for row in self.file_selections.drain(..) {
+            row.surface.removeFromSuperview();
+        }
         for row in self.permissions.drain(..) {
             row.surface.removeFromSuperview();
         }
@@ -2494,12 +2517,19 @@ impl DownloadPanel {
         &mut self,
         snapshot: crate::downloads::Snapshot,
         permissions: Vec<crate::download_permission_runtime::PermissionRow>,
+        file_selections: Vec<crate::file_selection::Row>,
+        file_notice: Option<String>,
         site: DownloadSiteQuery,
         target: &ShellTarget,
         window: &NSWindow,
     ) -> bool {
         let site_focus_removed = self.site.render(site, window);
-        let summary = if !permissions.is_empty() {
+        let summary = if !file_selections.is_empty() {
+            format!(
+                "파일 선택 요청 {}개 · 다운로드 진행 중 {}개 · 다운로드 허용 대기 {}개",
+                file_selections.len(), snapshot.active_count, permissions.len()
+            )
+        } else if !permissions.is_empty() {
             format!(
                 "여러 파일 다운로드 허용 대기 {}개, 진행 중 {}개",
                 permissions.len(),
@@ -2521,6 +2551,7 @@ impl DownloadPanel {
         let text = self
             .notice
             .as_deref()
+            .or(file_notice.as_deref())
             .or(snapshot.notice.as_deref())
             .map(|notice| format!("{summary} · {notice}"))
             .unwrap_or(summary);
@@ -2636,6 +2667,62 @@ impl DownloadPanel {
         }
         let responder = window.firstResponder();
         let mut action_focus_removed = false;
+        let mut previous_files = std::mem::take(&mut self.file_selections);
+        for item in file_selections.into_iter().take(crate::file_selection::MAX_PENDING) {
+            let mut row = if let Some(index) = previous_files.iter().position(|row| row.token == item.token) {
+                previous_files.remove(index)
+            } else {
+                let surface = surface_child(&self.document, SurfaceKind::Card, 9.0, true, marker);
+                let title = label(&surface, "파일 선택 요청", 14.0, true, marker);
+                let source = label(&surface, "", 11.5, false, marker);
+                let detail = label(&surface, "", 11.5, false, marker);
+                let delivery_hint = label(&surface, "선택한 파일을 요청 페이지에 전달합니다.", 11.5, false, marker);
+                let upload_hint = label(&surface, "사이트에서 바로 업로드할 수 있습니다.", 11.5, false, marker);
+                for hint in [&source, &detail, &delivery_hint, &upload_hint] {
+                    hint.setTextColor(Some(&NSColor::secondaryLabelColor()));
+                }
+                let choose = button(&surface, "파일 선택", target, sel!(chooseRequestedFiles:),
+                    "파일을 직접 선택하여 요청 페이지에 전달", marker);
+                let cancel = button(&surface, "요청 취소", target, sel!(cancelFileSelection:),
+                    "이번 파일 선택 요청 취소", marker);
+                FileSelectionRow {
+                    token: item.token, choosing: item.choosing, surface, title, source, detail,
+                    delivery_hint, upload_hint, choose, cancel,
+                }
+            };
+            let source = format!("{} · 요청 탭 {}", item.source, item.tab);
+            let detail = format!("{} · 제안 형식: {}", item.mode.label(), item.accept_hint);
+            for (label, value) in [(&row.source, &source), (&row.detail, &detail)] {
+                label.setStringValue(&NSString::from_str(&compact(value, 180)));
+                label.setToolTip(Some(&NSString::from_str(value)));
+                unsafe {
+                    let _: () = msg_send![&**label, setAccessibilityHelp: &*NSString::from_str(value)];
+                }
+            }
+            row.choose.setTitle(&NSString::from_str(if item.choosing {
+                "선택 중"
+            } else if item.mode == crate::file_selection::Mode::Folder {
+                "폴더 선택"
+            } else {
+                "파일 선택"
+            }));
+            row.choose.setEnabled(!item.choosing);
+            if item.choosing {
+                let control: &NSView = &row.choose;
+                action_focus_removed |= responder.as_ref()
+                    .and_then(|responder| responder.downcast_ref::<NSView>())
+                    .is_some_and(|view| std::ptr::eq(view, control));
+            }
+            row.choosing = item.choosing;
+            for (control, action) in [(&row.choose, "파일 선택"), (&row.cancel, "요청 취소")] {
+                let hint = NSString::from_str(&format!("{source} · {action}. 선택한 파일을 요청 페이지에 전달합니다. 사이트에서 바로 업로드할 수 있습니다."));
+                control.setToolTip(Some(&hint));
+                unsafe {
+                    let _: () = msg_send![&**control, setAccessibilityLabel: &*hint];
+                }
+            }
+            self.file_selections.push(row);
+        }
         let mut previous = std::mem::take(&mut self.rows);
         for item in snapshot.rows.into_iter().take(24) {
             let row = if let Some(index) = previous.iter().position(|row| row.id == item.id) {
@@ -2776,10 +2863,15 @@ impl DownloadPanel {
                 previous
                     .iter()
                     .any(|row| responder.isDescendantOf(&row.surface))
+                    || previous_files.iter()
+                        .any(|row| responder.isDescendantOf(&row.surface))
                     || previous_permissions
                         .iter()
                         .any(|row| responder.isDescendantOf(&row.surface))
             });
+        for row in previous_files {
+            row.surface.removeFromSuperview();
+        }
         for row in previous_permissions {
             row.surface.removeFromSuperview();
         }
@@ -2805,17 +2897,30 @@ impl DownloadPanel {
         self.scroll.setFrame(rect(36.0, 24.0, width, height));
         let width = self.scroll.contentSize().width.max(1.0);
         let site_height = 226.0;
+        let selection_height = self.file_selections.len() as f64 * 180.0;
         let permission_height = self.permissions.len() as f64 * 180.0;
         self.document.setFrame(rect(
             0.0,
             0.0,
             width,
-            (site_height + permission_height + self.rows.len() as f64 * 128.0).max(height),
+            (selection_height + site_height + permission_height + self.rows.len() as f64 * 128.0).max(height),
         ));
         self.site.layout(width);
+        self.site.surface.setFrameOrigin(NSPoint::new(0.0, selection_height));
+        for (index, row) in self.file_selections.iter().enumerate() {
+            row.surface.setFrame(rect(0.0, index as f64 * 180.0, width, 172.0));
+            let text_width = (width - 28.0).max(1.0);
+            row.title.setFrame(rect(14.0, 141.0, text_width, 21.0));
+            row.source.setFrame(rect(14.0, 117.0, text_width, 18.0));
+            row.detail.setFrame(rect(14.0, 94.0, text_width, 18.0));
+            row.delivery_hint.setFrame(rect(14.0, 68.0, text_width, 18.0));
+            row.upload_hint.setFrame(rect(14.0, 47.0, text_width, 18.0));
+            row.choose.setFrame(rect((width - 224.0).max(14.0), 10.0, 100.0, 30.0));
+            row.cancel.setFrame(rect((width - 116.0).max(122.0), 10.0, 102.0, 30.0));
+        }
         for (index, row) in self.permissions.iter().enumerate() {
             row.surface
-                .setFrame(rect(0.0, site_height + index as f64 * 180.0, width, 172.0));
+                .setFrame(rect(0.0, selection_height + site_height + index as f64 * 180.0, width, 172.0));
             let text_width = (width - 28.0).max(1.0);
             // Card surfaces are unflipped: y = card height - top - control height.
             row.title.setFrame(rect(14.0, 141.0, text_width, 21.0));
@@ -2831,7 +2936,7 @@ impl DownloadPanel {
         for (index, row) in self.rows.iter().enumerate() {
             row.surface.setFrame(rect(
                 0.0,
-                site_height + permission_height + index as f64 * 128.0,
+                selection_height + site_height + permission_height + index as f64 * 128.0,
                 width,
                 120.0,
             ));
@@ -3561,6 +3666,7 @@ impl Shell {
             downloads,
             download_activity: (0, 0),
             download_permission_count: 0,
+            file_selection_count: 0,
             find,
             recovery,
             start_page,
@@ -3871,18 +3977,21 @@ impl Shell {
         );
         let (active_downloads, pending_downloads) = self.download_activity;
         let permission_count = self.download_permission_count;
-        let download_title = (active_downloads > 0 || permission_count > 0).then(|| {
+        let file_count = self.file_selection_count;
+        let download_title = (active_downloads > 0 || permission_count > 0 || file_count > 0).then(|| {
             if self.sidebar_collapsed {
-                (active_downloads + permission_count).to_string()
+                (active_downloads + permission_count + file_count).to_string()
+            } else if file_count > 0 {
+                format!("파일 선택 {file_count}")
             } else if permission_count > 0 {
                 format!("다운로드 {active_downloads}, 허용 {permission_count}")
             } else {
                 format!("다운로드 {active_downloads}")
             }
         });
-        let download_hint = (active_downloads > 0 || permission_count > 0).then(|| {
+        let download_hint = (active_downloads > 0 || permission_count > 0 || file_count > 0).then(|| {
             format!(
-                "다운로드 목록, 여러 파일 다운로드 허용 대기 {permission_count}개, 저장 위치 선택 대기 {pending_downloads}개, 전체 진행 {active_downloads}개"
+                "다운로드 목록, 파일 선택 요청 {file_count}개, 여러 파일 다운로드 허용 대기 {permission_count}개, 저장 위치 선택 대기 {pending_downloads}개, 전체 진행 {active_downloads}개"
             )
         });
         set_symbol(
@@ -3899,7 +4008,7 @@ impl Shell {
             download_hint.as_deref().unwrap_or("다운로드 목록"),
         );
         let downloads_color =
-            if (pending_downloads > 0 || permission_count > 0) && !self.downloads.open {
+            if (pending_downloads > 0 || permission_count > 0 || file_count > 0) && !self.downloads.open {
                 accent_color()
             } else {
                 NSColor::secondaryLabelColor()
@@ -4855,6 +4964,59 @@ fn download_permission_action(sender: &NSButton, allow: bool) {
     // Never hold a shell borrow while continuing the permission callback.
     let result = crate::download_permission_runtime::decide(token, allow);
     set_download_notice(result.err());
+    sync();
+}
+
+fn file_selection_action(sender: &NSButton, choose: bool) {
+    let controls = SHELL.with(|slot| {
+        let slot = slot.try_borrow().ok()?;
+        let shell = slot.as_ref().filter(|shell| shell.downloads.open)?;
+        Some((shell.window.clone(), shell.downloads.surface.clone()))
+    });
+    let Some((window, surface)) = controls else { return };
+    if !window.isKeyWindow()
+        || !window.isVisible()
+        || window.isMiniaturized()
+        || surface.window().as_deref() != Some(&*window)
+        || surface.isHiddenOrHasHiddenAncestor()
+        || page_find_has_marked_text()
+    {
+        return;
+    }
+    // Resolve the exact visible control after native getters. A delayed click
+    // from a removed request cannot select files for a replacement request.
+    let token = SHELL.with(|slot| {
+        let slot = slot.try_borrow().ok()?;
+        let shell = slot.as_ref().filter(|shell| {
+            shell.downloads.open
+                && !shell.search.open
+                && !shell.bookmarks.state.open
+                && std::ptr::eq(&*shell.window, &*window)
+                && std::ptr::eq(&*shell.downloads.surface, &*surface)
+        })?;
+        shell.downloads.file_selections.iter().find_map(|row| {
+            let control = if choose { &*row.choose } else { &*row.cancel };
+            (std::ptr::eq(sender, control) && (!choose || !row.choosing)).then_some(row.token)
+        })
+    });
+    let Some(token) = token else { return };
+    // Opening a sheet may synchronously revoke the row or refresh the shell.
+    // Selection never reveals the source tab or changes task ownership.
+    let notice = if choose {
+        crate::file_selection_runtime::choose(token)
+    } else {
+        crate::file_selection_runtime::cancel(token)
+    }.err();
+    SHELL.with(|slot| {
+        let Ok(mut slot) = slot.try_borrow_mut() else { return };
+        if let Some(shell) = slot.as_mut().filter(|shell| {
+            shell.downloads.open
+                && std::ptr::eq(&*shell.window, &*window)
+                && std::ptr::eq(&*shell.downloads.surface, &*surface)
+        }) {
+            shell.downloads.notice = notice;
+        }
+    });
     sync();
 }
 
@@ -6833,6 +6995,13 @@ pub fn show() {
     sync();
 }
 
+pub(crate) fn file_selection_window() -> Option<Retained<NSWindow>> {
+    SHELL.with(|slot| {
+        let slot = slot.try_borrow().ok()?;
+        slot.as_ref().map(|shell| shell.window.clone())
+    })
+}
+
 pub fn refresh() {
     let marker = MainThreadMarker::new().expect("Browser shell requires the main thread");
     let window = SHELL.with(|slot| slot.borrow().as_ref().map(|shell| shell.window.clone()));
@@ -6909,10 +7078,13 @@ pub fn sync() {
     let history = history_query.map(|query| crate::history_runtime::snapshot(&query));
     let download_activity = crate::download_runtime::activity();
     let download_permission_count = crate::download_permission_runtime::pending_count();
+    let file_selection_count = crate::file_selection_runtime::pending_count();
     let downloads = downloads_are_open().then(|| {
         (
             crate::download_runtime::snapshot(),
             crate::download_permission_runtime::snapshot(),
+            crate::file_selection_runtime::snapshot(),
+            crate::file_selection_runtime::notice(),
         )
     });
     let mut download_focus = None;
@@ -6923,6 +7095,7 @@ pub fn sync() {
                 shell.active != snapshot.active_tab || shell.overview != snapshot.overview;
             shell.download_activity = download_activity;
             shell.download_permission_count = download_permission_count;
+            shell.file_selection_count = file_selection_count;
             shell.render(snapshot);
             if std::mem::take(&mut shell.tab_focus_removed)
                 && !changed
@@ -6946,7 +7119,7 @@ pub fn sync() {
                     shell.bookmarks.render(bookmarks, &shell.target);
                 }
             }
-            if let Some((downloads, permissions)) = downloads {
+            if let Some((downloads, permissions, file_selections, file_notice)) = downloads {
                 let expected = download_site_page_target(
                     &shell.tabs,
                     &shell.active_space,
@@ -6963,6 +7136,8 @@ pub fn sync() {
                     && shell.downloads.render(
                         downloads,
                         permissions,
+                        file_selections,
+                        file_notice,
                         site,
                         &shell.target,
                         &shell.window,
