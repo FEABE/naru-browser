@@ -94,12 +94,21 @@ pub(crate) fn show(
     accept_extensions: Option<&mut CefStringList>,
     callback: &FileDialogCallback,
 ) -> bool {
+    // Renderer folder selection reaches Chromium's upload confirmation, which
+    // cannot be hosted by the current macOS Alloy external-parent window.
+    // Cancel before checking task ownership so default handling cannot enter it.
+    if mode == FileDialogMode::OPEN_FOLDER {
+        callback.cancel();
+        set_notice(Some(
+            "현재 브라우저에서는 폴더 선택을 완료할 수 없습니다. 파일을 직접 선택해 주세요.".into(),
+        ));
+        crate::browser::notify_panel();
+        return true;
+    }
     let mode = if mode == FileDialogMode::OPEN {
         Mode::Open
     } else if mode == FileDialogMode::OPEN_MULTIPLE {
         Mode::Multiple
-    } else if mode == FileDialogMode::OPEN_FOLDER {
-        Mode::Folder
     } else {
         return false;
     };
@@ -459,5 +468,38 @@ mod tests {
         drop(callback);
         assert_eq!(&*calls.borrow(), &[token]);
         clear();
+    }
+
+    #[test]
+    fn file_selection_folder_cancels_once_before_context_without_queue_or_picker() {
+        clear();
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut object = unsafe { std::mem::zeroed::<sys::_cef_file_dialog_callback_t>() };
+        object.cancel = Some(record_cancel);
+        let raw = cef::rc::RcImpl::new(
+            object,
+            RecordingCallback {
+                canceled: calls.clone(),
+                token: 0,
+            },
+        );
+        let callback: FileDialogCallback = cef::rc::ConvertReturnValue::wrap_result(
+            raw.cast::<sys::_cef_file_dialog_callback_t>(),
+        );
+
+        // No browser/task context exists for this tab. Folder requests must be
+        // handled here for both user and AI tabs, never by the CEF fallback.
+        assert!(show(-1, FileDialogMode::OPEN_FOLDER, None, None, &callback));
+        assert_eq!(&*calls.borrow(), &[0]);
+        assert_eq!(pending_count(), 0);
+        assert!(!is_choosing());
+        assert!(RUNTIME.with(|slot| slot.borrow().callbacks.is_empty()));
+        assert_eq!(
+            notice().as_deref(),
+            Some("현재 브라우저에서는 폴더 선택을 완료할 수 없습니다. 파일을 직접 선택해 주세요.")
+        );
+        drop(callback);
+        clear();
+        assert_eq!(&*calls.borrow(), &[0]);
     }
 }

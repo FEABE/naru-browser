@@ -1077,6 +1077,7 @@ struct Shell {
     download_activity: (usize, usize),
     download_permission_count: usize,
     file_selection_count: usize,
+    file_selection_notice: Option<String>,
     find: FindBar,
     recovery: PageRecoveryBar,
     start_page: StartPage,
@@ -3667,6 +3668,7 @@ impl Shell {
             download_activity: (0, 0),
             download_permission_count: 0,
             file_selection_count: 0,
+            file_selection_notice: None,
             find,
             recovery,
             start_page,
@@ -3978,20 +3980,34 @@ impl Shell {
         let (active_downloads, pending_downloads) = self.download_activity;
         let permission_count = self.download_permission_count;
         let file_count = self.file_selection_count;
-        let download_title = (active_downloads > 0 || permission_count > 0 || file_count > 0).then(|| {
-            if self.sidebar_collapsed {
-                (active_downloads + permission_count + file_count).to_string()
-            } else if file_count > 0 {
-                format!("파일 선택 {file_count}")
-            } else if permission_count > 0 {
-                format!("다운로드 {active_downloads}, 허용 {permission_count}")
-            } else {
-                format!("다운로드 {active_downloads}")
-            }
-        });
-        let download_hint = (active_downloads > 0 || permission_count > 0 || file_count > 0).then(|| {
+        let file_notice = self
+            .file_selection_notice
+            .as_deref()
+            .filter(|_| file_count == 0);
+        let download_title = if file_notice.is_some() {
+            let title = if self.sidebar_collapsed { "!" } else { "파일 선택 안내" };
+            Some(title.to_owned())
+        } else {
+            (active_downloads > 0 || permission_count > 0 || file_count > 0).then(|| {
+                if self.sidebar_collapsed {
+                    (active_downloads + permission_count + file_count).to_string()
+                } else if file_count > 0 {
+                    format!("파일 선택 {file_count}")
+                } else if permission_count > 0 {
+                    format!("다운로드 {active_downloads}, 허용 {permission_count}")
+                } else {
+                    format!("다운로드 {active_downloads}")
+                }
+            })
+        };
+        let show_download_hint =
+            active_downloads > 0 || permission_count > 0 || file_count > 0 || file_notice.is_some();
+        let download_hint = show_download_hint.then(|| {
+            let notice = file_notice
+                .map(|notice| format!("파일 선택 안내: {notice}, "))
+                .unwrap_or_default();
             format!(
-                "다운로드 목록, 파일 선택 요청 {file_count}개, 여러 파일 다운로드 허용 대기 {permission_count}개, 저장 위치 선택 대기 {pending_downloads}개, 전체 진행 {active_downloads}개"
+                "{notice}다운로드 목록, 파일 선택 요청 {file_count}개, 여러 파일 다운로드 허용 대기 {permission_count}개, 저장 위치 선택 대기 {pending_downloads}개, 전체 진행 {active_downloads}개"
             )
         });
         set_symbol(
@@ -4007,12 +4023,16 @@ impl Shell {
             download_title.as_deref().unwrap_or("다운로드"),
             download_hint.as_deref().unwrap_or("다운로드 목록"),
         );
-        let downloads_color =
-            if (pending_downloads > 0 || permission_count > 0 || file_count > 0) && !self.downloads.open {
-                accent_color()
-            } else {
-                NSColor::secondaryLabelColor()
-            };
+        let downloads_color = if (pending_downloads > 0
+            || permission_count > 0
+            || file_count > 0
+            || file_notice.is_some())
+            && !self.downloads.open
+        {
+            accent_color()
+        } else {
+            NSColor::secondaryLabelColor()
+        };
         self.downloads_button
             .setContentTintColor(Some(&downloads_color));
         if self.sidebar_collapsed {
@@ -4619,7 +4639,9 @@ fn open_downloads() {
     let controls = SHELL.with(|slot| {
         let mut slot = slot.borrow_mut();
         let shell = slot.as_mut()?;
-        if !shell.downloads.open {
+        if !shell.downloads.open
+            || (shell.file_selection_count == 0 && shell.file_selection_notice.is_some())
+        {
             shell.downloads.notice = None;
         }
         shell.downloads.open = true;
@@ -7079,12 +7101,12 @@ pub fn sync() {
     let download_activity = crate::download_runtime::activity();
     let download_permission_count = crate::download_permission_runtime::pending_count();
     let file_selection_count = crate::file_selection_runtime::pending_count();
+    let file_selection_notice = crate::file_selection_runtime::notice();
     let downloads = downloads_are_open().then(|| {
         (
             crate::download_runtime::snapshot(),
             crate::download_permission_runtime::snapshot(),
             crate::file_selection_runtime::snapshot(),
-            crate::file_selection_runtime::notice(),
         )
     });
     let mut download_focus = None;
@@ -7096,6 +7118,7 @@ pub fn sync() {
             shell.download_activity = download_activity;
             shell.download_permission_count = download_permission_count;
             shell.file_selection_count = file_selection_count;
+            shell.file_selection_notice = file_selection_notice;
             shell.render(snapshot);
             if std::mem::take(&mut shell.tab_focus_removed)
                 && !changed
@@ -7119,7 +7142,7 @@ pub fn sync() {
                     shell.bookmarks.render(bookmarks, &shell.target);
                 }
             }
-            if let Some((downloads, permissions, file_selections, file_notice)) = downloads {
+            if let Some((downloads, permissions, file_selections)) = downloads {
                 let expected = download_site_page_target(
                     &shell.tabs,
                     &shell.active_space,
@@ -7137,7 +7160,7 @@ pub fn sync() {
                         downloads,
                         permissions,
                         file_selections,
-                        file_notice,
+                        shell.file_selection_notice.clone(),
                         site,
                         &shell.target,
                         &shell.window,
