@@ -38,7 +38,7 @@ lightbrowser task finish ID REV [--keep TAB ...]
 - 기존 작업이 `paused`(사용자에게 넘긴 상태)이면 상태를 바꾸지 않고 `status:"paused"` 그대로 돌려준다. 사용자의 제어권을 조용히 가져가지 않는다. 사용자가 돌려줬는지 모르면 `task wait ID --since REV`로 기다리거나(사용자가 화면의 "AI에게 돌려주기" 버튼을 누르면 깨어난다) 채팅으로 사용자에게 묻고 `task resume ID REV`를 쓴다.
 - 작업 이름은 세션이나 목적 식별자를 넣어 고유하게 짓는다(예: `"가격 확인-s0420a"`). 예상하지 못한 `resumed:true`가 오고 내가 모르는 탭이 들어 있으면 다른 작업이 쓰던 것이므로 `finish`하지 말고 다른 이름으로 새로 만든다.
 - `finishing`이나 `finished` 작업은 이어받지 않고 새 작업을 만든다.
-- 작업은 앱 메모리에만 있다. 앱을 다시 시작하면 사라진다. 작업은 최대 128개이며 가득 차면 가장 오래된 `finished` 작업부터 정리하고, 없으면 `TASK_LIMIT`이다. 작업당 탭은 4개, 자동화 탭은 전체 8개까지다(`TASK_TAB_LIMIT`, `TAB_LIMIT`).
+- 작업은 앱 메모리에만 있다. 앱을 다시 시작하면 사라진다. 작업은 최대 128개이며 가득 차면 가장 오래 전에 끝난 `finished` 작업부터 정리하고, 없으면 `TASK_LIMIT`이다. `finished` 기록은 가장 최근에 끝난 16개만 유지한다. 새 작업이 끝나면 더 오래 전에 끝난 17번째 이후 기록을 지우며(생성 순서가 아니라 완료 순서 기준), `active`, `paused`, `finishing` 작업은 지우지 않는다. 방금 끝낸 작업의 `task info`는 항상 가능하지만 오래 전에 끝난 작업은 `task list`와 `task info`에서 사라져 `TASK_NOT_FOUND`가 된다. 결과는 끝내기 전에 읽어 두고, 끝난 작업의 ID를 오래 보관해 다시 조회하지 않는다. 작업당 탭은 4개, 자동화 탭은 전체 8개까지다(`TASK_TAB_LIMIT`, `TAB_LIMIT`).
 
 ### revision 규칙
 
@@ -58,7 +58,7 @@ lightbrowser task wait ID 30000 --since REV
 
 - `paused` 작업은 사용자가 화면의 "AI에게 돌려주기" 버튼을 누르면(상태 `active`, revision 증가) `task wait`가 깨어난다. 작업 탭을 닫아도 깨어난다. 버튼은 AI 공간 카드와 그 공간을 볼 때의 도구 모음에 paused일 때만 보이며 사용자의 현재 공간·선택을 바꾸지 않는다. 대안으로 채팅에서 사용자에게 묻고 `task resume ID REV`를 호출해도 된다.
 
-  `task wait`는 호출 시점의 작업 상태(상태, revision, 소유 탭, 닫는 중인 탭)를 기준으로 한다. `--since REV`를 주면 현재 revision이 REV와 다를 때 기다리지 않고 즉시 `changed:true`로 돌려주므로 `task info`와 `task wait` 사이의 변경을 놓치지 않는다. 항상 마지막으로 아는 REV를 넘긴다. 탭 소실은 revision을 바꾸지 않으므로 `--since`로는 잡히지 않고 대기 중일 때만 깨운다. 기준 이후 하나라도 바뀌면 하나라도 바뀌면 새 작업 상태를 `{"task":{..},"changed":true}`로 돌려준다. 바뀌지 않고 제한 시간(기본 10000ms, 1..30000)이 지나면 `WAIT_TIMEOUT`이며 `error.details.task`에 현재 상태가 들어 있다. 타임아웃은 작업을 바꾸지 않으므로 다시 `task wait`를 호출해도 안전하다. 이미 `finished`인 작업은 기다리지 않고 `changed:false`로 즉시 돌려준다. 알 수 없는 ID는 `TASK_NOT_FOUND`다. `task wait`는 `task run` 안에 넣을 수 없다.
+  `task wait`는 호출 시점의 작업 상태(상태, revision, 소유 탭, 닫는 중인 탭)를 기준으로 한다. `--since REV`를 주면 현재 revision이 REV와 다를 때 기다리지 않고 즉시 `changed:true`로 돌려주므로 `task info`와 `task wait` 사이의 변경을 놓치지 않는다. 항상 마지막으로 아는 REV를 넘긴다. 탭 소실은 revision을 바꾸지 않으므로 `--since`로는 잡히지 않고 대기 중일 때만 깨운다. 기준 이후 하나라도 바뀌면 하나라도 바뀌면 새 작업 상태를 `{"task":{..},"changed":true}`로 돌려준다. 바뀌지 않고 제한 시간(기본 10000ms, 1..30000)이 지나면 `WAIT_TIMEOUT`이며 `error.details.task`에 현재 상태가 들어 있다. 타임아웃은 작업을 바꾸지 않으므로 다시 `task wait`를 호출해도 안전하다. 이미 `finished`인 작업은 기다리지 않고 `changed:false`로 즉시 돌려준다. 알 수 없는 ID나 보관 한도(최근 16개)로 정리된 `finished` 작업은 `TASK_NOT_FOUND`다. `task wait`는 `task run` 안에 넣을 수 없다.
 - 오류 뒤나 의심스러우면 `task info`를 먼저 호출한다.
 - 탭이 사용자에 의해 닫히면 소유 탭 목록이 바뀌어 `task wait`가 반환된다.
 

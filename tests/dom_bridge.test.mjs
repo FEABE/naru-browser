@@ -20,6 +20,11 @@ function fixture() {
       this.nextSibling = null;
     }
     get firstChild() { return this.children[0] || null; }
+    get childNodes() { return this.children; }
+    contains(node) {
+      for (let current = node; current; current = current.parentNode) if (current === this) return true;
+      return false;
+    }
     get parentElement() { return this.parentNode?.nodeType === 1 ? this.parentNode : null; }
     get isConnected() {
       if (this.disconnected) return false;
@@ -202,9 +207,10 @@ function fixture() {
     set value(value) { this._value = value; }
     get selectionStart() { return this._selectionStart ?? 0; }
     get selectionEnd() { return this._selectionEnd ?? 0; }
-    setSelectionRange(start, end) {
+    get selectionDirection() { return this._selectionDirection ?? "none"; }
+    setSelectionRange(start, end, direction = "none") {
       this.selectionCalls = (this.selectionCalls || 0) + 1;
-      this._selectionStart = start; this._selectionEnd = end;
+      this._selectionStart = start; this._selectionEnd = end; this._selectionDirection = direction;
       this.onSelect?.();
     }
     get checked() { return this._checked; }
@@ -259,9 +265,10 @@ function fixture() {
     set value(value) { this._value = value; }
     get selectionStart() { return this._selectionStart ?? 0; }
     get selectionEnd() { return this._selectionEnd ?? 0; }
-    setSelectionRange(start, end) {
+    get selectionDirection() { return this._selectionDirection ?? "none"; }
+    setSelectionRange(start, end, direction = "none") {
       this.selectionCalls = (this.selectionCalls || 0) + 1;
-      this._selectionStart = start; this._selectionEnd = end;
+      this._selectionStart = start; this._selectionEnd = end; this._selectionDirection = direction;
       this.onSelect?.();
     }
   }
@@ -328,18 +335,7 @@ function fixture() {
   document.activeElement = document.body;
   document.body.innerText = "Fixture page";
   document.createTextNode = (value) => new Text(value);
-  document.createRange = () => ({
-    setStart(node, offset) { this.node = node; this.start = offset; },
-    setEnd(node, offset) {
-      assert.equal(node, this.node);
-      this.end = offset;
-      metrics.largestRange = Math.max(metrics.largestRange, offset - this.start);
-    },
-    getBoundingClientRect() {
-      return hasBox(this.node) && this.node.rects?.length !== 0 && this.end > this.start
-        ? { width: this.end - this.start, height: 1 } : { width: 0, height: 0 };
-    },
-  });
+  document.createRange = () => new Range();
   const window = {
     innerWidth: 1280, innerHeight: 800, scrollX: 0, scrollY: 0,
     visualViewport: { scale: 1, offsetLeft: 0, offsetTop: 0 },
@@ -356,6 +352,64 @@ function fixture() {
       this.inputType = options.inputType;
     }
   }
+  // Listener bookkeeping only: the double never dispatches trusted input to
+  // observation listeners, so receipts stay "unconfirmed" like an unobserved
+  // engine operation. Real trusted-event routing needs the CEF smoke tests.
+  class EventTarget {
+    addEventListener(type, listener, options) {
+      (this._listeners ||= []).push([type, listener, options]);
+    }
+    removeEventListener(type, listener) {
+      this._listeners = (this._listeners || []).filter((entry) => entry[0] !== type || entry[1] !== listener);
+    }
+  }
+  // Minimal Selection/Range for editing-host selection. Containers and offsets
+  // sit on separate prototype levels, as in Chromium, so lookups walk the chain.
+  class AbstractRange {
+    get startOffset() { return this._start; }
+    get endOffset() { return this._end; }
+  }
+  class Range extends AbstractRange {
+    get startContainer() { return this._startNode; }
+    get endContainer() { return this._endNode; }
+    // Geometry probes used by read() to measure bounded text slices.
+    setStart(node, offset) { this.node = node; this.start = offset; }
+    setEnd(node, offset) {
+      assert.equal(node, this.node);
+      this.end = offset;
+      metrics.largestRange = Math.max(metrics.largestRange, offset - this.start);
+    }
+    getBoundingClientRect() {
+      return hasBox(this.node) && this.node.rects?.length !== 0 && this.end > this.start
+        ? { width: this.end - this.start, height: 1 } : { width: 0, height: 0 };
+    }
+    selectNodeContents(node) {
+      this._startNode = this._endNode = node; this._start = 0; this._end = node.children.length;
+    }
+    intersectsNode(node) {
+      const inside = (container) => container === node || node.contains(container) || container.contains(node);
+      return inside(this._startNode) || inside(this._endNode);
+    }
+  }
+  class Selection {
+    constructor() { this._ranges = []; }
+    get rangeCount() { return this._ranges.length; }
+    removeAllRanges() { this._ranges = []; }
+    addRange(range) { this._ranges = [range]; }
+    getRangeAt(index) {
+      if (!this._ranges[index]) throw new Error("IndexSizeError");
+      return this._ranges[index];
+    }
+    get anchorNode() { return this._ranges[0]?._startNode ?? null; }
+    get anchorOffset() { return this._ranges[0]?._start ?? 0; }
+    get focusNode() { return this._ranges[0]?._endNode ?? null; }
+    get focusOffset() { return this._ranges[0]?._end ?? 0; }
+  }
+  const selection = new Selection();
+  Object.assign(window, { EventTarget, Range, Selection, Node, HTMLElement: Element,
+    getSelection: () => selection,
+    setTimeout: (callback, delay) => setTimeout(callback, delay).unref(),
+    clearTimeout: (timer) => clearTimeout(timer) });
   document.defaultView = window;
   document.URL = "https://example.test/";
   window.document = document;
@@ -365,7 +419,7 @@ function fixture() {
     HTMLSelectElement: Select, HTMLOptionElement: Option, Element, Event, KeyboardEvent, InputEvent,
   });
   const context = vm.createContext({
-    window, document, location: { href: "https://example.test/" }, crypto: webcrypto,
+    window, document, location: { href: "https://example.test/" }, crypto: webcrypto, performance,
     HTMLInputElement: Input, HTMLTextAreaElement: TextArea,
     HTMLSelectElement: Select, HTMLOptionElement: Option, Event, KeyboardEvent,
   });
@@ -628,10 +682,11 @@ test("password values never appear in snapshots, fill results or exception resul
   assert.equal(snapshot.interactive[0].value, undefined);
   assert.equal(JSON.stringify(snapshot).includes("old-secret"), false);
   const request = { action: "fill", ref: snapshot.interactive[0].ref, text: "new-secret" };
-  assert.equal(f.bridge.act(request).ok, true);
+  const prepared = f.bridge.act(request);
+  assert.equal(prepared.ok, true);
   assert.equal(password.value, "old-secret");
   password._value = "new-secret";
-  assert.equal(f.bridge.act({ ...request, verifyOnly: true, kind: "password" }).verified, true);
+  assert.equal(f.bridge.act({ ...request, verifyOnly: true, kind: "password", observation: prepared.observation }).verified, true);
   assert.equal(JSON.stringify(f.bridge.act(request)).includes("new-secret"), false);
   password.onFocus = () => { throw new Error("new-secret"); };
   const failure = f.bridge.act(request);
@@ -706,7 +761,7 @@ test("Enter prepares logical focus without dispatching keys or requesting form s
   let submissions = 0;
   input.form = { requestSubmit() { submissions += 1; } };
   const ref = f.bridge.read().interactive[0].ref;
-  assert.deepEqual(JSON.parse(JSON.stringify(f.bridge.act({ action: "press", ref, key: "Enter" }))),
+  assert.deepEqual(withoutReceipt(JSON.parse(JSON.stringify(f.bridge.act({ action: "press", ref, key: "Enter" })))),
     { ok: true, action: "press", key: "Enter", prepared: true, attempted: false });
   assert.equal(f.document.activeElement, input);
   assert.equal(submissions, 0);
@@ -731,7 +786,7 @@ test("press prepares the 24 canonical keys without synthesizing keys or editing"
     "Shift+Enter", "Shift+Tab", "Shift+ArrowLeft", "Shift+ArrowUp", "Shift+ArrowRight", "Shift+ArrowDown",
     "Shift+Home", "Shift+End", "Shift+PageUp", "Shift+PageDown"];
   for (const key of keys) {
-    assert.deepEqual({ ...f.bridge.act({ action: "press", ref, key }) },
+    assert.deepEqual(withoutReceipt({ ...f.bridge.act({ action: "press", ref, key }) }),
       { ok: true, action: "press", key, prepared: true, attempted: false });
     assert.equal(f.document.activeElement, input);
     assert.equal(input._value, "unchanged");
@@ -2482,6 +2537,15 @@ test("frame changes after input report partial dispatch and stop the old change 
   }
 });
 
+// Prepared press/fill results carry a single-use passive-observation receipt
+// token (commit 375e41a; docs/native-fill-control.md). Assert its shape and
+// compare the remaining public fields.
+function withoutReceipt(result) {
+  assert.match(result.observation, /^[a-f0-9]{32}$/);
+  const { observation, ...rest } = result;
+  return rest;
+}
+
 function editableRef(f, label = "Editor") {
   return f.bridge.read().interactive.find((item) => item.label === label)?.ref;
 }
@@ -2521,73 +2585,85 @@ test("contenteditable read exposes explicit editing hosts, not inherited or nest
   }
 });
 
-test("contenteditable fill replaces markup with exact literal text and ordered synthetic input events", () => {
+// contenteditable fill follows docs/contenteditable-control.md: the bridge only
+// prepares (focus plus full-content selection) and later verifies the native
+// innerText. The text itself is inserted by Chromium Input.insertText from Rust,
+// so the double models the engine result by editing the host after preparation.
+const editablePrepared = { ok: true, action: "fill", prepared: true, attempted: false, input: "chromium", kind: "contenteditable" };
+
+function verifyEditable(f, ref, text) {
+  return f.bridge.act({ action: "fill", ref, text, kind: "contenteditable", verifyOnly: true });
+}
+
+test("contenteditable fill selects the whole host without DOM writes or events, then verifies exact literal text", () => {
   const f = fixture();
   const host = f.add("DIV", { contenteditable: "", "aria-label": "Editor" });
   f.add("B", {}, host).textContent = "old";
   const text = "  <b>literal</b>\n다음 😀  ";
-  const observed = [];
-  host.onEvent = (event) => observed.push({ type: event.type, text: host.textContent,
-    data: event.data, inputType: event.inputType, cancelable: event.cancelable,
-    bubbles: event.bubbles, composed: event.composed, trusted: event.isTrusted });
-  const result = f.bridge.act({ action: "fill", ref: editableRef(f), text });
-  assert.equal(result.ok, true);
-  assert.equal(result.changed, true);
-  assert.equal(result.trusted, false);
-  assert.equal(host.firstChild.nodeType, 3);
-  assert.equal(host.firstChild.nextSibling, null);
-  assert.equal(host.textContent, text);
-  assert.deepEqual(observed, [
-    { type: "beforeinput", text: "old", data: text, inputType: "insertText", cancelable: true, bubbles: true, composed: true, trusted: false },
-    { type: "input", text, data: text, inputType: "insertText", cancelable: false, bubbles: true, composed: true, trusted: false },
-  ]);
-  assert.equal(f.bridge.act({ action: "fill", ref: editableRef(f), text: "" }).ok, true);
-  assert.equal(host.textContent, "");
-  assert.equal(host.firstChild.nodeType, 3);
+  const ref = editableRef(f);
+  const result = f.bridge.act({ action: "fill", ref, text });
+  assert.deepEqual({ ...result }, editablePrepared);
+  assert.equal(host.textContent, "old", "the bridge no longer replaces markup");
+  assert.equal(host.replacements, undefined);
+  assert.deepEqual(host.events, [], "no synthetic beforeinput/input");
+  assert.equal(f.document.activeElement, host);
+  const selection = f.window.getSelection();
+  assert.equal(selection.rangeCount, 1);
+  const range = selection.getRangeAt(0);
+  assert.deepEqual([range.startContainer, range.startOffset, range.endContainer, range.endOffset],
+    [host, 0, host, host.children.length], "the complete contents are selected");
+  assert.equal(verifyEditable(f, ref, text).error, "FILL_STATE_NOT_REACHED", "unchanged host is not the requested text");
+  host.textContent = text; // Engine completion is modeled independently.
+  assert.deepEqual({ ...verifyEditable(f, ref, text) }, { ok: true, action: "fill", verified: true, input: "chromium", attempted: true });
+  assert.equal(verifyEditable(f, ref, text.trim()).error, "FILL_STATE_NOT_REACHED", "whitespace is not normalized");
+  assert.equal(f.bridge.act({ action: "fill", ref, text: "" }).prepared, true);
+  host.textContent = "";
+  assert.equal(verifyEditable(f, ref, "").verified, true);
 });
 
-test("contenteditable no-op is limited to canonical plain text and avoids focus/events", () => {
+test("contenteditable fill never short-circuits an already matching host", () => {
   for (const text of ["", "same", "x".repeat(20000)]) {
     const f = fixture();
     const host = f.add("DIV", { contenteditable: "true", "aria-label": "Editor" });
     if (text) host.textContent = text;
     const ref = editableRef(f);
-    f.metrics.largestTextSlice = 0;
     const result = f.bridge.act({ action: "fill", ref, text });
-    assert.equal(result.ok, true);
-    assert.equal(result.changed, false);
-    assert.equal(host.focused, undefined);
+    assert.deepEqual({ ...result }, editablePrepared);
+    assert.equal(host.focused, 1, "same-value requests still prepare focus and selection");
     assert.equal(host.replacements, undefined);
     assert.deepEqual(host.events, []);
-    assert.ok(f.metrics.largestTextSlice <= 4096);
+    assert.equal(verifyEditable(f, ref, text).verified, true);
   }
   const f = fixture();
   const host = f.add("DIV", { contenteditable: "true", "aria-label": "Editor" });
   const bold = f.add("B", {}, host);
   bold.textContent = "same";
   const result = f.bridge.act({ action: "fill", ref: editableRef(f), text: "same" });
-  assert.equal(result.changed, true);
-  assert.equal(bold.isConnected, false);
-  assert.equal(host.firstChild.nodeType, 3);
+  assert.equal(result.prepared, true);
+  assert.equal(bold.isConnected, true, "markup is left for Chromium to replace");
 });
 
-test("contenteditable beforeinput cancellation preserves the page handler's changes without replacing", () => {
+test("contenteditable verification reports page-handler changes as an unreached state", () => {
+  // beforeinput cancellation and editor handlers run inside Chromium now. The
+  // bridge only sees the final text, so a canceled or rewritten input is
+  // FILL_STATE_NOT_REACHED rather than the old synthetic INPUT_CANCELED.
   const f = fixture();
   const host = f.add("DIV", { contenteditable: "true", "aria-label": "Editor" });
   host.textContent = "old";
-  host.onEvent = (event) => {
-    if (event.type === "beforeinput") { event.preventDefault(); host.firstChild.data = "handler side effect"; }
-  };
-  const result = f.bridge.act({ action: "fill", ref: editableRef(f), text: "new" });
-  assert.equal(result.error, "INPUT_CANCELED");
-  assert.equal(result.attempted, false);
-  assert.equal(result.trusted, false);
-  assert.equal(host.textContent, "handler side effect");
+  const ref = editableRef(f);
+  assert.equal(f.bridge.act({ action: "fill", ref, text: "new" }).prepared, true);
+  host.firstChild.data = "handler side effect";
+  const result = verifyEditable(f, ref, "new");
+  assert.equal(result.error, "FILL_STATE_NOT_REACHED");
+  assert.equal(result.attempted, true);
+  assert.equal(result.input, "chromium");
+  assert.equal(result.trusted, undefined);
+  assert.equal(host.textContent, "handler side effect", "verification never rewrites the page");
   assert.equal(host.replacements, undefined);
-  assert.deepEqual(host.events, ["beforeinput"]);
+  assert.deepEqual(host.events, []);
 });
 
-test("contenteditable readonly rejects before no-op and focus may reach the requested value", () => {
+test("contenteditable readonly rejects before focus even when text matches, and focus may reach the requested value", () => {
   const f = fixture();
   const host = f.add("DIV", { contenteditable: "true", "aria-readonly": "true", "aria-label": "Editor" });
   host.textContent = "same";
@@ -2597,14 +2673,15 @@ test("contenteditable readonly rejects before no-op and focus may reach the requ
   assert.equal(host.focused, undefined);
   host.removeAttribute("aria-readonly");
   host.onFocus = () => { host.firstChild.data = "new"; };
-  const reached = f.bridge.act({ action: "fill", ref: editableRef(f), text: "new" });
-  assert.equal(reached.ok, true);
-  assert.equal(reached.changed, false);
+  const ref = editableRef(f);
+  const reached = f.bridge.act({ action: "fill", ref, text: "new" });
+  assert.deepEqual({ ...reached }, editablePrepared);
   assert.equal(host.focused, 1);
   assert.deepEqual(host.events, []);
+  assert.equal(verifyEditable(f, ref, "new").verified, true);
 });
 
-test("contenteditable focus and beforeinput revalidate host, ref, document and ancestor control state", () => {
+test("contenteditable focus revalidates host, ref, document and ancestor control state", () => {
   const mutations = [
     (_f, host) => host.remove(),
     (_f, host) => host.setAttribute("contenteditable", "false"),
@@ -2616,62 +2693,90 @@ test("contenteditable focus and beforeinput revalidate host, ref, document and a
     (f) => f.bridge.read(),
     (_f, host) => { host.ownerDocument = fixture().document; },
   ];
-  for (const phase of ["focus", "beforeinput"]) for (const mutate of mutations) {
+  for (const mutate of mutations) {
     const f = fixture();
     const host = f.add("DIV", { contenteditable: "true", "aria-label": "Editor" });
     host.textContent = "old";
-    if (phase === "focus") host.onFocus = () => mutate(f, host);
-    else host.onEvent = (event) => { if (event.type === phase) mutate(f, host); };
+    host.onFocus = () => mutate(f, host);
     const result = f.bridge.act({ action: "fill", ref: editableRef(f), text: "new" });
-    assert.equal(result.error, "ELEMENT_UNAVAILABLE");
+    assert.equal(result.error, "ELEMENT_UNAVAILABLE", mutate.toString());
     assert.equal(result.attempted, false);
     assert.equal(host.replacements, undefined);
     assert.equal(host.textContent, "old");
-    assert.deepEqual(host.events, phase === "focus" ? [] : ["beforeinput"]);
+    assert.deepEqual(host.events, []);
+    assert.equal(f.window.getSelection().rangeCount, 0, "no selection is made for a changed host");
   }
 });
 
-test("contenteditable replacement and input mutations report attempted without false success", () => {
+test("contenteditable selection and focus failures stop before any input", () => {
+  const f = fixture();
+  const host = f.add("DIV", { contenteditable: "true", "aria-label": "Editor" });
+  const other = f.add("INPUT");
+  host.textContent = "old";
+  const ref = editableRef(f);
+  host.onFocus = () => other.focus();
+  assert.equal(f.bridge.act({ action: "fill", ref, text: "new" }).error, "FOCUS_NOT_REACHED");
+  host.onFocus = undefined;
+  const RangePrototype = f.window.Range.prototype;
+  const select = RangePrototype.selectNodeContents;
+  RangePrototype.selectNodeContents = function() { select.call(this, other); };
+  const redirected = f.bridge.act({ action: "fill", ref, text: "new" });
+  assert.equal(redirected.error, "SELECTION_NOT_REACHED");
+  assert.equal(redirected.attempted, false);
+  assert.equal(host.textContent, "old");
+});
+
+test("contenteditable verification reports attempted without false success when the host changes", () => {
   const cases = [
-    ["replace", (host) => { host.hidden = true; }, "FILL_STATE_UNCONFIRMED"],
-    ["input", (host) => host.remove(), "FILL_STATE_UNCONFIRMED"],
-    ["input", (host) => host.setAttribute("aria-readonly", "true"), "FILL_STATE_UNCONFIRMED"],
-    ["input", (host) => { host.textContent = "new"; }, "FILL_STATE_UNCONFIRMED"],
-    ["input", (host) => { host.firstChild.data = "reverted"; }, "FILL_STATE_NOT_REACHED"],
+    ["hidden", (_f, host) => { host.hidden = true; }, "FILL_STATE_UNCONFIRMED"],
+    ["removed", (_f, host) => host.remove(), "FILL_STATE_UNCONFIRMED"],
+    ["readonly", (_f, host) => host.setAttribute("aria-readonly", "true"), "FILL_STATE_UNCONFIRMED"],
+    ["focus moved", (f) => { f.document.activeElement = f.document.body; }, "FILL_STATE_UNCONFIRMED"],
+    ["new read", (f) => f.bridge.read(), "FILL_STATE_UNCONFIRMED"],
+    ["reverted", (_f, host) => { host.firstChild.data = "reverted"; }, "FILL_STATE_NOT_REACHED"],
   ];
-  for (const [phase, mutate, error] of cases) {
+  for (const [name, mutate, error] of cases) {
     const f = fixture();
     const host = f.add("DIV", { contenteditable: "true", "aria-label": "Editor" });
     host.textContent = "old";
-    if (phase === "replace") host.onReplace = () => mutate(host);
-    else host.onEvent = (event) => { if (event.type === "input") mutate(host); };
-    const result = f.bridge.act({ action: "fill", ref: editableRef(f), text: "new" });
-    assert.equal(result.error, error);
-    assert.equal(result.attempted, true);
-    assert.equal(result.trusted, false);
-    assert.equal(host.replacements, 1);
-    assert.deepEqual(host.events, phase === "replace" ? ["beforeinput"] : ["beforeinput", "input"]);
+    const ref = editableRef(f);
+    assert.equal(f.bridge.act({ action: "fill", ref, text: "new" }).prepared, true, name);
+    host.firstChild.data = "new"; // Engine completion is modeled independently.
+    mutate(f, host);
+    const result = verifyEditable(f, ref, "new");
+    assert.equal(result.error, error, name);
+    assert.equal(result.attempted, true, name);
+    assert.equal(result.input, "chromium");
+    assert.equal(result.trusted, undefined);
+    assert.equal(host.replacements, undefined);
+    assert.deepEqual(host.events, []);
   }
 });
 
-test("contenteditable exception receipts preserve only bounded attempted evidence", () => {
-  for (const phase of ["focus", "replace", "input"]) {
+test("contenteditable exception receipts do not echo page exceptions", () => {
+  for (const phase of ["focus", "select", "verify"]) {
     const f = fixture();
     const host = f.add("DIV", { contenteditable: "true", "aria-label": "Editor" });
     host.textContent = "old";
+    const ref = editableRef(f);
     const fail = () => { throw new Error("private-page-exception-text"); };
     if (phase === "focus") host.onFocus = fail;
-    else if (phase === "replace") host.onReplace = fail;
-    else host.onEvent = (event) => { if (event.type === "input") fail(); };
-    const result = f.bridge.act({ action: "fill", ref: editableRef(f), text: "new" });
-    assert.equal(result.error, "ACTION_FAILED");
-    assert.equal(result.attempted, phase !== "focus");
-    assert.equal(result.trusted, false);
+    else if (phase === "select") f.window.Range.prototype.selectNodeContents = fail;
+    let result;
+    if (phase === "verify") {
+      assert.equal(f.bridge.act({ action: "fill", ref, text: "old" }).prepared, true);
+      const descriptor = Object.getOwnPropertyDescriptor(f.window.HTMLElement.prototype, "innerText");
+      Object.defineProperty(f.window.HTMLElement.prototype, "innerText", { ...descriptor, get: fail });
+      result = verifyEditable(f, ref, "old");
+    } else result = f.bridge.act({ action: "fill", ref, text: "new" });
+    assert.equal(result.error, phase === "verify" ? "FILL_STATE_UNCONFIRMED" : "ACTION_FAILED", phase);
+    assert.equal(result.attempted, phase === "verify");
+    assert.equal(result.trusted, undefined);
     assert.ok(!JSON.stringify(result).includes("private-page-exception-text"));
   }
 });
 
-test("contenteditable read and equality remain bounded without whole-host text getters", () => {
+test("contenteditable read and fill remain bounded without whole-host text getters", () => {
   const f = fixture();
   const host = f.add("DIV", { contenteditable: "true", "aria-label": "Editor" });
   const long = f.text("x".repeat(1000000), host);
@@ -2680,11 +2785,19 @@ test("contenteditable read and equality remain bounded without whole-host text g
   const page = f.bridge.read();
   assert.equal(page.interactive[0].value, "x".repeat(240));
   assert.ok(f.metrics.largestTextSlice <= 12001);
-  f.metrics.largestTextSlice = 0;
-  const result = f.bridge.act({ action: "fill", ref: page.interactive[0].ref, text: "short" });
-  assert.equal(result.ok, true);
-  assert.equal(host.firstChild.data, "short");
-  assert.ok(f.metrics.largestTextSlice <= 4096);
+  const ref = page.interactive[0].ref;
+  // 1,000,000 units fit the 1Mi editing budget, so the host can be selected.
+  assert.equal(f.bridge.act({ action: "fill", ref, text: "short" }).prepared, true);
+  // Verification refuses to read innerText when the host is larger than the
+  // requested text plus the node budget could explain.
+  const result = verifyEditable(f, ref, "short");
+  assert.equal(result.error, "FILL_STATE_UNCONFIRMED");
+  assert.equal(result.attempted, true);
+  // A host beyond the editing budget is rejected before selection.
+  f.text("y".repeat(100000), host);
+  const oversized = f.bridge.act({ action: "fill", ref: editableRef(f), text: "short" });
+  assert.equal(oversized.error, "UNSUPPORTED_ELEMENT");
+  assert.equal(oversized.attempted, false);
 });
 
 test("contenteditable uses the accessible frame realm and rejects navigation around input", () => {
@@ -2692,17 +2805,20 @@ test("contenteditable uses the accessible frame realm and rejects navigation aro
   const { frame, child } = embed(f);
   const host = child.add("DIV", { contenteditable: "plaintext-only", "aria-label": "Editor" });
   host.textContent = "old";
-  child.window.InputEvent = class extends child.window.InputEvent {
-    constructor(...args) { super(...args); this.realm = "child"; }
-  };
-  host.onEvent = (event) => assert.equal(event.realm, "child");
-  assert.equal(f.bridge.act({ action: "fill", ref: editableRef(f), text: "new" }).ok, true);
-  assert.equal(host.firstChild.ownerDocument, child.document);
-  host.onEvent = (event) => { if (event.type === "input") frame.contentDocument = fixture().document; };
-  const result = f.bridge.act({ action: "fill", ref: editableRef(f), text: "later" });
+  const ref = editableRef(f);
+  assert.deepEqual({ ...f.bridge.act({ action: "fill", ref, text: "new" }) }, editablePrepared);
+  assert.equal(child.window.getSelection().rangeCount, 1, "selection is made in the frame's own realm");
+  assert.equal(f.window.getSelection().rangeCount, 0);
+  assert.equal(f.document.activeElement, frame);
+  assert.equal(child.document.activeElement, host);
+  host.textContent = "new";
+  assert.equal(verifyEditable(f, ref, "new").verified, true);
+  assert.equal(f.bridge.act({ action: "fill", ref, text: "later" }).prepared, true);
+  host.textContent = "later";
+  frame.contentDocument = fixture().document;
+  const result = verifyEditable(f, ref, "later");
   assert.equal(result.error, "FILL_STATE_UNCONFIRMED");
   assert.equal(result.attempted, true);
-  assert.equal(host.firstChild.data, "later");
 });
 
 test("native form controls retain their existing fill policy despite a contenteditable attribute", () => {
@@ -2865,12 +2981,14 @@ test("Chromium fill retains empty/same-value preparation and shadow/frame verifi
     for (const text of ["", "same", "same"]) {
       const ref = f.bridge.read().interactive.find((item) => item.label === label).ref;
       const old = element._value;
-      assert.equal(f.bridge.act({ action: "fill", ref, text }).prepared, true);
+      const prepared = f.bridge.act({ action: "fill", ref, text });
+      assert.equal(prepared.prepared, true);
       assert.equal(element._value, old);
       assert.deepEqual(element.events, []);
       element._value = text; // Engine completion is modeled independently.
-      const result = f.bridge.act({ action: "fill", ref, text, verifyOnly: true, kind });
+      const result = f.bridge.act({ action: "fill", ref, text, verifyOnly: true, kind, observation: prepared.observation });
       assert.equal(result.verified, true);
+      assert.equal(result.inputTarget, "unconfirmed", "the double delivers no trusted input events");
       assert.equal(result.attempted, true);
       assert.equal(result.trusted, undefined);
     }
@@ -2889,7 +3007,7 @@ test("Chromium fill prepares a full native selection without writing or dispatch
     const ref = f.bridge.read().interactive[0].ref;
     for (const text of ["changed", "", "original😀"]) {
       const result = f.bridge.act({ action: "fill", ref, text });
-      assert.deepEqual({ ...result }, { ok: true, action: "fill", prepared: true, attempted: false, input: "chromium", kind });
+      assert.deepEqual(withoutReceipt({ ...result }), { ok: true, action: "fill", prepared: true, attempted: false, input: "chromium", kind });
       assert.equal(element._value, "original😀");
       assert.equal(element._selectionStart, 0);
       assert.equal(element._selectionEnd, "original😀".length);
@@ -2952,11 +3070,12 @@ test("Chromium fill verification observes native value without focus or input si
   const ref = f.bridge.read().interactive[0].ref;
   const prepared = f.bridge.act({ action: "fill", ref, text: "new private" });
   assert.equal(prepared.kind, "password");
+  assert.match(prepared.observation, /^[a-f0-9]{32}$/);
   input._value = "new private"; // Independently model the already-completed engine operation.
   Object.defineProperty(input, "value", { get: () => "page spoof" });
   const focusCount = input.focused, selectionCount = input.selectionCalls;
-  const result = f.bridge.act({ action: "fill", ref, text: "new private", verifyOnly: true, kind: "password" });
-  assert.deepEqual({ ...result }, { ok: true, action: "fill", verified: true, input: "chromium", attempted: true });
+  const result = f.bridge.act({ action: "fill", ref, text: "new private", verifyOnly: true, kind: "password", observation: prepared.observation });
+  assert.deepEqual({ ...result }, { ok: true, action: "fill", verified: true, input: "chromium", attempted: true, inputTarget: "unconfirmed" });
   assert.equal(input.focused, focusCount);
   assert.equal(input.selectionCalls, selectionCount);
   assert.deepEqual(input.events, []);
@@ -2967,7 +3086,7 @@ test("Chromium fill verification distinguishes final value mismatch from unavail
   for (const mode of ["canceled", "maxlength", "normalized", "reset", "detached", "hidden", "disabled", "readonly", "retyped", "new-read", "wrong-kind"]) {
     const f = fixture(); const input = f.add("INPUT"); input._value = "old";
     const ref = f.bridge.read().interactive[0].ref;
-    f.bridge.act({ action: "fill", ref, text: "requested" });
+    const prepared = f.bridge.act({ action: "fill", ref, text: "requested" });
     input._value = "requested";
     if (["canceled", "maxlength", "normalized", "reset"].includes(mode)) input._value = mode;
     if (mode === "detached") input.remove();
@@ -2977,7 +3096,7 @@ test("Chromium fill verification distinguishes final value mismatch from unavail
     if (mode === "retyped") input.type = "password";
     if (mode === "new-read") f.bridge.read();
     const value = input._value, events = input.events.slice(), focusCount = input.focused;
-    const result = f.bridge.act({ action: "fill", ref, text: "requested", verifyOnly: true, kind: mode === "wrong-kind" ? "email" : "text" });
+    const result = f.bridge.act({ action: "fill", ref, text: "requested", verifyOnly: true, kind: mode === "wrong-kind" ? "email" : "text", observation: prepared.observation });
     assert.equal(result.error, ["canceled", "maxlength", "normalized", "reset"].includes(mode) ? "FILL_STATE_NOT_REACHED" : "FILL_STATE_UNCONFIRMED", mode);
     assert.equal(result.attempted, true);
     assert.equal(result.input, "chromium");
@@ -2993,14 +3112,18 @@ test("Chromium fill uses bounded logical focus through shadow and frame contexts
   const host = child.add("DIV"); const root = host.attachShadow({ mode: "open" });
   const input = child.add("TEXTAREA", {}, root); input._value = "original";
   const ref = f.bridge.read().interactive[0].ref;
-  assert.equal(f.bridge.act({ action: "fill", ref, text: "changed" }).prepared, true);
+  const first = f.bridge.act({ action: "fill", ref, text: "changed" });
+  assert.equal(first.prepared, true);
   input._value = "changed";
-  assert.equal(f.bridge.act({ action: "fill", ref, text: "changed", kind: "textarea", verifyOnly: true }).verified, true);
+  assert.equal(f.bridge.act({ action: "fill", ref, text: "changed", kind: "textarea", verifyOnly: true, observation: first.observation }).verified, true);
   const focused = input.focus;
   input.focus = () => { focused.call(input); f.document.activeElement = f.document.body; };
   assert.equal(f.bridge.act({ action: "fill", ref, text: "later" }).error, "FOCUS_NOT_REACHED");
+  input.focus = focused;
+  const second = f.bridge.act({ action: "fill", ref, text: "changed" });
+  assert.equal(second.prepared, true);
   frame.contentDocument = fixture().document;
-  assert.equal(f.bridge.act({ action: "fill", ref, text: "changed", kind: "textarea", verifyOnly: true }).error, "FILL_STATE_UNCONFIRMED");
+  assert.equal(f.bridge.act({ action: "fill", ref, text: "changed", kind: "textarea", verifyOnly: true, observation: second.observation }).error, "FILL_STATE_UNCONFIRMED");
 });
 
 test("Chromium fill sanitizes native access failures and rechecks after its getters", () => {

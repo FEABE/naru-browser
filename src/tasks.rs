@@ -11,6 +11,10 @@ use std::fs::File;
 use std::io::Read;
 
 pub const MAX_TASKS: usize = 128;
+/// Most recent finished tasks kept for `task info`/`task list`. Older finished
+/// tasks are pruned when a newer task finishes; active, paused and finishing
+/// tasks are never pruned.
+pub const MAX_FINISHED_TASKS: usize = 16;
 pub const MAX_TASK_TABS: usize = 4;
 const MAX_NAME_CHARS: usize = 120;
 
@@ -83,6 +87,8 @@ struct TaskRecord {
     revision: u64,
     tabs: BTreeMap<i32, Origin>,
     released_tabs: Vec<i32>,
+    /// Order in which the task reached `Finished`; `None` until then.
+    finished_seq: Option<u64>,
 }
 
 impl TaskRecord {
@@ -116,9 +122,12 @@ impl TaskRecord {
 
 #[derive(Default)]
 pub struct Registry {
-    // Creation order makes eviction of the oldest finished record predictable.
-    // At most 128 records with 4 tabs each also bounds ownership lookup.
+    // At most 128 records with 4 tabs each bounds ownership lookup; at most
+    // MAX_FINISHED_TASKS of them are finished.
     records: Vec<TaskRecord>,
+    // Finish order, not creation order, decides which finished record is oldest:
+    // a long-running early task that just finished must stay inspectable.
+    finish_counter: u64,
 }
 
 impl Registry {
@@ -134,9 +143,7 @@ impl Registry {
         }
         let prune = if self.records.len() >= MAX_TASKS {
             Some(
-                self.records
-                    .iter()
-                    .position(|task| task.status == Status::Finished)
+                self.oldest_finished()
                     .ok_or(TaskError::new(
                         "TASK_LIMIT",
                         "Finish an existing task before creating another task.",
@@ -158,6 +165,7 @@ impl Registry {
             revision: 1,
             tabs: BTreeMap::new(),
             released_tabs: Vec::new(),
+            finished_seq: None,
         };
         let view = task.view();
         self.records.push(task);
@@ -344,6 +352,9 @@ impl Registry {
         task.revision = revision;
         task.released_tabs = released;
         let view = task.view();
+        if view.status == Status::Finished {
+            self.mark_finished(index);
+        }
         Ok(FinishPlan {
             close: view.closing_tabs.clone(),
             task: view,
@@ -351,15 +362,50 @@ impl Registry {
     }
 
     pub fn tab_closed(&mut self, tab: i32) -> Option<TaskView> {
-        let task = self
+        let index = self
             .records
-            .iter_mut()
-            .find(|task| task.tabs.contains_key(&tab))?;
+            .iter()
+            .position(|task| task.tabs.contains_key(&tab))?;
+        let task = &mut self.records[index];
         task.tabs.remove(&tab);
-        if task.status == Status::Finishing && task.tabs.is_empty() {
+        let finished = task.status == Status::Finishing && task.tabs.is_empty();
+        if finished {
             task.status = Status::Finished;
         }
-        Some(task.view())
+        let view = task.view();
+        if finished {
+            self.mark_finished(index);
+        }
+        Some(view)
+    }
+
+    /// Stamp a task that just reached `Finished` and keep only the
+    /// `MAX_FINISHED_TASKS` most recently finished records. The task that just
+    /// finished has the newest stamp, so it is never the one pruned.
+    fn mark_finished(&mut self, index: usize) {
+        self.finish_counter += 1;
+        self.records[index].finished_seq = Some(self.finish_counter);
+        while self
+            .records
+            .iter()
+            .filter(|task| task.status == Status::Finished)
+            .count()
+            > MAX_FINISHED_TASKS
+        {
+            let Some(oldest) = self.oldest_finished() else {
+                break;
+            };
+            self.records.remove(oldest);
+        }
+    }
+
+    fn oldest_finished(&self) -> Option<usize> {
+        self.records
+            .iter()
+            .enumerate()
+            .filter(|(_, task)| task.status == Status::Finished)
+            .min_by_key(|(_, task)| task.finished_seq.unwrap_or(0))
+            .map(|(index, _)| index)
     }
 
     fn index(&self, id: &str) -> Result<usize, TaskError> {
@@ -734,6 +780,108 @@ mod tests {
             registry.info(&tasks[2].id).unwrap().status,
             Status::Finished
         );
+    }
+
+    #[test]
+    fn finished_tasks_are_pruned_by_finish_order_beyond_the_retention_limit() {
+        let mut registry = Registry::default();
+        let tasks = (0..MAX_FINISHED_TASKS + 4)
+            .map(|index| registry.create(&format!("task {index}")).unwrap())
+            .collect::<Vec<_>>();
+        // Finish in reverse creation order: the first-created task finishes last
+        // and must stay inspectable even though it is the oldest by creation.
+        for task in tasks.iter().rev().take(MAX_FINISHED_TASKS) {
+            let plan = registry.finish(&scope(task), &[]).unwrap();
+            assert_eq!(plan.task.status, Status::Finished);
+            assert_eq!(registry.info(&task.id).unwrap().status, Status::Finished);
+        }
+        assert_eq!(registry.list().len(), tasks.len());
+        let just_finished = &tasks[0];
+        registry.finish(&scope(just_finished), &[]).unwrap();
+        assert_eq!(
+            registry.info(&just_finished.id).unwrap().status,
+            Status::Finished,
+            "a just-finished task is retained for task info"
+        );
+        // The earliest finisher (last created) was pruned; the rest remain.
+        let oldest_finisher = tasks.last().unwrap();
+        assert_eq!(
+            registry.info(&oldest_finisher.id).unwrap_err().code,
+            "TASK_NOT_FOUND"
+        );
+        let finished = registry
+            .list()
+            .into_iter()
+            .filter(|task| task.status == Status::Finished)
+            .count();
+        assert_eq!(finished, MAX_FINISHED_TASKS);
+        // The three never-finished tasks that were not finished are untouched.
+        for task in &tasks[1..4] {
+            assert_eq!(registry.info(&task.id).unwrap().status, Status::Active);
+        }
+    }
+
+    #[test]
+    fn pruning_never_removes_active_paused_or_finishing_tasks() {
+        let mut registry = Registry::default();
+        let active = registry.create("active").unwrap();
+        let paused = registry.create("paused").unwrap();
+        registry.handoff(&scope(&paused)).unwrap();
+        let paused = registry.info(&paused.id).unwrap();
+        let finishing = registry.create("finishing").unwrap();
+        registry
+            .attach(&scope(&finishing), 99, Origin::Created)
+            .unwrap();
+        let finishing_view = registry.finish(&scope(&finishing), &[]).unwrap().task;
+        assert_eq!(finishing_view.status, Status::Finishing);
+        for index in 0..MAX_FINISHED_TASKS * 2 {
+            let task = registry.create(&format!("done {index}")).unwrap();
+            registry.finish(&scope(&task), &[]).unwrap();
+        }
+        assert_eq!(registry.info(&active.id).unwrap().status, Status::Active);
+        assert_eq!(registry.info(&paused.id).unwrap().status, Status::Paused);
+        assert_eq!(
+            registry.info(&finishing_view.id).unwrap().status,
+            Status::Finishing
+        );
+        assert_eq!(registry.list().len(), 3 + MAX_FINISHED_TASKS);
+        // A finishing task counts as finished only after its tab closes, and
+        // then it is the newest finisher, so it survives the next prune.
+        let closed = registry.tab_closed(99).unwrap();
+        assert_eq!(closed.status, Status::Finished);
+        // The 17th finished record (this one) displaces the oldest finisher.
+        assert_eq!(registry.list().len(), 2 + MAX_FINISHED_TASKS);
+        assert_eq!(
+            registry.info(&finishing_view.id).unwrap().status,
+            Status::Finished
+        );
+    }
+
+    #[test]
+    fn retention_does_not_change_resume_by_name_or_finished_checks() {
+        let mut registry = Registry::default();
+        let (live, _) = registry.create_or_resume("keeper").unwrap();
+        let mut last = None;
+        for index in 0..MAX_FINISHED_TASKS + 5 {
+            let task = registry.create(&format!("done {index}")).unwrap();
+            registry.finish(&scope(&task), &[]).unwrap();
+            last = Some(task);
+        }
+        let (again, resumed) = registry.create_or_resume("keeper").unwrap();
+        assert!(resumed);
+        assert_eq!(again, live);
+        // A finished (retained) task still reports TASK_FINISHED, and its name
+        // is never resumed.
+        let last = last.unwrap();
+        let finished = registry.info(&last.id).unwrap();
+        assert_eq!(finished.status, Status::Finished);
+        assert_eq!(
+            registry.check(&scope(&finished)).unwrap_err().code,
+            "TASK_FINISHED"
+        );
+        let (fresh, resumed) = registry.create_or_resume(&last.name).unwrap();
+        assert!(!resumed);
+        assert_ne!(fresh.id, last.id);
     }
 
     #[test]
