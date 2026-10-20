@@ -18,6 +18,14 @@ use std::time::{Duration, Instant};
 pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_SELECT_VALUE_UTF16: usize = 1024;
+/// Longest ref accepted by element commands.
+pub const MAX_REF_BYTES: usize = 256;
+/// Longest `text=`, `css=` or `role=` selector accepted where a ref is accepted.
+pub const MAX_SELECTOR_BYTES: usize = 1024;
+/// Largest absolute wheel delta, in CSS pixels.
+pub const MAX_WHEEL_DELTA: i32 = 10000;
+pub const MAX_POINTER_COORDINATE: i32 = 1_000_000;
+pub const MAX_CLICK_COUNT: u8 = 3;
 /// Response id the server uses when it rejects a request before reading its id.
 pub const INVALID_REQUEST_ID: &str = "invalid";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -55,6 +63,62 @@ pub enum WaitUntil {
 }
 
 pub const WAIT_NEEDLE_MAX_BYTES: usize = 4096;
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MouseButton {
+    #[default]
+    Left,
+    Right,
+}
+
+impl MouseButton {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+}
+
+fn default_click_count() -> u8 {
+    1
+}
+
+/// True when a target string is a selector (`text=`, `css=` or `role=`), not a ref.
+/// Refs start with a navigation epoch digit or `frame/`, so the forms never collide.
+pub fn is_selector(value: &str) -> bool {
+    value.starts_with("text=") || value.starts_with("css=") || value.starts_with("role=")
+}
+
+/// Validate a REF or selector target. Refs keep their 1..256 byte rule; selectors
+/// allow at most 1024 bytes in total, a non-empty body and no NUL.
+pub fn validate_target(value: &str) -> Result<(), ProtocolError> {
+    let invalid = |message| ProtocolError::new("INVALID_REQUEST", message);
+    if is_selector(value) {
+        let body = &value[value.find('=').map_or(0, |index| index + 1)..];
+        if value.len() > MAX_SELECTOR_BYTES || value.contains('\0') || body.is_empty() {
+            return Err(invalid(
+                "Selector must be text=, css= or role= with a non-empty value, at most 1024 bytes in total and no NUL.",
+            ));
+        }
+        return Ok(());
+    }
+    if value.is_empty() || value.len() > MAX_REF_BYTES {
+        return Err(invalid("REF must contain 1 to 256 bytes."));
+    }
+    Ok(())
+}
+
+fn validate_coordinates(x: i32, y: i32) -> Result<(), ProtocolError> {
+    if !(0..=MAX_POINTER_COORDINATE).contains(&x) || !(0..=MAX_POINTER_COORDINATE).contains(&y) {
+        return Err(ProtocolError::new(
+            "INVALID_REQUEST",
+            "X and Y must be integer viewport CSS pixels from 0 to 1000000.",
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -219,6 +283,49 @@ pub enum Command {
         #[serde(rename = "ref")]
         reference: String,
     },
+    /// Chromium double click (two press/release pairs, clickCount 1 then 2).
+    #[serde(rename = "dblclick")]
+    DblClick {
+        tab: i32,
+        #[serde(rename = "ref")]
+        reference: String,
+    },
+    /// Chromium right button press/release at a verified element point.
+    RightClick {
+        tab: i32,
+        #[serde(rename = "ref")]
+        reference: String,
+    },
+    /// Chromium mouseWheel at a verified element point (distinct from `scroll`).
+    Wheel {
+        tab: i32,
+        #[serde(rename = "ref")]
+        reference: String,
+        dx: i32,
+        dy: i32,
+    },
+    /// Press at `from`, move through intermediate points, release at `to`.
+    Drag {
+        tab: i32,
+        from: String,
+        to: String,
+    },
+    /// Click at a viewport CSS-pixel coordinate.
+    ClickAt {
+        tab: i32,
+        x: i32,
+        y: i32,
+        #[serde(default)]
+        button: MouseButton,
+        #[serde(default = "default_click_count")]
+        count: u8,
+    },
+    /// Move the pointer to a viewport CSS-pixel coordinate.
+    MoveAt {
+        tab: i32,
+        x: i32,
+        y: i32,
+    },
     Check {
         tab: i32,
         #[serde(rename = "ref")]
@@ -282,6 +389,12 @@ impl Command {
             | Self::ScrollElement { tab, .. }
             | Self::Click { tab, .. }
             | Self::Hover { tab, .. }
+            | Self::DblClick { tab, .. }
+            | Self::RightClick { tab, .. }
+            | Self::Wheel { tab, .. }
+            | Self::Drag { tab, .. }
+            | Self::ClickAt { tab, .. }
+            | Self::MoveAt { tab, .. }
             | Self::Check { tab, .. }
             | Self::Fill { tab, .. }
             | Self::Insert { tab, .. }
@@ -392,27 +505,78 @@ impl Command {
                     "Dialog TEXT must be at most 4096 bytes and contain no NUL.",
                 ));
             }
-            Self::ScrollElement { reference, .. }
-                if reference.is_empty() || reference.len() > 256 =>
-            {
-                return Err(invalid("REF must contain 1 to 256 bytes."));
+            Self::Click { reference, .. }
+            | Self::Hover { reference, .. }
+            | Self::DblClick { reference, .. }
+            | Self::RightClick { reference, .. }
+            | Self::Check { reference, .. }
+            | Self::Fill { reference, .. }
+            | Self::Insert { reference, .. }
+            | Self::Press { reference, .. } => validate_target(reference)?,
+            Self::Wheel {
+                reference, dx, dy, ..
+            } => {
+                validate_target(reference)?;
+                if !(-MAX_WHEEL_DELTA..=MAX_WHEEL_DELTA).contains(dx)
+                    || !(-MAX_WHEEL_DELTA..=MAX_WHEEL_DELTA).contains(dy)
+                    || (*dx == 0 && *dy == 0)
+                {
+                    return Err(invalid(
+                        "Wheel dx and dy must be integers between -10000 and 10000 and not both zero.",
+                    ));
+                }
             }
-            Self::Scroll { x, y, .. } | Self::ScrollElement { x, y, .. }
-                if !(-10000..=10000).contains(x) || !(-10000..=10000).contains(y) =>
-            {
-                return Err(invalid(
-                    "Scroll x and y must be integers between -10000 and 10000 CSS pixels.",
-                ));
+            Self::Drag { from, to, .. } => {
+                validate_target(from)?;
+                validate_target(to)?;
+                if from == to {
+                    return Err(invalid("Drag FROM and TO must differ."));
+                }
+                // A selector re-reads the page and renumbers every ref, so a ref
+                // mixed with a selector would be stale before it is used.
+                if is_selector(from) != is_selector(to) {
+                    return Err(invalid(
+                        "Drag FROM and TO must both be refs or both be selectors.",
+                    ));
+                }
             }
-            Self::Select { value, .. }
+            Self::ClickAt { x, y, count, .. } => {
+                validate_coordinates(*x, *y)?;
+                if !(1..=MAX_CLICK_COUNT).contains(count) {
+                    return Err(invalid("Click count must be 1 to 3."));
+                }
+            }
+            Self::MoveAt { x, y, .. } => validate_coordinates(*x, *y)?,
+            Self::ScrollElement { reference, .. } => {
+                validate_target(reference)?;
+                if let Self::ScrollElement { x, y, .. } = self
+                    && (!(-10000..=10000).contains(x) || !(-10000..=10000).contains(y))
+                {
+                    return Err(invalid(
+                        "Scroll x and y must be integers between -10000 and 10000 CSS pixels.",
+                    ));
+                }
+            }
+            Self::Select {
+                reference, value, ..
+            } => {
+                validate_target(reference)?;
                 if value
                     .encode_utf16()
                     .take(MAX_SELECT_VALUE_UTF16 + 1)
                     .count()
-                    > MAX_SELECT_VALUE_UTF16 =>
+                    > MAX_SELECT_VALUE_UTF16
+                {
+                    return Err(invalid(
+                        "Select value must contain at most 1024 UTF-16 code units.",
+                    ));
+                }
+            }
+            Self::Scroll { x, y, .. }
+                if !(-10000..=10000).contains(x) || !(-10000..=10000).contains(y) =>
             {
                 return Err(invalid(
-                    "Select value must contain at most 1024 UTF-16 code units.",
+                    "Scroll x and y must be integers between -10000 and 10000 CSS pixels.",
                 ));
             }
             _ => {}
@@ -1045,6 +1209,12 @@ fn validate_command_fields(value: &Value, allow_task: bool) -> Result<(), Protoc
                     | "scroll_element"
                     | "click"
                     | "hover"
+                    | "dblclick"
+                    | "right_click"
+                    | "wheel"
+                    | "drag"
+                    | "click_at"
+                    | "move_at"
                     | "check"
                     | "fill"
                     | "insert"
@@ -2384,5 +2554,136 @@ mod tests {
         fs::write(&socket, "preserve me").unwrap();
         assert_eq!(bind_listener(&socket).unwrap_err().code, "INSECURE_SOCKET");
         assert_eq!(fs::read_to_string(&socket).unwrap(), "preserve me");
+    }
+
+    #[test]
+    fn pointer_expansion_commands_round_trip_in_both_scopes() {
+        let wires = [
+            json!({"type":"dblclick","tab":3,"ref":"9/doc:1:1"}),
+            json!({"type":"right_click","tab":3,"ref":"text=Save"}),
+            json!({"type":"wheel","tab":3,"ref":"css=#list","dx":-10000,"dy":10000}),
+            json!({"type":"drag","tab":3,"from":"9/doc:1:1","to":"9/doc:1:2"}),
+            json!({"type":"drag","tab":3,"from":"css=#a","to":"role=button[name=Drop]"}),
+            json!({"type":"click_at","tab":3,"x":0,"y":1000000,"button":"right","count":3}),
+            json!({"type":"move_at","tab":3,"x":12,"y":34}),
+        ];
+        for wire in wires {
+            let command = request_from_command_value(wire.clone()).unwrap().command;
+            assert_eq!(command.tab_id(), Some(3));
+            assert!(!command.is_task_command());
+            assert_eq!(serde_json::to_value(&command).unwrap(), wire);
+            let nested = request_from_command_value(json!({
+                "type":"task_run","task":"task-1","revision":2,"command":wire
+            }))
+            .unwrap()
+            .command;
+            assert_eq!(nested.tab_id(), Some(3));
+        }
+        // click_at defaults: left button, single click.
+        let command = request_from_command_value(json!({"type":"click_at","tab":3,"x":1,"y":2}))
+            .unwrap()
+            .command;
+        assert_eq!(
+            command,
+            Command::ClickAt {
+                tab: 3,
+                x: 1,
+                y: 2,
+                button: MouseButton::Left,
+                count: 1
+            }
+        );
+    }
+
+    #[test]
+    fn pointer_expansion_commands_reject_invalid_fields() {
+        let invalid = [
+            json!({"type":"dblclick","tab":0,"ref":"r"}),
+            json!({"type":"dblclick","tab":3,"ref":""}),
+            json!({"type":"dblclick","tab":3,"ref":"r".repeat(257)}),
+            json!({"type":"right_click","tab":3,"ref":"text="}),
+            json!({"type":"right_click","tab":3,"ref":"css=a\u{0}b"}),
+            json!({"type":"right_click","tab":3,"ref":format!("css={}", "a".repeat(1022))}),
+            json!({"type":"wheel","tab":3,"ref":"r","dx":0,"dy":0}),
+            json!({"type":"wheel","tab":3,"ref":"r","dx":10001,"dy":0}),
+            json!({"type":"wheel","tab":3,"ref":"r","dx":0,"dy":-10001}),
+            json!({"type":"wheel","tab":3,"ref":"r","dx":1.5,"dy":1}),
+            json!({"type":"wheel","tab":3,"ref":"r","dx":1}),
+            json!({"type":"drag","tab":3,"from":"r","to":"r"}),
+            json!({"type":"drag","tab":3,"from":"css=a","to":"9/doc:1:2"}),
+            json!({"type":"drag","tab":3,"from":"9/doc:1:2","to":"css=a"}),
+            json!({"type":"drag","tab":3,"from":"","to":"r"}),
+            json!({"type":"drag","tab":3,"from":"r"}),
+            json!({"type":"click_at","tab":3,"x":-1,"y":0}),
+            json!({"type":"click_at","tab":3,"x":0,"y":1000001}),
+            json!({"type":"click_at","tab":3,"x":1.5,"y":0}),
+            json!({"type":"click_at","tab":3,"x":1,"y":2,"count":0}),
+            json!({"type":"click_at","tab":3,"x":1,"y":2,"count":4}),
+            json!({"type":"click_at","tab":3,"x":1,"y":2,"button":"middle"}),
+            json!({"type":"click_at","tab":3,"x":1,"y":2,"extra":true}),
+            json!({"type":"move_at","tab":3,"x":1}),
+            json!({"type":"move_at","tab":3,"x":1,"y":2,"button":"left"}),
+        ];
+        for command in invalid {
+            assert_eq!(
+                request_from_command_value(command.clone())
+                    .unwrap_err()
+                    .code,
+                "INVALID_REQUEST",
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn selectors_are_accepted_wherever_a_ref_is_and_bounded() {
+        let long_ok = format!("css={}", "a".repeat(MAX_SELECTOR_BYTES - 4));
+        let long_bad = format!("css={}", "a".repeat(MAX_SELECTOR_BYTES - 3));
+        let multibyte_ok = format!("text={}", "가".repeat(339)); // 5 + 1017 bytes
+        let multibyte_bad = format!("text={}", "가".repeat(342)); // 5 + 1026 bytes
+        for selector in [
+            "text=Sign in",
+            "css=button.primary",
+            "role=button[name=OK]",
+            &long_ok,
+            &multibyte_ok,
+        ] {
+            for wire in [
+                json!({"type":"click","tab":3,"ref":selector}),
+                json!({"type":"hover","tab":3,"ref":selector}),
+                json!({"type":"fill","tab":3,"ref":selector,"text":"x"}),
+                json!({"type":"insert","tab":3,"ref":selector,"text":"x"}),
+                json!({"type":"press","tab":3,"ref":selector,"key":"Enter"}),
+                json!({"type":"check","tab":3,"ref":selector,"checked":true}),
+                json!({"type":"select","tab":3,"ref":selector,"value":"a"}),
+                json!({"type":"scroll_element","tab":3,"ref":selector,"x":0,"y":5}),
+            ] {
+                assert!(request_from_command_value(wire.clone()).is_ok(), "{wire}");
+            }
+        }
+        for selector in [&long_bad, &multibyte_bad, "css=", "role=", "text="] {
+            for wire in [
+                json!({"type":"click","tab":3,"ref":selector}),
+                json!({"type":"fill","tab":3,"ref":selector,"text":"x"}),
+                json!({"type":"scroll_element","tab":3,"ref":selector,"x":0,"y":5}),
+            ] {
+                assert_eq!(
+                    request_from_command_value(wire.clone()).unwrap_err().code,
+                    "INVALID_REQUEST",
+                    "{wire}"
+                );
+            }
+        }
+        // Refs keep their own 256-byte limit even when they look like a selector's neighbors.
+        assert!(is_selector("text=a") && is_selector("css=a") && is_selector("role=a"));
+        assert!(
+            !is_selector("9/doc:1:1")
+                && !is_selector("frame/1/2/doc:1:1")
+                && !is_selector("Text=a")
+        );
+        assert!(
+            request_from_command_value(json!({"type":"click","tab":3,"ref":"r".repeat(257)}))
+                .is_err()
+        );
     }
 }

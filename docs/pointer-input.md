@@ -1,5 +1,7 @@
 # CLI 클릭과 마우스 올리기
 
+더블클릭, 오른쪽 클릭, 휠, 끌기, 좌표 클릭·이동과 `text=`/`css=`/`role=` 선택자 대상은 같은 경로를 확장한 것이다. [포인터 확장](pointer-ext.md)을 따른다.
+
 ## 참조와 포인터 준비
 
 `lightbrowser task run ID REV click TAB REF`는 최근 `read` 또는 최신 `read-frame`에서 받은 참조를 사용한다. DOM의 `.click()` 대신 Chromium 포인터 입력을 요청한다. `hover TAB REF`는 같은 참조 준비와 위치 확인을 사용하되 포인터 이동만 수행한다. 지원되는 텍스트 fill·insert는 별도의 Chromium 입력 경로를 사용하며 check와 select는 DOM 동작을 유지한다. 기존 `read`의 접근 가능한 문서 참조와 `read-frame`의 exact session/context 참조는 수명과 준비 경로를 구분한다.

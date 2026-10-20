@@ -3,7 +3,7 @@ use crate::control_panel::{ShellAction, ShellSnapshot, ShellTab};
 use crate::keyboard::{KeyPress, UNSUPPORTED_KEY_MESSAGE};
 use crate::page_find::{Request as FindRequest, State as FindState, Target as FindTarget};
 use crate::page_recovery::{PageFailure, PageRecoveryTarget};
-use crate::protocol::{self, Command, Request, Response, TaskScope, WaitUntil};
+use crate::protocol::{self, Command, MouseButton, Request, Response, TaskScope, WaitUntil};
 use crate::resources::{MAX_AUTOMATION_TABS, ResourceBudget};
 use crate::spaces::{Spaces, USER_SPACE};
 use crate::start_page::StartPageTarget;
@@ -71,6 +71,8 @@ struct Reply {
     scope: Option<TaskScope>,
     focus_completion: Option<i32>,
     frame_completion: Option<i32>,
+    /// Elements a `text=`/`css=`/`role=` selector resolved to; echoed in a success result.
+    resolved: Option<Json>,
 }
 impl Reply {
     fn send(&self, response: Response) {
@@ -91,7 +93,10 @@ impl Reply {
             let _ = self.sender.send(response);
         }
     }
-    fn ok(&self, result: Json) {
+    fn ok(&self, mut result: Json) {
+        if let (Some(resolved), Some(object)) = (&self.resolved, result.as_object_mut()) {
+            object.insert("resolved".into(), resolved.clone());
+        }
         self.send(Response::success(&self.id, result));
     }
     fn error(&self, code: &str, message: &str) {
@@ -557,6 +562,79 @@ enum ActionEvidence {
     Fill(Shared<FillTarget>),
     Press(Shared<PressTarget>),
     Click(Shared<ClickTarget>),
+    /// Read-only selector resolution; the original command runs afterwards.
+    Resolve(Shared<SelectorResolution>),
+}
+
+/// The command whose `text=`/`css=`/`role=` targets are being resolved.
+struct SelectorResolution {
+    command: Command,
+    selectors: Vec<String>,
+}
+
+impl SelectorResolution {
+    fn for_command(command: &Command) -> Option<Self> {
+        let selectors: Vec<String> = command_targets(command)
+            .into_iter()
+            .filter(|target| protocol::is_selector(target))
+            .map(str::to_owned)
+            .collect();
+        (!selectors.is_empty()).then(|| Self {
+            command: command.clone(),
+            selectors,
+        })
+    }
+
+    /// Rebuild the command with each selector replaced by its resolved ref.
+    fn rewritten(&self, epoch: u64, refs: &[String]) -> Option<Command> {
+        let mut refs = refs.iter();
+        let mut next = |target: &str| -> Option<String> {
+            if protocol::is_selector(target) {
+                Some(format!("{epoch}/{}", refs.next()?))
+            } else {
+                Some(target.to_owned())
+            }
+        };
+        let mut command = self.command.clone();
+        match &mut command {
+            Command::Click { reference, .. }
+            | Command::Hover { reference, .. }
+            | Command::DblClick { reference, .. }
+            | Command::RightClick { reference, .. }
+            | Command::Wheel { reference, .. }
+            | Command::Check { reference, .. }
+            | Command::Fill { reference, .. }
+            | Command::Insert { reference, .. }
+            | Command::Select { reference, .. }
+            | Command::Press { reference, .. }
+            | Command::ScrollElement { reference, .. } => *reference = next(reference)?,
+            Command::Drag { from, to, .. } => {
+                *from = next(from)?;
+                *to = next(to)?;
+            }
+            _ => return None,
+        }
+        Some(command)
+    }
+}
+
+/// Every REF-or-selector target a command carries, in argument order.
+fn command_targets(command: &Command) -> Vec<&str> {
+    match command {
+        Command::Click { reference, .. }
+        | Command::Hover { reference, .. }
+        | Command::DblClick { reference, .. }
+        | Command::RightClick { reference, .. }
+        | Command::Wheel { reference, .. }
+        | Command::Check { reference, .. }
+        | Command::Fill { reference, .. }
+        | Command::Insert { reference, .. }
+        | Command::Select { reference, .. }
+        | Command::Press { reference, .. }
+        | Command::ScrollElement { reference, .. } => vec![reference],
+        Command::Drag { from, to, .. } => vec![from, to],
+        _ => Vec::new(),
+    }
 }
 
 impl ActionEvidence {
@@ -583,15 +661,15 @@ impl ActionEvidence {
             }))),
             Command::Press { reference, key, .. } => KeyPress::parse(key)
                 .map(|key| Self::Press(Shared::new(PressTarget::new(reference.clone(), key)))),
-            Command::Click { reference, .. } | Command::Hover { reference, .. } => {
-                Some(Self::Click(Shared::new(ClickTarget {
-                    reference: reference.clone(),
-                    hover: matches!(command, Command::Hover { .. }),
-                    context: Cell::new(None),
-                    point: Cell::new(None),
-                    local_point: Cell::new(None),
-                    attempted: Cell::new(false),
-                })))
+            Command::Click { .. }
+            | Command::Hover { .. }
+            | Command::DblClick { .. }
+            | Command::RightClick { .. }
+            | Command::Wheel { .. }
+            | Command::Drag { .. }
+            | Command::ClickAt { .. }
+            | Command::MoveAt { .. } => {
+                ClickTarget::for_command(command).map(|target| Self::Click(Shared::new(target)))
             }
             _ => None,
         }
@@ -944,18 +1022,164 @@ impl ClickPoint {
     }
 }
 
+/// The terminal pointer input after the shared move-and-verify steps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Gesture {
+    Click { button: MouseButton, count: u8 },
+    Hover,
+    Wheel { dx: i32, dy: i32 },
+    Drag,
+}
+
+/// Intermediate mouseMoved events of a drag; the last one lands on the destination.
+const DRAG_MOVE_STEPS: usize = 10;
+/// Hold the "no native context menu" guard this long after a CLI right-click.
+const CONTEXT_CLICK_GUARD: Duration = Duration::from_secs(3);
+
 struct ClickTarget {
+    // Empty for coordinate gestures.
     reference: String,
-    hover: bool,
+    // Drag destination; empty otherwise.
+    to_reference: String,
+    // Viewport CSS pixel coordinate for click-at / move-at.
+    at: Option<(i32, i32)>,
+    gesture: Gesture,
     context: Cell<Option<i64>>,
     point: Cell<Option<ClickPoint>>,
     local_point: Cell<Option<ClickPoint>>,
+    to_point: Cell<Option<ClickPoint>>,
     attempted: Cell<bool>,
 }
 
 impl ClickTarget {
+    fn new(reference: String, gesture: Gesture) -> Self {
+        Self {
+            reference,
+            to_reference: String::new(),
+            at: None,
+            gesture,
+            context: Cell::new(None),
+            point: Cell::new(None),
+            local_point: Cell::new(None),
+            to_point: Cell::new(None),
+            attempted: Cell::new(false),
+        }
+    }
+
+    fn for_command(command: &Command) -> Option<Self> {
+        let click = |count| Gesture::Click {
+            button: MouseButton::Left,
+            count,
+        };
+        Some(match command {
+            Command::Click { reference, .. } => Self::new(reference.clone(), click(1)),
+            Command::Hover { reference, .. } => Self::new(reference.clone(), Gesture::Hover),
+            Command::DblClick { reference, .. } => Self::new(reference.clone(), click(2)),
+            Command::RightClick { reference, .. } => Self::new(
+                reference.clone(),
+                Gesture::Click {
+                    button: MouseButton::Right,
+                    count: 1,
+                },
+            ),
+            Command::Wheel {
+                reference, dx, dy, ..
+            } => Self::new(reference.clone(), Gesture::Wheel { dx: *dx, dy: *dy }),
+            Command::Drag { from, to, .. } => {
+                let mut target = Self::new(from.clone(), Gesture::Drag);
+                target.to_reference = to.clone();
+                target
+            }
+            Command::ClickAt {
+                x,
+                y,
+                button,
+                count,
+                ..
+            } => {
+                let mut target = Self::new(
+                    String::new(),
+                    Gesture::Click {
+                        button: *button,
+                        count: *count,
+                    },
+                );
+                target.at = Some((*x, *y));
+                target
+            }
+            Command::MoveAt { x, y, .. } => {
+                let mut target = Self::new(String::new(), Gesture::Hover);
+                target.at = Some((*x, *y));
+                target
+            }
+            _ => return None,
+        })
+    }
+
+    /// The DOM bridge preparation action; wheel and multi-click reuse `click`.
     fn action(&self) -> &'static str {
-        if self.hover { "hover" } else { "click" }
+        if self.at.is_some() {
+            "pointAt"
+        } else {
+            match self.gesture {
+                Gesture::Hover => "hover",
+                Gesture::Drag => "drag",
+                _ => "click",
+            }
+        }
+    }
+
+    fn is_hover(&self) -> bool {
+        self.gesture == Gesture::Hover
+    }
+
+    /// The user-visible action name in a success result.
+    fn result_action(&self) -> &'static str {
+        match (self.gesture, self.at.is_some()) {
+            (Gesture::Hover, false) => "hover",
+            (Gesture::Hover, true) => "move-at",
+            (Gesture::Click { .. }, true) => "click-at",
+            (Gesture::Click { count: 2, .. }, false) => "dblclick",
+            (Gesture::Click { .. }, false) => "click",
+            (Gesture::Wheel { .. }, _) => "wheel",
+            (Gesture::Drag, _) => "drag",
+        }
+    }
+
+    /// The input that follows a verified mouseMoved, or None when move is terminal.
+    fn terminal_input(&self, point: ClickPoint) -> Option<NativeInput> {
+        match self.gesture {
+            Gesture::Hover => None,
+            Gesture::Click { button, count } => Some(NativeInput::Click(PointerClick {
+                point,
+                button,
+                count,
+                result: self.result_action(),
+                at: self.at,
+            })),
+            Gesture::Wheel { dx, dy } => Some(NativeInput::Wheel { point, dx, dy }),
+            Gesture::Drag => Some(NativeInput::Drag {
+                from: point,
+                to: self.to_point.get()?,
+            }),
+        }
+    }
+
+    fn hover_success(&self, frame: bool) -> Json {
+        let mut page = json!({"ok":true,"action":self.result_action(),"input":"chromium","attempted":true,
+            "dispatchAcknowledged":true,"pointVerified":true});
+        page["detail"] = json!(if frame {
+            "Chromium acknowledged mouseMoved; the original frame point and embedding chain passed their subsequent hit tests. Read again to verify hover effects."
+        } else if self.at.is_some() {
+            "Chromium acknowledged mouseMoved at the requested viewport point. Read again to verify hover effects."
+        } else {
+            "Chromium acknowledged mouseMoved and the original point still reached the reference. Read again to verify hover effects."
+        });
+        if let Some((x, y)) = self.at {
+            page["x"] = json!(x);
+            page["y"] = json!(y);
+        }
+        page
     }
 }
 
@@ -1017,33 +1241,57 @@ fn native_fill_kind(value: &Json) -> Option<&'static str> {
     }
 }
 
+/// Terminal press/release pairs after a verified mouseMoved.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PointerClick {
+    point: ClickPoint,
+    button: MouseButton,
+    count: u8,
+    result: &'static str,
+    at: Option<(i32, i32)>,
+}
+
 enum NativeInput {
     Key(Shared<PressTarget>),
     Fill(Shared<FillTarget>),
     MouseMove(Shared<ClickTarget>),
-    Click(ClickPoint),
+    Click(PointerClick),
+    Wheel { point: ClickPoint, dx: i32, dy: i32 },
+    Drag { from: ClickPoint, to: ClickPoint },
 }
 
 impl NativeInput {
     fn is_pointer(&self) -> bool {
-        matches!(self, Self::MouseMove(_) | Self::Click(_))
+        !matches!(self, Self::Key(_) | Self::Fill(_))
+    }
+    /// Press, wheel or drag input that follows the verified mouseMoved.
+    fn is_terminal_pointer(&self) -> bool {
+        matches!(
+            self,
+            Self::Click(_) | Self::Wheel { .. } | Self::Drag { .. }
+        )
     }
     fn count(&self) -> usize {
-        if matches!(self, Self::MouseMove(_) | Self::Fill(_)) {
-            1
-        } else {
-            2
+        match self {
+            Self::MouseMove(_) | Self::Fill(_) | Self::Wheel { .. } => 1,
+            Self::Key(_) => 2,
+            Self::Click(click) => 2 * usize::from(click.count),
+            // Press, intermediate moves ending on the destination, release.
+            Self::Drag { .. } => DRAG_MOVE_STEPS + 2,
         }
     }
     fn prior_attempted(&self) -> bool {
-        matches!(self, Self::Click(_))
-            || matches!(self, Self::Fill(target) if target.attempted.get())
+        self.is_terminal_pointer() || matches!(self, Self::Fill(target) if target.attempted.get())
+    }
+    /// One event per acknowledgement; consecutive mouseMoved events would coalesce.
+    fn paced(&self) -> bool {
+        matches!(self, Self::Drag { .. })
     }
     fn verifies_after_input(&self) -> bool {
         matches!(self, Self::MouseMove(_) | Self::Fill(_) | Self::Key(_))
     }
     fn allows_navigation(&self) -> bool {
-        matches!(self, Self::Key(_) | Self::Click(_))
+        matches!(self, Self::Key(_) | Self::Click(_) | Self::Drag { .. })
     }
     fn method(&self) -> &'static str {
         match self {
@@ -1084,9 +1332,43 @@ impl NativeInput {
                     .expect("mouse move follows point preparation");
                 json!({"type":"mouseMoved","x":point.x,"y":point.y,"button":"none","buttons":0,"clickCount":0,"modifiers":0,"pointerType":"mouse"})
             }
-            Self::Click(point) => {
-                json!({"type":if part == 0 {"mousePressed"} else {"mouseReleased"},
-                "x":point.x,"y":point.y,"button":"left","buttons":if part == 0 {1} else {0},"clickCount":1,"modifiers":0,"pointerType":"mouse"})
+            Self::Click(click) => {
+                let pressed = part % 2 == 0;
+                // Pair N reports clickCount N + 1, so the second pair is a double click.
+                let (name, mask) = match click.button {
+                    MouseButton::Left => ("left", 1),
+                    MouseButton::Right => ("right", 2),
+                };
+                json!({"type":if pressed {"mousePressed"} else {"mouseReleased"},
+                "x":click.point.x,"y":click.point.y,"button":name,"buttons":if pressed {mask} else {0},
+                "clickCount":part / 2 + 1,"modifiers":0,"pointerType":"mouse"})
+            }
+            Self::Wheel { point, dx, dy } => {
+                json!({"type":"mouseWheel","x":point.x,"y":point.y,"deltaX":dx,"deltaY":dy,
+                "button":"none","buttons":0,"modifiers":0,"pointerType":"mouse"})
+            }
+            Self::Drag { from, to } => {
+                let last = DRAG_MOVE_STEPS + 1;
+                match part {
+                    0 => {
+                        json!({"type":"mousePressed","x":from.x,"y":from.y,"button":"left","buttons":1,
+                        "clickCount":1,"modifiers":0,"pointerType":"mouse"})
+                    }
+                    part if part == last => {
+                        json!({"type":"mouseReleased","x":to.x,"y":to.y,"button":"left",
+                        "buttons":0,"clickCount":1,"modifiers":0,"pointerType":"mouse"})
+                    }
+                    step => {
+                        let (x, y) = if step == DRAG_MOVE_STEPS {
+                            (to.x, to.y)
+                        } else {
+                            let t = step as f64 / DRAG_MOVE_STEPS as f64;
+                            (from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t)
+                        };
+                        json!({"type":"mouseMoved","x":x,"y":y,"button":"left","buttons":1,
+                            "clickCount":0,"modifiers":0,"pointerType":"mouse"})
+                    }
+                }
             }
         }
     }
@@ -1097,9 +1379,36 @@ impl NativeInput {
                 "attempted":true,"dispatchAcknowledged":true,"keydownTarget":"unconfirmed",
                 "detail":"Chromium acknowledged the keys, but the target observation is unavailable. Read again to verify effects; do not automatically repeat the action."})
             }
-            Self::Click(_) => json!({"ok":true,"action":"click","input":"chromium",
-                "attempted":true,"dispatchAcknowledged":true,
-                "detail":"Chromium acknowledged mousePressed and mouseReleased; read again to verify effects."}),
+            Self::Click(click) => {
+                let mut page = json!({"ok":true,"action":click.result,"input":"chromium",
+                    "attempted":true,"dispatchAcknowledged":true,
+                    "detail":"Chromium acknowledged mousePressed and mouseReleased; read again to verify effects."});
+                if click.button == MouseButton::Right {
+                    page["button"] = json!("right");
+                    page["detail"] = json!(
+                        "Chromium acknowledged the right mousePressed and mouseReleased. No native context menu is shown for CLI input; read again to verify page effects."
+                    );
+                }
+                if click.count > 1 {
+                    page["clickCount"] = json!(click.count);
+                    page["detail"] = json!(format!(
+                        "Chromium acknowledged {} press/release pairs (clickCount 1..{}); read again to verify effects.",
+                        click.count, click.count
+                    ));
+                }
+                if let Some((x, y)) = click.at {
+                    page["x"] = json!(x);
+                    page["y"] = json!(y);
+                    page["button"] = json!(click.button.name());
+                }
+                page
+            }
+            Self::Wheel { dx, dy, .. } => json!({"ok":true,"action":"wheel","input":"chromium",
+                "attempted":true,"dispatchAcknowledged":true,"deltaX":dx,"deltaY":dy,
+                "detail":"Chromium acknowledged mouseWheel at the verified point; scrolling can finish asynchronously, so read again to verify effects."}),
+            Self::Drag { .. } => json!({"ok":true,"action":"drag","input":"chromium",
+                "attempted":true,"dispatchAcknowledged":true,"moveSteps":DRAG_MOVE_STEPS,
+                "detail":"Chromium acknowledged mousePressed, the intermediate mouseMoved events and mouseReleased; the destination was not re-verified during the drag. Read again to verify effects."}),
             Self::MouseMove(_) | Self::Fill(_) => {
                 unreachable!("intermediate input must be verified before completing the action")
             }
@@ -1115,14 +1424,14 @@ struct InputFailure {
 
 struct InputProgress {
     enqueuing: bool,
-    attempted: [bool; 2],
-    accepted: [Option<bool>; 2],
-    acknowledged: [bool; 2],
+    attempted: Vec<bool>,
+    accepted: Vec<Option<bool>>,
+    acknowledged: Vec<bool>,
     failure: Option<InputFailure>,
 }
 
 struct InputBatch {
-    ids: [i32; 2],
+    ids: Vec<i32>,
     kind: NativeInput,
     tab: i32,
     epoch: u64,
@@ -1484,6 +1793,11 @@ struct State {
     // exact late disable ACK or destruction of the control connection.
     focus_leases: BTreeMap<i32, FocusLease>,
     focus_watchdog_queued: bool,
+    // CLI right-clicks must never reach the native context menu. The deadline
+    // covers the click and the late renderer-to-browser menu request.
+    context_click_until: BTreeMap<i32, Instant>,
+    // A drag whose button press was accepted but whose release was not sent yet.
+    pointer_holds: BTreeMap<i32, PointerHold>,
     frame_controls: BTreeMap<i32, FrameControl>,
     closed_pages: crate::closed_pages::ClosedPages,
     page_find: FindState,
@@ -1660,7 +1974,10 @@ fn answer_dialog(tab: i32, action: &crate::protocol::DialogAction, reply: Reply)
         return;
     }
     match crate::dialog_runtime::answer(tab, action) {
-        Ok(result) => reply.ok(result),
+        Ok(result) => {
+            flush_pointer_hold(tab);
+            reply.ok(result)
+        }
         Err(error) => reply.error(error.code, error.message),
     }
 }
@@ -2460,6 +2777,7 @@ fn native_reply() -> (Reply, mpsc::Receiver<Response>) {
             scope: None,
             focus_completion: None,
             frame_completion: None,
+            resolved: None,
         },
         receiver,
     )
@@ -2604,6 +2922,177 @@ fn context_menu_target_matches(state: &State, target: &ContextMenuTarget) -> boo
                 && page.navigation.epoch == target.navigation_epoch
                 && page.navigation.document_epoch == target.document_epoch
         })
+}
+
+/// A left button the engine accepted a press for, until its release is sent.
+/// Cleanup sends exactly one mouseReleased at the last coordinates and is
+/// exempt from task ownership checks (the same rule as focus-lease cleanup).
+struct PointerHold {
+    browser: Browser,
+    // The in-flight message whose acknowledgement may reveal an aborted drag.
+    id: i32,
+    point: ClickPoint,
+}
+
+fn record_pointer_hold(batch: &InputBatch, part: usize) {
+    if !matches!(batch.kind, NativeInput::Drag { .. }) {
+        return;
+    }
+    let params = batch.kind.params(part);
+    let point = ClickPoint::from_json(&params);
+    STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        match point {
+            // The release itself is the last part; nothing is held afterwards.
+            _ if part + 1 == batch.kind.count() => {
+                state.pointer_holds.remove(&batch.tab);
+            }
+            Some(point) => {
+                state.pointer_holds.insert(
+                    batch.tab,
+                    PointerHold {
+                        browser: batch.browser.clone(),
+                        id: batch.ids[part],
+                        point,
+                    },
+                );
+            }
+            None => {}
+        }
+    });
+}
+
+fn hold_tab_for_message(browser: &Browser, id: i32) -> Option<i32> {
+    STATE.with(|slot| {
+        slot.borrow()
+            .pointer_holds
+            .iter()
+            .find(|(_, hold)| hold.id == id && same_browser(&hold.browser, browser))
+            .map(|(tab, _)| *tab)
+    })
+}
+
+fn send_pointer_release(browser: &Browser, id: i32, params: &Json) -> bool {
+    #[cfg(test)]
+    {
+        let _ = (browser, id);
+        TEST_POINTER_RELEASES.with(|releases| releases.borrow_mut().push(params.clone()));
+        true
+    }
+    #[cfg(not(test))]
+    {
+        browser.host().is_some_and(|host| {
+            send_session_command(&host, id, "Input.dispatchMouseEvent", params, None) == id
+        })
+    }
+}
+
+#[cfg(test)]
+thread_local! { static TEST_POINTER_RELEASES: RefCell<Vec<Json>> = const { RefCell::new(Vec::new()) }; }
+
+/// Send the single cleanup release for an aborted drag. Returns None when no
+/// press is held, else "released" (accepted by Chromium), "pending" (a
+/// JavaScript dialog blocks the page; flushed once it is answered) or "failed".
+fn release_pointer_hold(tab: i32) -> Option<&'static str> {
+    enum Plan {
+        Send(Browser, i32, Json),
+        Defer,
+        Fail,
+    }
+    let plan = STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        let hold = state.pointer_holds.remove(&tab)?;
+        let current = state.tabs.get(&tab).is_some_and(|page| {
+            !page.rejected_creation
+                && same_browser(&page.browser, &hold.browser)
+                && page.navigation.renderer_exit.is_none()
+        });
+        if !current {
+            return Some(Plan::Fail);
+        }
+        if crate::dialog_runtime::tab_json(tab).is_some() {
+            // A blocked renderer would only queue the release; keep the hold.
+            let id = hold.id;
+            state.pointer_holds.insert(tab, PointerHold { id, ..hold });
+            return Some(Plan::Defer);
+        }
+        let Some(id) = state.next_control_message() else {
+            return Some(Plan::Fail);
+        };
+        let params = json!({"type":"mouseReleased","x":hold.point.x,"y":hold.point.y,
+            "button":"left","buttons":0,"clickCount":1,"modifiers":0,"pointerType":"mouse"});
+        Some(Plan::Send(hold.browser, id, params))
+    })?;
+    Some(match plan {
+        Plan::Send(browser, id, params) => {
+            if send_pointer_release(&browser, id, &params) {
+                "released"
+            } else {
+                "failed"
+            }
+        }
+        Plan::Defer => "pending",
+        Plan::Fail => "failed",
+    })
+}
+
+/// Called after a dialog is answered: the page can now take the deferred release.
+fn flush_pointer_hold(tab: i32) {
+    let _ = release_pointer_hold(tab);
+}
+
+/// True when a native context menu for this tab must not be shown: a CLI
+/// right-click is in flight or just finished, the tab belongs to an Active AI
+/// task (a user right-click would already have paused it), or it is not the
+/// visible selected tab. `consume` makes the click deadline one-shot.
+fn native_menu_blocked(tab: i32, consume: bool) -> bool {
+    STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        let deadline = state
+            .context_click_until
+            .get(&tab)
+            .is_some_and(|until| *until > Instant::now());
+        let active_owner = matches!(link_owner(&state.tasks, tab), Some((_, Status::Active)));
+        let hidden = state.spaces.overview()
+            || state.spaces.active_tab() != Some(tab)
+            || state.spaces.tab_space(tab) != Some(state.spaces.active_space());
+        let blocked = deadline || active_owner || hidden;
+        if consume && blocked {
+            state.context_click_until.remove(&tab);
+        }
+        blocked
+    })
+}
+
+/// A CLI right-click is page input only. Chromium would otherwise hand its
+/// contextmenu to the native menu runner, which could draw over the user's
+/// window, so the tab is guarded until that late request has been refused.
+fn guard_context_click(tab: i32) {
+    STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        let now = Instant::now();
+        state.context_click_until.retain(|_, until| *until > now);
+        state
+            .context_click_until
+            .insert(tab, now + CONTEXT_CLICK_GUARD + Duration::from_secs(2));
+    });
+}
+
+/// Armed before the first button event of any CLI right-click.
+fn arm_context_click_guard(kind: &NativeInput, tab: i32) {
+    if matches!(kind, NativeInput::Click(click) if click.button == MouseButton::Right) {
+        guard_context_click(tab);
+    }
+}
+
+#[cfg(test)]
+fn context_click_guarded(tab: i32) -> bool {
+    STATE.with(|slot| {
+        slot.borrow()
+            .context_click_until
+            .get(&tab)
+            .is_some_and(|until| *until > Instant::now())
+    })
 }
 
 fn dismiss_context_menu(tab: i32) {
@@ -4752,6 +5241,7 @@ fn serve_connection(
             scope: None,
             focus_completion: None,
             frame_completion: None,
+            resolved: None,
         },
         _permit: permit,
     }))));
@@ -5969,6 +6459,12 @@ fn handle(command: &Command, reply: Reply) {
                 | Command::ReadPage { tab }
                 | Command::Click { tab, .. }
                 | Command::Hover { tab, .. }
+                | Command::DblClick { tab, .. }
+                | Command::RightClick { tab, .. }
+                | Command::Wheel { tab, .. }
+                | Command::Drag { tab, .. }
+                | Command::ClickAt { tab, .. }
+                | Command::MoveAt { tab, .. }
                 | Command::Check { tab, .. }
                 | Command::Fill { tab, .. }
                 | Command::Insert { tab, .. }
@@ -6163,6 +6659,16 @@ fn handle(command: &Command, reply: Reply) {
                     );
                 }
                 _ => {
+                    if let Command::Drag { from, to, .. } = other
+                        && (from.starts_with("frame/") || to.starts_with("frame/"))
+                    {
+                        reply.error_details(
+                            "UNSUPPORTED_TARGET",
+                            "Drag does not support cross-origin frame refs; use refs from read in the main document.",
+                            json!({"tab":tab_id,"attempted":false,"outcomeUnknown":false}),
+                        );
+                        return;
+                    }
                     if command_reference(other)
                         .is_some_and(|reference| reference.starts_with("frame/"))
                     {
@@ -6198,6 +6704,33 @@ fn handle(command: &Command, reply: Reply) {
                         observation_error(&reply, OBSERVATION_CHANGED);
                         return;
                     };
+                    if let Some(resolution) = SelectorResolution::for_command(other) {
+                        // Read-only first pass: resolve to refs, then rerun the
+                        // original command through this same ref path.
+                        let request = json!({"action":"resolve","selectors":resolution.selectors});
+                        let expression = format!(
+                            "(()=>{{{DOM_BRIDGE}\nreturn window.__lightBrowserBridge.act({request});}})()"
+                        );
+                        dispatch(
+                            &browser,
+                            "Page.getFrameTree",
+                            json!({}),
+                            Pending {
+                                frame: None,
+                                tab: tab_id,
+                                epoch,
+                                evaluation: Evaluation::Page {
+                                    mutation: false,
+                                    evidence: Some(ActionEvidence::Resolve(Shared::new(
+                                        resolution,
+                                    ))),
+                                },
+                                reply,
+                                step: Step::Frame(expression),
+                            },
+                        );
+                        return;
+                    }
                     let invocation = match other {
                         Command::Read { .. } => "window.__lightBrowserBridge.read()".to_owned(),
                         Command::Click { reference, .. } => {
@@ -6206,6 +6739,34 @@ fn handle(command: &Command, reply: Reply) {
                         Command::Hover { reference, .. } => {
                             action_expression("hover", reference, None, epoch, &reply)
                         }
+                        Command::DblClick { reference, .. }
+                        | Command::RightClick { reference, .. } => {
+                            action_expression("click", reference, None, epoch, &reply)
+                        }
+                        // A nested link may sit under the wheel pointer.
+                        Command::Wheel { reference, .. } => action_expression(
+                            "click",
+                            reference,
+                            Some(("relaxed", ActionValue::Bool(true))),
+                            epoch,
+                            &reply,
+                        ),
+                        Command::Drag { from, to, .. } => {
+                            let Some(from) = action_reference(from, epoch, &reply) else {
+                                return;
+                            };
+                            let Some(to) = action_reference(to, epoch, &reply) else {
+                                return;
+                            };
+                            format!(
+                                "window.__lightBrowserBridge.act({})",
+                                json!({"action":"drag","ref":from,"toRef":to})
+                            )
+                        }
+                        Command::ClickAt { x, y, .. } | Command::MoveAt { x, y, .. } => format!(
+                            "window.__lightBrowserBridge.act({})",
+                            json!({"action":"pointAt","x":x,"y":y})
+                        ),
                         Command::Check {
                             reference, checked, ..
                         } => action_expression(
@@ -6937,11 +7498,15 @@ fn finish_input_batch(batch: &Shared<InputBatch>) -> bool {
     }
     remove_input_batch(batch);
     if let Some(failure) = failure {
-        batch.reply.error_details(
-            failure.code,
-            failure.message,
-            json!({"tab":batch.tab,"outcomeUnknown":true,"attempted":attempted}),
-        );
+        let mut details = json!({"tab":batch.tab,"outcomeUnknown":true,"attempted":attempted});
+        if matches!(batch.kind, NativeInput::Drag { .. })
+            && let Some(cleanup) = release_pointer_hold(batch.tab)
+        {
+            details["pointerCleanup"] = json!(cleanup);
+        }
+        batch
+            .reply
+            .error_details(failure.code, failure.message, details);
     } else {
         batch
             .reply
@@ -6950,71 +7515,141 @@ fn finish_input_batch(batch: &Shared<InputBatch>) -> bool {
     false
 }
 
-// CEF documents asynchronous results. Keep both entries even if a transport
+enum PartOutcome {
+    /// The event was submitted and Chromium accepted the request.
+    Sent,
+    /// A failure is recorded (or already was); send nothing further.
+    Stopped,
+    /// The batch is no longer registered; its owner already replied.
+    Gone,
+}
+
+fn enqueue_input_part(
+    batch: &Shared<InputBatch>,
+    part: usize,
+    native_available: &mut impl FnMut() -> bool,
+    submit: &mut impl FnMut(usize, i32) -> i32,
+) -> PartOutcome {
+    if !STATE.with(|state| input_registered(&state.borrow(), batch)) {
+        return PartOutcome::Gone;
+    }
+    if batch.progress.borrow().failure.is_some() {
+        return PartOutcome::Stopped;
+    }
+    let available = native_available();
+    // Native getters can re-enter cancellation, handoff, navigation or close.
+    let checked = STATE.with(|state| {
+        let state = state.borrow();
+        input_registered(&state, batch)
+            .then(|| batch_input_failure(&state, &batch.browser, batch, false).or_else(|| {
+                (!focus_input_active(&state, &batch.browser, batch.tab, &batch.reply,
+                    batch.frame.as_ref().and_then(|frame| frame.session_id())))
+                    .then_some(InputFailure { code:"FOCUS_PREPARATION_FAILED", message:"Temporary input focus is no longer active; no remaining input is dispatched." })
+            }))
+    });
+    let Some(failure) = checked else {
+        return PartOutcome::Gone;
+    };
+    if batch.progress.borrow().failure.is_some() {
+        return PartOutcome::Stopped;
+    }
+    let failure = failure.or_else(|| {
+        (!available).then_some(InputFailure {
+            code: "TAB_CLOSED",
+            message: "The browser is unavailable during input dispatch.",
+        })
+    });
+    if let Some(failure) = failure {
+        batch.progress.borrow_mut().failure = Some(failure);
+        return PartOutcome::Stopped;
+    }
+    batch.progress.borrow_mut().attempted[part] = true;
+    match &batch.kind {
+        NativeInput::MouseMove(target) => target.attempted.set(true),
+        NativeInput::Fill(target) => target.attempted.set(true),
+        NativeInput::Key(target) => target.attempted.set(true),
+        _ => {}
+    }
+    let receipt = submit(part, batch.ids[part]);
+    if !STATE.with(|state| input_registered(&state.borrow(), batch)) {
+        return PartOutcome::Gone;
+    }
+    let mut progress = batch.progress.borrow_mut();
+    progress.accepted[part] = Some(receipt == batch.ids[part]);
+    if receipt != batch.ids[part] {
+        progress.failure = Some(InputFailure {
+            code: "CONTROL_UNAVAILABLE",
+            message: "Chromium rejected an input event. Inspect before retrying.",
+        });
+        return PartOutcome::Stopped;
+    }
+    drop(progress);
+    record_pointer_hold(batch, part);
+    PartOutcome::Sent
+}
+
+// CEF documents asynchronous results. Keep every entry even if a transport
 // re-enters its observer before returning; a callback alone cannot acknowledge
 // dispatch. These adjacent UI submissions are not an atomic renderer operation.
+// A paced batch (drag) sends one event per acknowledgement so Chromium cannot
+// coalesce its consecutive mouseMoved events into a single page mousemove.
 fn enqueue_input_batch(
     batch: &Shared<InputBatch>,
     mut native_available: impl FnMut() -> bool,
     mut submit: impl FnMut(usize, i32) -> i32,
 ) -> bool {
+    let paced = batch.kind.paced();
     for part in 0..batch.kind.count() {
-        if !STATE.with(|state| input_registered(&state.borrow(), batch)) {
-            return false;
-        }
-        if batch.progress.borrow().failure.is_some() {
-            break;
-        }
-        let available = native_available();
-        // Native getters can re-enter cancellation, handoff, navigation or close.
-        let checked = STATE.with(|state| {
-            let state = state.borrow();
-            input_registered(&state, batch)
-                .then(|| batch_input_failure(&state, &batch.browser, batch, false).or_else(|| {
-                    (!focus_input_active(&state, &batch.browser, batch.tab, &batch.reply,
-                        batch.frame.as_ref().and_then(|frame| frame.session_id())))
-                        .then_some(InputFailure { code:"FOCUS_PREPARATION_FAILED", message:"Temporary input focus is no longer active; no remaining input is dispatched." })
-                }))
-        });
-        let Some(failure) = checked else {
-            return false;
-        };
-        if batch.progress.borrow().failure.is_some() {
-            break;
-        }
-        let failure = failure.or_else(|| {
-            (!available).then_some(InputFailure {
-                code: "TAB_CLOSED",
-                message: "The browser is unavailable during input dispatch.",
-            })
-        });
-        if let Some(failure) = failure {
-            batch.progress.borrow_mut().failure = Some(failure);
-            break;
-        }
-        batch.progress.borrow_mut().attempted[part] = true;
-        match &batch.kind {
-            NativeInput::MouseMove(target) => target.attempted.set(true),
-            NativeInput::Fill(target) => target.attempted.set(true),
-            NativeInput::Key(target) => target.attempted.set(true),
-            _ => {}
-        }
-        let receipt = submit(part, batch.ids[part]);
-        if !STATE.with(|state| input_registered(&state.borrow(), batch)) {
-            return false;
-        }
-        let mut progress = batch.progress.borrow_mut();
-        progress.accepted[part] = Some(receipt == batch.ids[part]);
-        if receipt != batch.ids[part] {
-            progress.failure = Some(InputFailure {
-                code: "CONTROL_UNAVAILABLE",
-                message: "Chromium rejected an input event. Inspect before retrying.",
-            });
-            break;
+        match enqueue_input_part(batch, part, &mut native_available, &mut submit) {
+            PartOutcome::Gone => return false,
+            PartOutcome::Stopped => break,
+            // A re-entrant acknowledgement already arrived: keep going in this loop.
+            PartOutcome::Sent if paced && !batch.progress.borrow().acknowledged[part] => break,
+            PartOutcome::Sent => {}
         }
     }
     batch.progress.borrow_mut().enqueuing = false;
     finish_input_batch(batch)
+}
+
+/// Submit the next event of a paced batch after its predecessor was acknowledged.
+fn continue_paced_input(batch: &Shared<InputBatch>, part: usize) {
+    batch.progress.borrow_mut().enqueuing = true;
+    let browser = batch.browser.clone();
+    let host = browser.host();
+    let outcome = enqueue_input_part(
+        batch,
+        part,
+        &mut || browser.is_valid() != 0 && browser.has_document() != 0,
+        &mut |part, id| match &host {
+            Some(host) => send_session_command(
+                host,
+                id,
+                batch.kind.method(),
+                &batch.kind.params(part),
+                None,
+            ),
+            None => 0,
+        },
+    );
+    if matches!(outcome, PartOutcome::Gone) {
+        // Canceled or closed while paused between events: release the button.
+        let _ = release_pointer_hold(batch.tab);
+        return;
+    }
+    // A synchronous acknowledgement of this part may already have advanced it.
+    let next = part + 1;
+    let advance = matches!(outcome, PartOutcome::Sent)
+        && next < batch.kind.count()
+        && batch.progress.borrow().acknowledged[part];
+    if advance {
+        continue_paced_input(batch, next);
+        return;
+    }
+    batch.progress.borrow_mut().enqueuing = false;
+    if finish_input_batch(batch) {
+        dispatch_input_verification(batch);
+    }
 }
 
 fn input_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) -> bool {
@@ -7026,6 +7661,12 @@ fn input_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) -> bool
         }
     });
     let Some((batch, part)) = part else {
+        // The drag was canceled while this event was in flight: its press is
+        // still down, so release it once at the last coordinates.
+        if let Some(tab) = hold_tab_for_message(browser, id) {
+            let _ = release_pointer_hold(tab);
+            return true;
+        }
         return false;
     };
     // Input results are empty objects in this protocol. Bound error payloads,
@@ -7056,6 +7697,14 @@ fn input_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) -> bool
             progress.failure = Some(failure);
         }
         progress.acknowledged[part] = true;
+    }
+    let next = part + 1;
+    if batch.kind.paced() && next < batch.kind.count() && {
+        let progress = batch.progress.borrow();
+        !progress.enqueuing && progress.failure.is_none()
+    } {
+        continue_paced_input(&batch, next);
+        return true;
     }
     if finish_input_batch(&batch) {
         dispatch_input_verification(&batch);
@@ -7091,12 +7740,9 @@ fn reserve_input_batch(
                 message: "The control message identifiers are exhausted.",
             });
         };
+        let first = last - count as i32 + 1;
         let batch = Shared::new(InputBatch {
-            ids: if count == 1 {
-                [last, 0]
-            } else {
-                [last - 1, last]
-            },
+            ids: (first..=last).collect(),
             kind,
             tab: pending.tab,
             epoch: pending.epoch,
@@ -7105,9 +7751,9 @@ fn reserve_input_batch(
             reply: pending.reply.clone(),
             progress: RefCell::new(InputProgress {
                 enqueuing: true,
-                attempted: [false; 2],
-                accepted: [None; 2],
-                acknowledged: [false; 2],
+                attempted: vec![false; count],
+                accepted: vec![None; count],
+                acknowledged: vec![false; count],
                 failure: None,
             }),
         });
@@ -7360,7 +8006,7 @@ fn pointer_press_dispatched(state: &State, lease: &FocusLease) -> bool {
             FocusPhase::Active => state.pending.values().any(|pending| {
                 pending.reply.token == lease.token
                     && matches!(&pending.step, Step::Input { batch, .. }
-                        if matches!(batch.kind, NativeInput::Click(_)))
+                        if batch.kind.is_terminal_pointer())
             }),
             FocusPhase::Disabling => matches!(&lease.after,
                 Some(FocusContinuation::Respond { response, .. }) if response.ok),
@@ -7494,6 +8140,8 @@ fn begin_focus_cleanup(
     after: Option<FocusContinuation>,
     stop_frames: bool,
 ) -> bool {
+    // No lease ends with a pressed drag button still held (no-op when none).
+    let _ = release_pointer_hold(tab);
     let mut retired = Vec::with_capacity(2);
     let reserved = STATE.with(|slot| {
         let mut state = slot.borrow_mut();
@@ -7576,13 +8224,26 @@ fn defer_focus_verification(batch: &Shared<InputBatch>) -> bool {
 }
 
 fn abort_focus_lease(tab: i32, code: &str, message: &str, stop_frames: bool) {
+    // An aborted drag leaves the button down, and the page may never acknowledge
+    // its in-flight event once focus emulation ends. Release while the lease is
+    // still active, before the cleanup below disables it.
+    let pointer_cleanup = release_pointer_hold(tab);
     let captured = STATE.with(|slot| {
         let mut state = slot.borrow_mut();
         let lease = state.focus_leases.get(&tab)?;
         let token = lease.token;
+        let mut response = lease.failure(code, message, "pending");
+        if let Some(cleanup) = pointer_cleanup
+            && let Some(Json::Object(details)) = response
+                .error
+                .as_mut()
+                .and_then(|error| error.details.as_mut())
+        {
+            details.insert("pointerCleanup".into(), json!(cleanup));
+        }
         let after = FocusContinuation::Respond {
             reply: lease.reply.clone(),
-            response: lease.failure(code, message, "pending"),
+            response,
         };
         let ids = state
             .pending
@@ -7865,8 +8526,7 @@ wrap_task! {
 fn dispatch_input(browser: &Browser, id: i32, pending: &Pending, kind: NativeInput) {
     let host = browser.host();
     let count = kind.count();
-    let params: [Option<Json>; 2] =
-        std::array::from_fn(|part| (part < count).then(|| kind.params(part)));
+    let params: Vec<Json> = (0..count).map(|part| kind.params(part)).collect();
     // Native code zero prevents native browser key fallback. This dispatch code
     // does not call native focus or selected-space methods.
     let available = browser.is_valid() != 0 && browser.has_document() != 0;
@@ -7919,6 +8579,7 @@ fn dispatch_input(browser: &Browser, id: i32, pending: &Pending, kind: NativeInp
         }
     };
     let host = host.unwrap();
+    arm_context_click_guard(&batch.kind, pending.tab);
     if enqueue_input_batch(
         &batch,
         || browser.is_valid() != 0 && browser.has_document() != 0,
@@ -7927,7 +8588,7 @@ fn dispatch_input(browser: &Browser, id: i32, pending: &Pending, kind: NativeInp
                 &host,
                 message,
                 batch.kind.method(),
-                params[part].as_ref().unwrap(),
+                &params[part],
                 if batch.kind.is_pointer() {
                     None
                 } else {
@@ -7948,11 +8609,27 @@ fn input_verification_params(batch: &InputBatch) -> Option<Json> {
             } else {
                 target.point.get()?
             };
-            (
-                &target.reference,
-                target.context.get(),
-                json!({"action":target.action(),"point":{"x":point.x,"y":point.y},"verifyOnly":true}),
-            )
+            let mut request = json!({"action":target.action(),"point":{"x":point.x,"y":point.y},"verifyOnly":true});
+            if let Some((x, y)) = target.at {
+                // A coordinate has no element: verify only the viewport bound.
+                request["x"] = json!(x);
+                request["y"] = json!(y);
+            }
+            if matches!(target.gesture, Gesture::Wheel { .. }) {
+                request["relaxed"] = json!(true);
+            }
+            if target.gesture == Gesture::Drag {
+                let to = target.to_point.get()?;
+                request["toPoint"] = json!({"x":to.x,"y":to.y});
+                let root_prefix = format!("{}/", batch.epoch);
+                request["toRef"] = json!(
+                    target
+                        .to_reference
+                        .strip_prefix(root_prefix.as_str())
+                        .filter(|value| !value.is_empty())?
+                );
+            }
+            (&target.reference, target.context.get(), request)
         }
         NativeInput::Fill(target) => {
             let mut request = json!({"action":target.action(),"text":target.text,
@@ -7975,11 +8652,13 @@ fn input_verification_params(batch: &InputBatch) -> Option<Json> {
         .frame
         .as_ref()
         .map_or(root_prefix.as_str(), |frame| frame.ref_prefix());
-    request["ref"] = json!(
-        reference
-            .strip_prefix(prefix)
-            .filter(|value| !value.is_empty())?
-    );
+    if !matches!(&batch.kind, NativeInput::MouseMove(target) if target.at.is_some()) {
+        request["ref"] = json!(
+            reference
+                .strip_prefix(prefix)
+                .filter(|value| !value.is_empty())?
+        );
+    }
     if let Some(frame) = &batch.frame {
         let binding = frame.binding();
         Some(
@@ -8538,15 +9217,28 @@ fn prepared_input_kind(pending: &Pending, value: &Json) -> Option<NativeInput> {
     }
     if let Some(target) = pending.click_target() {
         let point = ClickPoint::from_json(&value["point"])?;
+        // Drag carries a hit-tested destination alongside the source point.
+        let to_point = (target.gesture == Gesture::Drag)
+            .then(|| ClickPoint::from_json(&value["toPoint"]))
+            .flatten();
+        if target.gesture == Gesture::Drag && to_point.is_none() {
+            return None;
+        }
         if matches!(pending.step, Step::ClickVerify) {
-            (!target.hover && target.attempted.get() && target.point.get() == Some(point))
-                .then_some(NativeInput::Click(point))
+            (target.attempted.get()
+                && target.point.get() == Some(point)
+                && (target.gesture != Gesture::Drag || target.to_point.get() == to_point))
+                .then(|| target.terminal_input(point))
+                .flatten()
         } else if matches!(pending.step, Step::Evaluate)
             && !target.attempted.get()
             && (pending.frame.is_some() || target.context.get().is_some())
             && target.point.get().is_none_or(|existing| existing == point)
         {
             target.point.set(Some(point));
+            if to_point.is_some() {
+                target.to_point.set(to_point);
+            }
             Some(NativeInput::MouseMove(target.clone()))
         } else {
             None
@@ -8573,7 +9265,7 @@ fn prepared_input_kind(pending: &Pending, value: &Json) -> Option<NativeInput> {
 
 fn hover_verified(pending: &Pending, value: &Json) -> bool {
     pending.click_target().is_some_and(|target| {
-        target.hover
+        target.is_hover()
             && matches!(pending.step, Step::ClickVerify)
             && target.attempted.get()
             && (pending.frame.is_some() || target.context.get().is_some())
@@ -8651,11 +9343,10 @@ fn input_preparation_result(browser: &Browser, id: i32, success: bool, bytes: &[
         // Hover is terminal after one mouseMoved and its original-point check.
         // Never advance it to the click press/release pair.
         if take_input_preparation(id, &pending) {
-            pending.reply.ok(json!({"tab":pending.tab,"page":{
-                "ok":true,"action":"hover","input":"chromium","attempted":true,
-                "dispatchAcknowledged":true,"pointVerified":true,
-                "detail":"Chromium acknowledged mouseMoved and the original point still reached the reference. Read again to verify hover effects."
-            }}));
+            let page = pending
+                .click_target()
+                .map_or(Json::Null, |target| target.hover_success(false));
+            pending.reply.ok(json!({"tab":pending.tab,"page":page}));
         }
     } else if let Some(kind) = prepared_input_kind(&pending, value) {
         dispatch_input(browser, id, &pending, kind);
@@ -8792,10 +9483,147 @@ fn dispatch_readiness_with<H, P>(
     }
 }
 
+fn selector_error(code: Option<&str>) -> (&'static str, &'static str) {
+    match code {
+        Some("INVALID_SELECTOR") => (
+            "INVALID_SELECTOR",
+            "Use text=SUBSTR, css=SELECTOR or role=ROLE[name=NAME] with a valid, non-empty value.",
+        ),
+        Some("TARGET_NOT_FOUND") => (
+            "TARGET_NOT_FOUND",
+            "No visible interactive element matches the selector within the read budgets. Use read to inspect the page.",
+        ),
+        Some("TARGET_AMBIGUOUS") => (
+            "TARGET_AMBIGUOUS",
+            "The selector matches more than one visible interactive element. Pick a candidate ref or make the selector unique.",
+        ),
+        _ => (
+            "ACTION_FAILED",
+            "The selector could not be resolved; read the page again.",
+        ),
+    }
+}
+
+fn valid_resolved_ref(reference: &str) -> bool {
+    // documentId:generation:ordinal, exactly what the bridge issues.
+    let mut parts = reference.split(':');
+    let (Some(id), Some(generation), Some(ordinal), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    id.len() == 32
+        && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && !generation.is_empty()
+        && generation.len() <= 16
+        && generation.bytes().all(|byte| byte.is_ascii_digit())
+        && !ordinal.is_empty()
+        && ordinal.len() <= 6
+        && ordinal.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Continue a command after its selector pass: rewrite targets to refs and
+/// rerun the unchanged ref path (hit test, post-checks, ownership, focus).
+fn finish_selector_resolution(pending: &Pending, resolution: &SelectorResolution, value: &Json) {
+    let reply = &pending.reply;
+    let prefix = format!("{}/", pending.epoch);
+    if value["ok"] == false {
+        let (code, message) = selector_error(value["error"].as_str());
+        let candidates: Vec<Json> = value["candidates"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .take(5)
+                    .filter_map(|item| {
+                        let reference = item["ref"].as_str().filter(|r| valid_resolved_ref(r))?;
+                        let mut candidate = json!({"ref":format!("{prefix}{reference}"),
+                            "role":item["role"].as_str().unwrap_or(""),
+                            "label":item["label"].as_str().unwrap_or("")});
+                        if let Some(frame) = item["frame"].as_str() {
+                            candidate["frame"] = json!(frame);
+                        }
+                        Some(candidate)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let selector = value["index"]
+            .as_u64()
+            .and_then(|index| resolution.selectors.get(index as usize))
+            .or_else(|| resolution.selectors.first());
+        reply.error_details(
+            code,
+            message,
+            json!({"tab":pending.tab,"selector":selector,"matchCount":value["matchCount"].as_u64(),
+                "truncated":value["truncated"].as_bool().unwrap_or(false),"candidates":candidates,
+                "attempted":false,"outcomeUnknown":false}),
+        );
+        return;
+    }
+    let targets = value["targets"].as_array().filter(|targets| {
+        value["action"] == "resolve" && targets.len() == resolution.selectors.len()
+    });
+    let refs: Option<Vec<String>> = targets.and_then(|targets| {
+        targets
+            .iter()
+            .map(|target| {
+                target["ref"]
+                    .as_str()
+                    .filter(|r| valid_resolved_ref(r))
+                    .map(str::to_owned)
+            })
+            .collect()
+    });
+    let Some(refs) = refs else {
+        reply.error(
+            "INVALID_PAGE_RESULT",
+            "The page did not return resolved element refs. Read again.",
+        );
+        return;
+    };
+    if refs.len() == 2 && refs[0] == refs[1] {
+        reply.error(
+            "INVALID_ARGUMENTS",
+            "The two selectors resolve to the same element.",
+        );
+        return;
+    }
+    let Some(command) = resolution.rewritten(pending.epoch, &refs) else {
+        reply.error(
+            "INVALID_ARGUMENTS",
+            "The command cannot take a selector target.",
+        );
+        return;
+    };
+    let resolved: Vec<Json> = resolution
+        .selectors
+        .iter()
+        .zip(value["targets"].as_array().into_iter().flatten())
+        .zip(&refs)
+        .map(|((selector, target), reference)| {
+            json!({"selector":selector,"ref":format!("{prefix}{reference}"),
+                "role":target["role"].as_str().unwrap_or(""),
+                "label":target["label"].as_str().unwrap_or("")})
+        })
+        .collect();
+    handle(
+        &command,
+        Reply {
+            resolved: Some(Json::Array(resolved)),
+            ..reply.clone()
+        },
+    );
+}
+
 fn command_reference(command: &Command) -> Option<&str> {
     match command {
+        Command::Drag { from, .. } => Some(from),
         Command::Click { reference, .. }
         | Command::Hover { reference, .. }
+        | Command::DblClick { reference, .. }
+        | Command::RightClick { reference, .. }
+        | Command::Wheel { reference, .. }
         | Command::Check { reference, .. }
         | Command::Fill { reference, .. }
         | Command::Insert { reference, .. }
@@ -8813,7 +9641,10 @@ fn frame_action_arguments(command: &Command, snapshot: &FrameSnapshot) -> Option
     }
     let reference = reference.strip_prefix(snapshot.ref_prefix())?;
     Some(match command {
-        Command::Click { .. } => json!({"action":"click","ref":reference}),
+        Command::Click { .. }
+        | Command::DblClick { .. }
+        | Command::RightClick { .. }
+        | Command::Wheel { .. } => json!({"action":"click","ref":reference}),
         Command::Hover { .. } => json!({"action":"hover","ref":reference}),
         Command::Fill { text, .. } => json!({"action":"fill","ref":reference,"text":text}),
         Command::Insert { text, .. } => json!({"action":"insert","ref":reference,"text":text}),
@@ -10654,16 +11485,19 @@ fn frame_pointer_input_ready(browser: &Browser, id: i32, pending: &Pending, valu
             frame_pointer_parents(&next, &inventory);
         }
         (FramePointerStage::Finish, Step::Evaluate, true) => {
-            if pointer.target.hover {
+            if pointer.target.is_hover() {
                 if take_input_preparation(id, pending) {
-                    pending.reply.ok(json!({"tab":pending.tab,"page":{
-                        "ok":true,"action":"hover","input":"chromium","attempted":true,
-                        "dispatchAcknowledged":true,"pointVerified":true,
-                        "detail":"Chromium acknowledged mouseMoved; the original frame point and embedding chain passed their subsequent hit tests. Read again to verify hover effects."
-                    }}));
+                    pending
+                        .reply
+                        .ok(json!({"tab":pending.tab,"page":pointer.target.hover_success(true)}));
                 }
-            } else if let Some(point) = pointer.target.point.get() {
-                dispatch_input(browser, id, pending, NativeInput::Click(point));
+            } else if let Some(kind) = pointer
+                .target
+                .point
+                .get()
+                .and_then(|point| pointer.target.terminal_input(point))
+            {
+                dispatch_input(browser, id, pending, kind);
             } else {
                 finish_input_preparation(
                     id,
@@ -11831,6 +12665,14 @@ fn devtools_result(browser: &Browser, id: i32, success: bool, bytes: &[u8]) {
                 );
                 return;
             }
+            if let Evaluation::Page {
+                evidence: Some(ActionEvidence::Resolve(resolution)),
+                ..
+            } = &pending.evaluation
+            {
+                finish_selector_resolution(&pending, resolution, value);
+                return;
+            }
             if value["ok"] == false {
                 let code = value["error"].as_str().unwrap_or("ACTION_FAILED");
                 let message = value["detail"]
@@ -11965,11 +12807,28 @@ wrap_context_menu_handler! {
             params:Option<&mut ContextMenuParams>, model:Option<&mut MenuModel>) {
             if let Some(browser) = browser {
                 let tab = browser.identifier();
+                if native_menu_blocked(tab, false) {
+                    // Automation input: no menu, no command target for a later user click.
+                    if let Some(model) = model { model.clear(); }
+                    dismiss_context_menu(tab);
+                    return;
+                }
                 if capture_context_menu(tab, ||context_menu_frame_id(frame.as_deref()), context_menu_current_frame) {
                     add_context_link(tab, ||context_link_url(params.as_deref()), context_menu_current_frame,
                         || model.is_some_and(|model| model.insert_item_at(0, CONTEXT_OPEN_LINK, Some(&CefString::from("링크 주소를 새 탭에서 열기"))) != 0));
                 }
             }
+        }
+        fn run_context_menu(&self, browser:Option<&mut Browser>, _frame:Option<&mut Frame>,
+            _params:Option<&mut ContextMenuParams>, _model:Option<&mut MenuModel>,
+            callback:Option<&mut RunContextMenuCallback>) -> i32 {
+            // 1 = handled: the native menu runner is not started. Cancel to release CEF's callback.
+            let Some(browser) = browser else { return 0; };
+            let tab = browser.identifier();
+            if !native_menu_blocked(tab, true) { return 0; }
+            dismiss_context_menu(tab);
+            if let Some(callback) = callback { callback.cancel(); }
+            1
         }
         fn on_context_menu_command(&self, browser:Option<&mut Browser>, frame:Option<&mut Frame>,
             _params:Option<&mut ContextMenuParams>, command_id:i32, _event_flags:EventFlags) -> i32 {
@@ -16450,6 +17309,7 @@ mod tests {
                 scope: None,
                 focus_completion: None,
                 frame_completion: None,
+                resolved: None,
             },
             receiver,
         )
@@ -18947,7 +19807,7 @@ mod tests {
                 assert_eq!(state.spaces.active_space(), USER_SPACE);
                 assert_eq!(state.spaces.active_tab(), Some(8));
             });
-            for id in batch.ids {
+            for id in batch.ids.clone() {
                 devtools_result(&batch.browser, id, true, b"{}");
             }
             assert!(receiver.try_recv().is_err());
@@ -19000,7 +19860,7 @@ mod tests {
                 error.details.unwrap(),
                 json!({"tab":7,"outcomeUnknown":true,"attempted":true})
             );
-            for id in batch.ids {
+            for id in batch.ids.clone() {
                 devtools_result(&batch.browser, id, true, b"{}");
             }
             assert!(receiver.try_recv().is_err());
@@ -19073,7 +19933,7 @@ mod tests {
                     assert_eq!(error.code, "TAB_CLOSED");
                     assert_eq!(error.details.unwrap()["attempted"], false);
                 }
-                for id in batch.ids {
+                for id in batch.ids.clone() {
                     devtools_result(&batch.browser, id, true, b"{}");
                 }
                 assert!(receiver.try_recv().is_err());
@@ -19119,7 +19979,7 @@ mod tests {
                 let details = error.details.unwrap();
                 assert_eq!(details["outcomeUnknown"], true);
                 assert_eq!(details["attempted"], true);
-                for id in batch.ids {
+                for id in batch.ids.clone() {
                     devtools_result(&batch.browser, id, true, b"{}");
                 }
                 assert!(receiver.try_recv().is_err());
@@ -20975,6 +21835,873 @@ mod tests {
         assert_eq!(status["pending"], 1);
         assert_eq!(status["requests"][0]["type"], "alert");
         assert_eq!(crate::dialog_runtime::pending_tabs(), [7].into_iter().collect());
+        clear();
+    }
+
+    // ---- pointer expansion (dblclick, right click, wheel, drag, coordinates) ----
+
+    fn pointer_preparation(command: &Command) -> (Pending, Browser, mpsc::Receiver<Response>) {
+        let (mut pending, browser, receiver) = test_input_preparation();
+        pending.evaluation = Evaluation::Page {
+            mutation: true,
+            evidence: ActionEvidence::for_command(command),
+        };
+        pending.click_target().unwrap().context.set(Some(17));
+        STATE.with(|state| {
+            state.borrow_mut().pending.insert(42, pending.clone());
+        });
+        (pending, browser, receiver)
+    }
+
+    /// Drive prepare -> mouseMoved -> verify -> terminal input and return every
+    /// Input.dispatchMouseEvent parameter object plus the final response.
+    fn run_pointer(command: &Command, prepared: Json, verified: Json) -> (Vec<Json>, Json) {
+        let (pending, browser, receiver) = pointer_preparation(command);
+        let kind = prepared_input_kind(&pending, &prepared).unwrap();
+        let batch = reserve_input_batch(42, &pending, &browser, kind).unwrap();
+        let mut events = Vec::new();
+        assert!(enqueue_input_batch(
+            &batch,
+            || true,
+            |part, id| {
+                events.push(batch.kind.params(part));
+                devtools_result(&batch.browser, id, true, b"{}");
+                id
+            },
+        ));
+        let (id, pending) = reserve_input_verification(&batch).unwrap().unwrap();
+        let kind = prepared_input_kind(&pending, &verified).unwrap();
+        let terminal = reserve_input_batch(id, &pending, &batch.browser, kind).unwrap();
+        assert!(!enqueue_input_batch(
+            &terminal,
+            || true,
+            |part, id| {
+                events.push(terminal.kind.params(part));
+                devtools_result(&terminal.browser, id, true, b"{}");
+                id
+            },
+        ));
+        let wire = serde_json::to_value(receiver.try_recv().unwrap()).unwrap();
+        STATE.with(|state| assert!(state.borrow().pending.is_empty()));
+        clear();
+        (events, wire)
+    }
+
+    fn point_value(action: &str, x: f64, y: f64) -> Json {
+        json!({"ok":true,"action":action,"prepared":true,"attempted":false,"point":{"x":x,"y":y}})
+    }
+
+    #[test]
+    fn dblclick_sends_two_press_release_pairs_with_rising_click_count() {
+        let command = Command::DblClick {
+            tab: 7,
+            reference: "4/document:3:8".into(),
+        };
+        let prepared = point_value("click", 30.0, 40.0);
+        let (events, wire) = run_pointer(&command, prepared.clone(), prepared);
+        let kinds: Vec<_> = events
+            .iter()
+            .map(|e| {
+                (
+                    e["type"].as_str().unwrap(),
+                    e["clickCount"].as_i64().unwrap(),
+                    e["buttons"].as_i64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("mouseMoved", 0, 0),
+                ("mousePressed", 1, 1),
+                ("mouseReleased", 1, 0),
+                ("mousePressed", 2, 1),
+                ("mouseReleased", 2, 0),
+            ]
+        );
+        assert!(
+            events[1..]
+                .iter()
+                .all(|e| e["button"] == "left" && e["x"] == 30.0 && e["y"] == 40.0)
+        );
+        assert_eq!(wire["result"]["page"]["action"], "dblclick");
+        assert_eq!(wire["result"]["page"]["clickCount"], 2);
+        assert_eq!(wire["result"]["page"]["dispatchAcknowledged"], true);
+    }
+
+    #[test]
+    fn right_click_uses_the_right_button_mask_and_guards_the_native_menu() {
+        let command = Command::RightClick {
+            tab: 7,
+            reference: "4/document:3:8".into(),
+        };
+        let prepared = point_value("click", 12.0, 13.0);
+        assert!(!context_click_guarded(7));
+        let (pending, browser, receiver) = pointer_preparation(&command);
+        let kind = prepared_input_kind(&pending, &prepared).unwrap();
+        let batch = reserve_input_batch(42, &pending, &browser, kind).unwrap();
+        assert!(enqueue_input_batch(
+            &batch,
+            || true,
+            |_, id| {
+                devtools_result(&batch.browser, id, true, b"{}");
+                id
+            }
+        ));
+        let (id, pending) = reserve_input_verification(&batch).unwrap().unwrap();
+        let kind = prepared_input_kind(&pending, &prepared).unwrap();
+        assert!(matches!(&kind, NativeInput::Click(click) if click.button == MouseButton::Right));
+        arm_context_click_guard(&kind, 7);
+        let click = reserve_input_batch(id, &pending, &batch.browser, kind).unwrap();
+        let mut events = Vec::new();
+        assert!(!enqueue_input_batch(
+            &click,
+            || true,
+            |part, id| {
+                events.push(click.kind.params(part));
+                devtools_result(&click.browser, id, true, b"{}");
+                id
+            }
+        ));
+        assert_eq!(events[0]["type"], "mousePressed");
+        assert_eq!(events[0]["button"], "right");
+        assert_eq!(events[0]["buttons"], 2);
+        assert_eq!(events[1]["type"], "mouseReleased");
+        assert_eq!(events[1]["button"], "right");
+        assert_eq!(events[1]["buttons"], 0);
+        let wire = serde_json::to_value(receiver.try_recv().unwrap()).unwrap();
+        assert_eq!(wire["result"]["page"]["action"], "click");
+        assert_eq!(wire["result"]["page"]["button"], "right");
+        // dispatch_input arms the guard through arm_context_click_guard before the press.
+        assert!(context_click_guarded(7));
+        assert!(!context_click_guarded(8));
+        clear();
+        assert!(!context_click_guarded(7));
+    }
+
+    #[test]
+    fn wheel_moves_then_sends_one_mouse_wheel_with_both_deltas() {
+        let command = Command::Wheel {
+            tab: 7,
+            reference: "4/document:3:8".into(),
+            dx: -5,
+            dy: 120,
+        };
+        let prepared = point_value("click", 50.0, 60.0);
+        let (events, wire) = run_pointer(&command, prepared.clone(), prepared);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["type"], "mouseMoved");
+        assert_eq!(
+            events[1],
+            json!({"type":"mouseWheel","x":50.0,"y":60.0,"deltaX":-5,"deltaY":120,
+                "button":"none","buttons":0,"modifiers":0,"pointerType":"mouse"})
+        );
+        assert_eq!(wire["result"]["page"]["action"], "wheel");
+        assert_eq!(wire["result"]["page"]["deltaY"], 120);
+    }
+
+    #[test]
+    fn drag_presses_moves_in_steps_and_releases_exactly_on_the_destination() {
+        let command = Command::Drag {
+            tab: 7,
+            from: "4/document:3:8".into(),
+            to: "4/document:3:9".into(),
+        };
+        let prepared = json!({"ok":true,"action":"drag","prepared":true,"attempted":false,
+            "point":{"x":10.0,"y":20.0},"toPoint":{"x":110.0,"y":220.0}});
+        let (events, wire) = run_pointer(&command, prepared.clone(), prepared);
+        // mouseMoved(from) + press + DRAG_MOVE_STEPS moves + release
+        assert_eq!(events.len(), 1 + 1 + DRAG_MOVE_STEPS + 1);
+        assert_eq!(events[0]["type"], "mouseMoved");
+        assert_eq!(events[1]["type"], "mousePressed");
+        assert_eq!(
+            (events[1]["x"].clone(), events[1]["y"].clone()),
+            (json!(10.0), json!(20.0))
+        );
+        let moves = &events[2..2 + DRAG_MOVE_STEPS];
+        assert!(
+            moves
+                .iter()
+                .all(|e| e["type"] == "mouseMoved" && e["buttons"] == 1 && e["button"] == "left")
+        );
+        let xs: Vec<f64> = moves.iter().map(|e| e["x"].as_f64().unwrap()).collect();
+        assert!(
+            xs.windows(2).all(|pair| pair[0] < pair[1]),
+            "intermediate moves advance"
+        );
+        assert_eq!(xs[0], 20.0);
+        assert_eq!(*xs.last().unwrap(), 110.0);
+        assert_eq!(moves.last().unwrap()["y"], 220.0);
+        let release = events.last().unwrap();
+        assert_eq!(release["type"], "mouseReleased");
+        assert_eq!(
+            (release["x"].clone(), release["y"].clone()),
+            (json!(110.0), json!(220.0))
+        );
+        assert_eq!(wire["result"]["page"]["action"], "drag");
+    }
+
+    #[test]
+    fn drag_verification_must_repeat_both_original_points() {
+        let command = Command::Drag {
+            tab: 7,
+            from: "4/document:3:8".into(),
+            to: "4/document:3:9".into(),
+        };
+        let (pending, browser, _receiver) = pointer_preparation(&command);
+        let prepared = json!({"ok":true,"action":"drag","prepared":true,"attempted":false,
+            "point":{"x":10.0,"y":20.0},"toPoint":{"x":110.0,"y":220.0}});
+        assert!(
+            prepared_input_kind(
+                &pending,
+                &json!({"ok":true,"action":"drag","prepared":true,
+            "attempted":false,"point":{"x":10.0,"y":20.0}})
+            )
+            .is_none(),
+            "toPoint is required"
+        );
+        let kind = prepared_input_kind(&pending, &prepared).unwrap();
+        let batch = reserve_input_batch(42, &pending, &browser, kind).unwrap();
+        let params = input_verification_params(&batch).unwrap();
+        assert_eq!(
+            params["expression"],
+            format!(
+                "window.__lightBrowserBridge.act({})",
+                json!({"action":"drag","point":{"x":10.0,"y":20.0},"verifyOnly":true,
+                    "toPoint":{"x":110.0,"y":220.0},"toRef":"document:3:9","ref":"document:3:8"})
+            )
+        );
+        // A moved destination never reaches the press.
+        batch.progress.borrow_mut().attempted[0] = true;
+        pending.click_target().unwrap().attempted.set(true);
+        let moved = json!({"ok":true,"action":"drag","prepared":true,"attempted":false,
+            "point":{"x":10.0,"y":20.0},"toPoint":{"x":111.0,"y":220.0}});
+        let mut verify = pending.clone();
+        verify.step = Step::ClickVerify;
+        assert!(prepared_input_kind(&verify, &moved).is_none());
+        assert!(prepared_input_kind(&verify, &prepared).is_some());
+        clear();
+    }
+
+    #[test]
+    fn click_at_and_move_at_use_the_point_action_and_no_ref() {
+        let click = Command::ClickAt {
+            tab: 7,
+            x: 31,
+            y: 47,
+            button: MouseButton::Right,
+            count: 3,
+        };
+        let target = ClickTarget::for_command(&click).unwrap();
+        assert_eq!(target.action(), "pointAt");
+        assert_eq!(target.result_action(), "click-at");
+        assert!(target.reference.is_empty());
+        let prepared = json!({"ok":true,"action":"pointAt","prepared":true,"attempted":false,
+            "point":{"x":31,"y":47},"viewport":{"width":1280,"height":800}});
+        let (events, wire) = run_pointer(&click, prepared.clone(), prepared.clone());
+        // mouseMoved + 3 right press/release pairs with clickCount 1, 2, 3
+        assert_eq!(events.len(), 1 + 6);
+        let counts: Vec<i64> = events[1..]
+            .iter()
+            .map(|e| e["clickCount"].as_i64().unwrap())
+            .collect();
+        assert_eq!(counts, [1, 1, 2, 2, 3, 3]);
+        assert!(events[1..].iter().all(|e| e["button"] == "right"));
+        assert_eq!(wire["result"]["page"]["action"], "click-at");
+        assert_eq!(wire["result"]["page"]["x"], 31);
+        assert_eq!(wire["result"]["page"]["clickCount"], 3);
+        let mv = Command::MoveAt { tab: 7, x: 5, y: 6 };
+        let target = ClickTarget::for_command(&mv).unwrap();
+        assert_eq!(target.result_action(), "move-at");
+        assert!(target.is_hover());
+        assert!(
+            target
+                .terminal_input(ClickPoint { x: 5.0, y: 6.0 })
+                .is_none()
+        );
+        let page = target.hover_success(false);
+        assert_eq!(
+            (
+                page["action"].clone(),
+                page["x"].clone(),
+                page["pointVerified"].clone()
+            ),
+            (json!("move-at"), json!(5), json!(true))
+        );
+        // The verification request carries the coordinate and no ref.
+        let (pending, browser, _receiver) = pointer_preparation(&mv);
+        let kind = prepared_input_kind(
+            &pending,
+            &json!({"ok":true,"action":"pointAt","prepared":true,
+            "attempted":false,"point":{"x":5,"y":6}}),
+        )
+        .unwrap();
+        let batch = reserve_input_batch(42, &pending, &browser, kind).unwrap();
+        batch.progress.borrow_mut().enqueuing = false;
+        let params = input_verification_params(&batch).unwrap();
+        assert_eq!(
+            params["expression"],
+            format!(
+                "window.__lightBrowserBridge.act({})",
+                json!({"action":"pointAt","point":{"x":5.0,"y":6.0},"verifyOnly":true,"x":5,"y":6})
+            )
+        );
+        clear();
+    }
+
+    #[test]
+    fn plain_click_keeps_its_original_wire_shape() {
+        let command = Command::Click {
+            tab: 7,
+            reference: "4/document:3:8".into(),
+        };
+        let prepared = point_value("click", 1.5, 2.5);
+        let (events, wire) = run_pointer(&command, prepared.clone(), prepared);
+        assert_eq!(
+            events[1],
+            json!({"type":"mousePressed","x":1.5,"y":2.5,"button":"left","buttons":1,"clickCount":1,"modifiers":0,"pointerType":"mouse"})
+        );
+        assert_eq!(wire["result"]["page"]["action"], "click");
+        assert!(wire["result"]["page"].get("button").is_none());
+        assert!(wire["result"]["page"].get("clickCount").is_none());
+    }
+
+    #[test]
+    fn gesture_message_counts_match_their_event_plans() {
+        let point = ClickPoint { x: 1.0, y: 1.0 };
+        let click = |count| {
+            NativeInput::Click(PointerClick {
+                point,
+                button: MouseButton::Left,
+                count,
+                result: "click",
+                at: None,
+            })
+        };
+        assert_eq!(click(1).count(), 2);
+        assert_eq!(click(2).count(), 4);
+        assert_eq!(click(3).count(), 6);
+        assert_eq!(
+            NativeInput::Wheel {
+                point,
+                dx: 0,
+                dy: 1
+            }
+            .count(),
+            1
+        );
+        assert_eq!(
+            NativeInput::Drag {
+                from: point,
+                to: point
+            }
+            .count(),
+            DRAG_MOVE_STEPS + 2
+        );
+        assert!(click(1).is_terminal_pointer() && !click(1).verifies_after_input());
+        assert!(
+            NativeInput::Drag {
+                from: point,
+                to: point
+            }
+            .allows_navigation()
+        );
+        assert!(
+            !NativeInput::Wheel {
+                point,
+                dx: 0,
+                dy: 1
+            }
+            .allows_navigation()
+        );
+    }
+
+    #[test]
+    fn frame_refs_serve_multi_click_and_wheel_but_not_drag() {
+        let snapshot_refs = |command: &Command| {
+            let snapshot = FrameSnapshot {
+                browser: native_blank_tab().browser,
+                epoch: 4,
+                document_epoch: 1,
+                owner: None,
+                frame: crate::frame_sessions::FrameRecord {
+                    frame_id: "F".into(),
+                    parent_id: None,
+                    session_id: None,
+                    url: String::new(),
+                    name: String::new(),
+                },
+                unique_context: "ctx".into(),
+                prefix: "frame/4/1/".into(),
+                document_id: "d".into(),
+                generation: 1,
+                references: ["frame/4/1/doc:1:1".to_owned()].into_iter().collect(),
+                invalidated: Cell::new(false),
+            };
+            frame_action_arguments(command, &snapshot)
+        };
+        for command in [
+            Command::DblClick {
+                tab: 7,
+                reference: "frame/4/1/doc:1:1".into(),
+            },
+            Command::RightClick {
+                tab: 7,
+                reference: "frame/4/1/doc:1:1".into(),
+            },
+            Command::Wheel {
+                tab: 7,
+                reference: "frame/4/1/doc:1:1".into(),
+                dx: 0,
+                dy: 5,
+            },
+        ] {
+            assert_eq!(
+                snapshot_refs(&command).unwrap(),
+                json!({"action":"click","ref":"doc:1:1"})
+            );
+        }
+        let drag = Command::Drag {
+            tab: 7,
+            from: "frame/4/1/doc:1:1".into(),
+            to: "frame/4/1/doc:1:1".into(),
+        };
+        assert!(snapshot_refs(&drag).is_none());
+        clear();
+    }
+
+    // ---- selector resolution ----
+
+    #[test]
+    fn selector_resolution_collects_selectors_and_rewrites_only_them() {
+        let click = Command::Click {
+            tab: 7,
+            reference: "text=Sign in".into(),
+        };
+        let resolution = SelectorResolution::for_command(&click).unwrap();
+        assert_eq!(resolution.selectors, ["text=Sign in"]);
+        let doc = "0123456789abcdef0123456789abcdef";
+        let reference = format!("{doc}:3:8");
+        assert_eq!(
+            resolution.rewritten(9, std::slice::from_ref(&reference)),
+            Some(Command::Click {
+                tab: 7,
+                reference: format!("9/{reference}")
+            })
+        );
+        // Plain refs never trigger the extra pass.
+        assert!(
+            SelectorResolution::for_command(&Command::Click {
+                tab: 7,
+                reference: "9/doc:1:1".into()
+            })
+            .is_none()
+        );
+        let drag = Command::Drag {
+            tab: 7,
+            from: "css=#a".into(),
+            to: "role=button[name=B]".into(),
+        };
+        let resolution = SelectorResolution::for_command(&drag).unwrap();
+        assert_eq!(resolution.selectors.len(), 2);
+        let refs = [format!("{doc}:3:1"), format!("{doc}:3:2")];
+        assert_eq!(
+            resolution.rewritten(9, &refs),
+            Some(Command::Drag {
+                tab: 7,
+                from: format!("9/{}", refs[0]),
+                to: format!("9/{}", refs[1])
+            })
+        );
+        assert!(resolution.rewritten(9, &refs[..1]).is_none());
+        for command in [
+            Command::Hover {
+                tab: 7,
+                reference: "css=a".into(),
+            },
+            Command::Fill {
+                tab: 7,
+                reference: "css=input".into(),
+                text: "x".into(),
+            },
+            Command::Insert {
+                tab: 7,
+                reference: "css=input".into(),
+                text: "x".into(),
+            },
+            Command::Press {
+                tab: 7,
+                reference: "css=input".into(),
+                key: "Enter".into(),
+            },
+            Command::Check {
+                tab: 7,
+                reference: "css=input".into(),
+                checked: true,
+            },
+            Command::Select {
+                tab: 7,
+                reference: "css=select".into(),
+                value: "a".into(),
+            },
+            Command::ScrollElement {
+                tab: 7,
+                reference: "css=div".into(),
+                x: 0,
+                y: 5,
+            },
+            Command::DblClick {
+                tab: 7,
+                reference: "css=a".into(),
+            },
+            Command::RightClick {
+                tab: 7,
+                reference: "css=a".into(),
+            },
+            Command::Wheel {
+                tab: 7,
+                reference: "css=div".into(),
+                dx: 0,
+                dy: 5,
+            },
+        ] {
+            let resolution = SelectorResolution::for_command(&command).unwrap();
+            let rewritten = resolution.rewritten(2, &[format!("{doc}:1:1")]).unwrap();
+            assert_eq!(
+                command_targets(&rewritten),
+                [format!("2/{doc}:1:1").as_str()]
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_refs_are_validated_before_they_are_trusted() {
+        let doc = "0123456789abcdef0123456789abcdef";
+        assert!(valid_resolved_ref(&format!("{doc}:1:1")));
+        for bad in [
+            "",
+            "doc:1:1",
+            &format!("{doc}:x:1"),
+            &format!("{doc}:1"),
+            &format!("{doc}:1:1:1"),
+            &format!("{doc}:1:"),
+            &format!("{doc}:1:1\n"),
+        ] {
+            assert!(!valid_resolved_ref(bad), "{bad:?}");
+        }
+        assert_eq!(
+            selector_error(Some("TARGET_NOT_FOUND")).0,
+            "TARGET_NOT_FOUND"
+        );
+        assert_eq!(
+            selector_error(Some("TARGET_AMBIGUOUS")).0,
+            "TARGET_AMBIGUOUS"
+        );
+        assert_eq!(
+            selector_error(Some("INVALID_SELECTOR")).0,
+            "INVALID_SELECTOR"
+        );
+        assert_eq!(
+            selector_error(Some("anything else from the page")).0,
+            "ACTION_FAILED"
+        );
+    }
+
+    fn resolve_failure(command: &Command, value: Json) -> Option<crate::protocol::ApiError> {
+        let (mut pending, _browser, receiver) = test_input_preparation();
+        let resolution = Shared::new(SelectorResolution::for_command(command).unwrap());
+        pending.evaluation = Evaluation::Page {
+            mutation: false,
+            evidence: Some(ActionEvidence::Resolve(resolution.clone())),
+        };
+        finish_selector_resolution(&pending, &resolution, &value);
+        let error = receiver.try_recv().ok().and_then(|response| response.error);
+        STATE.with(|state| assert_eq!(state.borrow().pending.len(), 1));
+        clear();
+        error
+    }
+
+    #[test]
+    fn selector_failures_report_epoch_prefixed_candidates_without_acting() {
+        let doc = "0123456789abcdef0123456789abcdef";
+        let command = Command::Click {
+            tab: 7,
+            reference: "text=Buy".into(),
+        };
+        let items: Vec<Json> = (1..=8)
+            .map(|n| json!({"ref":format!("{doc}:3:{n}"),"role":"button","label":format!("Buy {n}")}))
+            .chain([json!({"ref":"bad ref","role":"button","label":"x"})])
+            .collect();
+        let error = resolve_failure(
+            &command,
+            json!({"ok":false,"action":"resolve","error":"TARGET_AMBIGUOUS","index":0,
+                "matchCount":8,"truncated":false,"candidates":items}),
+        )
+        .unwrap();
+        assert_eq!(error.code, "TARGET_AMBIGUOUS");
+        let details = error.details.unwrap();
+        assert_eq!(details["matchCount"], 8);
+        assert_eq!(details["selector"], "text=Buy");
+        assert_eq!(details["outcomeUnknown"], false);
+        let candidates = details["candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), 5);
+        assert_eq!(candidates[0]["ref"], format!("4/{doc}:3:1"));
+        assert_eq!(candidates[0]["label"], "Buy 1");
+        let error = resolve_failure(
+            &command,
+            json!({"ok":false,"action":"resolve","error":"TARGET_NOT_FOUND","index":0,"matchCount":0,"truncated":true}),
+        )
+        .unwrap();
+        assert_eq!(error.code, "TARGET_NOT_FOUND");
+        let details = error.details.unwrap();
+        assert_eq!(details["truncated"], true);
+        assert_eq!(details["candidates"], json!([]));
+        // A malformed or unexpected resolution never continues into an action.
+        for value in [
+            json!({"ok":true,"action":"resolve","targets":[]}),
+            json!({"ok":true,"action":"resolve","targets":[{"ref":"nope"}]}),
+            json!({"ok":true,"action":"click","targets":[{"ref":format!("{doc}:3:1")}]}),
+        ] {
+            assert_eq!(
+                resolve_failure(&command, value).unwrap().code,
+                "INVALID_PAGE_RESULT"
+            );
+        }
+    }
+
+    #[test]
+    fn same_element_for_both_drag_selectors_is_rejected() {
+        let (mut pending, _browser, receiver) = test_input_preparation();
+        let doc = "0123456789abcdef0123456789abcdef";
+        let command = Command::Drag {
+            tab: 7,
+            from: "css=.a".into(),
+            to: "css=.b".into(),
+        };
+        let resolution = Shared::new(SelectorResolution::for_command(&command).unwrap());
+        pending.evaluation = Evaluation::Page {
+            mutation: false,
+            evidence: Some(ActionEvidence::Resolve(resolution.clone())),
+        };
+        let target = json!({"ref":format!("{doc}:3:1"),"role":"generic","label":""});
+        finish_selector_resolution(
+            &pending,
+            &resolution,
+            &json!({"ok":true,"action":"resolve","targets":[target.clone(), target]}),
+        );
+        assert_eq!(
+            receiver.try_recv().unwrap().error.unwrap().code,
+            "INVALID_ARGUMENTS"
+        );
+        clear();
+    }
+
+    #[test]
+    fn resolved_selector_details_are_added_to_a_success_result_only() {
+        let (mut reply, receiver) = test_reply(703);
+        reply.resolved = Some(json!([{"selector":"text=Go","ref":"2/x"}]));
+        reply.ok(json!({"tab":7,"page":{"ok":true}}));
+        let wire = serde_json::to_value(receiver.try_recv().unwrap()).unwrap();
+        assert_eq!(wire["result"]["resolved"][0]["selector"], "text=Go");
+        let (reply, receiver) = test_reply(704);
+        reply.ok(json!({"tab":7}));
+        let wire = serde_json::to_value(receiver.try_recv().unwrap()).unwrap();
+        assert!(wire["result"].get("resolved").is_none());
+    }
+
+    #[test]
+    fn drag_events_are_paced_one_per_acknowledgement() {
+        let command = Command::Drag {
+            tab: 7,
+            from: "4/document:3:8".into(),
+            to: "4/document:3:9".into(),
+        };
+        let (pending, browser, receiver) = pointer_preparation(&command);
+        let kind = NativeInput::Drag {
+            from: ClickPoint { x: 10.0, y: 20.0 },
+            to: ClickPoint { x: 110.0, y: 220.0 },
+        };
+        let batch = reserve_input_batch(42, &pending, &browser, kind).unwrap();
+        assert!(batch.kind.paced());
+        let mut sent = Vec::new();
+        // The transport accepts the request but does not acknowledge it yet.
+        assert!(!enqueue_input_batch(
+            &batch,
+            || true,
+            |part, id| {
+                sent.push(part);
+                id
+            }
+        ));
+        assert_eq!(
+            sent,
+            [0],
+            "only the first event is submitted before its acknowledgement"
+        );
+        assert!(receiver.try_recv().is_err());
+        STATE.with(|state| assert_eq!(state.borrow().pending.len(), batch.ids.len()));
+        // Its acknowledgement releases exactly the next event. This test browser has
+        // no host, so that submission fails closed instead of sending more input.
+        devtools_result(&batch.browser, batch.ids[0], true, b"{}");
+        let error = receiver.try_recv().unwrap().error.unwrap();
+        assert_eq!(error.code, "TAB_CLOSED");
+        let details = error.details.unwrap();
+        assert_eq!(details["attempted"], true);
+        assert_eq!(details["outcomeUnknown"], true);
+        assert!(receiver.try_recv().is_err());
+        STATE.with(|state| assert!(state.borrow().pending.is_empty()));
+        // Click pairs stay unpaced: both events are submitted back to back.
+        let click = NativeInput::Click(PointerClick {
+            point: ClickPoint { x: 1.0, y: 1.0 },
+            button: MouseButton::Left,
+            count: 2,
+            result: "dblclick",
+            at: None,
+        });
+        assert!(!click.paced());
+        clear();
+    }
+
+    fn drag_after_first_event() -> (Shared<InputBatch>, mpsc::Receiver<Response>) {
+        TEST_POINTER_RELEASES.with(|releases| releases.borrow_mut().clear());
+        let command = Command::Drag {
+            tab: 7,
+            from: "4/document:3:8".into(),
+            to: "4/document:3:9".into(),
+        };
+        let (pending, browser, receiver) = pointer_preparation(&command);
+        let kind = NativeInput::Drag {
+            from: ClickPoint { x: 10.0, y: 20.0 },
+            to: ClickPoint { x: 110.0, y: 220.0 },
+        };
+        let batch = reserve_input_batch(42, &pending, &browser, kind).unwrap();
+        // The press is accepted; its acknowledgement is still in flight.
+        assert!(!enqueue_input_batch(&batch, || true, |_, id| id));
+        (batch, receiver)
+    }
+
+    fn releases() -> Vec<Json> {
+        TEST_POINTER_RELEASES.with(|releases| releases.borrow().clone())
+    }
+
+    #[test]
+    fn canceled_drag_releases_the_pressed_button_exactly_once() {
+        let (batch, receiver) = drag_after_first_event();
+        // Cancellation removes the batch's pending entries.
+        remove_input_batch(&batch);
+        devtools_result(&batch.browser, batch.ids[0], true, b"{}");
+        assert_eq!(
+            releases(),
+            [
+                json!({"type":"mouseReleased","x":10.0,"y":20.0,"button":"left","buttons":0,
+                "clickCount":1,"modifiers":0,"pointerType":"mouse"})
+            ]
+        );
+        devtools_result(&batch.browser, batch.ids[0], true, b"{}");
+        assert_eq!(
+            releases().len(),
+            1,
+            "a duplicate acknowledgement never releases twice"
+        );
+        assert!(receiver.try_recv().is_err());
+        clear();
+    }
+
+    #[test]
+    fn handed_off_drag_fails_with_one_cleanup_release_at_the_last_point() {
+        let (batch, receiver) = drag_after_first_event();
+        STATE.with(|state| {
+            state
+                .borrow_mut()
+                .tasks
+                .handoff(batch.reply.scope.as_ref().unwrap())
+                .unwrap()
+        });
+        devtools_result(&batch.browser, batch.ids[0], true, b"{}");
+        let error = receiver.try_recv().unwrap().error.unwrap();
+        assert_eq!(error.details.unwrap()["pointerCleanup"], "released");
+        assert_eq!(releases().len(), 1);
+        assert_eq!(releases()[0]["x"], 10.0);
+        STATE.with(|state| assert!(state.borrow().pointer_holds.is_empty()));
+        devtools_result(&batch.browser, batch.ids[0], true, b"{}");
+        assert_eq!(releases().len(), 1);
+        clear();
+    }
+
+    #[test]
+    fn dialog_during_drag_defers_the_release_until_it_is_answered() {
+        let (batch, receiver) = drag_after_first_event();
+        assert!(crate::dialog_runtime::test_insert(
+            7,
+            crate::dialogs::Kind::Alert,
+            "hello",
+            ""
+        ));
+        let dialog = crate::dialog_runtime::tab_json(7).unwrap();
+        dialog_opened(7, dialog);
+        // The page resumes only after the dialog; its late acknowledgement must not release.
+        devtools_result(&batch.browser, batch.ids[0], true, b"{}");
+        assert!(
+            releases().is_empty(),
+            "no release while a dialog blocks the page"
+        );
+        STATE.with(|state| assert!(state.borrow().pointer_holds.contains_key(&7)));
+        crate::dialog_runtime::settle_tabs([7], false);
+        flush_pointer_hold(7);
+        assert_eq!(releases().len(), 1);
+        flush_pointer_hold(7);
+        assert_eq!(releases().len(), 1);
+        drop(receiver);
+        clear();
+    }
+
+    #[test]
+    fn drag_cleanup_requires_the_same_live_browser() {
+        let (batch, _receiver) = drag_after_first_event();
+        STATE.with(|state| state.borrow_mut().tabs.insert(7, native_blank_tab()));
+        remove_input_batch(&batch);
+        devtools_result(&batch.browser, batch.ids[0], true, b"{}");
+        assert!(
+            releases().is_empty(),
+            "a replaced tab never receives the old release"
+        );
+        clear();
+    }
+
+    #[test]
+    fn native_menu_suppression_is_state_based_and_the_deadline_is_one_shot() {
+        // Expired (absent) deadline: an Active AI task's tab is still blocked.
+        let scope = context_menu_fixture(true).unwrap();
+        assert!(native_menu_blocked(7, false));
+        // A paused owner (the user took over) and a plain visible user tab are not.
+        STATE.with(|state| state.borrow_mut().tasks.handoff(&scope).unwrap());
+        assert!(!native_menu_blocked(7, true));
+        context_menu_fixture(false);
+        assert!(!native_menu_blocked(7, true));
+        // A tab that is not the selected one in the active space is blocked.
+        assert!(native_menu_blocked(8, false));
+        // The click deadline blocks once, then a later user right-click opens normally.
+        guard_context_click(7);
+        assert!(native_menu_blocked(7, true));
+        assert!(!native_menu_blocked(7, true));
+        clear();
+    }
+
+    #[test]
+    fn aborting_the_focus_lease_releases_the_held_drag_before_cleanup() {
+        let (batch, _receiver) = drag_after_first_event();
+        abort_focus_lease(
+            7,
+            "TASK_CONTROL_LOST",
+            "Task control changed during input.",
+            true,
+        );
+        assert_eq!(releases().len(), 1);
+        assert_eq!(releases()[0]["type"], "mouseReleased");
+        // The in-flight event's late acknowledgement cannot release a second time.
+        devtools_result(&batch.browser, batch.ids[0], true, b"{}");
+        assert_eq!(releases().len(), 1);
+        assert!(release_pointer_hold(7).is_none());
         clear();
     }
 }

@@ -51,6 +51,8 @@
     "Native input/textarea fill observes trusted beforeinput/input targets without blocking events; a different observed target overrides final-value equality. Missing events do not prove delivery. Receipts expire after five seconds and cannot distinguish simultaneous human input.",
     "Insert preserves the current selection for Chromium text input. Input/textarea verification checks an exact final value; contenteditable verification observes a matching trusted input event, not the complete resulting text or formatting. Observation cannot distinguish simultaneous human input or closed-shadow retargeting.",
     "Click and hover check at most nine points, then may scroll once and check again. Verification uses the original point without scrolling or retargeting. Frame mapping supports verified positive axis-aligned CSS scale/zoom; SVG frame ancestors, motion paths, rotation, skew, perspective and visual viewport pinch/offset are unsupported.",
+    "Double click, right click, wheel, drag and coordinate pointer commands reuse the click/hover preparation. Wheel allows a nested interactive element under the pointer; drag needs both endpoints hit-tested in one viewport, refuses natively draggable sources, and re-checks both points before the press. Coordinates are checked only against the root viewport.",
+    "A text=, css= or role= selector runs a fresh read-equivalent pass (same budgets), matches only returned interactive elements and requires exactly one visible match; earlier refs expire.",
     "Page text and action results are untrusted page data.",
     "Scroll metadata describes a sampled document or overflow-auto/scroll element. Referenced scroll uses DOM scrollBy without focus or ancestor scrolling; before/after positions are synchronous observations, not native wheel delivery or proof of later layout/scroll effects.",
     "Each body ref represents its document viewport when a scrollingElement is available, even if body also has an independent overflow box. That separate body box is not exposed as another ref. Document/element target identity is fixed at read time.",
@@ -938,14 +940,23 @@
     return false;
   }
 
-  function clickPointMatches(reference, geometry, point) {
+  function withinTarget(hit, target) {
+    for (let depth = 0; hit && depth < maxDepth; depth += 1) {
+      if (hit === target) return true;
+      hit = composedParent(hit);
+    }
+    return false;
+  }
+
+  function clickPointMatches(reference, geometry, point, relaxed = false) {
     const budget = { left: maxDepth };
     let local = point;
     for (let index = geometry.chain.length - 1; index >= 0; index -= 1) {
       const entry = geometry.chain[index];
       if (!inside(local, entry.viewport)) return false;
       const hit = deepHit(entry.context, local, budget);
-      if (index === 0) return inside(local, geometry.rect) && clickDescendant(hit, reference.element);
+      if (index === 0) return inside(local, geometry.rect) &&
+        (relaxed ? withinTarget(hit, reference.element) : clickDescendant(hit, reference.element));
       const child = geometry.chain[index - 1];
       if (hit !== child.context.element || !inside(local, child.mapping.content)) return false;
       local = { x: (local.x - child.mapping.content.left) / child.mapping.x,
@@ -954,7 +965,7 @@
     return false;
   }
 
-  function findClickPoint(reference, geometry) {
+  function findClickPoint(reference, geometry, relaxed = false) {
     const clip = { left: geometry.rect.left, top: geometry.rect.top,
       right: geometry.rect.right, bottom: geometry.rect.bottom };
     let x = 1, y = 1, left = 0, top = 0;
@@ -979,7 +990,7 @@
     for (const [fx, fy] of pointerFractions) {
       const point = { x: left + (clip.left + (clip.right - clip.left) * fx) * x,
         y: top + (clip.top + (clip.bottom - clip.top) * fy) * y };
-      if (validClickPoint(point) && clickPointMatches(reference, geometry, point)) return point;
+      if (validClickPoint(point) && clickPointMatches(reference, geometry, point, relaxed)) return point;
     }
     return null;
   }
@@ -1070,11 +1081,13 @@
     const unavailable = refFailure(reference, action);
     if (unavailable) return { ...unavailable, attempted: false };
     const verify = request.verifyOnly === true;
+    // Wheel only needs the pointer over the target; a nested link may sit under it.
+    const relaxed = request.relaxed === true;
     if (verify && !validClickPoint(request.point)) return fail("INVALID_POINT", "Provide a finite viewport point within the supported bounds.");
     try {
       let geometry = clickGeometry(reference);
-      let point = verify ? (clickPointMatches(reference, geometry, request.point) ? request.point : null)
-        : findClickPoint(reference, geometry);
+      let point = verify ? (clickPointMatches(reference, geometry, request.point, relaxed) ? request.point : null)
+        : findClickPoint(reference, geometry, relaxed);
       let invalid = changed();
       if (invalid) return { ...invalid, attempted: false };
       if (!point && !verify) {
@@ -1087,7 +1100,7 @@
           if (invalid) return { ...invalid, attempted: false };
         }
         geometry = clickGeometry(reference);
-        point = findClickPoint(reference, geometry);
+        point = findClickPoint(reference, geometry, relaxed);
         invalid = changed();
         if (invalid) return { ...invalid, attempted: false };
       }
@@ -1097,6 +1110,198 @@
       if (error === unsupportedGeometry) return fail("UNSUPPORTED_GEOMETRY", "The element's viewport or frame geometry is not supported safely.");
       throw error;
     }
+  }
+
+  // Elements Chromium would start a native drag-and-drop session for. A synthetic
+  // press/move pair could enter the platform drag loop, so drag refuses them.
+  function nativeDraggable(element) {
+    let node = element;
+    for (let depth = 0; node && depth < maxDepth; depth += 1) {
+      if (node.nodeType === 1 && (node.getAttribute("draggable") === "true" || node.tagName === "IMG" ||
+          (node.tagName === "A" && node.getAttribute("href") !== null))) return true;
+      node = composedParent(node);
+    }
+    return false;
+  }
+
+  // Two ref points for `drag`: both must be hit-tested in the same viewport.
+  // Verification re-checks the exact original pair without scrolling.
+  function preparePointerPair(request) {
+    const action = "drag";
+    const fail = (error, detail) => ({ ...failure(action, error, detail), attempted: false });
+    if (typeof request.ref !== "string" || typeof request.toRef !== "string") {
+      return fail("INVALID_REQUEST", "Drag needs source and destination refs.");
+    }
+    const from = resolveReference(request.ref);
+    const to = resolveReference(request.toRef);
+    const changed = () => refFailure(from, action, "The drag source changed; read again.", "ELEMENT_UNAVAILABLE") ||
+      refFailure(to, action, "The drag destination changed; read again.", "ELEMENT_UNAVAILABLE");
+    const unavailable = refFailure(from, action) || refFailure(to, action);
+    if (unavailable) return { ...unavailable, attempted: false };
+    const verify = request.verifyOnly === true;
+    if (verify && (!validClickPoint(request.point) || !validClickPoint(request.toPoint))) {
+      return fail("INVALID_POINT", "Provide finite viewport points within the supported bounds.");
+    }
+    if (!verify && nativeDraggable(from.element)) {
+      return fail("DRAG_UNSUPPORTED", "The source is natively draggable (draggable, image or link); a synthetic drag could start a platform drag session.");
+    }
+    try {
+      let fromGeometry = clickGeometry(from);
+      let toGeometry = clickGeometry(to);
+      let a = verify ? (clickPointMatches(from, fromGeometry, request.point, true) ? request.point : null)
+        : findClickPoint(from, fromGeometry, true);
+      let b = verify ? (clickPointMatches(to, toGeometry, request.toPoint, true) ? request.toPoint : null)
+        : findClickPoint(to, toGeometry, true);
+      let invalid = changed();
+      if (invalid) return { ...invalid, attempted: false };
+      if (!verify && (!a || !b)) {
+        // One bounded scroll per missing endpoint, then both must be visible together.
+        for (const [reference, missing] of [[from, !a], [to, !b]]) {
+          if (!missing) continue;
+          reference.element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+          invalid = changed();
+          if (invalid) return { ...invalid, attempted: false };
+          for (let context = reference.context; context.parent; context = context.parent) {
+            context.element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+            invalid = changed();
+            if (invalid) return { ...invalid, attempted: false };
+          }
+        }
+        fromGeometry = clickGeometry(from);
+        toGeometry = clickGeometry(to);
+        a = findClickPoint(from, fromGeometry, true);
+        b = findClickPoint(to, toGeometry, true);
+        invalid = changed();
+        if (invalid) return { ...invalid, attempted: false };
+      }
+      if (!a || !b) return fail("CLICK_POINT_UNAVAILABLE", "No supported hit-tested point reached both drag targets in one viewport. Inspect the page before retrying.");
+      if (Math.hypot(a.x - b.x, a.y - b.y) < 1) return fail("INVALID_POINT", "The drag source and destination resolve to the same point.");
+      return { ok: true, action, prepared: true, attempted: false,
+        point: { x: a.x, y: a.y }, toPoint: { x: b.x, y: b.y } };
+    } catch (error) {
+      if (error === unsupportedGeometry) return fail("UNSUPPORTED_GEOMETRY", "The element's viewport or frame geometry is not supported safely.");
+      throw error;
+    }
+  }
+
+  // Coordinate forms: only the root viewport bound is checked. There is no
+  // target element, so no hit test and no scrolling happen.
+  function preparePointAt(request) {
+    const action = "pointAt";
+    const fail = (error, detail) => ({ ...failure(action, error, detail), attempted: false });
+    const { x, y } = request;
+    if (!Number.isInteger(x) || !Number.isInteger(y) || x < 0 || y < 0 || x > maxPointerCoordinate || y > maxPointerCoordinate) {
+      return fail("INVALID_POINT", "Provide integer viewport CSS pixel coordinates within the supported bounds.");
+    }
+    try {
+      const viewport = clickViewport({ view: window, document });
+      if (!(x < viewport.right && y < viewport.bottom)) {
+        return fail("INVALID_POINT", `The point (${x}, ${y}) is outside the ${viewport.right}x${viewport.bottom} CSS pixel viewport.`);
+      }
+      if (request.verifyOnly === true && !(request.point?.x === x && request.point?.y === y)) {
+        return fail("INVALID_POINT", "The verified point differs from the requested point.");
+      }
+      return { ok: true, action, prepared: true, attempted: false, point: { x, y },
+        viewport: { width: viewport.right, height: viewport.bottom } };
+    } catch (error) {
+      if (error === unsupportedGeometry) return fail("UNSUPPORTED_GEOMETRY", "The viewport geometry is not supported safely.");
+      throw error;
+    }
+  }
+
+  const maxSelectorChars = 1024;
+  const maxSelectorCandidates = 5;
+
+  function collapseSpace(value) {
+    return String(value || "").replace(/\s+/g, " ").trim();
+  }
+
+  function parseQuoted(value) {
+    const first = value[0];
+    if ((first === '"' || first === "'") && value.length >= 2 && value[value.length - 1] === first) {
+      return { text: value.slice(1, -1), quoted: true };
+    }
+    return { text: value, quoted: false };
+  }
+
+  // text=SUBSTR | css=SELECTOR | role=ROLE[name=NAME] (name*= for a substring).
+  function parseSelector(selectorText) {
+    if (typeof selectorText !== "string" || selectorText.length === 0 || selectorText.length > maxSelectorChars ||
+        selectorText.includes("\u0000")) return null;
+    if (selectorText.startsWith("text=")) {
+      const { text, quoted } = parseQuoted(selectorText.slice(5));
+      const wanted = collapseSpace(text);
+      if (!wanted) return null;
+      return { kind: "text", test: quoted
+        ? (item) => collapseSpace(item.label) === wanted
+        : (item) => collapseSpace(item.label).toLowerCase().includes(wanted.toLowerCase()) };
+    }
+    if (selectorText.startsWith("css=")) {
+      const css = selectorText.slice(4).trim();
+      if (!css) return null;
+      try { document.createDocumentFragment().querySelector(css); } catch (_error) { return null; }
+      return { kind: "css", test: (item, element) => {
+        try { return element.matches(css); } catch (_error) { return false; }
+      } };
+    }
+    if (selectorText.startsWith("role=")) {
+      const match = /^([A-Za-z][A-Za-z0-9_-]{0,79})(?:\[name(\*?)=([\s\S]*)\])?$/.exec(selectorText.slice(5).trim());
+      if (!match) return null;
+      const role = match[1].toLowerCase();
+      if (match[3] === undefined) return { kind: "role", test: (item) => item.role.toLowerCase() === role };
+      const { text } = parseQuoted(match[3].trim());
+      const wanted = collapseSpace(text);
+      if (!wanted) return null;
+      return { kind: "role", test: match[2] === "*"
+        ? (item) => item.role.toLowerCase() === role && collapseSpace(item.label).toLowerCase().includes(wanted.toLowerCase())
+        : (item) => item.role.toLowerCase() === role && collapseSpace(item.label) === wanted };
+    }
+    return null;
+  }
+
+  // Resolve one or two selectors, each to exactly one ref, against ONE fresh
+  // `read`-equivalent pass (same traversal, visibility rules and budgets), so the
+  // refs of a drag share a generation. Page state is untouched; earlier refs
+  // expire because the pass renumbers the generation.
+  function resolveSelector(request) {
+    const fail = (error, detail, extra = {}) => ({ ...failure("resolve", error, detail), attempted: false, ...extra });
+    const selectors = request.selectors;
+    if (!Array.isArray(selectors) || selectors.length < 1 || selectors.length > 2) {
+      return fail("INVALID_REQUEST", "Provide one or two selectors.");
+    }
+    const matchers = selectors.map(parseSelector);
+    const bad = matchers.findIndex((matcher) => !matcher);
+    if (bad >= 0) {
+      return fail("INVALID_SELECTOR", "Use text=SUBSTR, css=SELECTOR or role=ROLE[name=NAME] with a valid, non-empty value.", { index: bad });
+    }
+    const page = readDocument(false);
+    const truncated = !!(page.truncated.interactive || page.truncated.nodes || page.truncated.shadowRoots ||
+      page.truncated.depth || page.truncated.frames || page.truncated.frameDepth);
+    const targets = [];
+    for (let index = 0; index < matchers.length; index += 1) {
+      const matches = [];
+      for (const item of page.interactive) {
+        if (item.role === "document") continue;
+        const stored = refs.get(item.ref);
+        if (!stored || !refIsCurrent(stored)) continue;
+        let hit = false;
+        try { hit = matchers[index].test(item, stored.element); } catch (_error) { hit = false; }
+        if (hit) matches.push(item);
+      }
+      if (matches.length === 0) {
+        return fail("TARGET_NOT_FOUND", "No visible interactive element matches the selector within the read budgets.",
+          { index, matchCount: 0, truncated });
+      }
+      if (matches.length > 1) {
+        const candidates = matches.slice(0, maxSelectorCandidates).map((item) => ({
+          ref: item.ref, role: item.role, label: item.label, ...(item.frame ? { frame: item.frame } : {}) }));
+        return fail("TARGET_AMBIGUOUS", "The selector matches more than one visible interactive element; make it unique.",
+          { index, matchCount: matches.length, candidates, truncated });
+      }
+      targets.push({ ref: matches[0].ref, role: matches[0].role, label: matches[0].label,
+        ...(matches[0].frame ? { frame: matches[0].frame } : {}) });
+    }
+    return { ok: true, action: "resolve", attempted: false, targets };
   }
 
   const supportedPressKeys = new Set([
@@ -1782,7 +1987,8 @@
   }
 
   function act(request) {
-    if (frameSnapshot) {
+    // Selector resolution is a fresh read and replaces any frame snapshot, as read does.
+    if (frameSnapshot && request?.action !== "resolve") {
       return { ...failure(request?.action ?? null, "FRAME_BINDING_REQUIRED", "Use frameAct with this frame snapshot's documentId/generation binding."), attempted: false };
     }
     return performAction(request);
@@ -1854,10 +2060,13 @@
       return failure(null, "INVALID_REQUEST", "Expected an action object.");
     }
     const action = request.action;
-    if (!["click", "hover", "fill", "insert", "press", "scroll", "select", "check"].includes(action)) {
+    if (!["click", "hover", "fill", "insert", "press", "scroll", "select", "check", "drag", "pointAt", "resolve"].includes(action)) {
       return failure(null, "UNSUPPORTED_ACTION", "Use click, hover, fill, insert, press, scroll, select or check.");
     }
     try {
+      if (action === "resolve") return resolveSelector(request);
+      if (action === "pointAt") return preparePointAt(request);
+      if (action === "drag") return preparePointerPair(request);
       if (action === "scroll") {
         if (Object.prototype.hasOwnProperty.call(request, "ref")) return scrollReference(request);
         const x = request.x ?? 0;
@@ -1904,7 +2113,7 @@
       const result = failure(action, "ACTION_FAILED", "The page action raised an exception; read again to inspect the page.");
       if (action === "insert") return { ...result, input: "chromium", attempted: verifyingInsert,
         ...(verifyingInsert ? { observation: typeof request.observation === "string" && /^[a-f0-9]{32}$/.test(request.observation) ? request.observation : "" } : {}) };
-      return ["press", "click", "hover"].includes(action) ? { ...result, attempted: action === "press" && verifyingPress } : result;
+      return ["press", "click", "hover", "drag", "pointAt", "resolve"].includes(action) ? { ...result, attempted: action === "press" && verifyingPress } : result;
     }
   }
 

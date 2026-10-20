@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Naru pointer ext fixture</title>
+<style>
+  body { margin: 0; padding: 8px; font: 14px sans-serif; }
+  .row { display: flex; gap: 12px; align-items: flex-start; margin-bottom: 10px; }
+  button, [role=button] { width: 130px; height: 34px; box-sizing: border-box; }
+  #scroller { width: 220px; height: 110px; overflow: auto; border: 1px solid #888; }
+  #tall { height: 600px; }
+  #inner-link { display: block; height: 400px; background: #eef; }
+  #pad { position: relative; width: 220px; height: 110px; border: 1px solid #484; background: #efe; }
+  #card, #slot, #native { box-sizing: border-box; border: 1px solid #333; display: flex; align-items: center; justify-content: center; }
+  #card { width: 90px; height: 40px; background: #fe9; }
+  #slot { width: 150px; height: 70px; background: #9ef; margin-left: 140px; }
+  #native { width: 110px; height: 40px; background: #fcc; }
+  #cover-box { position: relative; width: 130px; height: 34px; }
+  #cover { position: absolute; inset: 0; background: rgba(200, 200, 200, .9); }
+  pre { white-space: pre-wrap; word-break: break-all; font-size: 10px; margin: 0; }
+</style>
+</head>
+<body>
+<div class="row">
+  <button id="dbl" type="button">Double target</button>
+  <button id="ctx" type="button">Context target</button>
+  <button id="ctxdefault" type="button">Context default</button>
+  <button id="save" type="button">Save draft</button>
+  <button id="buy1" type="button">Buy 1</button>
+  <button id="buy2" type="button">Buy 2</button>
+  <button id="buy3" type="button">Buy 3</button>
+</div>
+<div class="row">
+  <div id="scroller" tabindex="0" aria-label="Scroll area"><div id="tall"><a id="inner-link" href="#inner">Inner link</a></div></div>
+  <div id="pad" aria-hidden="false"></div>
+</div>
+<div class="row">
+  <div id="card" role="button" tabindex="0" aria-label="Drag card">card</div>
+  <div id="slot" role="button" tabindex="0" aria-label="Drop slot">slot</div>
+  <div id="native" role="button" tabindex="0" draggable="true" aria-label="Native draggable">native</div>
+</div>
+<div class="row">
+  <input id="query" name="q" aria-label="Query" type="text">
+  <input id="agree" type="checkbox" aria-label="Agree">
+  <select id="choice" aria-label="Choice"><option value="a">Alpha</option><option value="b">Beta</option></select>
+  <div id="cover-box"><button id="covered" type="button">Covered button</button><div id="cover"></div></div>
+  <a id="plain-link" href="#plain">Plain link</a>
+</div>
+<div id="frame-slot"></div>
+<pre id="receipt"></pre>
+<script>
+  const MAX_EVENTS = 14;
+  const state = {
+    ready: false, width: 0, height: 0, pad: null,
+    counts: {}, clicks: {}, events: [], keys: [],
+    contextDefaultPrevented: {}, drag: { down: 0, ups: 0, moves: 0, upTarget: null, order: "", buttonsOk: true, lastMove: null },
+    lastPad: null, scrollTop: 0, wheels: 0, wheelEvents: [], hoverMoves: 0,
+  };
+  const receipt = document.getElementById("receipt");
+  let dragging = false;
+  // ?slow=MS makes every drag mousemove block the page, so a drag stays in flight.
+  const slowMs = Number(new URLSearchParams(location.search).get("slow")) || 0;
+
+  function idOf(node) {
+    const owner = node && node.closest ? node.closest("[id]") : null;
+    return owner ? owner.id : "";
+  }
+  function publish() {
+    state.width = window.innerWidth;
+    state.height = window.innerHeight;
+    const pad = document.getElementById("pad").getBoundingClientRect();
+    state.pad = { left: pad.left, top: pad.top, width: pad.width, height: pad.height };
+    state.scrollTop = document.getElementById("scroller").scrollTop;
+    receipt.textContent = "POINTER_STATE_BEGIN " + encodeURIComponent(JSON.stringify(state)) + " POINTER_STATE_END";
+  }
+  function record(event) {
+    state.counts[event.type] = (state.counts[event.type] || 0) + 1;
+    const id = idOf(event.target);
+    if (event.type === "click" && id) state.clicks[id] = (state.clicks[id] || 0) + 1;
+    if (event.type !== "mousemove" || dragging) {
+      state.events.push({ t: event.type, id, b: event.button, bs: event.buttons, d: event.detail,
+        x: event.clientX, y: event.clientY, tr: event.isTrusted });
+      if (state.events.length > MAX_EVENTS) state.events.shift();
+    }
+    if (event.type === "mousedown" && id === "card") {
+      dragging = true;
+      state.drag.down += 1;
+      state.drag.order = "D";
+      state.drag.buttonsOk = event.buttons === 1;
+    } else if (event.type === "mousemove" && dragging) {
+      state.drag.moves += 1;
+      state.drag.buttonsOk = state.drag.buttonsOk && event.buttons === 1;
+      state.drag.lastMove = { x: event.clientX, y: event.clientY };
+      if (state.drag.order.length < 40) state.drag.order += "M";
+      if (slowMs) { const until = performance.now() + slowMs; while (performance.now() < until) { /* hold the renderer */ } }
+    } else if (event.type === "mouseup" && dragging) {
+      dragging = false;
+      state.drag.ups += 1;
+      state.drag.upTarget = id;
+      state.drag.up = { x: event.clientX, y: event.clientY, trusted: event.isTrusted };
+      state.drag.order += "U";
+    } else if (event.type === "mousemove") {
+      state.hoverMoves += 1;
+      state.lastMove = { x: event.clientX, y: event.clientY, id };
+    }
+    if (id === "pad" && ["click", "dblclick", "contextmenu"].includes(event.type)) {
+      state.lastPad = { type: event.type, x: event.clientX, y: event.clientY, button: event.button, detail: event.detail };
+    }
+    if (event.type === "wheel") {
+      state.wheels += 1;
+      state.wheelEvents.push({ id, dx: event.deltaX, dy: event.deltaY, tr: event.isTrusted });
+      if (state.wheelEvents.length > 4) state.wheelEvents.shift();
+    }
+    if (event.type === "contextmenu") {
+      if (id === "ctx" || id === "pad") event.preventDefault();
+      state.contextDefaultPrevented[id] = event.defaultPrevented;
+    }
+    publish();
+  }
+  for (const type of ["mousedown", "mouseup", "click", "dblclick", "contextmenu", "auxclick", "mousemove", "wheel"]) {
+    document.addEventListener(type, record, { capture: true, passive: type === "wheel" });
+  }
+  document.getElementById("query").addEventListener("keydown", (event) => {
+    state.keys.push(event.key);
+    publish();
+  });
+  document.getElementById("scroller").addEventListener("scroll", publish);
+  window.addEventListener("resize", publish);
+  // ?frame=URL embeds a cross-origin child for the read-frame gesture checks.
+  const frameUrl = new URLSearchParams(location.search).get("frame");
+  if (frameUrl) {
+    const child = document.createElement("iframe");
+    child.id = "xframe";
+    child.title = "Cross-origin child";
+    child.style.cssText = "width:300px;height:70px;border:1px solid #666";
+    child.src = frameUrl;
+    document.getElementById("frame-slot").appendChild(child);
+  }
+  state.ready = true;
+  publish();
+</script>
+</body>
+</html>
