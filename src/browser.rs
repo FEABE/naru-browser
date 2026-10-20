@@ -748,6 +748,9 @@ impl Pending {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FramePhase {
+    /// Child sessions only: browser-side Inspector.enable reports an already
+    /// crashed renderer as Inspector.targetCrashed before its ACK.
+    CrashProbe,
     Enable,
     Attach,
     Tree,
@@ -3919,6 +3922,10 @@ pub fn close_all() {
             .map(|tab| tab.browser.clone())
             .collect::<Vec<_>>()
     });
+    // OnBeforeClose of the last tab quits; without tabs nothing else will.
+    if browsers.is_empty() {
+        quit_message_loop();
+    }
     for browser in browsers {
         if let Some(host) = browser.host() {
             host.close_browser(0);
@@ -4857,6 +4864,20 @@ fn renderer_terminated(tab: i32, reason: Json) {
         );
     }
     notify_panel();
+}
+
+wrap_task! {
+    // OnBeforeClose answers a closed tab; an ID reused by another browser is
+    // not the renderer that ended.
+    struct RendererTerminatedTask { browser: Browser, reason: Json }
+    impl Task {
+        fn execute(&self) {
+            let id = self.browser.identifier();
+            if STATE.with(|state| state.borrow().tabs.get(&id).is_some_and(|tab| same_browser(&tab.browser, &self.browser))) {
+                renderer_terminated(id, self.reason.clone());
+            }
+        }
+    }
 }
 
 fn task_result<T: serde::Serialize>(result: Result<T, TaskError>, reply: &Reply) {
@@ -6733,8 +6754,8 @@ fn send_focus_message(tab: i32, token: u64, enabled: bool) {
     });
     advance_focus_lease(tab, token);
     // Cancellation while enable's native sender was on the stack defers the
-    // disable send until the enable call has returned. Otherwise a synchronous
-    // disable ACK could release a lease before the earlier enable was accepted.
+    // disable send until enable's acceptance is recorded above, so the lease
+    // never sees disable complete before the earlier enable was accepted.
     if enabled {
         send_focus_message(tab, token, false);
     }
@@ -8438,6 +8459,7 @@ fn dispatch_frame_phase(pending: Pending) {
         });
     }
     let (method, params) = match phase {
+        FramePhase::CrashProbe => ("Inspector.enable", json!({})),
         FramePhase::Enable => ("Page.enable", json!({})),
         FramePhase::Attach => (
             "Target.setAutoAttach",
@@ -8556,8 +8578,8 @@ fn stop_frame_tracking(tab: i32, token: Option<u64>) {
             "The frame action was revoked during input; inspect before retrying.",
             true,
         );
-        // A reentrant ACK may already have removed the lease and completed the
-        // deferred stop. Never detach its session a second time here.
+        // The focus-disable ACK releases the lease and then runs this deferred
+        // stop. Detaching its session here as well would detach it twice.
         let _ = focus_token;
         return;
     }
@@ -8769,6 +8791,16 @@ fn frame_inventory_result(browser: &Browser, pending: &Pending, success: bool, b
         return;
     }
     let next_phase = match phase {
+        // A crashed child never answers Page.enable; skip it below.
+        FramePhase::CrashProbe => (!STATE.with(|slot| {
+            slot.borrow()
+                .frame_controls
+                .get(&pending.tab)
+                .zip(session.as_deref())
+                .and_then(|(control, session)| control.sessions.get(session))
+                .is_some_and(|entry| entry.crashed)
+        }))
+        .then_some(FramePhase::Enable),
         FramePhase::Enable => Some(FramePhase::Attach),
         FramePhase::Attach => {
             STATE.with(|slot| {
@@ -8796,51 +8828,50 @@ fn frame_inventory_result(browser: &Browser, pending: &Pending, success: bool, b
         });
         return;
     }
-    let tree = match crate::frame_sessions::normalize_frame_tree(&result, session.as_deref()) {
-        Ok(tree) => tree,
-        Err(message) => {
-            pending_error(pending, "INVALID_RESULT", message);
-            return;
-        }
-    };
-    inventory
-        .truncated
-        .set(inventory.truncated.get() || tree.truncated);
-    {
-        let mut frames = inventory.frames.borrow_mut();
-        for frame in tree.frames {
-            if frames
-                .iter()
-                .any(|previous| previous.frame_id == frame.frame_id)
-            {
-                drop(frames);
-                pending_error(
-                    pending,
-                    "FRAME_CHANGED",
-                    "A frame appeared in more than one observed tree. Inspect again after navigation settles.",
-                );
+    if *phase == FramePhase::Tree {
+        let tree = match crate::frame_sessions::normalize_frame_tree(&result, session.as_deref()) {
+            Ok(tree) => tree,
+            Err(message) => {
+                pending_error(pending, "INVALID_RESULT", message);
                 return;
             }
-            if frames.len() >= crate::frame_sessions::MAX_FRAMES {
-                inventory.truncated.set(true);
-                break;
+        };
+        inventory
+            .truncated
+            .set(inventory.truncated.get() || tree.truncated);
+        {
+            let mut frames = inventory.frames.borrow_mut();
+            for frame in tree.frames {
+                if frames
+                    .iter()
+                    .any(|previous| previous.frame_id == frame.frame_id)
+                {
+                    drop(frames);
+                    pending_error(
+                        pending,
+                        "FRAME_CHANGED",
+                        "A frame appeared in more than one observed tree. Inspect again after navigation settles.",
+                    );
+                    return;
+                }
+                if frames.len() >= crate::frame_sessions::MAX_FRAMES {
+                    inventory.truncated.set(true);
+                    break;
+                }
+                frames.push(frame);
             }
-            frames.push(frame);
         }
+        inventory.visited.borrow_mut().insert(session.clone());
     }
-    inventory.visited.borrow_mut().insert(session.clone());
     let next = STATE.with(|slot| {
         let state = slot.borrow();
         let control = state.frame_controls.get(&pending.tab)?;
-        control
-            .sessions
-            .ids()
-            .into_iter()
-            .find(|id| !inventory.visited.borrow().contains(&Some(id.clone())))
-            .map(|id| {
-                let ready = control.sessions.get(&id).is_some_and(|entry| entry.ready);
-                (id, ready)
-            })
+        // Chromium keeps a crashed child's renderer-bound commands queued
+        // until a reload. Omit its frames and report the inventory incomplete.
+        if control.sessions.has_crashed() {
+            inventory.truncated.set(true);
+        }
+        control.sessions.next_live(&inventory.visited.borrow())
     });
     if let Some((session, ready)) = next {
         if inventory.visited.borrow().len() > crate::frame_sessions::MAX_CHILD_SESSIONS {
@@ -8858,7 +8889,7 @@ fn frame_inventory_result(browser: &Browser, pending: &Pending, success: bool, b
                 phase: if ready {
                     FramePhase::Tree
                 } else {
-                    FramePhase::Enable
+                    FramePhase::CrashProbe
                 },
             },
             ..pending.clone()
@@ -10235,7 +10266,12 @@ fn frame_event(browser: &Browser, session: Option<&str>, method: &str, bytes: &[
             | "Runtime.executionContextCreated"
             | "Runtime.executionContextDestroyed"
             | "Runtime.executionContextsCleared"
-    ) {
+            | "Inspector.targetCrashed"
+            | "Inspector.detached"
+            | "Inspector.targetReloadedAfterCrash"
+    ) || (method.starts_with("Inspector.") && session.is_none())
+    {
+        // A root renderer exit keeps its RENDERER_TERMINATED path.
         return;
     }
     let tab = STATE.with(|slot| {
@@ -10290,6 +10326,7 @@ fn frame_event(browser: &Browser, session: Option<&str>, method: &str, bytes: &[
             });
         let mut rejected = false;
         let mut removed = Vec::new();
+        let mut renderer_changed = false;
         match method {
             "Runtime.executionContextCreated"
             | "Runtime.executionContextDestroyed"
@@ -10339,12 +10376,35 @@ fn frame_event(browser: &Browser, session: Option<&str>, method: &str, bytes: &[
                     .unwrap_or_default();
                 changed = !removed.is_empty();
             }
+            "Inspector.targetCrashed"
+            | "Inspector.detached"
+            | "Inspector.targetReloadedAfterCrash" => {
+                // Chromium keeps the crashed child attached and queues its
+                // renderer-bound commands until a reload; no detach follows.
+                let id = session.unwrap_or_default();
+                let crashed = method != "Inspector.targetReloadedAfterCrash";
+                control.sessions.set_crashed(id, crashed);
+                let probing = control.active_inventory.as_ref().is_some_and(|inventory| {
+                    *inventory.current.borrow() == (Some(id.to_owned()), FramePhase::CrashProbe)
+                });
+                if !probing {
+                    renderer_changed = true;
+                    changed = control.active_inventory.as_ref().is_some_and(|inventory| {
+                        inventory.current.borrow().0.as_deref() == Some(id)
+                            || inventory.visited.borrow().contains(&Some(id.to_owned()))
+                    });
+                    if crashed {
+                        // A focus lease there can never receive its disable ACK.
+                        removed = vec![id.to_owned()];
+                    }
+                }
+            }
             _ => {}
         }
         let snapshot_changed = match method {
             "Page.frameAttached" | "Page.frameDetached" | "Page.frameNavigated" => true,
             "Target.detachedFromTarget" => changed,
-            _ => false,
+            _ => renderer_changed,
         };
         if changed || rejected || snapshot_changed {
             for snapshot in &control.snapshots {
@@ -11263,10 +11323,10 @@ wrap_life_span_handler! {
         }
         fn do_close(&self, browser: Option<&mut Browser>) -> i32 {
             if let Some(browser) = browser {
-                // Teardown reports child-session detaches synchronously; a
-                // command sent from that callback re-enters the dying DevTools
-                // agent and crashes. Stop observing now; OnBeforeClose answers
-                // the tab's pending requests.
+                // DevTools envelopes, including teardown's child-session
+                // detaches, are handled in posted UI tasks. Stop observing now;
+                // tasks still queued after OnBeforeClose removes the tab and
+                // answers its pending requests fail re-validation and do nothing.
                 let devtools = STATE.with(|state| state.borrow_mut().tabs.get_mut(&browser.identifier()).and_then(|tab| tab._devtools.take()));
                 drop(devtools);
                 crate::download_permission_runtime::cancel_tab(browser.identifier());
@@ -11480,8 +11540,11 @@ wrap_request_handler! {
                     TerminationStatus::INTEGRITY_FAILURE => "integrity_failure",
                     _ => "unknown",
                 };
-                renderer_terminated(browser.identifier(),json!({"status":name,"rawStatus":status.get_raw(),"errorCode":error_code,
+                // Cleanup sends DevTools commands into the dying agent; run it
+                // after this callback, like ControlObserver envelopes.
+                let mut task = RendererTerminatedTask::new(browser.clone(), json!({"status":name,"rawStatus":status.get_raw(),"errorCode":error_code,
                     "message":error_string.map(|value|value.to_string().chars().take(240).collect::<String>()).unwrap_or_default()}));
+                post_task(ThreadId::UI, Some(&mut task));
             }
         }
         fn on_before_browse(&self,browser:Option<&mut Browser>,frame:Option<&mut Frame>,request:Option<&mut cef::Request>,user_gesture:i32,is_redirect:i32) -> i32 {
@@ -11585,30 +11648,71 @@ wrap_load_handler! {
 wrap_dev_tools_message_observer! {
     struct ControlObserver;
     impl DevToolsMessageObserver {
+        // Chromium calls these while iterating DevTools observer lists, also
+        // inside child-session teardown. A command sent from here re-enters
+        // that iteration and can free the session still on the stack. Handle
+        // each envelope in its own UI task; posting order keeps protocol order.
         fn on_dev_tools_message(&self,browser:Option<&mut Browser>,message:Option<&[u8]>) -> i32 {
-            let Some(browser) = browser else { return 1; };
-            let Some(message) = message.and_then(crate::devtools_wire::incoming_message) else { return 1; };
-            match message {
-                crate::devtools_wire::Incoming::Response { id, session, success, payload } => {
-                    if STATE.with(|state| response_matches(&state.borrow(), browser, id, session)) {
-                        devtools_result(browser, id, success, payload);
-                    }
-                }
-                crate::devtools_wire::Incoming::Event { session, method, params } => {
-                    frame_event(browser, session, method, params);
-                }
+            if let (Some(browser), Some(message)) = (browser, message) {
+                post_control_event(browser, Some(message.to_vec()));
             }
             // Consume every envelope. Typed CEF parsing drops session identity
-            // and assumes field order; the payload above borrows the raw bytes.
+            // and assumes field order.
             1
         }
         fn on_dev_tools_agent_detached(&self,browser:Option<&mut Browser>) {
             if let Some(browser) = browser {
-                let id = browser.identifier();
-                if STATE.with(|state| state.borrow().tabs.get(&id).is_some_and(|tab| same_browser(&tab.browser, &browser))) {
-                    control_detached(id);
+                post_control_event(browser, None);
+            }
+        }
+    }
+}
+
+wrap_task! {
+    // `None` reports that the DevTools agent detached.
+    struct ControlEventTask { browser: Browser, message: Option<Vec<u8>> }
+    impl Task {
+        fn execute(&self) {
+            match &self.message {
+                Some(message) => control_message(&self.browser, message),
+                None => {
+                    let id = self.browser.identifier();
+                    if STATE.with(|state| state.borrow().tabs.get(&id).is_some_and(|tab| same_browser(&tab.browser, &self.browser))) {
+                        control_detached(id);
+                    }
                 }
             }
+        }
+    }
+}
+
+fn post_control_event(browser: &Browser, message: Option<Vec<u8>>) {
+    let mut task = ControlEventTask::new(browser.clone(), message);
+    // A rejected post drops the envelope; handling it inline would re-enter.
+    post_task(ThreadId::UI, Some(&mut task));
+}
+
+fn control_message(browser: &Browser, message: &[u8]) {
+    let Some(message) = crate::devtools_wire::incoming_message(message) else {
+        return;
+    };
+    match message {
+        crate::devtools_wire::Incoming::Response {
+            id,
+            session,
+            success,
+            payload,
+        } => {
+            if STATE.with(|state| response_matches(&state.borrow(), browser, id, session)) {
+                devtools_result(browser, id, success, payload);
+            }
+        }
+        crate::devtools_wire::Incoming::Event {
+            session,
+            method,
+            params,
+        } => {
+            frame_event(browser, session, method, params);
         }
     }
 }
@@ -15073,6 +15177,62 @@ mod tests {
     }
 
     #[test]
+    fn child_renderer_crash_skips_a_probe_but_fails_an_observed_session() {
+        let attached = json!({"sessionId":"child","targetInfo":{"targetId":"t","type":"iframe"}});
+        let run = |current: (Option<String>, FramePhase), visited: bool, session: Option<&str>| {
+            clear();
+            let tab = native_blank_tab();
+            let browser = tab.browser.clone();
+            let inventory = Shared::new(FrameInventory {
+                browser: browser.clone(),
+                document_epoch: 0,
+                owner: None,
+                requested_frame: None,
+                page_read: None,
+                action: None,
+                pointer: None,
+                response: RefCell::new(None),
+                read: RefCell::new(None),
+                current: RefCell::new(current),
+                invalidated: Cell::new(false),
+                visited: RefCell::new(BTreeSet::from([None])),
+                frames: RefCell::new(Vec::new()),
+                truncated: Cell::new(false),
+            });
+            if visited {
+                inventory.visited.borrow_mut().insert(Some("child".into()));
+            }
+            STATE.with(|slot| {
+                let mut state = slot.borrow_mut();
+                state.tabs.insert(7, tab);
+                let control = state.frame_controls.entry(7).or_default();
+                control.enabled = true;
+                control.active_token = Some(1);
+                control.active_inventory = Some(inventory.clone());
+                control.sessions.attach(None, &attached);
+            });
+            frame_event(&browser, session, "Inspector.targetCrashed", b"{}");
+            let crashed = STATE.with(|slot| {
+                slot.borrow().frame_controls[&7]
+                    .sessions
+                    .get("child")
+                    .map(|entry| entry.crashed)
+            });
+            (crashed, inventory.invalidated.get())
+        };
+        // Probe: the crashed child is skipped and the inventory continues.
+        assert_eq!(run((Some("child".into()), FramePhase::CrashProbe), false, Some("child")), (Some(true), false));
+        // A pending command on, or frames from, that renderer can never finish:
+        // the inventory fails and tracking stops, clearing the registry.
+        assert_eq!(run((Some("child".into()), FramePhase::Enable), false, Some("child")), (None, true));
+        assert_eq!(run((None, FramePhase::Tree), true, Some("child")), (None, true));
+        // Unvisited: skipped by the next selection instead of failing now.
+        assert_eq!(run((None, FramePhase::Tree), false, Some("child")), (Some(true), false));
+        // The root renderer keeps its RENDERER_TERMINATED path.
+        assert_eq!(run((None, FramePhase::Tree), true, None), (Some(false), false));
+    }
+
+    #[test]
     fn superseded_preview_releases_permit_and_allows_unchanged_card_retry() {
         clear();
         let key = ("task-a".to_owned(), 7, 3);
@@ -15265,6 +15425,45 @@ mod tests {
             nav.commit("https://example.test/recovered");
             assert_eq!(nav.renderer_status(), "running");
         }
+    }
+
+    #[test]
+    fn posted_control_message_revalidates_tab_and_ignores_malformed_bytes() {
+        clear();
+        let tab = native_blank_tab();
+        let browser = tab.browser.clone();
+        let (reply, receiver) = test_reply(1);
+        let pending = Pending {
+            frame: None,
+            tab: 7,
+            epoch: tab.navigation.epoch,
+            reply,
+            step: Step::Evaluate,
+            evaluation: Evaluation::Page {
+                mutation: false,
+                evidence: None,
+            },
+        };
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.tabs.insert(7, tab);
+            state.pending.insert(42, pending.clone());
+        });
+        let message = br#"{"id":42,"result":{"result":{"value":{"ok":true}}}}"#;
+        control_message(&browser, message);
+        assert!(receiver.try_recv().unwrap().ok);
+        // A task queued before OnBeforeClose runs after the tab is gone.
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.tabs.remove(&7);
+            state.pending.insert(42, pending);
+        });
+        control_message(&browser, message);
+        assert!(receiver.try_recv().is_err());
+        control_message(&browser, b"{\"id\":42,");
+        assert!(receiver.try_recv().is_err());
+        assert!(STATE.with(|state| state.borrow().pending.contains_key(&42)));
+        clear();
     }
 
     #[test]

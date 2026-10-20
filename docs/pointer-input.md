@@ -46,6 +46,8 @@ mouseMoved의 응답이 모든 hover 효과의 완료를 보증하지 않는다.
 
 Chromium 입력의 기본 동작은 과거 합성 click과 다를 수 있다. 사용자 활성화가 필요한 팝업, 다운로드와 파일 선택은 실제 Naru에서 별도 확인해야 한다. 기존 합성 click 기반 권한 검사 결과를 이 버전의 성공 증거로 재사용하지 않는다.
 
+확인한 다운로드 동작은 다음과 같다. CLI click의 mouseDown은 Chromium 자동 다운로드 제한기에 사용자 상호작용으로 집계된다. click 한 번마다 다운로드 한 건이 허용된다. 한 번의 click에서 스크립트가 여러 다운로드를 시작하면 첫 건 뒤의 요청은 권한 승인을 기다린다. 모든 다운로드는 여전히 사람이 저장 위치를 고른 뒤에 시작한다. 2026-10-19에 사용자가 이 Chromium 동작을 유지하기로 정했다. `tests/download_permissions_smoke.py`는 이 동작 기준으로 fixture 버튼 한 번의 click에서 두 다운로드를 시작해 검사한다.
+
 모의 DOM은 위치 준비와 거절 조건을, Rust 단위 검사는 요청과 응답의 수명을 확인한다. 독립 ego Chromium의 자체 fixture 결과는 Naru CEF의 배경 입력, 네이티브 선택 보존과 실제 macOS 입력의 증거가 아니다. 준비된 `tests/native_click_smoke.py`는 hover로 메뉴가 열려도 버튼 누름과 클릭은 0회인지, 후속 read의 새 ref로 선택이 한 번만 일어나는지, 사용자 공간과 선택이 유지되는지 확인한다. 실행 전에는 통합 성공으로 기록하지 않는다. 실행 결과와 미검증 범위는 [작업 기록](work-log.md)에 구분한다.
 
 이전 frame ref 다섯 입력의 [v7 통합 빌드](../artifacts/ego-parity-v7-build.json)는 exit 0이었다. 이번 frame click·hover의 [v8 통합 빌드](../artifacts/ego-parity-v8-build.json)도 exit 0, 91.49초로 완료했고 제품 소스·Cargo 35개의 전후 해시가 일치했다. 단위·모의 DOM·앱·CEF 검사는 실행하지 않았다. source 단계 연결과 upstream 근거를 실제 cross-origin/OOPIF 포인터 성공으로 대신하지 않는다.

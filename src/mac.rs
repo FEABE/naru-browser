@@ -9,7 +9,9 @@ use objc2_app_kit::{
     NSApp, NSApplication, NSApplicationActivationPolicy, NSApplicationDidUnhideNotification,
     NSEvent, NSEventType, NSWorkspace,
 };
-use objc2_foundation::{NSNotification, NSNotificationCenter, NSString};
+use objc2_foundation::{
+    NSDictionary, NSNotification, NSNotificationCenter, NSNumber, NSString, NSUserDefaults,
+};
 use std::cell::Cell;
 
 #[derive(Default)]
@@ -90,6 +92,18 @@ pub fn setup() {
     let marker = MainThreadMarker::new().expect("App startup must run on the main thread");
     assert!(NSApp(marker).isKindOfClass(LightBrowserApplication::class()));
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+    // After an unclean exit AppKit's launch handling can run a "reopen
+    // windows" crash-history alert as a background modal loop. Chromium's
+    // quit then stops that loop instead of the main one, so the app hangs
+    // after its last tab closes. Naru restores no window state. Registered
+    // defaults are not persisted.
+    let key = NSString::from_str("ApplePersistenceIgnoreState");
+    let ignore = NSNumber::new_bool(true);
+    let ignore: &AnyObject = &ignore;
+    unsafe {
+        NSUserDefaults::standardUserDefaults()
+            .registerDefaults(&NSDictionary::from_slices(&[&*key], &[ignore]));
+    }
     // Observe this application's unhide without replacing CEF's app delegate.
     // The singleton application outlives the observer registration.
     unsafe {
@@ -99,6 +113,77 @@ pub fn setup() {
             Some(NSApplicationDidUnhideNotification),
             Some(&app),
         );
+    }
+}
+
+/// Chromium's macOS SIGTERM handler ends the session without closing CEF
+/// browsers, so cookies set just before exit are not flushed. Route SIGTERM,
+/// SIGINT and SIGHUP to the same browser close as Quit. Call after CEF
+/// initialization, which installs Chromium's handlers.
+pub fn quit_on_signals() {
+    use std::ffi::c_void;
+    #[repr(C)]
+    struct Opaque([u8; 0]);
+    unsafe extern "C" {
+        static _dispatch_source_type_signal: Opaque;
+        static _dispatch_main_q: Opaque;
+        fn dispatch_get_global_queue(identifier: isize, flags: usize) -> *const Opaque;
+        fn dispatch_source_create(
+            kind: *const Opaque,
+            handle: usize,
+            mask: usize,
+            queue: *const Opaque,
+        ) -> *mut c_void;
+        fn dispatch_set_context(object: *mut c_void, context: *mut c_void);
+        fn dispatch_source_set_event_handler_f(
+            source: *mut c_void,
+            handler: extern "C" fn(*mut c_void),
+        );
+        fn dispatch_resume(object: *mut c_void);
+        fn dispatch_async_f(
+            queue: *const Opaque,
+            context: *mut c_void,
+            work: extern "C" fn(*mut c_void),
+        );
+    }
+    extern "C" fn close(_: *mut c_void) {
+        crate::browser::close_all();
+    }
+    // Runs on a background queue, outside signal context. An unload prompt or
+    // a wedged main thread must not make termination signals ineffective. As
+    // with Chromium's handler, a second signal exits immediately.
+    extern "C" fn received(signal: *mut c_void) {
+        static SIGNALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let status = 128 + signal as i32;
+        if SIGNALLED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            unsafe { libc::_exit(status) };
+        }
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            unsafe { libc::_exit(status) };
+        });
+        unsafe { dispatch_async_f(&raw const _dispatch_main_q, std::ptr::null_mut(), close) };
+    }
+    // Replaces Chromium's handler. Unlike SIG_IGN, a handler is reset to the
+    // default in spawned helpers; the process-lifetime source still observes it.
+    extern "C" fn ignore(_: libc::c_int) {}
+    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+        unsafe {
+            let source = dispatch_source_create(
+                &raw const _dispatch_source_type_signal,
+                signal as usize,
+                0,
+                dispatch_get_global_queue(0, 0),
+            );
+            assert!(!source.is_null(), "Signal source creation failed");
+            dispatch_set_context(source, signal as usize as *mut c_void);
+            dispatch_source_set_event_handler_f(source, received);
+            dispatch_resume(source);
+            libc::signal(
+                signal,
+                ignore as extern "C" fn(libc::c_int) as libc::sighandler_t,
+            );
+        }
     }
 }
 

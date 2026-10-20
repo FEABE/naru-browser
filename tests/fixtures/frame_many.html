@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>frame many</title></head><body>
+<!-- Query: n=COUNT sibling iframes; cross=1 points them at {{CROSS}}; name=LEN adds a long iframe name; churn=1 adds/removes one frame continuously. -->
+<p>MANY_DOC_MARK</p><div id="box"></div>
+<script>
+const q = new URLSearchParams(location.search);
+const n = Number(q.get('n') || 0), base = q.get('cross') ? '{{CROSS}}' : '';
+const longName = 'N'.repeat(Number(q.get('name') || 0));
+for (let i = 0; i < n; i++) {
+  const f = document.createElement('iframe');
+  f.width = 60; f.height = 30;
+  if (longName) f.name = longName + i;
+  f.src = base + '/f/chain.html?d=0&i=' + i + (longName ? '&pad=' + longName : '');
+  document.getElementById('box').append(f);
+}
+if (q.get('churn')) {
+  let f = null;
+  setInterval(() => {
+    if (f) { f.remove(); f = null; }
+    else { f = document.createElement('iframe'); f.src = base + '/f/chain.html?d=0&churn=' + Date.now(); document.body.append(f); }
+  }, 2);
+}
+</script></body></html>

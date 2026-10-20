@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>frame chain</title></head><body>
+<!-- Query: d=REMAINING nesting depth; alt=1 alternates between this origin and {{CROSS}} at each level. -->
+<p id="m"></p><input aria-label="Chain input"><div id="box"></div>
+<script>
+const q = new URLSearchParams(location.search);
+const d = Number(q.get('d') || 0);
+document.getElementById('m').textContent = 'CHAIN_DEPTH_' + d + '_MARK';
+if (d > 0) {
+  const f = document.createElement('iframe');
+  f.width = 400; f.height = 200;
+  f.src = (q.get('alt') ? '{{CROSS}}' : '') + '/f/chain.html?d=' + (d - 1) + (q.get('alt') ? '&alt=1' : '');
+  document.getElementById('box').append(f);
+}
+</script></body></html>

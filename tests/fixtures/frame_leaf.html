@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>frame leaf</title>
+<style>body{font:14px system-ui;margin:6px}button,input,select,textarea{font:inherit;margin:2px}#cover{position:fixed;inset:0;background:rgba(255,0,0,.3);display:none}</style>
+</head><body>
+<!-- Query: name=LABEL, nest=N (same-origin nested leaves), mm=hide|move|cover|replace|nav (first mousemove on the button),
+     sels=N (N selects x 40 options), fx=sync|timer|raf (focus handler on the text input moves focus), big=1 (read limits), busy=MS (main-thread busy loop). -->
+<p id="mark"></p>
+<label>LEAF text <input id="text" value="seed-value"></label>
+<label>LEAF area <textarea id="area">area-seed</textarea></label>
+<label>LEAF other <input id="other"></label>
+<label>LEAF check <input id="check" type="checkbox"></label>
+<label>LEAF choice <select id="choice"><option value="a">Alpha</option><option value="b">Beta</option></select></label>
+<div id="editor" contenteditable="true" role="textbox" aria-label="LEAF editor" style="border:1px solid #888;min-height:1.4em">editor-seed</div>
+<button id="btn" type="button">LEAF button</button>
+<div id="host"></div>
+<p id="state"></p>
+<div id="cover"></div>
+<div id="nest"></div>
+<script>
+const q = new URLSearchParams(location.search);
+const name = q.get('name') || 'LEAF';
+const S = {click:0, down:0, up:0, move:0, over:0, shadowClick:0, keys:[], inputs:[], focus:[], clicked:[], scrolled:0};
+document.title = name + ' leaf';
+document.getElementById('mark').textContent = name + '_DOC_MARK';
+for (const el of document.querySelectorAll('label')) el.firstChild.textContent = el.firstChild.textContent.replace('LEAF', name);
+const btn = document.getElementById('btn');
+btn.textContent = name + ' button';
+document.getElementById('editor').setAttribute('aria-label', name + ' editor');
+document.getElementById('editor').addEventListener('beforeinput', e => { S.inputs.push('beforeinput:' + e.inputType); render(); });
+const render = () => { document.getElementById('state').textContent = 'STATE_' + name + ' ' + JSON.stringify(S); };
+btn.addEventListener('click', () => { S.click++; render(); });
+btn.addEventListener('mousedown', () => { S.down++; render(); });
+btn.addEventListener('mouseup', () => { S.up++; render(); });
+btn.addEventListener('mouseover', () => { S.over++; render(); });
+let moved = false;
+btn.addEventListener('mousemove', () => {
+  S.move++;
+  if (!moved && q.get('mm')) {
+    moved = true;
+    const mm = q.get('mm');
+    if (mm === 'hide') btn.style.visibility = 'hidden';
+    else if (mm === 'move') { btn.style.position = 'relative'; btn.style.left = '200px'; }
+    else if (mm === 'cover') document.getElementById('cover').style.display = 'block';
+    else if (mm === 'replace') { const b = btn.cloneNode(true); b.id = 'btn2'; btn.replaceWith(b); }
+    else if (mm === 'nav') location.href = location.pathname + '?name=' + name + '_NAVIGATED';
+  }
+  render();
+});
+document.addEventListener('click', e => { S.clicked.push(e.target.textContent.slice(0, 20)); render(); }, true);
+addEventListener('scroll', () => { S.scrolled++; render(); }, {passive: true});
+document.addEventListener('keydown', e => { S.keys.push(e.key + '@' + (e.target.id || e.target.tagName)); render(); }, true);
+document.addEventListener('input', e => { S.inputs.push((e.target.id || e.target.tagName) + '=' + (e.target.value ?? e.target.textContent)); render(); }, true);
+document.addEventListener('change', e => { S.inputs.push('change:' + e.target.id + '=' + (e.target.type === 'checkbox' ? e.target.checked : e.target.value)); render(); }, true);
+const text = document.getElementById('text');
+text.addEventListener('focus', () => {
+  S.focus.push('text');
+  const fx = q.get('fx');
+  if (fx === 'sync') document.getElementById('other').focus();
+  else if (fx === 'timer') setTimeout(() => document.getElementById('other').focus(), 0);
+  else if (fx === 'raf') requestAnimationFrame(() => document.getElementById('other').focus());
+  render();
+});
+document.getElementById('other').addEventListener('focus', () => { S.focus.push('other'); render(); });
+const root = document.getElementById('host').attachShadow({mode: 'open'});
+root.innerHTML = '<p>' + name + '_SHADOW_MARK</p><button>' + name + ' shadow button</button>';
+root.querySelector('button').addEventListener('click', () => { S.shadowClick++; render(); });
+if (q.get('big')) {
+  const box = document.createElement('div');
+  box.append('BIG_TEXT_START ' + 'y'.repeat(13000) + ' BIG_TEXT_END');
+  for (let i = 0; i < 130; i++) { const b = document.createElement('button'); b.textContent = 'Big ' + i; box.append(b); }
+  const sel = document.createElement('select'); sel.setAttribute('aria-label', 'Big options');
+  for (let i = 0; i < 300; i++) sel.add(new Option('Opt ' + i, 'o' + i));
+  document.body.prepend(sel);
+  document.body.append(box);
+}
+for (let n = 0; n < Number(q.get('sels') || 0); n++) {
+  const sel = document.createElement('select'); sel.setAttribute('aria-label', 'Many options ' + n);
+  for (let i = 0; i < 40; i++) sel.add(new Option('S' + n + ' opt ' + i, 's' + n + '-' + i));
+  document.body.append(sel);
+}
+const nest = Number(q.get('nest') || 0);
+if (nest > 0) {
+  const f = document.createElement('iframe');
+  f.src = location.pathname + '?name=' + name + 'N&nest=' + (nest - 1);
+  f.width = 520; f.height = 260; f.title = name + ' nested';
+  document.getElementById('nest').append(f);
+}
+const busy = Number(q.get('busy') || 0);
+// MessageChannel tasks are not throttled in hidden tabs, unlike setInterval.
+if (busy) { const ch = new MessageChannel(); ch.port1.onmessage = () => { const t = Date.now(); while (Date.now() - t < busy); ch.port2.postMessage(0); }; ch.port2.postMessage(0); }
+render();
+</script>
+</body></html>

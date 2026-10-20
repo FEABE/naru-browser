@@ -1,5 +1,66 @@
 # Naru 작업 기록
 
+## 2026-10-20, 현재 변경 커밋과 비공개 원격 반영
+
+사용자가 현재 작업의 커밋과 푸시를 요청했다. `FEABE/naru-browser`가 비공개 저장소임을 GitHub에서 확인했고, 대상은 기본 브랜치가 아닌 `codex/navigation-readiness`다. 원격 갱신 후 로컬에만 있는 기존 커밋 7개와 새 변경을 함께 반영하는 범위다. 이번 작업에서 제품 코드를 추가로 수정하지 않았다.
+
+커밋에는 `src/browser.rs`, `src/frame_sessions.rs`, `src/mac.rs`, `src/main.rs`의 프레임 렌더러 종료 처리, DevTools 콜백 처리 지연, 정상 종료 보완과 관련 검사 자료를 포함한다. 다운로드 권한 검사 수정, v15부터 v17까지의 E2E 러너, 프레임 fixture, 네이티브 E2E 결과와 제품 문서도 포함한다. 버전별 러너는 실행 전에 해당 `artifacts/e2e-vXX/cli` 출력 폴더를 만들어야 한다.
+
+커밋 준비 과정에서 `git diff --check`와 변경된 Python 파일 20개의 AST 구문 확인을 통과했다. 구문 확인은 테스트 실행 결과가 아니다. 단위 테스트, 모의 DOM 검사, 로컬 CEF 통합 검사, 네이티브 UI 확인, 외부 사이트 검증과 빌드는 이번 요청에서 반복하지 않았다. 이전 실행의 결과와 미확인 범위는 아래 기록과 `docs/native-e2e-2026-10-20.md`에 유지한다. 첫 로딩 중지 원인, 남은 파일 UI 흐름, IME, v17 지속 사용과 실제 로그인 등은 여전히 미완료다.
+
+`dist`, `target`, `.local-data`, `artifacts`는 Git 제외를 확인했다. 앱 바이너리, 사용자 프로필, 실행 로그와 다운로드한 검증 파일은 커밋 대상이 아니다. 이번에는 앱이나 서버를 실행하지 않았고 새 빌드 산출물도 만들지 않아 추가 정리 대상은 없다. 이전 네이티브 검증의 프로세스 종료와 프로필 정리 결과는 바로 아래에 기록돼 있다.
+
+## 2026-10-20, 기존 v17의 네이티브 사용 흐름 확인
+
+직전 커밋과 푸시는 완료된 진전이었다. 이번 goal 재개 시 실제 checkout은 HEAD `607fd69`와 기존 v17 미커밋 변경 상태여서 이전 v10 상태를 기준으로 구현을 반복하지 않았다. 제품 소스와 기존 검사 자료를 보존하고, 아직 확인하지 못한 네이티브 UI 여정을 기존 v17 앱으로 실행했다. Naru 독립 브라우저 완성과 이후 Preseller 내장 목표는 진행 중이다.
+
+Codex Computer Use에서 AppKit 접근과 입력이 가능했다. 앞선 Antigravity의 접근성 권한 문제를 이 환경의 차단 사유로 적용하지 않았다. 앱 해시 `909809680609d3fc847714f3be961bb0a3aa795d36af937ab7296ad1233e7d98`, CLI 해시 `da321cbfe2d47b48836c21fbaf9f89750c7e69cfc5efb23642c01b6f0a58a784`는 기존 v17 기록과 같았다. 별도 `.local-data/e2e-v17-native-20261020`과 이미 구현된 `NARU_MOCK_KEYCHAIN=1`을 사용했다. 키체인 재승인이나 시스템 보안 설정 변경은 요청하지 않았다. 실제 사용자 프로필의 로그인과 안정 서명 확인은 아니다.
+
+네이티브 UI에서 중앙 주소 입력, 주소창 이동, 뒤로와 앞으로, 잘못된 주소 보존, 두 번째 지연 중지, 북마크 추가와 이름 수정, 검색과 열기, 탭 생성과 닫기 및 재열기, 두 행 드래그의 선택 보존을 확인했다. 통합 검색을 왕복해도 한글 주소 초안을 유지했다. 배경 AI A와 B를 만들어도 사용자 공간과 초안은 바뀌지 않았다. 공간 카드의 중지는 A만 paused revision 2로 바꿨고, 재개 뒤 본문 직접 클릭과 입력은 revision 4로 인계했다. 읽은 값은 `human-input`이었다. 다시 재개한 뒤 클릭 없는 키 입력은 revision 6으로 인계했으며 B는 active revision 1과 읽기를 유지했다. 이전 revision은 `TASK_STALE_REVISION`으로 거절했다.
+
+실제 다운로드 저장창으로 검증 폴더에 131,072바이트 파일을 저장했고 fixture 원본 SHA-256과 일치했다. 파일 선택창으로 같은 파일을 골라 localhost 페이지에 파일명과 크기, trusted 이벤트 표시를 확인했다. 외부 업로드는 없다. A와 B를 finish한 뒤 정상 종료하고 같은 바이너리로 재실행했으며 UI에서 만든 한글 북마크의 유지와 열기를 확인했다. AI 전용 `/a`는 검증 방문 기록에 없었다. `/b`는 사용자가 먼저 방문한 주소라 AI 기록 제외의 독립 근거로 쓰지 않았다.
+
+제한과 실패 관찰도 남겼다. 첫 중지 시도는 클릭 뒤 로딩이 계속됐고 새 검색 요청이 `NAVIGATION_BUSY`로 거절된 뒤 느린 페이지가 완료됐다. 정확한 클릭 시점과 원인은 미확정이다. 중지 표시 확인과 클릭을 같은 호출로 연결한 두 번째 시도는 중지됐고 해당 경로 요청은 1회였다. Google 검색 URL 변환은 확인했지만 결과는 `/sorry/` 접근 제한으로 blocked다. 한글 typeText는 전체 문구를 입력하지 못해 붙여넣기를 사용했으며 IME 통과나 제품 결함으로 판단하지 않았다. 저장창 경로 붙여넣기도 반영되지 않아 실제 입력 필드의 setValue를 사용했다. 공간 카드 갱신 뒤 오래된 접근성 ID를 사용한 한 번의 도구 거절은 새 ID로 해결했다. 종료 로그에는 GPU adapter와 저장 패널의 파일 경로 조회 경고가 있어 빈 stderr라고 기록하지 않는다.
+
+단위 검사, 모의 DOM, 전체 CEF 회귀 묶음과 새 빌드는 실행하지 않았다. 이번 근거는 네이티브 UI, localhost fixture와 CLI 대조, 제한된 외부 검색 탐색이다. 실행 중 제품 소스와 앱 및 CLI 해시가 바뀌지 않았음을 확인했다. 과거 v17 빌드 시점 전체 소스 manifest는 찾지 못했으므로 현재 소스 전체의 빌드 대응 관계를 새로 입증한 결과로 쓰지 않는다.
+
+변경 문서는 `docs/native-e2e-2026-10-20.md`, `docs/ego-parity-e2e.md`, `docs/product-plan.md`와 이 기록이다. 실행 자료는 `artifacts/e2e-v17-native-20261020/`에 있으며 Git 제외 대상이다. 새 제품 기능이나 코드 수정은 없다. 북마크와 기록 삭제, 긴 목록 가장자리 이동, 입력 중 UI 인계 경합, 휠, 파일 권한과 재시도, Finder, 실제 IME, 최소 창, 다크 모드, v17 지속 사용과 실제 로그인은 남아 있다. 일부 여정의 확인을 전체 pass로 올리지 않았다.
+
+문서의 로컬 링크 69개에서 누락은 없었고 `git diff --check`를 통과했다. 정리 결과는 `final.json`에 기록했다. 앱 PID 50056과 재실행 54960, fixture 서버 50028과 53619가 모두 종료 코드 0으로 끝났고 해당 PID와 프로젝트 앱 프로세스가 남지 않았다. 종료 전 다운로드와 권한, 저장 대기, 생성 예약, 캡처, focus lease와 대기 요청은 0이었다. 새 검증 프로필의 Chromium 데이터 137,065,617바이트를 정리하고 북마크와 기록 JSON 1,013바이트만 남겼다. 실행 근거와 검증 파일은 보존했다. 기존 사용자 프로필과 다른 작업 자료는 변경하지 않았으며 커밋, 푸시, 배포는 하지 않았다.
+
+## 2026-10-19, v16과 v17 최종 후보 실행
+
+v16은 앱 `9b685cba41fa9d1f6c78415a0ee428bdd93cc9c9fe6f7981484be59604dc6b75`, CLI `da321cbfe2d47b48836c21fbaf9f89750c7e69cfc5efb23642c01b6f0a58a784`다. v17은 OOPIF 렌더러 종료 수정을 더한 앱 `909809680609d3fc847714f3be961bb0a3aa795d36af937ab7296ad1233e7d98`이고 CLI는 v16과 같다. 단위 테스트는 v17 소스에서 393개 통과했다. 모두 `NARU_MOCK_KEYCHAIN=1`과 별도 검증 프로필에서 실행한 로컬 CEF 통합 검사다.
+
+| 여정 | v16 | v17 |
+| --- | --- | --- |
+| 01, 04, 06, 07, 12 | 통과 | 통과. `select_smoke` 첫 실행 1회가 `TASK_STALE_REVISION`으로 실패했고 이후 7회 연속 통과했다. 원인 미확인 |
+| 05 CLI 부분 | 통과 | 통과 |
+| 08 프레임 | 5번 항목 실패. OOPIF 렌더러 종료 뒤 `frames`가 45초 TIMEOUT | 통과. v14 충돌 재현 10종 각 15회, OOPIF 렌더러 종료 4가지 방식 각 10회에서 앱 종료와 TIMEOUT 0건 |
+| 09 CLI 부분 | 통과. 권한 검사 2회 통과 | 통과 |
+| 11 공개 읽기 | 통과 | 통과. 로그인 부분은 미실행 |
+| 13 재시작 | 통과. SIGTERM 종료 뒤 쿠키 3회 유지, 마지막 탭 닫기 10회 멈춤 없음 | 통과 |
+| 14 지속 사용 | 통과. 60분 31초, 10회 오류 0, footprint 195.6MiB에서 최고 221.2MiB, 유휴 뒤 213.0MiB | 미완료. 1회차 뒤 앱 메인 프로세스가 크래시 보고서와 로그 없이 사라졌다. 같은 시간대에 다른 검증 앱도 사라졌다. 사용자가 여러 창이 떠 있어 직접 종료했다고 확인해 앱 결함이 아니다. 단독 재실행은 사용자 요청으로 시작 직후 중지했다 |
+| 02, 03, 05 UI, 09 UI, 10 | blocked. 이 세션의 상위 프로세스인 Antigravity IDE에 손쉬운 사용 권한이 반영되지 않아 `AXIsProcessTrusted`가 false다. 10번은 다크 모드 창 캡처만 실행했다 | 같은 이유로 미실행 |
+
+- 렌더러 종료 수정: Chromium은 OOPIF 렌더러가 죽어도 child session을 떼지 않고 `Inspector.targetCrashed`만 보내며, 렌더러로 가는 명령은 응답 없이 보관한다. Naru는 이 이벤트를 버려 `Page.enable`과 `Page.getFrameTree` 응답을 기다렸다. child session 준비 첫 단계에 `Inspector.enable`을 보내 이미 죽은 session을 표시하고, 표시된 session은 건너뛴 뒤 결과를 `truncated:true`로 보고한다. 관련 파일은 `src/browser.rs`, `src/frame_sessions.rs`, `docs/devtools-routing.md`다.
+- 다운로드 권한: 사용자가 Chromium 동작 유지를 선택했다. CLI click 한 번은 사용자 상호작용 한 번이며 한 클릭에서 나온 두 번째 다운로드는 권한을 기다린다.
+- 정리: 사용자 요청으로 모든 실행을 중지했다. 검증 앱, fixture 서버, `caffeinate`가 모두 종료됐고 남은 Naru 프로세스는 없다. 검증 프로필 `.local-data/e2e-v16-*`, `e2e-v17-*`은 근거로 보존한다. 커밋은 하지 않았다.
+- 근거: `artifacts/e2e-v16/`, `artifacts/e2e-v17/`. 추가한 검사는 `tests/frame_crash_smoke.py`, `tests/e2e_v16_*.py`, `tests/e2e_v17_*.py`다.
+- 남은 일: 14번 v17 재실행, 손쉬운 사용 권한 반영 뒤 네이티브 UI 여정, 11번 Google 로그인 확인, 한글 IME 사용자 수동 확인, 커밋 여부 결정.
+
+## 2026-10-19, OOPIF renderer 종료 뒤 frames 무응답 수정
+
+v16(앱 `9b685cba…`)에서 OOPIF renderer를 SIGKILL로 끝내면 그 탭의 `frames`가 45초 뒤 `TIMEOUT`이었고 두 번째 호출도 같았다. Chromium은 죽은 child session을 detach하지 않고 `Inspector.targetCrashed`만 보낸다. renderer로 가는 명령은 frame이 다시 살아날 때까지 보관한다. Naru는 이 이벤트를 무시하고 그 session에 `Page.getFrameTree`나 `Page.enable`을 보냈다. 프레임 경로에는 요청 단위 45초 deadline 외의 감시가 없어서, CLI 제한과 같은 시점에 앱이 `TIMEOUT`을 답했다. 다시 연결한 session에는 crash 알림이 오지 않아 다음 호출도 같은 자리에서 멈췄다.
+
+- 변경: child session 준비 첫 단계로 `Inspector.enable`(`FramePhase::CrashProbe`)을 보낸다. child의 `Inspector.targetCrashed`, `Inspector.detached`는 registry에 crashed를 표시하고 `Inspector.targetReloadedAfterCrash`는 해제한다. crashed session은 건너뛰고 `truncated:true`로 보고한다. 진행 중 inventory가 읽었거나 명령을 보낸 session이면 `FRAME_CHANGED`로 끝내고 추적을 정리하며, 그 session의 focus lease도 해제한다. root 이벤트는 무시해 `RENDERER_TERMINATED` 경로를 유지한다. 쓰지 않게 된 `Registry::ids`를 지웠다.
+- 관련 파일: `src/browser.rs`, `src/frame_sessions.rs`, `docs/devtools-routing.md`
+- 단위 테스트: `cargo test --locked` 393개 통과. 새 테스트는 `crashed_sessions_are_skipped_until_reloaded`, `child_renderer_crash_skips_a_probe_but_fails_an_observed_session`이다.
+- 빌드: 격리 worktree release 빌드 성공. 앱 `157118ad1cc80c61361dd5a8ad9658b4111f64be13f5b348325320e174734b15`, CLI `1fca1e52aa4fdf2d6a583ab349375d0a497c2a6fe715b11f23c2b38e5b575826`.
+- 로컬 CEF 통합 검사: 검증 프로필 `.local-data/e2e-wt-oopkill-data-1`에서 실행했다. 사전 frames 후 종료, frames 없이 종료, frames 진행 중 종료를 각 10회 반복했다. 30회 모두 종료 뒤 frames 두 번이 `ok`, root 1개, `truncated:true`였고 최대 12ms였다. 진행 중 요청은 10회 모두 `FRAME_CHANGED`였다. read, read-page, close, task finish도 모두 `ok`였고 앱은 계속 응답했다. `tests/frame_journey_smoke.py` 56개 검사와 `tests/frame_crash_smoke.py` 50개 결과가 모두 통과했다.
+- 미확인: 다른 작업 탭이 같은 renderer를 공유했을 때의 동작은 재현하지 않았다. 처리 경로는 같지만 실측은 없다.
+- 정리: 검증용 앱 프로세스와 fixture 서버를 종료했다. 다른 Naru 인스턴스는 건드리지 않았다.
+
 ## 2026-10-19, 메모리 측정의 footprint 복구와 e2e-v15 진행
 
 e2e-v14의 14번 측정에서 footprint가 모든 시점에서 비었던 원인을 확인했다. Chromium 프로세스에 `vmmap -summary`를 실행하면 종료 코드는 0이고 `Physical footprint` 값도 나오지만, stderr에 "Can't examine target process's malloc zone PartitionAlloc_…"와 "Reason: failed to resolve canonical path …" 두 줄이 찍힌다. `scripts/measure-memory.py`는 stderr가 비어 있지 않으면 모두 `footprint_warning`으로 처리했다. malloc zone 분석 실패는 커널이 보고하는 physical footprint에 영향을 주지 않으므로 이 두 줄만 허용하고 다른 stderr는 계속 경고로 처리하도록 바꿨다.
@@ -7,7 +68,52 @@ e2e-v14의 14번 측정에서 footprint가 모든 시점에서 비었던 원인�
 - 관련 파일: `scripts/measure-memory.py`, `tests/memory_report_test.py`
 - 단위 테스트: `python3 -m unittest tests.memory_report_test` 10개 통과. 허용 경고만 있을 때 값 반환, 다른 경고가 섞이면 `footprint_warning`을 확인한다.
 - 로컬 실측: 검증 프로필 `.local-data/fp-probe`에서 v14 앱을 띄워 `--footprint`로 측정했다. 프로세스 6개 모두 값이 나왔고 합계 192.8MiB였다. 측정 뒤 앱을 종료하고 프로필을 지웠다.
-- 진행 중: 14번 60분 재실행(잠자기 방지 `caffeinate`, 자식 프로세스 종류 기록), 08번 남은 항목, 13·05·09·11번의 CLI 부분을 같은 v14 바이너리에서 실행하고 있다. 결과는 끝난 뒤 이 절에 추가한다.
+
+### v14 바이너리 탐색 실행 (e2e-v15 러너)
+
+모두 앱 `877bb599…`, CLI `a47eff17…`에서 실행한 로컬 CEF 통합 검사다. 이후 코드를 고쳤으므로 최종 판정 근거가 아니라 결함 탐색 결과다.
+
+- 14번 지속 사용: `caffeinate`로 60분 24초 연속 실행했다. 10회 모두 기준으로 돌아왔고 충돌은 없었다. 자식 프로세스는 처음부터 끝까지 5개였다. footprint 합계는 191.5MiB에서 최고 213.1MiB, 15분 유휴 뒤 208.7MiB였고 열린 파일은 2회부터 190개로 고정됐다. e2e-v14의 6회 증가는 재현되지 않았다. 근거는 `artifacts/e2e-v15/j14/`.
+- 08번 프레임: 9개 문서 유형에서 7개 입력과 hover, click의 DOM 결과, 부모 숨김과 비활성, 가림, stale·위조 ref 거절, 프레임과 본문·요소·옵션 상한을 확인했다. 결함은 OOPIF 추적 뒤 메인 탐색, 같은 프로세스로 전환, OOPIF 반복 생성, 깊이 9 이상에서의 앱 종료 4종과, 연결 수 초과 뒤 누락 목록을 truncated false로 보고한 1건이다. 근거는 `artifacts/e2e-v15/j08/`, 회귀 검사로 `tests/frame_journey_smoke.py`와 `tests/fixtures/frame_*.html`을 추가했다.
+- 05번 CLI 부분: handoff 뒤 이전 revision은 `TASK_STALE_REVISION`, 진행 중이던 `wait`은 `TASK_CONTROL_LOST`, resume 뒤 옛 ref는 `STALE_REF`였고 B 작업은 계속 동작했다.
+- 11번 공개 읽기: example.com, Wikipedia, MDN에서 읽기, 스크린샷, 링크 이동을 확인했다.
+- 13번: 사용자 공간 방문만 기록되고 작업 페이지는 빠졌다. 재시작 뒤 기록과 localStorage가 유지됐고 이전 CLI 요청은 재실행되지 않았다. 북마크는 앱 종료 상태에서 파일을 직접 작성한 seeded 자료라 파일 보존만 확인했다. 결함은 SIGTERM 종료 뒤 쿠키 유실과 마지막 탭 닫기 뒤 종료되지 않는 경우 1회다.
+- 09번 CLI 부분: 작업 탭의 연속 다운로드가 권한 대기 없이 진행됐다. 기존 검사가 2회 모두 실패했다.
+- 근거는 `artifacts/e2e-v15/cli/`, 러너 스크립트는 `tests/e2e_v15_*.py`.
+
+### 결함 수정 (v15 빌드)
+
+- 프레임 추적 앱 종료: Chromium이 DevTools 관찰자를 순회하는 콜백 안에서 Naru가 응답 처리와 다음 명령 전송, `Target.setAutoAttach(false)`를 동기로 실행해 관찰자 목록을 바꿨다. 크래시 보고서 스택에 `on_dev_tools_message → devtools_result → … → send_session_command`가 남았다. `ControlObserver`의 두 콜백은 메시지를 복사해 UI 작업으로 넘기고, `control_message`가 탭과 브라우저를 다시 확인한 뒤 처리한다. 격리 빌드에서 재현 9종을 5회씩 실행해 앱 종료 0회, `observer_list` 로그 0줄이었고 연결 수 초과는 매번 `FRAME_LIMIT`이었다.
+- SIGTERM 쿠키 유실: Chromium의 macOS SIGTERM 처리는 CEF 브라우저를 닫지 않고 끝낸다. `mac::quit_on_signals`가 SIGTERM, SIGINT, SIGHUP을 Quit 메뉴와 같은 `close_all`로 보내고 10초 안에 끝나지 않으면 강제 종료한다. 격리 빌드에서 SIGTERM 3회, SIGINT와 SIGHUP 각 1회 쿠키가 유지됐고 `control.sock`이 지워졌다.
+- 마지막 탭 닫기 뒤 종료 실패: 비정상 종료 이력이 있으면 AppKit이 시작 시 창 복원 질문을 modal로 띄우고, 그 안에서 Chromium의 종료 요청이 modal loop만 끝냈다. `ApplePersistenceIgnoreState`를 등록 기본값으로 넣어 이 질문을 막고, 탭이 없을 때 `close_all`이 종료를 요청한다. 수정 후 크래시 뒤 재실행 10회와 마지막 탭 닫기 20회에서 멈춤은 없었다.
+- 연속 다운로드 권한: CLI click이 실제 Chromium 포인터 입력이라 클릭마다 사용자 상호작용으로 집계되는 정상 동작이었다. 사용자가 이 동작을 유지하기로 정했다. `tests/download_permissions_smoke.py`를 클릭 한 번에 두 요청을 보내는 방식으로 바꾸고 `docs/pointer-input.md`에 기록했다. v15 빌드에서 2회 통과했다.
+- 두 수정을 합친 v15 빌드는 앱 `4948423fe107c9e8b72ce9fad2fc62bd0c83da7ac19d053540af9557db2adb94`, CLI `edf9a74224c0bc94a7f6434a49aa2841818db73d4695c942b9cf43b45b2e6e26`이다. Fable 리뷰에서 blocker는 없었고, 두 번째 종료 신호의 즉시 종료와 렌더러 종료 콜백의 DevTools 전송 지연을 반영 결과는 아래 v16 절에 있다.
+
+### 리뷰 반영 (v16 빌드)
+
+- 두 번째 종료 신호: Chromium 처리기는 두 번째 SIGTERM, SIGINT에 바로 끝났는데 v15는 10초 감시만 기다렸다. `quit_on_signals`의 `received`가 `AtomicBool`로 두 번째 신호를 구분해 `_exit(128+신호)`로 끝낸다. 첫 신호는 기존처럼 `close_all`과 10초 감시를 쓴다.
+- 렌더러 종료 콜백: `on_render_process_terminated`가 콜백 안에서 `renderer_terminated`를 실행해 종료 중인 agent에 `Emulation.setFocusEmulationEnabled(false)`, `Runtime.disable`, `Target.setAutoAttach(false)`를 보낼 수 있었다. `RendererTerminatedTask`를 UI 작업으로 넘기고, 작업에서 탭이 남아 있고 같은 브라우저인지 다시 확인한 뒤 기존 처리를 실행한다. 콜백 안에서 미리 해야 하는 상태 변경은 없다고 판단했다. 그 사이 실행된 요청은 같은 탭의 pending으로 남으므로 작업이 `RENDERER_TERMINATED`로 답한다. 이 부분은 코드 경로로 확인했고 실측하지 않았다. 콜백은 반환값이 없고 다른 처리도 없다.
+- 주석: `do_close`의 관찰 해제 이유를 UI 작업 처리 기준으로 고쳤다. 동기 ACK를 전제로 한 주석 두 곳(`stop_frame_tracking`, `send_focus_message`)을 현재 동작 기준으로 바꿨다. 코드는 그대로다.
+- 단위 테스트 `posted_control_message_revalidates_tab_and_ignores_malformed_bytes`: 대기 요청의 응답 전달, 탭 제거 뒤 같은 메시지의 무응답, 잘린 JSON 무시를 확인한다.
+- 관련 파일: `src/mac.rs`, `src/browser.rs`
+
+| 구분 | 내용 | 결과 |
+|---|---|---|
+| 단위 테스트 | `cargo test --locked` (`.cache/bin` PATH, `CEF_PATH=.cache/cef`) | 391개 통과, 실패 0 |
+| 릴리스 번들 | `scripts/dev.sh --release --build-only` | 성공, 기존 dead_code 경고 1건. 앱 `9b685cba41fa9d1f6c78415a0ee428bdd93cc9c9fe6f7981484be59604dc6b75`, CLI `da321cbfe2d47b48836c21fbaf9f89750c7e69cfc5efb23642c01b6f0a58a784` |
+| 로컬 CEF 통합 | SIGTERM 1회, 유휴 프로필 | 0.13초에 정상 종료(rc 0), `control.sock` 제거 |
+| 로컬 CEF 통합 | 사용자 탭 `single-window.html`에서 CLI click으로 beforeunload를 켠 뒤 SIGTERM 2회 | 첫 신호 뒤 3초간 실행 유지, 두 번째 신호 뒤 0.035초에 종료(rc 143). `_exit`라 `control.sock`이 남아 수동 삭제 |
+| 로컬 CEF 통합 | 작업 탭 `check.html`에서 `frames` 뒤 탭 렌더러 `kill -9`, 3회 | 매회 앱 생존, `read`는 `RENDERER_TERMINATED`, `reload`와 `wait load` 뒤 `read` 성공. 앱 로그 `observer_list` 0줄 |
+
+- 작업 탭에서 beforeunload를 켠 첫 시도는 첫 SIGTERM 뒤 2.81초에 정상 종료됐다. 숨은 작업 탭에서 확인 창이 뜨지 않은 것으로 보이며 원인은 확인하지 않았다.
+- 탭 렌더러 식별: 탭을 열면 Chromium이 대기 렌더러를 쓰고 새 대기 렌더러를 띄워 "새 자식 프로세스"가 탭 렌더러가 아니었다. 후보를 하나씩 종료하며 `tabs`의 렌더러 상태가 `terminated`가 될 때까지 확인했다. 2회차에는 탭과 무관한 렌더러 2개를 먼저 종료했고 앱은 살아 있었다.
+- 검증 프로필 `.local-data/v16-check`, 스크립트와 로그는 세션 scratchpad에 있다. fixture 서버와 앱은 모두 종료했다. 커밋은 하지 않았다.
+
+### 크래시 보고서 정리
+
+2026-10-18부터 19일까지 `~/Library/Logs/DiagnosticReports`의 Light Browser 보고서는 26개다. 10월 19일 18시대 10개는 08번 러너가 v14에서 만난 프레임 추적 종료이고, 18시 47분 7개는 수정 전 빌드로 일부러 재현한 것이며, 18시 59분과 19시 1분 2개는 멈춤 재현을 위해 SIGSEGV를 보낸 것이다. 10월 18일 20시대 6개는 탭 닫기 충돌 재현 시간과 겹친다. 10월 18일 14시 39분 1개는 원인을 확인하지 못했다.
+
+- 정리: e2e-v15 러너와 격리 빌드 앱, fixture 서버는 모두 종료됐다. worktree `.local-data/wt-fix`, `.local-data/wt-frames`는 소스 변경을 본 트리에 합친 뒤 제거했다. 검증 프로필 `.local-data/e2e-v15-*`, `wt-*-data-*`는 근거로 보존한다.
 
 ## 2026-10-18, E2E e2e-v14 로컬 CEF 통합 실행
 

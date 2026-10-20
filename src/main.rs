@@ -71,6 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         return Err("CEF initialization failed".into());
     }
+    mac::quit_on_signals();
     light_browser::bookmark_runtime::initialize(data_dir.clone());
     light_browser::history_runtime::initialize(data_dir);
     let stopped = Arc::new(AtomicBool::new(false));

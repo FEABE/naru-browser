@@ -157,6 +157,8 @@ pub struct Session {
     pub target: String,
     pub depth: usize,
     pub ready: bool,
+    /// Its renderer died. Renderer-bound commands stay queued until a reload.
+    pub crashed: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -397,6 +399,7 @@ impl Registry {
                 target: target.to_owned(),
                 depth,
                 ready: false,
+                crashed: false,
             },
         );
         AttachOutcome::Added { id: id.to_owned() }
@@ -471,16 +474,32 @@ impl Registry {
         true
     }
 
+    pub fn set_crashed(&mut self, session: &str, crashed: bool) -> bool {
+        let Some(session) = self.sessions.get_mut(session) else {
+            return false;
+        };
+        session.crashed = crashed;
+        true
+    }
+
+    pub fn has_crashed(&self) -> bool {
+        self.sessions.values().any(|session| session.crashed)
+    }
+
+    /// The next unvisited session, in id order, that can answer its commands.
+    pub fn next_live(&self, visited: &BTreeSet<Option<String>>) -> Option<(String, bool)> {
+        self.sessions
+            .values()
+            .find(|session| !session.crashed && !visited.contains(&Some(session.id.clone())))
+            .map(|session| (session.id.clone(), session.ready))
+    }
+
     pub fn contains(&self, session: &str) -> bool {
         self.sessions.contains_key(session)
     }
 
     pub fn get(&self, session: &str) -> Option<&Session> {
         self.sessions.get(session)
-    }
-
-    pub fn ids(&self) -> Vec<String> {
-        self.sessions.keys().cloned().collect()
     }
 
     pub fn len(&self) -> usize {
@@ -514,6 +533,27 @@ mod tests {
 
     fn context_created(id: i32, unique_id: &str, frame: &str, world: &str) -> Json {
         json!({"context":{"id":id,"uniqueId":unique_id,"name":world,"auxData":{"frameId":frame,"type":"isolated","isDefault":false}}})
+    }
+
+    #[test]
+    fn crashed_sessions_are_skipped_until_reloaded() {
+        let mut registry = Registry::default();
+        registry.attach(None, &attached("a", "ta"));
+        registry.attach(None, &attached("b", "tb"));
+        registry.mark_ready("b");
+        let mut visited = BTreeSet::from([None]);
+        assert!(!registry.set_crashed("missing", true));
+        assert!(registry.set_crashed("a", true));
+        assert!(registry.has_crashed());
+        assert_eq!(registry.next_live(&visited), Some(("b".into(), true)));
+        // A duplicate attach must not hide an already reported crash.
+        assert_eq!(registry.attach(None, &attached("a", "ta")), AttachOutcome::Duplicate);
+        assert!(registry.get("a").unwrap().crashed);
+        visited.insert(Some("b".into()));
+        assert_eq!(registry.next_live(&visited), None);
+        assert!(registry.set_crashed("a", false));
+        assert!(!registry.has_crashed());
+        assert_eq!(registry.next_live(&visited), Some(("a".into(), false)));
     }
 
     #[test]
@@ -747,7 +787,7 @@ mod tests {
         registry.attach(None, &attached("other", "fo"));
         assert!(registry.detach(None, "b").is_empty());
         assert!(registry.detach(Some("other"), "b").is_empty());
-        assert_eq!(registry.ids(), ["a", "b", "c", "other"]);
+        assert_eq!(registry.len(), 4);
         assert_eq!(registry.detach(Some("a"), "b"), ["b", "c"]);
         assert!(!registry.mark_ready("b"));
         assert!(registry.contains("a"));

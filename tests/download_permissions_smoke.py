@@ -6,9 +6,11 @@ with the user space selected and no active downloads or permission requests.
 Close native downloads, search and bookmarks overlays before running this test.
 No permission is accepted and no save dialog is opened. Initial tabs are never
 navigated, adopted or closed. This checks CEF lifecycle callbacks through CLI
-clicks; it does not inspect native permission cards or Save UI. The recorded
-passing run used synthetic clicks. Chromium pointer input may change user
-activation and download permission behavior; this sequence needs a new CEF run.
+clicks; it does not inspect native permission cards or Save UI. A CLI click is
+a real Chromium pointer click and counts as one user interaction for Chromium's
+download limiter, so each click allows one download. One click on the fixture
+button "두 파일 연속 요청" starts two downloads from script: the first proceeds
+and the second must wait for permission.
 Explicit test space selection is needed to surface Chromium hidden prompts.
 This does not verify automatic permission presentation for background tasks.
 """
@@ -41,7 +43,7 @@ def poll(read, ready, message):
 def run(args):
     cli = BrowserCli(args.cli.resolve(), args.data_dir.resolve())
     report = {"ok": False,
-              "scope": "CEF permission lifecycle through Chromium CLI clicks; user activation behavior requires revalidation",
+              "scope": "CEF permission lifecycle; one Chromium CLI pointer click is one user interaction, and a second download from that click waits for permission",
               "checks": [], "receipts": {}, "spaceSelections": [],
               "notRun": ["paused user request then resume requires native fixture button"]}
     tasks = {}
@@ -140,13 +142,12 @@ def run(args):
     def queue_hidden(case, tab, task=None):
         before = state.snapshot()
         counts(0, 0, 0)
-        click(tab, "작은 파일 저장", task)
-        counts(1, 1, 0)
+        reference = click(tab, "두 파일 연속 요청", task)
+        counts(1, 1, 1)
         first = poll(state.snapshot,
                      lambda value: value["requests"]["/small.bin"] == before["requests"]["/small.bin"] + 1,
                      "The first attachment request was not observed")
-        reference = click(tab, "느린 파일 저장", task)
-        pending = counts(1, 1, 0)
+        pending = counts(1, 1, 1)
         after = state.snapshot()
         require(after["requests"]["/slow.bin"] == before["requests"]["/slow.bin"],
                 "The second attachment reached the server before permission approval")
@@ -220,7 +221,7 @@ def run(args):
         require(state.snapshot()["requests"]["/slow.bin"] == 0, "Handoff allowed a pending request")
         preserve_user()
         finish(task)
-        report["checks"].append("hidden second download waits without network or user selection change; explicit owned-space selection surfaces permission; after returning to user, handoff clears permission and save queue; old revision cannot click")
+        report["checks"].append("hidden second download waits without network or user selection change; permission is counted while hidden and stays pending after explicit owned-space selection; after returning to user, handoff clears permission and save queue; old revision cannot click")
 
         task = create_task("navigation")
         tab = open_tab(url + "&case=navigation", task)

@@ -16,7 +16,7 @@
 
 `frames TAB`과 `task run ID REV frames TAB`은 지정한 탭의 프레임 메타데이터를 조회한다. 작업 범위에서는 기존 task revision과 탭 소유권 검사를 거친다. 탭이나 공간을 선택하거나 전역 target을 가져오지 않는다. 연결 대상은 해당 Browser에서 발견된 `iframe`뿐이며 worker, 다른 페이지와 다른 작업의 탭은 등록하지 않는다.
 
-첫 조회는 루트 session에 `Page.enable` → `Target.setAutoAttach` → `Page.getFrameTree`를 순서대로 보낸다. auto-attach는 `flatten:true`, `waitForDebuggerOnStart:false`와 iframe 필터를 사용한다. 발견한 각 child에도 같은 준비를 하고 해당 session의 FrameTree를 수집한다. 준비가 끝난 연결은 다음 조회에서 재사용하며, 결과용 프레임 목록과 방문 집합은 매 요청마다 새로 만들고 요청 종료 후 해제한다.
+첫 조회는 루트 session에 `Page.enable` → `Target.setAutoAttach` → `Page.getFrameTree`를 순서대로 보낸다. auto-attach는 `flatten:true`, `waitForDebuggerOnStart:false`와 iframe 필터를 사용한다. 발견한 각 child에는 먼저 `Inspector.enable`을 보낸 뒤 같은 준비를 하고 해당 session의 FrameTree를 수집한다. 준비가 끝난 연결은 다음 조회에서 재사용하며, 결과용 프레임 목록과 방문 집합은 매 요청마다 새로 만들고 요청 종료 후 해제한다.
 
 응답에는 `tab`, `epoch`, `documentEpoch`, `frames`, `truncated`, `atomic:false`, `contentIncluded:false`가 있다. 각 프레임 항목은 `frameId`, `parentId`, `sessionId`, `url`, `name`을 담으며 루트 session은 `sessionId:null`이다. `contentIncluded:false`는 이 응답에 문서 내용이 없다는 뜻이며 DOM 접근 가능 여부를 판정한 값이 아니다. URL과 이름은 제한된 메타데이터이고 문서 본문이나 actionable ref가 아니다. 기존 `read`의 `page.frames`와 식별자 계약도 다르다.
 
@@ -60,6 +60,8 @@ bridge 실행 전 readyState/body 검사에서 확인한 문서별 `PAGE_LOADING
 수집은 원래 Browser, 메인 navigation epoch·document epoch, 탭 소유자와 상태, task scope, 활성 요청 token에 묶인다. 문서가 준비되지 않았거나 다른 페이지 명령이 진행 중이면 시작하지 않는다. CEF host 조회가 끝난 뒤에도 상태를 다시 검사하고, 응답 처리 전에 같은 검사를 수행한다. 이 검사는 배경 AI 작업 때문에 사용자의 선택이나 공간을 바꾸지 않는다.
 
 `Target.attachedToTarget`, `Target.detachedFromTarget`과 `Page.frameAttached`, `Page.frameDetached`, `Page.frameNavigated`를 현재 Browser와 등록된 부모 session에 한정해 처리한다. 이미 읽은 session이나 현재 FrameTree를 변경하는 이벤트는 수집을 무효화한다. `FrameControl.active_inventory`가 단계 사이에도 현재 session·단계와 무효화 상태를 유지하므로, 앞선 pending을 제거한 뒤 CEF host 조회에 재진입해 생긴 변화도 다음 전송 전에 확인한다. 성공과 추적 중지 때 이 수집 상태를 해제한다. detach는 부모 관계가 맞는 session과 그 자손을 제거한다. 준비 중의 정상 attach는 수집 대상에 포함하며, 같은 연결의 중복 attach로 기존 항목을 교체하지 않는다.
+
+OOPIF renderer가 죽어도 Chromium은 child session을 detach하지 않는다. 그 session에 `Inspector.targetCrashed`를 보내고, renderer로 가는 명령은 frame이 다시 살아날 때까지 응답 없이 보관한다. 그래서 child session의 `Inspector.targetCrashed`와 `Inspector.detached`를 받으면 registry 항목에 crashed 표시를 하고, `Inspector.targetReloadedAfterCrash`에서 해제한다. 브라우저가 처리하는 `Inspector.enable`은 이미 죽은 frame이면 ACK 전에 `Inspector.targetCrashed`를 보낸다. 새 child 준비 중 이 단계에서 crashed가 확인되면 Page.enable을 보내지 않는다. crashed session은 inventory에서 건너뛰므로 그 frame은 `frames`에서 빠지고 `truncated:true`가 된다. `read-frame`이 그 frame을 요청하면 기존 잘림 규칙에 따라 `FRAME_LIMIT`이다. 진행 중인 inventory가 이미 읽었거나 현재 명령을 보낸 session이 죽으면 `FRAME_CHANGED`로 끝내고 추적을 정리한다. 다음 조회는 다시 연결한 session을 같은 방식으로 확인한다. root session의 Inspector 이벤트는 처리하지 않고 기존 `RENDERER_TERMINATED` 경로를 유지한다. 근거는 고정 Chromium 156.0.8078.17 `content/browser/devtools/render_frame_devtools_agent_host.cc`의 `RenderProcessExited`, `UpdateFrameAlive`와 `protocol/inspector_handler.cc`의 `Enable`이다.
 
 본문 읽기와 입력 준비에서는 `Runtime.executionContextCreated`, `executionContextDestroyed`, `executionContextsCleared`도 추적한다. 이벤트 session과 일치하는 대상 tracker, 모든 부모 tracker와 이미 수집한 문서의 tracker에 전달하므로, 부모 여러 개가 같은 session을 쓰거나 다음 부모 검사 중 앞선 world가 바뀌어도 현재 부모 하나만 확인하지 않는다. 고정 world에 상충하는 context가 보고되거나 관찰한 context가 파괴·초기화되면 흐름을 무효화하며 다른 context로 자동 재시도하지 않는다. `uniqueContextId`는 numeric ID의 프로세스 간 재사용을 피하지만 기존 Browser·문서·소유권 검사를 대신하지 않는다.
 

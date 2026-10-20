@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>frame root</title>
+<style>body{font:14px system-ui;margin:8px}button,input,select{font:inherit;margin:2px}iframe{width:540px;height:300px;display:block}
+.wrap{position:relative;margin:4px 0}.cover{position:absolute;inset:0;background:rgba(0,0,255,.25)}</style>
+</head><body>
+<!-- Query: same=, xo= (same-site cross-origin {{XO}}), cross=, shadow= leaf query strings (empty value omits the frame); geo=box|rotate|skew|persp|tall;
+     slow=1|same adds a never-finishing /slow frame; act=OP:TARGET:DELAY_MS applies one mutation automatically. Cross origin is {{CROSS}}. -->
+<h1>ROOT_DOC_MARK</h1>
+<div id="rhost"></div>
+<label>Root text <input id="rtext" value="root-seed"></label>
+<label>Root check <input id="rcheck" type="checkbox"></label>
+<label>Root choice <select id="rchoice"><option value="a">A</option><option value="b">B</option></select></label>
+<button id="rbtn" type="button">Root button</button>
+<p id="rstate"></p>
+<div id="controls"></div>
+<div id="frames"></div>
+<script>
+const q = new URLSearchParams(location.search);
+const CROSS = '{{CROSS}}', XO = '{{XO}}';
+const R = {click:0, keys:[], inputs:[]};
+const render = () => { document.getElementById('rstate').textContent = 'STATE_ROOT ' + JSON.stringify(R); };
+document.getElementById('rbtn').addEventListener('click', () => { R.click++; render(); });
+document.addEventListener('keydown', e => { R.keys.push(e.key + '@' + (e.target.id || e.target.tagName)); render(); }, true);
+document.addEventListener('input', e => { R.inputs.push(e.target.id + '=' + e.target.value); render(); }, true);
+document.addEventListener('change', e => { R.inputs.push('change:' + e.target.id + '=' + (e.target.type === 'checkbox' ? e.target.checked : e.target.value)); render(); }, true);
+const rs = document.getElementById('rhost').attachShadow({mode: 'open'});
+rs.innerHTML = '<p>ROOT_SHADOW_MARK</p><div id="sframe"></div>';
+const geo = q.get('geo');
+const wraps = {};
+function addFrame(id, src, parent) {
+  const wrap = document.createElement('div');
+  wrap.className = 'wrap'; wrap.id = 'wrap-' + id; wrap.style.position = 'relative'; // inline: document CSS does not reach shadow roots
+  const f = document.createElement('iframe');
+  f.id = 'f-' + id; f.title = id + ' frame'; f.src = src;
+  if (geo === 'box') { f.style.border = '9px solid #888'; f.style.padding = '7px'; wrap.style.transform = 'scale(0.8)'; wrap.style.transformOrigin = '0 0'; wrap.style.zoom = '1.25'; }
+  if (geo === 'rotate') wrap.style.transform = 'rotate(4deg)';
+  if (geo === 'skew') wrap.style.transform = 'skewX(8deg)';
+  if (geo === 'persp') { wrap.style.transform = 'perspective(400px) rotateY(10deg)'; }
+  if (geo === 'tall') { f.style.height = '200px'; }
+  wrap.append(f); parent.append(wrap); wraps[id] = wrap;
+}
+for (const [id, base] of [['same', ''], ['xo', XO], ['cross', CROSS]]) {
+  if (q.has(id) && q.get(id) === '') continue;
+  addFrame(id, base + '/f/leaf.html?' + (q.get(id) || 'name=' + id.toUpperCase() + '&nest=1'), document.getElementById('frames'));
+}
+if (q.get('slow')) { const f = document.createElement('iframe'); f.title = 'slow frame'; f.src = (q.get('slow') === 'same' ? '' : CROSS) + '/slow'; document.getElementById('frames').append(f); }
+if (q.get('shadow') !== null && q.get('shadow') !== '') addFrame('shadow', CROSS + '/f/leaf.html?' + q.get('shadow'), rs.getElementById('sframe'));
+function apply(op, id) {
+  const wrap = wraps[id]; if (!wrap) return;
+  const f = wrap.querySelector('iframe');
+  if (op === 'hide') f.hidden = true;
+  else if (op === 'display') f.style.display = 'none';
+  else if (op === 'inert') f.inert = true;
+  else if (op === 'remove') f.remove();
+  else if (op === 'swap') f.src = location.origin + '/f/leaf.html?name=SWAPPED';
+  else if (op === 'oop') f.src = CROSS + '/f/leaf.html?name=OOP';
+  else if (op === 'navigate') f.src = f.src.replace(/name=([A-Z]+)/, 'name=$1NAV');
+  else if (op === 'cover') { const c = document.createElement('div'); c.className = 'cover'; c.style.cssText = 'position:absolute;inset:0;background:rgba(0,0,255,.25)'; wrap.append(c); }
+  else if (op === 'wraphide') wrap.style.display = 'none';
+  else if (op === 'wrapinert') wrap.inert = true;
+  else if (op === 'visibility') f.style.visibility = 'hidden';
+  else if (op === 'ariahidden') wrap.setAttribute('aria-hidden', 'true');
+  else if (op === 'restore') {
+    f.hidden = false; f.inert = false; f.style.display = ''; f.style.visibility = ''; wrap.style.display = ''; wrap.inert = false;
+    wrap.removeAttribute('aria-hidden'); for (const c of wrap.querySelectorAll('.cover')) c.remove();
+  }
+  R.inputs.push('applied:' + op + ':' + id); render();
+}
+for (const id of Object.keys(wraps)) for (const op of ['hide', 'display', 'inert', 'remove', 'navigate', 'cover', 'wraphide', 'wrapinert', 'visibility', 'ariahidden', 'restore', 'swap', 'oop']) {
+  const b = document.createElement('button'); b.type = 'button'; b.textContent = op + ' ' + id;
+  b.addEventListener('click', () => apply(op, id)); document.getElementById('controls').append(b);
+}
+if (q.get('act')) { const [op, id, delay] = q.get('act').split(':'); setTimeout(() => apply(op, id), Number(delay || 0)); }
+render();
+</script>
+</body></html>
