@@ -117,6 +117,7 @@ def create_app(path, source_binary, executable_name, identifier, display_name, h
         "NSSupportsAutomaticGraphicsSwitching": True,
         "NSCameraUsageDescription": "Allow websites to use the camera with your permission.",
         "NSMicrophoneUsageDescription": "Allow websites to use the microphone with your permission.",
+        "NSLocationUsageDescription": "Allow websites to request your location with your permission.",
         "NSBluetoothAlwaysUsageDescription": "Allow websites to use Bluetooth with your permission.",
         "NSWebBrowserPublicKeyCredentialUsageDescription": "Use passkeys to sign in to websites.",
     }

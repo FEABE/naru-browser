@@ -1044,6 +1044,65 @@ struct DownloadPanel {
     rows: Vec<DownloadRow>,
 }
 
+struct SitePermissionRow {
+    token: u64,
+    surface: Retained<SurfaceView>,
+    title: Retained<NSTextField>,
+    origin: Retained<NSTextField>,
+    source: Retained<NSTextField>,
+    scope_hint: Retained<NSTextField>,
+    allow: Retained<NSButton>,
+    cancel: Retained<NSButton>,
+    reveal: Retained<NSButton>,
+}
+
+type SitePermissionSiteView = (
+    crate::browser::CurrentPageTarget,
+    Result<crate::site_permission_runtime::SiteSnapshot, String>,
+);
+
+enum SitePermissionSiteQuery {
+    Skipped,
+    Ready(Option<SitePermissionSiteView>),
+}
+
+impl SitePermissionSiteQuery {
+    fn for_target(
+        self,
+        expected: Option<&crate::browser::CurrentPageTarget>,
+        shown: Option<&crate::browser::CurrentPageTarget>,
+    ) -> Self {
+        match self {
+            Self::Skipped if expected == shown => Self::Skipped,
+            Self::Skipped => Self::Ready(None),
+            Self::Ready(value) => Self::Ready(value.filter(|(page, _)| Some(page) == expected)),
+        }
+    }
+}
+
+struct SitePermissionPanel {
+    open: bool,
+    notice: Option<String>,
+    surface: Retained<SurfaceView>,
+    title: Retained<NSTextField>,
+    hint: Retained<NSTextField>,
+    close: Retained<NSButton>,
+    scroll: Retained<NSScrollView>,
+    document: Retained<TopDownView>,
+    site_surface: Retained<SurfaceView>,
+    site_title: Retained<NSTextField>,
+    site_origin: Retained<NSTextField>,
+    site_status: Retained<NSTextField>,
+    site_scope: Retained<NSTextField>,
+    site_hint: Retained<NSTextField>,
+    reset: Retained<NSButton>,
+    current: Option<(
+        crate::browser::CurrentPageTarget,
+        crate::site_permission_runtime::SiteSnapshot,
+    )>,
+    rows: Vec<SitePermissionRow>,
+}
+
 struct Shell {
     window: Retained<NSWindow>,
     root: Retained<SurfaceView>,
@@ -1074,6 +1133,11 @@ struct Shell {
     bookmarks: BookmarkPanel,
     downloads_button: Retained<NSButton>,
     downloads: DownloadPanel,
+    site_permissions_button: Retained<NSButton>,
+    site_permissions: SitePermissionPanel,
+    site_permission_count: usize,
+    site_permission_notice: Option<String>,
+    site_permission_media: Option<String>,
     download_activity: (usize, usize),
     download_permission_count: usize,
     file_selection_count: usize,
@@ -1143,6 +1207,7 @@ thread_local! {
     static FOCUS_TRACE_EVENT: Cell<Option<u32>> = const { Cell::new(None) };
     static FOCUS_TRACE_SAMPLING: Cell<bool> = const { Cell::new(false) };
     static DOWNLOAD_SITE_QUERYING: Cell<bool> = const { Cell::new(false) };
+    static SITE_PERMISSION_QUERYING: Cell<bool> = const { Cell::new(false) };
     static TAB_AUDIO_QUERYING: Cell<bool> = const { Cell::new(false) };
     static TAB_AUDIO_MENU: RefCell<Option<TabAudioMenu>> = const { RefCell::new(None) };
     static TAB_ORDER_MENU: RefCell<[Option<TabOrderMenu>; 2]> = const { RefCell::new([None, None]) };
@@ -1864,6 +1929,18 @@ define_class!(
         fn show_downloads(&self, _sender: Option<&AnyObject>) { open_downloads(); }
         #[unsafe(method(closeDownloads:))]
         fn close_downloads(&self, _sender: Option<&AnyObject>) { close_downloads(true); }
+        #[unsafe(method(showSitePermissions:))]
+        fn show_site_permissions(&self, _sender: Option<&AnyObject>) { open_site_permissions(); }
+        #[unsafe(method(closeSitePermissions:))]
+        fn close_site_permissions(&self, _sender: Option<&AnyObject>) { close_site_permissions(true); }
+        #[unsafe(method(allowSitePermission:))]
+        fn allow_site_permission(&self, sender: &NSButton) { site_permission_action(sender, SitePermissionAction::Allow); }
+        #[unsafe(method(cancelSitePermission:))]
+        fn cancel_site_permission(&self, sender: &NSButton) { site_permission_action(sender, SitePermissionAction::Cancel); }
+        #[unsafe(method(revealSitePermissionSource:))]
+        fn reveal_site_permission_source(&self, sender: &NSButton) { site_permission_action(sender, SitePermissionAction::Reveal); }
+        #[unsafe(method(resetCurrentSitePermissions:))]
+        fn reset_current_site_permissions(&self, sender: &NSButton) { reset_site_permissions(sender); }
         #[unsafe(method(chooseDownloadPath:))]
         fn choose_download_path(&self, sender: &NSButton) { download_row_action(sender, true); }
         #[unsafe(method(cancelDownload:))]
@@ -2677,15 +2754,39 @@ impl DownloadPanel {
                 let title = label(&surface, "파일 선택 요청", 14.0, true, marker);
                 let source = label(&surface, "", 11.5, false, marker);
                 let detail = label(&surface, "", 11.5, false, marker);
-                let delivery_hint = label(&surface, "선택한 파일을 요청 페이지에 전달합니다.", 11.5, false, marker);
-                let upload_hint = label(&surface, "사이트에서 바로 업로드할 수 있습니다.", 11.5, false, marker);
+                let delivery_hint = label(
+                    &surface,
+                    "선택한 파일을 요청 페이지에 전달합니다.",
+                    11.5,
+                    false,
+                    marker,
+                );
+                let upload_hint = label(
+                    &surface,
+                    "사이트에서 바로 업로드할 수 있습니다.",
+                    11.5,
+                    false,
+                    marker,
+                );
                 for hint in [&source, &detail, &delivery_hint, &upload_hint] {
                     hint.setTextColor(Some(&NSColor::secondaryLabelColor()));
                 }
-                let choose = button(&surface, "파일 선택", target, sel!(chooseRequestedFiles:),
-                    "파일을 직접 선택하여 요청 페이지에 전달", marker);
-                let cancel = button(&surface, "요청 취소", target, sel!(cancelFileSelection:),
-                    "이번 파일 선택 요청 취소", marker);
+                let choose = button(
+                    &surface,
+                    "파일 선택",
+                    target,
+                    sel!(chooseRequestedFiles:),
+                    "파일을 직접 선택하여 요청 페이지에 전달",
+                    marker,
+                );
+                let cancel = button(
+                    &surface,
+                    "요청 취소",
+                    target,
+                    sel!(cancelFileSelection:),
+                    "이번 파일 선택 요청 취소",
+                    marker,
+                );
                 FileSelectionRow {
                     token: item.token, choosing: item.choosing, surface, title, source, detail,
                     delivery_hint, upload_hint, choose, cancel,
@@ -2920,8 +3021,12 @@ impl DownloadPanel {
             row.cancel.setFrame(rect((width - 116.0).max(122.0), 10.0, 102.0, 30.0));
         }
         for (index, row) in self.permissions.iter().enumerate() {
-            row.surface
-                .setFrame(rect(0.0, selection_height + site_height + index as f64 * 180.0, width, 172.0));
+            row.surface.setFrame(rect(
+                0.0,
+                selection_height + site_height + index as f64 * 180.0,
+                width,
+                172.0,
+            ));
             let text_width = (width - 28.0).max(1.0);
             // Card surfaces are unflipped: y = card height - top - control height.
             row.title.setFrame(rect(14.0, 141.0, text_width, 21.0));
@@ -2952,6 +3057,348 @@ impl DownloadPanel {
             row.cancel.setFrame(cancel);
             row.reveal.setFrame(reveal);
         }
+    }
+}
+
+impl SitePermissionPanel {
+    fn new(parent: &NSView, target: &ShellTarget, marker: MainThreadMarker) -> Self {
+        let surface = surface_child(parent, SurfaceKind::Window, 0.0, true, marker);
+        surface.setHidden(true);
+        let title = label(&surface, "사이트 권한", 24.0, true, marker);
+        let hint = label(
+            &surface,
+            "대기 중인 권한 요청이 없습니다.",
+            12.0,
+            false,
+            marker,
+        );
+        site_permission_wrap(&hint, 3);
+        hint.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        let close = button(
+            &surface,
+            "닫기",
+            target,
+            sel!(closeSitePermissions:),
+            "사이트 권한 닫기 (Esc), 대기 요청은 유지됨",
+            marker,
+        );
+        let document = TopDownView::new(marker);
+        let scroll = scroll_view(&surface, &document, marker);
+        let site_surface = surface_child(&document, SurfaceKind::Card, 9.0, true, marker);
+        let site_title = label(
+            &site_surface,
+            "현재 사이트의 저장된 권한",
+            14.0,
+            true,
+            marker,
+        );
+        let site_origin = label(
+            &site_surface,
+            "현재 웹페이지가 없습니다",
+            12.0,
+            false,
+            marker,
+        );
+        let site_status = label(&site_surface, "", 11.5, false, marker);
+        let site_scope = label(
+            &site_surface,
+            "모든 공간의 같은 사이트에 적용됩니다.",
+            11.5,
+            false,
+            marker,
+        );
+        let site_hint = label(
+            &site_surface,
+            "초기화하면 이 사이트의 대기 요청을 취소합니다. 열린 페이지는 다시 열어 확인하세요.",
+            11.5,
+            false,
+            marker,
+        );
+        site_permission_wrap(&site_hint, 2);
+        for label in [&site_status, &site_scope, &site_hint] {
+            label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        }
+        let reset = button(
+            &site_surface,
+            "저장된 설정 초기화",
+            target,
+            sel!(resetCurrentSitePermissions:),
+            "현재 사이트의 저장된 위치와 알림 권한 초기화",
+            marker,
+        );
+        reset.setEnabled(false);
+        Self {
+            open: false,
+            notice: None,
+            surface,
+            title,
+            hint,
+            close,
+            scroll,
+            document,
+            site_surface,
+            site_title,
+            site_origin,
+            site_status,
+            site_scope,
+            site_hint,
+            reset,
+            current: None,
+            rows: Vec::new(),
+        }
+    }
+
+    fn clear_rows(&mut self) {
+        self.current = None;
+        self.reset.setEnabled(false);
+        for row in self.rows.drain(..) {
+            row.surface.removeFromSuperview();
+        }
+    }
+
+    fn render(
+        &mut self,
+        requests: Vec<crate::site_permission_runtime::Row>,
+        notice: Option<String>,
+        media: Option<String>,
+        query: SitePermissionSiteQuery,
+        target: &ShellTarget,
+        window: &NSWindow,
+    ) -> bool {
+        let responder = window.firstResponder();
+        let mut focus_removed = false;
+        if let SitePermissionSiteQuery::Ready(value) = query {
+            let (current, origin, status) = match value {
+                Some((page, Ok(snapshot))) => {
+                    let status = format!(
+                        "위치: {}    알림: {}",
+                        snapshot.geolocation.label(),
+                        snapshot.notifications.label()
+                    );
+                    let origin = snapshot.origin.clone();
+                    (Some((page, snapshot)), origin, status)
+                }
+                Some((_, Err(error))) => {
+                    (None, "사이트 설정을 확인할 수 없습니다".to_owned(), error)
+                }
+                None => (
+                    None,
+                    "현재 웹페이지가 없습니다".to_owned(),
+                    "HTTP(S) 페이지를 연 뒤 확인할 수 있습니다.".to_owned(),
+                ),
+            };
+            let changed = self
+                .current
+                .as_ref()
+                .map(|(page, site)| (page, &site.origin))
+                != current.as_ref().map(|(page, site)| (page, &site.origin));
+            let enabled = current
+                .as_ref()
+                .is_some_and(|(_, snapshot)| snapshot.can_reset());
+            let reset_view: &NSView = &self.reset;
+            focus_removed |= (changed || !enabled)
+                && responder
+                    .as_ref()
+                    .and_then(|responder| responder.downcast_ref::<NSView>())
+                    .is_some_and(|view| std::ptr::eq(view, reset_view));
+            site_permission_label(&self.site_origin, &origin);
+            site_permission_label(&self.site_status, &status);
+            let help = NSString::from_str(&format!(
+                "{origin}, 저장된 위치와 알림 설정 초기화, 모든 공간에 적용, 대기 요청 취소, 열린 페이지는 다시 열어 확인"
+            ));
+            self.reset.setToolTip(Some(&help));
+            unsafe {
+                let _: () = msg_send![&*self.reset, setAccessibilityLabel: &*help];
+            }
+            self.reset.setEnabled(enabled);
+            self.current = current;
+        }
+        let summary = if requests.is_empty() {
+            "대기 중인 권한 요청이 없습니다.".to_owned()
+        } else {
+            format!(
+                "권한 요청 {}개. 출처와 적용 범위를 확인한 뒤 직접 선택하세요.",
+                requests.len().min(4)
+            )
+        };
+        let summary = media
+            .as_deref()
+            .map(|media| format!("{summary} {media}"))
+            .unwrap_or(summary);
+        let summary = self
+            .notice
+            .as_deref()
+            .or(notice.as_deref())
+            .map(|notice| format!("{summary} {notice}"))
+            .unwrap_or(summary);
+        site_permission_label(&self.hint, &summary);
+        self.hint.setStringValue(&NSString::from_str(&summary));
+        let marker = MainThreadMarker::new().expect("Browser shell requires the main thread");
+        let mut previous = std::mem::take(&mut self.rows);
+        for item in requests.into_iter().take(4) {
+            let row = if let Some(index) = previous.iter().position(|row| row.token == item.token) {
+                previous.remove(index)
+            } else {
+                let surface = surface_child(&self.document, SurfaceKind::Card, 9.0, true, marker);
+                let title = label(&surface, "", 14.0, true, marker);
+                let origin = label(&surface, "", 12.0, false, marker);
+                let source = label(&surface, "", 11.5, false, marker);
+                let scope_hint = label(&surface, "", 11.5, false, marker);
+                site_permission_wrap(&scope_hint, 3);
+                for label in [&source, &scope_hint] {
+                    label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+                }
+                let allow = button(
+                    &surface,
+                    "허용",
+                    target,
+                    sel!(allowSitePermission:),
+                    "표시된 사이트 권한 요청 허용",
+                    marker,
+                );
+                allow.setContentTintColor(Some(&accent_color()));
+                let cancel = button(
+                    &surface,
+                    "이번 요청 취소",
+                    target,
+                    sel!(cancelSitePermission:),
+                    "이번 사이트 권한 요청 취소",
+                    marker,
+                );
+                let reveal = button(
+                    &surface,
+                    "요청 탭 보기",
+                    target,
+                    sel!(revealSitePermissionSource:),
+                    "권한을 요청한 탭 보기, AI 제어권 유지",
+                    marker,
+                );
+                SitePermissionRow {
+                    token: item.token,
+                    surface,
+                    title,
+                    origin,
+                    source,
+                    scope_hint,
+                    allow,
+                    cancel,
+                    reveal,
+                }
+            };
+            let source = format!("{}, 요청 탭 {}", item.source, item.tab);
+            for (label, value) in [
+                (&row.title, format!("{} 사용 요청", item.permissions)),
+                (&row.origin, item.origin.clone()),
+                (&row.source, source.clone()),
+                (&row.scope_hint, item.scope_hint.clone()),
+            ] {
+                site_permission_label(label, &value);
+            }
+            row.scope_hint
+                .setStringValue(&NSString::from_str(&item.scope_hint));
+            row.allow.setTitle(&NSString::from_str(&item.allow_label));
+            for (control, action) in [
+                (&row.allow, item.allow_label.as_str()),
+                (&row.cancel, "이번 요청 취소"),
+                (&row.reveal, "요청 탭 보기, AI 제어권 유지"),
+            ] {
+                let help = NSString::from_str(&format!(
+                    "{}, {}, {}, {}, {action}",
+                    item.origin, source, item.permissions, item.scope_hint
+                ));
+                control.setToolTip(Some(&help));
+                unsafe {
+                    let _: () = msg_send![&**control, setAccessibilityLabel: &*help];
+                }
+            }
+            self.rows.push(row);
+        }
+        focus_removed |= responder
+            .as_ref()
+            .and_then(|responder| responder.downcast_ref::<NSView>())
+            .is_some_and(|responder| {
+                previous
+                    .iter()
+                    .any(|row| responder.isDescendantOf(&row.surface))
+            });
+        for row in previous {
+            row.surface.removeFromSuperview();
+        }
+        focus_removed
+    }
+
+    fn layout(&self, size: NSSize) {
+        let width = (size.width - 72.0).max(1.0);
+        self.surface
+            .setFrame(rect(0.0, 0.0, size.width, size.height));
+        self.title.setFrame(rect(
+            36.0,
+            size.height - 66.0,
+            (width - 80.0).max(1.0),
+            32.0,
+        ));
+        self.close
+            .setFrame(rect(size.width - 94.0, size.height - 62.0, 58.0, 30.0));
+        self.hint
+            .setFrame(rect(36.0, size.height - 132.0, width, 54.0));
+        let height = (size.height - 169.0).max(1.0);
+        self.scroll.setFrame(rect(36.0, 24.0, width, height));
+        let width = self.scroll.contentSize().width.max(1.0);
+        let narrow = width < 440.0;
+        let row_height = if narrow { 248.0 } else { 214.0 };
+        let requests_height = self.rows.len() as f64 * row_height;
+        self.document
+            .setFrame(rect(0.0, 0.0, width, (requests_height + 210.0).max(height)));
+        let text_width = (width - 28.0).max(1.0);
+        for (index, row) in self.rows.iter().enumerate() {
+            let card_height = row_height - 8.0;
+            row.surface
+                .setFrame(rect(0.0, index as f64 * row_height, width, card_height));
+            for (label, top, height) in [
+                (&row.title, 10.0, 21.0),
+                (&row.origin, 35.0, 18.0),
+                (&row.source, 59.0, 18.0),
+                (&row.scope_hint, 83.0, 54.0),
+            ] {
+                label.setFrame(rect(14.0, card_height - top - height, text_width, height));
+            }
+            row.reveal
+                .setFrame(rect(14.0, if narrow { 44.0 } else { 10.0 }, 124.0, 30.0));
+            row.allow
+                .setFrame(rect((width - 264.0).max(14.0), 10.0, 124.0, 30.0));
+            row.cancel
+                .setFrame(rect((width - 130.0).max(148.0), 10.0, 116.0, 30.0));
+        }
+        self.site_surface
+            .setFrame(rect(0.0, requests_height, width, 202.0));
+        for (label, top, height) in [
+            (&self.site_title, 10.0, 21.0),
+            (&self.site_origin, 35.0, 18.0),
+            (&self.site_status, 59.0, 18.0),
+            (&self.site_scope, 83.0, 18.0),
+            (&self.site_hint, 107.0, 36.0),
+        ] {
+            label.setFrame(rect(14.0, 202.0 - top - height, text_width, height));
+        }
+        self.reset
+            .setFrame(rect((width - 170.0).max(14.0), 10.0, 156.0, 30.0));
+    }
+}
+
+fn site_permission_label(label: &NSTextField, text: &str) {
+    label.setStringValue(&NSString::from_str(&compact(text, 160)));
+    let full = NSString::from_str(text);
+    label.setToolTip(Some(&full));
+    unsafe {
+        let _: () = msg_send![label, setAccessibilityHelp: &*full];
+    }
+}
+
+fn site_permission_wrap(label: &NSTextField, lines: isize) {
+    unsafe {
+        let _: () = msg_send![label, setUsesSingleLineMode: false];
+        let _: () = msg_send![label, setLineBreakMode: 0isize];
+        let _: () = msg_send![label, setMaximumNumberOfLines: lines];
     }
 }
 
@@ -2992,7 +3439,10 @@ fn bookmark_field(
 
 impl Shell {
     fn overlay_is_open(&self) -> bool {
-        self.search.open || self.bookmarks.state.open || self.downloads.open
+        self.search.open
+            || self.bookmarks.state.open
+            || self.downloads.open
+            || self.site_permissions.open
     }
 
     fn rebuild_search_results(
@@ -3437,6 +3887,14 @@ impl Shell {
             "다운로드 목록",
             marker,
         );
+        let site_permissions_button = button(
+            &sidebar,
+            "사이트 권한",
+            &target,
+            sel!(showSitePermissions:),
+            "사이트 권한 설정과 대기 요청",
+            marker,
+        );
         let sidebar_separator = surface_child(&sidebar, SurfaceKind::Separator, 0.0, false, marker);
         let space_label = label(&sidebar, "내 공간", 11.0, true, marker);
         space_label.setTextColor(Some(&NSColor::secondaryLabelColor()));
@@ -3509,6 +3967,7 @@ impl Shell {
             &search_button,
             &bookmarks_button,
             &downloads_button,
+            &site_permissions_button,
         ] {
             control.setFont(Some(&NSFont::systemFontOfSize(13.0)));
             control.setContentTintColor(Some(&NSColor::labelColor()));
@@ -3629,6 +4088,7 @@ impl Shell {
         let search_scroll = scroll_view(&search_surface, &search_document, marker);
         let bookmarks = BookmarkPanel::new(&root, &target, marker);
         let downloads = DownloadPanel::new(&root, &target, marker);
+        let site_permissions = SitePermissionPanel::new(&root, &target, marker);
         let find = FindBar::new(&root, &target, marker);
         let recovery = PageRecoveryBar::new(&root, &target, marker);
         let start_page = StartPage::new(&root, &target, marker);
@@ -3665,6 +4125,11 @@ impl Shell {
             bookmarks,
             downloads_button,
             downloads,
+            site_permissions_button,
+            site_permissions,
+            site_permission_count: 0,
+            site_permission_notice: None,
+            site_permission_media: None,
             download_activity: (0, 0),
             download_permission_count: 0,
             file_selection_count: 0,
@@ -4035,16 +4500,66 @@ impl Shell {
         };
         self.downloads_button
             .setContentTintColor(Some(&downloads_color));
+        let permission_count = self.site_permission_count;
+        let permission_title = if self.sidebar_collapsed {
+            if permission_count > 0 {
+                permission_count.to_string()
+            } else if self.site_permission_media.is_some() {
+                "활성".to_owned()
+            } else if self.site_permission_notice.is_some() {
+                "!".to_owned()
+            } else {
+                String::new()
+            }
+        } else if permission_count > 0 {
+            format!("사이트 권한 {permission_count}")
+        } else if self.site_permission_media.is_some() {
+            "미디어 활성".to_owned()
+        } else if self.site_permission_notice.is_some() {
+            "권한 안내".to_owned()
+        } else {
+            "사이트 권한".to_owned()
+        };
+        let permission_hint = format!(
+            "사이트 권한 설정, 승인 대기 {permission_count}개{}{}",
+            self.site_permission_notice
+                .as_deref()
+                .map(|notice| format!(", {notice}"))
+                .unwrap_or_default(),
+            self.site_permission_media
+                .as_deref()
+                .map(|media| format!(", {media}"))
+                .unwrap_or_default()
+        );
+        set_symbol(
+            &self.site_permissions_button,
+            "hand.raised",
+            &permission_title,
+            "사이트 권한",
+            &permission_hint,
+        );
+        let permission_color = if (permission_count > 0
+            || self.site_permission_media.is_some()
+            || self.site_permission_notice.is_some())
+            && !self.site_permissions.open
+        {
+            accent_color()
+        } else {
+            NSColor::secondaryLabelColor()
+        };
+        self.site_permissions_button.setContentTintColor(Some(&permission_color));
         if self.sidebar_collapsed {
             align_center(&self.spaces_button);
             align_center(&self.search_button);
             align_center(&self.bookmarks_button);
             align_center(&self.downloads_button);
+            align_center(&self.site_permissions_button);
         } else {
             align_left(&self.spaces_button);
             align_left(&self.search_button);
             align_left(&self.bookmarks_button);
             align_left(&self.downloads_button);
+            align_left(&self.site_permissions_button);
         }
         align_center(&self.new_tab);
         let title = if self.overview {
@@ -4602,6 +5117,357 @@ fn downloads_are_open() -> bool {
     })
 }
 
+fn site_permissions_are_open() -> bool {
+    SHELL.with(|slot| {
+        slot.try_borrow().ok().is_some_and(|slot| {
+            slot.as_ref()
+                .is_some_and(|shell| shell.site_permissions.open)
+        })
+    })
+}
+
+fn open_site_permissions() {
+    if page_find_has_marked_text() {
+        return;
+    }
+    preserve_address_for_overlay();
+    close_page_find(false, false);
+    close_tab_search(false);
+    close_bookmarks(false);
+    close_downloads(false);
+    let controls = SHELL.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let shell = slot.as_mut()?;
+        if !shell.site_permissions.open {
+            shell.site_permissions.notice = None;
+        }
+        shell.site_permissions.open = true;
+        Some((shell.window.clone(), shell.site_permissions.close.clone()))
+    });
+    if let Some((window, close)) = controls {
+        sync();
+        // Opening the panel is explicit; never preselect an approval button.
+        window.makeFirstResponder(Some(&close));
+    }
+}
+
+fn close_site_permissions(restore_focus: bool) {
+    let window = SHELL.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let shell = slot.as_mut()?;
+        if !shell.site_permissions.open {
+            return None;
+        }
+        shell.site_permissions.open = false;
+        shell.site_permissions.notice = None;
+        Some(shell.window.clone())
+    });
+    if let Some(window) = window {
+        window.makeFirstResponder(None);
+        SHELL.with(|slot| {
+            if let Some(shell) = slot.borrow_mut().as_mut() {
+                shell.site_permissions.clear_rows();
+            }
+        });
+        sync();
+        apply_selection(restore_focus);
+    }
+}
+
+fn site_permission_panel_matches(window: &NSWindow, surface: &NSView) -> bool {
+    SHELL.with(|slot| {
+        slot.try_borrow().ok().is_some_and(|slot| {
+            slot.as_ref().is_some_and(|shell| {
+                let current: &NSView = &shell.site_permissions.surface;
+                shell.site_permissions.open
+                    && !shell.search.open
+                    && !shell.bookmarks.state.open
+                    && !shell.downloads.open
+                    && std::ptr::eq(&*shell.window, window)
+                    && std::ptr::eq(current, surface)
+            })
+        })
+    })
+}
+
+fn site_permission_controls() -> Option<(Retained<NSWindow>, Retained<SurfaceView>)> {
+    let controls = SHELL.with(|slot| {
+        let slot = slot.try_borrow().ok()?;
+        let shell = slot.as_ref().filter(|shell| shell.site_permissions.open)?;
+        Some((shell.window.clone(), shell.site_permissions.surface.clone()))
+    })?;
+    let (window, surface) = &controls;
+    if !window.isKeyWindow()
+        || !window.isVisible()
+        || window.isMiniaturized()
+        || surface.window().as_deref() != Some(&**window)
+        || surface.isHiddenOrHasHiddenAncestor()
+        || page_find_has_marked_text()
+        || !site_permission_panel_matches(window, surface)
+    {
+        return None;
+    }
+    Some(controls)
+}
+
+#[derive(Clone, Copy)]
+enum SitePermissionAction {
+    Allow,
+    Cancel,
+    Reveal,
+}
+
+fn site_permission_action(sender: &NSButton, action: SitePermissionAction) {
+    let Some((window, surface)) = site_permission_controls() else {
+        return;
+    };
+    // Native getters above can reenter. Resolve the exact current visible button
+    // afterwards; a queued action may never decide a replacement request.
+    let token = SHELL.with(|slot| {
+        let slot = slot.try_borrow().ok()?;
+        let shell = slot.as_ref().filter(|shell| {
+            shell.site_permissions.open
+                && !shell.search.open
+                && !shell.bookmarks.state.open
+                && !shell.downloads.open
+                && std::ptr::eq(&*shell.window, &*window)
+                && std::ptr::eq(&*shell.site_permissions.surface, &*surface)
+        })?;
+        shell.site_permissions.rows.iter().find_map(|row| {
+            let control = match action {
+                SitePermissionAction::Allow => &row.allow,
+                SitePermissionAction::Cancel => &row.cancel,
+                SitePermissionAction::Reveal => &row.reveal,
+            };
+            std::ptr::eq(sender, &**control).then_some(row.token)
+        })
+    });
+    let Some(token) = token else { return };
+    // A CEF callback can synchronously dismiss requests and refresh this panel.
+    // No SHELL borrow survives a runtime call.
+    let result = match action {
+        SitePermissionAction::Allow => {
+            crate::site_permission_runtime::decide(token, true).map(|_| None)
+        }
+        SitePermissionAction::Cancel => {
+            crate::site_permission_runtime::decide(token, false).map(|_| None)
+        }
+        SitePermissionAction::Reveal => {
+            crate::site_permission_runtime::reveal_source(token).map(Some)
+        }
+    };
+    let revealed = match result {
+        Ok(tab) => tab,
+        Err(error) => {
+            if site_permission_panel_matches(&window, &surface) {
+                SHELL.with(|slot| {
+                    if let Some(shell) = slot.borrow_mut().as_mut() {
+                        shell.site_permissions.notice = Some(error);
+                    }
+                });
+                sync();
+            }
+            return;
+        }
+    };
+    let Some(tab) = revealed else {
+        if site_permission_panel_matches(&window, &surface) {
+            SHELL.with(|slot| {
+                if let Some(shell) = slot.borrow_mut().as_mut() {
+                    shell.site_permissions.notice = None;
+                }
+            });
+            sync();
+        }
+        return;
+    };
+    let Some(snapshot) = crate::browser::shell_snapshot() else {
+        return;
+    };
+    let Some(space) = download_reveal_selection(&snapshot, tab).map(str::to_owned) else {
+        return;
+    };
+    if !site_permission_panel_matches(&window, &surface)
+        || !window.isKeyWindow()
+        || page_find_has_marked_text()
+        || !crate::browser::shell_snapshot().is_some_and(|snapshot| {
+            download_reveal_selection(&snapshot, tab) == Some(space.as_str())
+        })
+    {
+        return;
+    }
+    close_site_permissions(false);
+    if !window.isKeyWindow() || page_find_has_marked_text() {
+        return;
+    }
+    let can_focus = SHELL.with(|slot| {
+        slot.try_borrow().ok().is_some_and(|slot| {
+            slot.as_ref().is_some_and(|shell| {
+                !shell.overview
+                    && !shell.overlay_is_open()
+                    && shell.active == Some(tab)
+                    && shell.active_space == space
+                    && std::ptr::eq(&*shell.window, &*window)
+            })
+        })
+    });
+    if can_focus
+        && crate::browser::shell_snapshot().is_some_and(|snapshot| {
+            download_reveal_selection(&snapshot, tab) == Some(space.as_str())
+        })
+    {
+        crate::browser::focus_tab(tab);
+    }
+}
+
+fn site_permission_page_target(shell: &Shell) -> Option<crate::browser::CurrentPageTarget> {
+    if !shell.site_permissions.open
+        || shell.search.open
+        || shell.bookmarks.state.open
+        || shell.downloads.open
+    {
+        return None;
+    }
+    current_page_target(
+        &shell.tabs,
+        &shell.active_space,
+        shell.active,
+        shell.overview,
+        false,
+    )
+}
+
+fn site_permission_page_target_ui() -> Option<crate::browser::CurrentPageTarget> {
+    let (window, surface) = site_permission_controls()?;
+    let (page, view) = SHELL.with(|slot| {
+        let slot = slot.try_borrow().ok()?;
+        let shell = slot.as_ref()?;
+        let page = site_permission_page_target(shell)?;
+        Some((page.clone(), shell.views.get(&page.tab)?.clone()))
+    })?;
+    if view.window().as_deref() != Some(&*window)
+        || !site_permission_panel_matches(&window, &surface)
+    {
+        return None;
+    }
+    let current = SHELL.with(|slot| {
+        let slot = slot.try_borrow().ok()?;
+        let shell = slot.as_ref()?;
+        if !shell
+            .views
+            .get(&page.tab)
+            .is_some_and(|current| std::ptr::eq(&**current, &*view))
+        {
+            return None;
+        }
+        site_permission_page_target(shell)
+    });
+    if current.as_ref() != Some(&page) {
+        return None;
+    }
+    crate::browser::validate_current_page_target(&page).ok()?;
+    Some(page)
+}
+
+fn site_permission_site_snapshot_ui() -> SitePermissionSiteQuery {
+    if SITE_PERMISSION_QUERYING.with(|querying| querying.replace(true)) {
+        return SitePermissionSiteQuery::Skipped;
+    }
+    let mut snapshot_invalid = false;
+    let value = (|| {
+        let window = SHELL.with(|slot| {
+            let slot = slot.try_borrow().ok()?;
+            let shell = slot.as_ref().filter(|shell| {
+                shell.site_permissions.open
+                    && !shell.search.open
+                    && !shell.bookmarks.state.open
+                    && !shell.downloads.open
+            })?;
+            Some(shell.window.clone())
+        })?;
+        if !window.isVisible() || window.isMiniaturized() {
+            return None;
+        }
+        let Some(current) = crate::browser::shell_snapshot() else {
+            snapshot_invalid = true;
+            return None;
+        };
+        let page = current_page_target(
+            &current.tabs,
+            &current.active_space,
+            current.active_tab,
+            current.overview,
+            false,
+        )?;
+        let snapshot = crate::site_permission_runtime::site_snapshot(&page);
+        (site_permissions_are_open() && crate::browser::validate_current_page_target(&page).is_ok())
+            .then_some((page, snapshot))
+    })();
+    SITE_PERMISSION_QUERYING.with(|querying| querying.set(false));
+    if snapshot_invalid {
+        SitePermissionSiteQuery::Skipped
+    } else {
+        SitePermissionSiteQuery::Ready(value)
+    }
+}
+
+fn site_permission_site_is_current(page: &crate::browser::CurrentPageTarget, origin: &str) -> bool {
+    site_permission_page_target_ui().as_ref() == Some(page)
+        && SHELL.with(|slot| {
+            slot.try_borrow().ok().is_some_and(|slot| {
+                slot.as_ref()
+                    .and_then(|shell| shell.site_permissions.current.as_ref())
+                    .is_some_and(|(shown, snapshot)| shown == page && snapshot.origin == origin)
+            })
+        })
+}
+
+fn reset_site_permissions(sender: &NSButton) {
+    let Some((window, surface)) = site_permission_controls() else {
+        return;
+    };
+    let current = SHELL.with(|slot| {
+        let slot = slot.try_borrow().ok()?;
+        let shell = slot.as_ref().filter(|shell| {
+            shell.site_permissions.open
+                && !shell.search.open
+                && !shell.bookmarks.state.open
+                && !shell.downloads.open
+                && std::ptr::eq(&*shell.window, &*window)
+                && std::ptr::eq(&*shell.site_permissions.surface, &*surface)
+        })?;
+        if !std::ptr::eq(sender, &*shell.site_permissions.reset) {
+            return None;
+        }
+        shell
+            .site_permissions
+            .current
+            .as_ref()
+            .filter(|(_, snapshot)| snapshot.can_reset())
+            .cloned()
+    });
+    let Some((page, snapshot)) = current else {
+        return;
+    };
+    if !site_permission_site_is_current(&page, &snapshot.origin) {
+        return;
+    }
+    let result = crate::site_permission_runtime::reset_site(&snapshot, || {
+        site_permission_site_is_current(&page, &snapshot.origin)
+    });
+    if site_permission_panel_matches(&window, &surface) {
+        SHELL.with(|slot| {
+            if let Some(shell) = slot.borrow_mut().as_mut() {
+                shell.site_permissions.notice = Some(match result {
+                    Ok(()) => "저장된 위치와 알림 설정을 초기화했습니다. 해당 사이트의 대기 요청은 취소했으며 열린 페이지는 다시 열어 확인하세요.".to_owned(),
+                    Err(error) => error,
+                });
+            }
+        });
+        sync();
+    }
+}
+
 fn set_download_notice(notice: Option<String>) {
     SHELL.with(|slot| {
         if let Some(shell) = slot.borrow_mut().as_mut() {
@@ -4636,6 +5502,7 @@ fn open_downloads() {
     close_page_find(false, false);
     close_tab_search(false);
     close_bookmarks(false);
+    close_site_permissions(false);
     let controls = SHELL.with(|slot| {
         let mut slot = slot.borrow_mut();
         let shell = slot.as_mut()?;
@@ -4995,7 +5862,9 @@ fn file_selection_action(sender: &NSButton, choose: bool) {
         let shell = slot.as_ref().filter(|shell| shell.downloads.open)?;
         Some((shell.window.clone(), shell.downloads.surface.clone()))
     });
-    let Some((window, surface)) = controls else { return };
+    let Some((window, surface)) = controls else {
+        return;
+    };
     if !window.isKeyWindow()
         || !window.isVisible()
         || window.isMiniaturized()
@@ -5030,7 +5899,9 @@ fn file_selection_action(sender: &NSButton, choose: bool) {
         crate::file_selection_runtime::cancel(token)
     }.err();
     SHELL.with(|slot| {
-        let Ok(mut slot) = slot.try_borrow_mut() else { return };
+        let Ok(mut slot) = slot.try_borrow_mut() else {
+            return;
+        };
         if let Some(shell) = slot.as_mut().filter(|shell| {
             shell.downloads.open
                 && std::ptr::eq(&*shell.window, &*window)
@@ -5680,6 +6551,7 @@ fn open_bookmarks(add_current: bool) {
     let tab = active_tab();
     close_tab_search(false);
     close_downloads(false);
+    close_site_permissions(false);
     let existing_editor = SHELL.with(|slot| {
         let mut slot = slot.borrow_mut();
         let shell = slot.as_mut()?;
@@ -6059,6 +6931,7 @@ fn open_search(mode: SearchMode) {
     close_page_find(false, false);
     close_bookmarks(false);
     close_downloads(false);
+    close_site_permissions(false);
     let controls = SHELL.with(|slot| {
         let mut slot = slot.borrow_mut();
         let shell = slot.as_mut()?;
@@ -6398,6 +7271,7 @@ fn search_query_is_current(
                         && shell.overview == selection.2
                         && !shell.bookmarks.state.open
                         && !shell.downloads.open
+                        && !shell.site_permissions.open
                         && shell
                             .search_results
                             .contains(&SearchResultId::Query(target.revision))
@@ -6561,6 +7435,8 @@ fn layout() {
                 shell.bookmarks.surface.clone(),
                 shell.downloads.open,
                 shell.downloads.surface.clone(),
+                shell.site_permissions.open,
+                shell.site_permissions.surface.clone(),
                 shell.find.state.open,
                 shell.find.surface.clone(),
                 shell.recovery.target.is_some(),
@@ -6587,6 +7463,8 @@ fn layout() {
         bookmarks_surface,
         downloads_open,
         downloads_surface,
+        site_permissions_open,
+        site_permissions_surface,
         find_open,
         find_surface,
         recovery_open,
@@ -6603,7 +7481,7 @@ fn layout() {
     let side = if collapsed { RAIL_WIDTH } else { SIDEBAR_WIDTH };
     let main_width = (size.width - side).max(1.0);
     let toolbar_bottom = (size.height - TOOLBAR_HEIGHT).max(1.0);
-    let overlay_open = search_open || bookmarks_open || downloads_open;
+    let overlay_open = search_open || bookmarks_open || downloads_open || site_permissions_open;
     let find_visible = find_open && !overview && !overlay_open;
     let recovery_visible = recovery_open && !overview && !overlay_open;
     let start_page_visible = start_page_open && !overview && !overlay_open;
@@ -6616,7 +7494,8 @@ fn layout() {
         || start_page_surface.isHidden() == start_page_visible
         || search_surface.isHidden() == search_open
         || bookmarks_surface.isHidden() == bookmarks_open
-        || downloads_surface.isHidden() == downloads_open;
+        || downloads_surface.isHidden() == downloads_open
+        || site_permissions_surface.isHidden() == site_permissions_open;
     let vertical = page_vertical_layout(size.height, find_visible, recovery_visible);
     let page_height = vertical.page_height;
     sidebar.setFrame(rect(0.0, 0.0, side, size.height));
@@ -6649,6 +7528,7 @@ fn layout() {
     search_surface.setHidden(!search_open);
     bookmarks_surface.setHidden(!bookmarks_open);
     downloads_surface.setHidden(!downloads_open);
+    site_permissions_surface.setHidden(!site_permissions_open);
     // Only the CEF hierarchy can re-enter browser callbacks during layout.
     // Its frames are set before borrowing the shell for native chrome controls.
     let bounds = content.bounds();
@@ -6681,6 +7561,9 @@ fn layout() {
             }
             if shell.downloads.open {
                 shell.downloads.layout(size);
+            }
+            if shell.site_permissions.open {
+                shell.site_permissions.layout(size);
             }
             [
                 search_changed.then(|| shell.search_button_background.clone()),
@@ -6752,12 +7635,14 @@ impl Shell {
             .setFrame(rect(20.0, size.height - 176.0, side - 40.0, 20.0));
         self.tab_scroll.setFrame(rect(
             8.0,
-            156.0,
+            196.0,
             side - 16.0,
-            (size.height - if self.sidebar_collapsed { 320.0 } else { 344.0 }).max(1.0),
+            (size.height - if self.sidebar_collapsed { 360.0 } else { 384.0 }).max(1.0),
         ));
         self.sidebar_separator
-            .setFrame(rect(16.0, 148.0, side - 32.0, 1.0));
+            .setFrame(rect(16.0, 188.0, side - 32.0, 1.0));
+        self.site_permissions_button
+            .setFrame(rect(navigation_x, 144.0, navigation_width, 36.0));
         self.bookmarks_button
             .setFrame(rect(navigation_x, 104.0, navigation_width, 36.0));
         self.downloads_button
@@ -7037,6 +7922,7 @@ pub fn sync() {
     // Read a fresh browser snapshot after CEF setting queries, which may reenter
     // and change selection/navigation while the download panel is open.
     let site = download_site_snapshot_ui();
+    let permission_site = site_permission_site_snapshot_ui();
     let Some(snapshot) = crate::browser::shell_snapshot() else {
         return;
     };
@@ -7102,6 +7988,11 @@ pub fn sync() {
     let download_permission_count = crate::download_permission_runtime::pending_count();
     let file_selection_count = crate::file_selection_runtime::pending_count();
     let file_selection_notice = crate::file_selection_runtime::notice();
+    let site_permission_count = crate::site_permission_runtime::pending_count();
+    let site_permission_notice = crate::site_permission_runtime::notice();
+    let site_permission_media = crate::site_permission_runtime::media_summary();
+    let site_permissions =
+        site_permissions_are_open().then(crate::site_permission_runtime::snapshot);
     let downloads = downloads_are_open().then(|| {
         (
             crate::download_runtime::snapshot(),
@@ -7110,6 +8001,7 @@ pub fn sync() {
         )
     });
     let mut download_focus = None;
+    let mut permission_focus = None;
     let mut tab_focus = None;
     let changed = SHELL.with(|slot| {
         if let Some(shell) = slot.borrow_mut().as_mut() {
@@ -7119,6 +8011,9 @@ pub fn sync() {
             shell.download_permission_count = download_permission_count;
             shell.file_selection_count = file_selection_count;
             shell.file_selection_notice = file_selection_notice;
+            shell.site_permission_count = site_permission_count;
+            shell.site_permission_notice = site_permission_notice;
+            shell.site_permission_media = site_permission_media;
             shell.render(snapshot);
             if std::mem::take(&mut shell.tab_focus_removed)
                 && !changed
@@ -7169,6 +8064,30 @@ pub fn sync() {
                     download_focus = Some((shell.window.clone(), shell.downloads.close.clone()));
                 }
             }
+            if let Some(requests) = site_permissions {
+                let expected = site_permission_page_target(shell);
+                let site = permission_site.for_target(
+                    expected.as_ref(),
+                    shell
+                        .site_permissions
+                        .current
+                        .as_ref()
+                        .map(|(page, _)| page),
+                );
+                if shell.site_permissions.open
+                    && shell.site_permissions.render(
+                        requests,
+                        shell.site_permission_notice.clone(),
+                        shell.site_permission_media.clone(),
+                        site,
+                        &shell.target,
+                        &shell.window,
+                    )
+                {
+                    permission_focus =
+                        Some((shell.window.clone(), shell.site_permissions.close.clone()));
+                }
+            }
             changed
         } else {
             false
@@ -7194,6 +8113,9 @@ pub fn sync() {
         window.makeFirstResponder(Some(&control));
     }
     if let Some((window, close)) = download_focus.filter(|_| downloads_are_open()) {
+        window.makeFirstResponder(Some(&close));
+    }
+    if let Some((window, close)) = permission_focus.filter(|_| site_permissions_are_open()) {
         window.makeFirstResponder(Some(&close));
     }
     crate::browser::request_space_previews();
@@ -8576,6 +9498,7 @@ fn run_action(action: Option<ShellAction>) {
         close_tab_search(false);
         close_bookmarks(false);
         close_downloads(false);
+        close_site_permissions(false);
     }
     SHELL.with(|slot| {
         if let Some(shell) = slot.borrow_mut().as_mut() {
@@ -9132,6 +10055,7 @@ fn select_tab_command(resolve: impl FnOnce(&Shell) -> Option<i32>) {
     close_tab_search(false);
     close_bookmarks(false);
     close_downloads(false);
+    close_site_permissions(false);
     let selected = SHELL.with(|slot| {
         slot.borrow().as_ref().is_some_and(|shell| {
             shell.active == Some(tab)
@@ -9561,6 +10485,25 @@ pub fn handle_shortcut(event: &NSEvent) -> bool {
         }
         return true;
     }
+    if site_permissions_are_open() {
+        if event.keyCode() == 53
+            && !modifiers.intersects(
+                NSEventModifierFlags::Command
+                    | NSEventModifierFlags::Control
+                    | NSEventModifierFlags::Option,
+            )
+            && !page_find_has_marked_text()
+        {
+            close_site_permissions(true);
+            return true;
+        }
+        if command
+            && (matches!(key.as_str(), "l" | "t" | "w" | "[" | "]")
+                || is_menu_only_shortcut(&key, modifiers))
+        {
+            close_site_permissions(false);
+        }
+    }
     if downloads_are_open() {
         if event.keyCode() == 53
             && !modifiers.intersects(
@@ -9714,6 +10657,7 @@ pub(crate) fn focus_address() {
         close_tab_search(false);
         close_bookmarks(false);
         close_downloads(false);
+        close_site_permissions(false);
     }
     let controls = SHELL.with(|slot| {
         slot.borrow()
@@ -9909,6 +10853,15 @@ fn install_menu(target: &ShellTarget, marker: MainThreadMarker) {
         "]",
         Some(target),
         true,
+        marker,
+    );
+    menu_item(
+        &view,
+        "사이트 권한",
+        Some(sel!(showSitePermissions:)),
+        "",
+        Some(target),
+        false,
         marker,
     );
     menu_item(

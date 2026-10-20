@@ -12,6 +12,7 @@ pub mod page_find;
 pub mod page_recovery;
 pub mod protocol;
 pub mod resources;
+pub mod site_permissions;
 pub mod spaces;
 pub mod start_page;
 pub mod tab_search;
@@ -31,10 +32,10 @@ mod devtools_wire;
 pub mod download_permission_runtime;
 #[cfg(feature = "browser")]
 pub mod download_runtime;
-#[cfg(feature = "browser")]
-pub mod file_selection_runtime;
 #[cfg(all(feature = "browser", target_os = "macos"))]
 pub mod file_selection_native;
+#[cfg(feature = "browser")]
+pub mod file_selection_runtime;
 #[cfg(feature = "browser")]
 mod frame_pointer;
 #[cfg(feature = "browser")]
@@ -45,6 +46,8 @@ pub mod history_runtime;
 pub mod mac;
 #[cfg(feature = "browser")]
 mod page_read;
+#[cfg(feature = "browser")]
+pub mod site_permission_runtime;
 
 #[cfg(feature = "browser")]
 pub fn initialize_cef_api() -> bool {
