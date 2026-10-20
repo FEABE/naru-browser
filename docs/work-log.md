@@ -2463,3 +2463,56 @@ ad hoc 서명 빌드를 키체인 재승인 없이 검증 실행할 수 있도�
 | 단위 테스트 | 실행하지 않음 | 다음 통합 회귀에서 실행 예정 |
 
 검증 프로필은 `.local-data/e2e-v11`이다. 실제 사용자 프로필은 건드리지 않았다. 이 수정 뒤의 E2E 실행 결과는 2026-10-18 `e2e-v14` 기록에 있다.
+
+## M10, DOM bridge 단위 테스트 27건 정리와 완료 작업 보관 한도
+
+### 요청 범위와 변경
+
+`node --test tests/dom_bridge.test.mjs`가 오래전부터 27건 실패(161건 중 134 통과)였다. 원인을 건별로 분류해 제품 동작을 바꾸지 않고 테스트와 모의 DOM만 고쳤다. 별도로 `task list`에 끝난 작업이 계속 쌓이는 문제(60분 실행에서 41건 관찰)를 `src/tasks.rs`의 보관 한도로 해결했다. 관련 파일은 `tests/dom_bridge.test.mjs`, `src/tasks.rs`, `docs/agent-cli-guide.md`, `docs/architecture.md`다. `src/dom_bridge.js`는 수정하지 않았다.
+
+### 분류 결과
+
+범주는 (1) 제품이 의도적으로 바뀌었는데 테스트 기대가 옛 계약, (2) 모의 DOM이 필요한 API를 갖추지 못함, (3) 실제 제품 버그다. 근거 커밋은 375e41a(프레임 제어와 Chromium 입력 수명 보완)다. 이 커밋이 `prepareFill`/`verifyFill`의 수신 확인(observation), press 관찰, 편집 영역 Range/Selection 선택을 넣고 `docs/contenteditable-control.md`와 `docs/native-fill-control.md`를 고쳤지만 테스트와 모의 DOM은 갱신하지 않았다.
+
+| 테스트(번호) | 범주 | 조치 | 근거 |
+|---|---|---|---|
+| 13 password 값 노출 없음 | 1 | verify 요청에 prepare가 준 `observation` 전달 | native-fill-control.md 수신 확인 단락, 375e41a |
+| 14 fill 선택 준비, 23 text/password 전환 | 2 | 모의 DOM에 `performance`, `EventTarget`, `selectionDirection`, 타이머 추가(테스트 본문 변경 없음) | `armInsertObservation`이 `performance.now`, `EventTarget.prototype.addEventListener`를 필수로 사용 |
+| 24 Enter 준비, 25 press 24개 키 | 1 | 결과의 `observation` 토큰 형식(32 hex)을 확인하고 나머지 필드는 기존대로 deepEqual | `armPressObservation`(375e41a), keyboard-input.md |
+| 28, 29 Enter 준비의 포커스 경계 | 2 | 하네스 보강만으로 통과 | 위와 동일 |
+| 58, 101 shadow/frame 라벨과 ref | 2 | 하네스 보강만으로 통과 | 공통 준비 코드가 위 API를 사용 |
+| 110 편집 영역 read | 2 | 모의 `Range`/`Selection`/`getSelection`/`Node.contains`/`HTMLElement` 추가, `createRange`를 `Range` 인스턴스로 통합 | `selectEditingHost`가 Range/Selection을 필요로 함 |
+| 111~119 편집 영역 fill 9건 | 1 | 새 계약으로 재작성(아래 설명) | contenteditable-control.md "합성 beforeinput과 input, 직접 DOM 자식 교체를 제거했다" |
+| 120 네이티브 컨트롤 유지 | 2 | 하네스 보강만으로 통과 | |
+| 127, 128 준비 후 검증, 전체 선택 | 1 | `observation` 전달, `inputTarget:"unconfirmed"` 기대 추가, 결과의 토큰 형식 확인 | native-fill-control.md의 `inputTarget` |
+| 132, 133 검증 결과 분류 | 1 | 같은 방식. 133은 11개 모드를 모두 유지 | 위와 동일 |
+| 134 frame/shadow 포커스 | 1 | 영수증을 준비마다 새로 받고, 프레임 교체 확인이 영수증 있는 상태에서 검증하도록 순서 정리 | 위와 동일 |
+| 135, 137 접근 실패 정리, 포커스 이동 | 2 | 하네스 보강만으로 통과 | |
+
+범주 3(실제 제품 버그)은 없었다. 편집 영역 9건(111~119)은 삭제하지 않고 새 계약의 동등한 검사 10건으로 바꿨다. 준비 단계는 전체 선택 범위, 포커스, DOM과 이벤트 무변경, aria-readonly의 포커스 이전 거절, 포커스 중 변경과 선택 실패(`ELEMENT_UNAVAILABLE`, `FOCUS_NOT_REACHED`, `SELECTION_NOT_REACHED`)를 확인한다. 검증 단계는 정확한 리터럴 문자열(공백, 줄바꿈, 이모지), `FILL_STATE_NOT_REACHED`와 `FILL_STATE_UNCONFIRMED` 구분, 페이지 예외 원문 비노출, 1Mi 예산 경계를 확인한다. 같은 값이어도 무동작 성공으로 단축하지 않는다는 문서 계약도 별도 테스트로 고정했다. 옛 합성 이벤트 순서와 `INPUT_CANCELED`는 Chromium에 위임됐으므로 단위 수준에서 재현하지 않으며 그 부분은 로컬 CEF 검사(`contenteditable_smoke.py`)가 담당한다. 결과적으로 전체 테스트는 161개에서 162개가 됐다.
+
+### 작업 보관 한도
+
+`MAX_FINISHED_TASKS = 16`을 추가했다. 작업이 `finished`가 되는 순간(`finish`에서 열린 탭이 없을 때, 또는 마지막 탭의 `tab_closed`) 완료 순서 번호를 매기고, finished가 16개를 넘으면 완료 순서가 가장 오래된 기록부터 지운다. 생성 순서가 아닌 완료 순서이므로 오래 전에 만든 작업이 방금 끝나도 `task info`가 된다. `active`, `paused`, `finishing`은 지우지 않는다. 128개 한도에서의 생성 시 정리도 같은 완료 순서를 쓴다. `create_or_resume`과 `task wait`(finished 즉시 반환)는 바뀌지 않았고, 정리된 ID는 `TASK_NOT_FOUND`다. 문서는 agent-cli-guide.md와 architecture.md에 기록했다.
+
+### 검증
+
+| 구분 | 내용 | 결과 |
+|---|---|---|
+| 모의 DOM 검사 | `node --test tests/dom_bridge.test.mjs` | 수정 전 161건 중 134 통과·27 실패, 수정 후 162건 전부 통과 |
+| 모의 DOM 검사 | `node --test`(전체) | 162건 통과 |
+| 단위 테스트 | `cargo test --locked --lib` | 481건 통과(tasks 신규 3건 포함, 수정 전 478건) |
+| 빌드 검사 | `cargo check --locked --bins` | 통과, 기존 dead_code 경고 1건 |
+| 로컬 CEF 통합 | release 빌드, `NARU_MOCK_KEYCHAIN=1`, 프로필 `/private/tmp/nrpe-m10`에서 `tests/tasks_smoke.py`, `native_fill_smoke.py`, `native_press_smoke.py`, `contenteditable_smoke.py` | 4건 모두 `ok:true`, cleanupVerified |
+| 로컬 CEF 통합 | CLI로 작업 20개 생성·완료 | `task list`에 16개 보관, 마지막 작업의 `task info`/`task wait` 정상(changed:false), 첫 작업은 둘 다 `TASK_NOT_FOUND` |
+| 네이티브 UI, 외부 사이트 | 실행하지 않음 | 이번 변경은 UI와 외부 사이트 동작을 바꾸지 않음 |
+
+### 알려진 한계, 남은 작업
+
+- 모의 DOM은 trusted 입력 이벤트를 전달하지 않으므로 `inputTarget`은 항상 `unconfirmed`다. 실제 일치 관찰은 로컬 CEF 검사의 몫이다.
+- 정리된 finished 작업에 묶인 다른 기록(예: 다운로드 소유 정보)은 128개 한도 정리와 마찬가지로 따로 정리되지 않는다. 이번 변경이 새로 만든 한계는 아니지만 보관 수가 줄어 더 자주 생길 수 있다.
+- 에이전트가 16개보다 오래 전에 끝난 작업의 결과를 조회하면 `TASK_NOT_FOUND`다. 결과는 `finish` 전에 읽는다.
+
+### 정리
+
+release 빌드 앱과 helper를 이 작업 경로로 식별해 종료했고(잔여 0) `/private/tmp/nrpe-m10` 프로필, 워크트리의 `dist`와 `target`을 삭제했다. 사용자 프로필과 메인 체크아웃은 건드리지 않았다.
