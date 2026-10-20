@@ -260,6 +260,7 @@ struct Navigation {
     // Explicit navigation/control changes invalidate a file's source link;
     // provisional attachment requests must not hide earlier source links.
     download_source_generation: u64,
+    download_restart_provenance_blocked: Option<(u64, u64)>,
     download_permission_provenance: crate::download_permissions::Provenance,
     requested_url: String,
     provisional: bool,
@@ -1644,6 +1645,45 @@ pub(crate) fn validate_download_source(
             Err("다운로드를 요청한 탭이나 페이지의 제어권이 변경되었습니다.".into())
         }
     })
+}
+
+pub(crate) fn block_download_restart_provenance(target: &crate::downloads::SourceTarget) {
+    STATE.with(|slot| {
+        if let Some(tab) = slot.borrow_mut().tabs.get_mut(&target.tab) {
+            tab.navigation.download_restart_provenance_blocked =
+                Some((target.generation, target.document_epoch));
+        }
+    });
+}
+
+pub(crate) fn validate_download_restart_source(
+    target: &crate::downloads::SourceTarget,
+) -> Result<(), String> {
+    validate_download_source(target)?;
+    STATE.with(|slot| {
+        let state = slot.borrow();
+        let tab = &state.tabs[&target.tab];
+        if tab.navigation.download_restart_provenance_blocked
+            == Some((target.generation, target.document_epoch))
+        {
+            Err("이 페이지의 다운로드 요청이 겹쳐 원본 파일을 다시 확인해야 합니다.".into())
+        } else {
+            Ok(())
+        }
+    })
+}
+
+pub(crate) fn restart_download_host(
+    target: &crate::downloads::SourceTarget,
+    scope: Option<&TaskScope>,
+) -> Result<BrowserHost, String> {
+    validate_download_restart_source(target)?;
+    let host = download_host(target.tab, scope)?;
+    // host() can reenter CEF. No tab selection, ownership change or STATE borrow
+    // crosses that call; revalidate its captured document/controller afterward.
+    validate_download_restart_source(target)?;
+    validate_download(target.tab, scope)?;
+    Ok(host)
 }
 
 pub(crate) fn reveal_download_source(
@@ -11398,10 +11438,12 @@ wrap_life_span_handler! {
 wrap_download_handler! {
     struct FileDownloadHandler;
     impl DownloadHandler {
-        fn can_download(&self, browser:Option<&mut Browser>, _url:Option<&CefString>, _request_method:Option<&CefString>) -> i32 {
+        fn can_download(&self, browser:Option<&mut Browser>, url:Option<&CefString>, request_method:Option<&CefString>) -> i32 {
             i32::from(browser.is_some_and(|browser| {
                 let tab = browser.identifier();
-                crate::download_runtime::can_accept(tab) && record_download_permission_attempt(tab).is_ok()
+                crate::download_runtime::can_accept(tab, url)
+                    && record_download_permission_attempt(tab).is_ok()
+                    && crate::download_runtime::record_request(tab, url, request_method)
             }))
         }
         fn on_before_download(&self, browser:Option<&mut Browser>, download_item:Option<&mut DownloadItem>, suggested_name:Option<&CefString>, callback:Option<&mut BeforeDownloadCallback>) -> i32 {
@@ -14748,6 +14790,35 @@ mod tests {
         assert!(download_permission_context(7).is_err());
         clear();
         assert!(validate_download_permission(&loading).is_err());
+    }
+
+    #[test]
+    fn manual_restart_provenance_overflow_blocks_only_that_document() {
+        clear();
+        STATE.with(|slot| {
+            let mut state = slot.borrow_mut();
+            state.tabs.insert(7, native_blank_tab());
+            state.spaces.insert(7, USER_SPACE, true);
+        });
+        let target = download_context(7).unwrap().source_target;
+        assert!(validate_download_restart_source(&target).is_ok());
+        block_download_restart_provenance(&target);
+        assert!(validate_download_restart_source(&target).is_err());
+        // Showing the source and ordinary download admission remain available.
+        assert!(validate_download_source(&target).is_ok());
+        assert!(validate_download(7, None).is_ok());
+        STATE.with(|slot| {
+            slot.borrow_mut()
+                .tabs
+                .get_mut(&7)
+                .unwrap()
+                .navigation
+                .document_epoch += 1
+        });
+        let fresh = download_context(7).unwrap().source_target;
+        assert!(validate_download_restart_source(&fresh).is_ok());
+        assert!(validate_download_restart_source(&target).is_err());
+        clear();
     }
 
     #[test]

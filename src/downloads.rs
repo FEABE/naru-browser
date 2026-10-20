@@ -7,6 +7,7 @@ use std::{collections::VecDeque, path::Path};
 pub const MAX_ACTIVE: usize = 4;
 pub const MAX_RECORDS: usize = 24;
 pub const MAX_PATH_BYTES: usize = 8192;
+pub(crate) const MAX_RESTART_URL_BYTES: usize = 8192;
 const MAX_NAME_CHARS: usize = 256;
 const MAX_SOURCE_CHARS: usize = 80;
 const MAX_REASON_CHARS: usize = 160;
@@ -47,6 +48,8 @@ pub struct Entry {
     pub name: String,
     source: String,
     pub(crate) source_target: Option<SourceTarget>,
+    // Never serialized or exposed in UI. Only a proven GET can seed this URL.
+    restart_url: Option<String>,
     path: Option<String>,
     // Set only by a fresh Complete update matching the user's approved path.
     // Terminal records are immutable, so no second path string is retained.
@@ -90,6 +93,7 @@ pub struct DownloadRow {
     pub can_cancel: bool,
     pub can_reveal: bool,
     pub can_reveal_file: bool,
+    pub can_restart: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -157,6 +161,7 @@ impl Model {
             name: display_name(name),
             source: bounded_text(source, MAX_SOURCE_CHARS),
             source_target: source_target.filter(|target| target.tab == tab),
+            restart_url: None,
             path: None,
             file_verified: false,
             received: 0,
@@ -169,6 +174,21 @@ impl Model {
 
     pub fn entry(&self, id: u32) -> Option<&Entry> {
         self.entries.iter().find(|entry| entry.id == id)
+    }
+
+    pub(crate) fn set_restart_url(&mut self, id: u32, url: String) {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id)
+            && entry.status == Status::Pending
+            && restart_url_allowed(&url)
+        {
+            entry.restart_url = Some(url);
+        }
+    }
+
+    pub(crate) fn consume_restart_url(&mut self, id: u32) {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) {
+            entry.restart_url = None;
+        }
     }
 
     pub fn choose(&mut self, id: u32) -> bool {
@@ -286,6 +306,7 @@ impl Model {
                     can_cancel: !entry.status.is_terminal() && entry.status != Status::Canceling,
                     can_reveal: entry.source_target.is_some(),
                     can_reveal_file: entry.completed_file_path().is_some(),
+                    can_restart: entry.restart_url().is_some(),
                 })
                 .collect(),
             active_count: self.active_count(),
@@ -315,6 +336,12 @@ impl Model {
 }
 
 impl Entry {
+    pub(crate) fn restart_url(&self) -> Option<&str> {
+        matches!(self.status, Status::Canceled | Status::Interrupted)
+            .then_some(self.restart_url.as_deref())
+            .flatten()
+    }
+
     pub(crate) fn completed_file_path(&self) -> Option<&str> {
         (self.status == Status::Complete && self.file_verified)
             .then_some(self.path.as_deref())
@@ -368,6 +395,24 @@ impl Entry {
     }
 }
 
+pub(crate) fn restart_url_allowed(url: &str) -> bool {
+    if url.len() > MAX_RESTART_URL_BYTES
+        || url
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return false;
+    }
+    let Some(authority) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .map(|tail| tail.split(['/', '?', '#']).next().unwrap_or(""))
+    else {
+        return false;
+    };
+    !authority.is_empty() && !authority.contains('@') && !url.contains('\\')
+}
+
 fn validate_path(path: &str) -> Result<(), String> {
     if path.is_empty()
         || path.len() > MAX_PATH_BYTES
@@ -405,6 +450,60 @@ fn bounded_text(value: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_restart_only_replays_bounded_web_urls_after_cancel_or_failure() {
+        for url in [
+            "",
+            "blob:https://example.test/id",
+            "data:text/plain,a",
+            "file:///tmp/file",
+            "https://user:pass@example.test/file",
+            "https://example.test/with\nline",
+            "http://",
+            "https://example.test\\file",
+        ] {
+            assert!(!restart_url_allowed(url));
+        }
+        assert!(!restart_url_allowed(&format!(
+            "https://example.test/{}",
+            "a".repeat(MAX_RESTART_URL_BYTES)
+        )));
+        let url = "https://example.test/file?private-token=kept-only-in-memory";
+        let mut model = Model::new();
+        model.insert(1, 7, None, "file", "내 공간", None).unwrap();
+        model.set_restart_url(1, url.into());
+        assert!(!model.snapshot().rows[0].can_restart);
+        assert!(model.cancel(1));
+        assert!(model.snapshot().rows[0].can_restart);
+        assert_eq!(model.entry(1).unwrap().restart_url(), Some(url));
+        assert!(!format!("{:?}", model.snapshot()).contains("private-token"));
+        model.insert(2, 7, None, "file", "내 공간", None).unwrap();
+        model.set_restart_url(2, url.into());
+        model.consume_restart_url(1);
+        assert!(model.entry(1).unwrap().restart_url().is_none());
+        model.cancel(2);
+        assert_eq!(model.entry(2).unwrap().restart_url(), Some(url));
+        model.clear_finished();
+        assert!(model.entry(1).is_none());
+
+        for status in [Status::Complete, Status::Interrupted] {
+            model.insert(2, 7, None, "file", "내 공간", None).unwrap();
+            model.set_restart_url(2, url.into());
+            model.update(
+                2,
+                Progress {
+                    status,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                model.snapshot().rows[0].can_restart,
+                status == Status::Interrupted
+            );
+            model.clear_finished();
+        }
+    }
 
     #[test]
     fn source_identity_is_bounded_to_its_record_and_never_controls_file_lifetime() {

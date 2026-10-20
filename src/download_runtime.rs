@@ -1,7 +1,7 @@
 //! CEF download callbacks stay on the UI thread; rows contain copied metadata only.
 
 use crate::downloads::{
-    MAX_ACTIVE, MAX_PATH_BYTES, Model, Progress, Snapshot, SourceTarget, Status,
+    MAX_ACTIVE, MAX_PATH_BYTES, MAX_RECORDS, Model, Progress, Snapshot, SourceTarget, Status,
 };
 use cef::*;
 use std::{cell::RefCell, collections::BTreeMap, path::Path};
@@ -37,6 +37,34 @@ struct Retry {
     path: String,
 }
 
+#[derive(Clone)]
+struct RequestAttempt {
+    target: SourceTarget,
+    url: String,
+    get: bool,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct RestartRequest {
+    source_id: u32,
+    target: SourceTarget,
+    scope: Option<crate::protocol::TaskScope>,
+    url: String,
+    sequence: u64,
+}
+
+struct PendingRestart {
+    request: RestartRequest,
+    cef_id: Option<u32>,
+    canceled: bool,
+}
+
+impl PendingRestart {
+    fn canceled_update(&self, id: u32) -> bool {
+        self.canceled && self.cef_id == Some(id)
+    }
+}
+
 #[derive(Default)]
 struct Runtime {
     model: Model,
@@ -45,9 +73,86 @@ struct Runtime {
     next_dialog: u64,
     notice: Option<String>,
     shutting_down: bool,
+    requests: Vec<RequestAttempt>,
+    restart: Option<PendingRestart>,
+    next_restart: u64,
 }
 
 impl Runtime {
+    fn has_capacity(&self) -> bool {
+        let reserved = usize::from(self.restart.is_some());
+        self.model.activity().0 + reserved < MAX_ACTIVE
+            && self.callbacks.len() + reserved < MAX_ACTIVE
+    }
+
+    fn restart_entry(&self, id: u32) -> Result<&crate::downloads::Entry, String> {
+        if self.shutting_down {
+            return Err("브라우저를 종료하고 있습니다.".into());
+        }
+        if self.dialog.is_some() {
+            return Err("저장 위치 선택 창을 먼저 닫아 주세요.".into());
+        }
+        if self.restart.is_some() {
+            return Err("앞선 다시 받기 요청의 응답을 기다리고 있습니다.".into());
+        }
+        if !self.has_capacity() {
+            return Err("다운로드는 대기와 진행을 합쳐 최대 4개까지 받을 수 있습니다.".into());
+        }
+        let entry = self
+            .model
+            .entry(id)
+            .ok_or_else(|| "다시 받을 다운로드가 목록에서 지워졌습니다.".to_owned())?;
+        if entry.restart_url().is_none() {
+            return Err("이 파일은 원본 페이지에서 다시 받아 주세요.".into());
+        }
+        let target = entry
+            .source_target
+            .as_ref()
+            .ok_or_else(|| "다운로드를 요청한 탭을 확인할 수 없습니다.".to_owned())?;
+        if self
+            .requests
+            .iter()
+            .any(|request| request.target.tab == target.tab)
+        {
+            return Err("원본 탭의 앞선 다운로드 요청을 먼저 기다려 주세요.".into());
+        }
+        Ok(entry)
+    }
+
+    fn restart_request(&self, id: u32) -> Result<RestartRequest, String> {
+        let entry = self.restart_entry(id)?;
+        Ok(RestartRequest {
+            source_id: id,
+            target: entry.source_target.clone().unwrap(),
+            scope: entry.scope.clone(),
+            url: entry.restart_url().unwrap().to_owned(),
+            sequence: self
+                .next_restart
+                .checked_add(1)
+                .ok_or_else(|| "다시 받기 요청을 더 만들 수 없습니다.".to_owned())?,
+        })
+    }
+
+    fn consume_request(&mut self, tab: i32, url: &str, target: &SourceTarget) -> bool {
+        let matching = self
+            .requests
+            .iter()
+            .enumerate()
+            .filter(|(_, request)| request.target.tab == tab && request.url == url)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if matching.is_empty() {
+            return false;
+        }
+        if matching.len() > 1 {
+            for index in &matching {
+                self.requests[*index].get = false;
+            }
+        }
+        let request = self.requests.remove(matching[0]);
+        matching.len() == 1 && request.get && &request.target == target
+    }
+
     fn completed_file_path(&self, id: u32) -> Result<&str, String> {
         if self.shutting_down {
             return Err("브라우저를 종료하고 있습니다.".into());
@@ -138,7 +243,20 @@ pub fn snapshot() -> Snapshot {
         snapshot.notice = state.notice.clone();
         for row in &mut snapshot.rows {
             row.can_reveal_file &= !state.shutting_down && state.dialog.is_none();
+            row.can_restart &= state.restart_entry(row.id).is_ok();
+            if state
+                .restart
+                .as_ref()
+                .is_some_and(|pending| pending.request.source_id == row.id)
+            {
+                row.detail = if state.restart.as_ref().unwrap().canceled {
+                    "다시 받기 응답 대기 중, 원본 탭을 닫으면 정리됩니다.".into()
+                } else {
+                    "다시 받기 요청 중".into()
+                };
+            }
         }
+        snapshot.active_count += usize::from(state.restart.is_some());
         if state.dialog.is_some() {
             for row in &mut snapshot.rows {
                 row.can_choose = false;
@@ -160,6 +278,9 @@ pub fn snapshot() -> Snapshot {
         row.can_reveal = target
             .as_ref()
             .is_some_and(|target| crate::browser::validate_download_source(target).is_ok());
+        row.can_restart &= target
+            .as_ref()
+            .is_some_and(|target| crate::browser::validate_download_restart_source(target).is_ok());
     }
     snapshot
 }
@@ -192,7 +313,12 @@ pub(crate) fn reveal_file(id: u32) -> Result<(), String> {
 }
 
 pub fn activity() -> (usize, usize) {
-    RUNTIME.with(|slot| slot.borrow().model.activity())
+    RUNTIME.with(|slot| {
+        let state = slot.borrow();
+        let (active, pending) = state.model.activity();
+        let reserved = usize::from(state.restart.is_some());
+        (active + reserved, pending + reserved)
+    })
 }
 
 fn notice(message: &str) {
@@ -202,13 +328,16 @@ fn notice(message: &str) {
     crate::browser::notify_panel();
 }
 
-pub(crate) fn can_accept(tab: i32) -> bool {
+pub(crate) fn can_accept(tab: i32, url: Option<&CefString>) -> bool {
+    let url = request_url(url);
     let result = crate::browser::download_context(tab).and_then(|_| {
         RUNTIME.with(|slot| {
             let state = slot.borrow();
             if !state.shutting_down
-                && state.model.can_accept()
-                && state.callbacks.len() < MAX_ACTIVE
+                && state.has_capacity()
+                && !state.restart.as_ref().is_some_and(|pending| {
+                    pending.request.target.tab == tab && url.as_ref() == Some(&pending.request.url)
+                })
             {
                 Ok(())
             } else {
@@ -241,6 +370,135 @@ fn bounded_path(value: &CefString) -> Result<String, String> {
         path.push(character);
     }
     Ok(path)
+}
+
+fn request_url(value: Option<&CefString>) -> Option<String> {
+    value
+        .and_then(|value| bounded_path(value).ok())
+        .filter(|url| crate::downloads::restart_url_allowed(url))
+}
+
+/// CanDownload has the method but no download ID. Keep every matching GET/POST
+/// candidate until OnBeforeDownload; overlapping candidates are never evidence
+/// that a later URL-only request can safely reproduce the original request.
+pub(crate) fn record_request(
+    tab: i32,
+    url: Option<&CefString>,
+    method: Option<&CefString>,
+) -> bool {
+    let Ok(context) = crate::browser::download_context(tab) else {
+        return false;
+    };
+    let target = context.source_target;
+    let Some(url) = request_url(url) else {
+        crate::browser::block_download_restart_provenance(&target);
+        return true;
+    };
+    if crate::browser::validate_download_restart_source(&target).is_err() {
+        return true;
+    }
+    let candidates = RUNTIME.with(|slot| {
+        slot.borrow()
+            .requests
+            .iter()
+            .map(|request| request.target.clone())
+            .collect::<Vec<_>>()
+    });
+    let stale = candidates
+        .into_iter()
+        .filter(|target| crate::browser::validate_download_restart_source(target).is_err())
+        .collect::<Vec<_>>();
+    let blocked = RUNTIME.with(|slot| {
+        let mut state = slot.borrow_mut();
+        state
+            .requests
+            .retain(|request| !stale.contains(&request.target));
+        if state.requests.len() == MAX_RECORDS {
+            let mut blocked = state
+                .requests
+                .drain(..)
+                .map(|request| request.target)
+                .collect::<Vec<_>>();
+            blocked.push(target);
+            return blocked;
+        }
+        state.requests.push(RequestAttempt {
+            target,
+            url,
+            get: method.is_some_and(|method| method.as_slice() == Some(&[71, 69, 84])),
+        });
+        Vec::new()
+    });
+    // Overflow removes retry evidence for these documents, not their ordinary
+    // download permission. The per-tab generation stamp is constant-size.
+    for target in blocked {
+        crate::browser::block_download_restart_provenance(&target);
+    }
+    true
+}
+
+pub(crate) fn restart(id: u32) -> Result<(), String> {
+    let request = RUNTIME.with(|slot| slot.borrow().restart_request(id))?;
+    let host = crate::browser::restart_download_host(&request.target, request.scope.as_ref())?;
+    let url = CefString::from(request.url.as_str());
+    let pointer: *const cef::sys::cef_string_t = (&url).into();
+    if pointer.is_null() {
+        return Err("다시 받을 파일의 주소를 전달하지 못했습니다.".into());
+    }
+    RUNTIME.with(|slot| {
+        let mut state = slot.borrow_mut();
+        if state.restart_request(id)? != request {
+            return Err("다운로드 요청이 변경되었습니다.".to_owned());
+        }
+        state.next_restart = request.sequence;
+        state.restart = Some(PendingRestart {
+            request: request.clone(),
+            cef_id: None,
+            canceled: false,
+        });
+        state.notice =
+            Some("다시 받기를 요청했습니다. 새 항목에서 저장 위치를 선택해 주세요.".into());
+        Ok(())
+    })?;
+    let mut timeout = RestartTimeout::new(request.sequence);
+    let ready = post_delayed_task(ThreadId::UI, Some(&mut timeout), 30_000) != 0;
+    let validation =
+        crate::browser::validate_download_restart_source(&request.target).and_then(|()| {
+            crate::browser::validate_download(request.target.tab, request.scope.as_ref())
+        });
+    if !ready || validation.is_err() {
+        let error = validation
+            .err()
+            .unwrap_or_else(|| "다시 받기 요청을 준비하지 못했습니다.".into());
+        let removed = RUNTIME.with(|slot| {
+            let mut state = slot.borrow_mut();
+            state.notice = Some(error.clone());
+            state.restart.take()
+        });
+        drop(removed);
+        return Err(error);
+    }
+    // StartDownload returns void and skips CanDownload. Keep the reservation
+    // until an actual callback establishes the new ID. Never reuse a save path.
+    host.start_download(Some(&url));
+    crate::browser::notify_panel();
+    Ok(())
+}
+
+wrap_task! {
+    struct RestartTimeout { sequence: u64 }
+    impl Task {
+        fn execute(&self) {
+            RUNTIME.with(|slot| {
+                let mut state = slot.borrow_mut();
+                let Some(pending) = state.restart.as_mut()
+                    .filter(|pending| pending.request.sequence == self.sequence) else { return };
+                pending.canceled = true;
+                state.notice = Some("다시 받기 요청이 응답하지 않습니다. 원본 탭을 닫으면 요청이 정리됩니다.".into());
+            });
+            crate::browser::notify_panel();
+        }
+    }
 }
 
 pub(crate) fn before_download(
@@ -285,6 +543,44 @@ pub(crate) fn before_download(
             return false;
         }
     };
+    let original_url = request_url(Some(&CefString::from(&item.original_url())));
+    let restarted = RUNTIME.with(|slot| {
+        let state = slot.borrow();
+        state
+            .restart
+            .as_ref()
+            .filter(|pending| {
+                pending.request.target.tab == tab
+                    && (pending.cef_id == Some(id)
+                        || original_url.as_ref() == Some(&pending.request.url))
+            })
+            .map(|pending| {
+                (
+                    pending.request.clone(),
+                    pending.canceled,
+                    pending.cef_id.is_none_or(|current| current == id),
+                )
+            })
+    });
+    if let Some((request, canceled, same_id)) = &restarted {
+        if *canceled
+            || !same_id
+            || original_url.as_ref() != Some(&request.url)
+            || crate::browser::validate_download_restart_source(&request.target).is_err()
+            || crate::browser::validate_download(tab, request.scope.as_ref()).is_err()
+        {
+            // Destroy an unexecuted callback outside the runtime borrow. The
+            // pending slot remains a tombstone until a terminal update/close.
+            RUNTIME.with(|slot| {
+                if let Some(pending) = slot.borrow_mut().restart.as_mut() {
+                    pending.canceled = true;
+                    pending.cef_id.get_or_insert(id);
+                }
+            });
+            notice("다시 받기 요청의 원본 탭이나 제어권이 변경되었습니다.");
+            return true;
+        }
+    }
     let name = suggested_name
         .map(|name| bounded_text(name, 256))
         .unwrap_or_default();
@@ -295,8 +591,21 @@ pub(crate) fn before_download(
         if state.shutting_down {
             return Err("브라우저를 종료하고 있습니다.".to_owned());
         }
-        if state.callbacks.len() >= MAX_ACTIVE {
+        if (restarted.is_none() && !state.has_capacity()) || state.callbacks.len() >= MAX_ACTIVE {
             return Err("다운로드는 대기와 진행을 합쳐 최대 4개까지 받을 수 있습니다.".to_owned());
+        }
+        let replayable = if let Some((request, _, _)) = &restarted {
+            state
+                .restart
+                .as_ref()
+                .is_some_and(|pending| pending.request == *request && !pending.canceled)
+        } else {
+            original_url
+                .as_deref()
+                .is_some_and(|url| state.consume_request(tab, url, &context.source_target))
+        };
+        if restarted.is_some() && !replayable {
+            return Err("다시 받기 요청이 만료되었습니다.".to_owned());
         }
         state.model.insert(
             id,
@@ -306,6 +615,14 @@ pub(crate) fn before_download(
             &context.source,
             Some(context.source_target),
         )?;
+        if let Some((request, _, _)) = &restarted {
+            state.model.consume_restart_url(request.source_id);
+        }
+        if replayable {
+            state
+                .model
+                .set_restart_url(id, original_url.clone().unwrap());
+        }
         state.callbacks.insert(
             id,
             Callbacks {
@@ -314,12 +631,51 @@ pub(crate) fn before_download(
             },
         );
         state.notice = None;
-        Ok(())
+        Ok(if restarted.is_some() {
+            state.restart.take()
+        } else {
+            None
+        })
     });
     drop(before);
-    if let Err(error) = result {
-        notice(&error);
+    match result {
+        Ok(previous) => drop(previous),
+        Err(error) => {
+            notice(&error);
+            return false;
+        }
+    }
+    crate::browser::notify_panel();
+    true
+}
+
+fn update_restart(item: &DownloadItem, callback: Option<&DownloadItemCallback>) -> bool {
+    let id = item.id();
+    // IDs are unique, not ordered. A URL-only OnUpdated before OnBeforeDownload
+    // can belong to an evicted old record, so it cannot establish a new ID.
+    let canceled = RUNTIME.with(|slot| {
+        slot.borrow()
+            .restart
+            .as_ref()
+            .is_some_and(|pending| pending.canceled_update(id))
+    });
+    if !canceled {
         return false;
+    }
+    let terminal = item.is_complete() != 0 || item.is_canceled() != 0 || item.is_interrupted() != 0;
+    if terminal {
+        RUNTIME.with(|slot| {
+            let mut state = slot.borrow_mut();
+            if state
+                .restart
+                .as_ref()
+                .is_some_and(|pending| pending.cef_id == Some(id))
+            {
+                state.restart = None;
+            }
+        });
+    } else if let Some(callback) = callback {
+        callback.cancel();
     }
     crate::browser::notify_panel();
     true
@@ -331,6 +687,9 @@ pub(crate) fn updated(
     callback: Option<&DownloadItemCallback>,
 ) {
     if item.is_valid() == 0 {
+        return;
+    }
+    if update_restart(item, callback) {
         return;
     }
     let id = item.id();
@@ -587,9 +946,22 @@ pub(crate) fn cancel_task(task: &str, only_tab: Option<i32>) {
     let removed = RUNTIME.with(|slot| {
         let mut state = slot.borrow_mut();
         let ids = state.model.cancel_task(task, only_tab);
-        ids.into_iter()
+        let removed = ids
+            .into_iter()
             .filter_map(|id| take_for_cancel(&mut state, id))
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        if let Some(pending) = state.restart.as_mut().filter(|pending| {
+            pending
+                .request
+                .target
+                .owner
+                .as_ref()
+                .is_some_and(|(scope, _)| scope.task == task)
+                && only_tab.is_none_or(|tab| pending.request.target.tab == tab)
+        }) {
+            pending.canceled = true;
+        }
+        removed
     });
     for callbacks in removed {
         callbacks.cancel();
@@ -598,13 +970,26 @@ pub(crate) fn cancel_task(task: &str, only_tab: Option<i32>) {
 }
 
 pub(crate) fn cancel_tab(tab: i32) {
-    let removed = RUNTIME.with(|slot| {
+    let (removed, restart) = RUNTIME.with(|slot| {
         let mut state = slot.borrow_mut();
+        state.requests.retain(|request| request.target.tab != tab);
+        let restart = if state
+            .restart
+            .as_ref()
+            .is_some_and(|pending| pending.request.target.tab == tab)
+        {
+            state.restart.take()
+        } else {
+            None
+        };
         let ids = state.model.cancel_tab(tab);
-        ids.into_iter()
+        let removed = ids
+            .into_iter()
             .filter_map(|id| take_for_cancel(&mut state, id))
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        (removed, restart)
     });
+    drop(restart);
     for callbacks in removed {
         callbacks.cancel();
     }
@@ -645,10 +1030,12 @@ pub(crate) fn clear() {
     let previous = RUNTIME.with(|slot| {
         let mut state = slot.borrow_mut();
         let next_dialog = state.next_dialog;
+        let next_restart = state.next_restart;
         std::mem::replace(
             &mut *state,
             Runtime {
                 next_dialog,
+                next_restart,
                 shutting_down: true,
                 ..Default::default()
             },
@@ -662,6 +1049,108 @@ pub(crate) fn clear() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn restart_target() -> SourceTarget {
+        SourceTarget {
+            tab: 7,
+            generation: 2,
+            document_epoch: 3,
+            owner: None,
+        }
+    }
+
+    #[test]
+    fn manual_restart_requires_unique_get_and_exact_document() {
+        let target = restart_target();
+        let url = "https://example.test/file";
+        let attempt = |get| RequestAttempt {
+            target: target.clone(),
+            url: url.into(),
+            get,
+        };
+        let mut runtime = Runtime::default();
+        runtime.requests.push(attempt(true));
+        assert!(runtime.consume_request(7, url, &target));
+        assert!(!runtime.consume_request(7, url, &target));
+        runtime.requests.extend([attempt(true), attempt(false)]);
+        assert!(!runtime.consume_request(7, url, &target));
+        assert!(!runtime.consume_request(7, url, &target));
+        runtime.requests.extend([attempt(true), attempt(true)]);
+        assert!(!runtime.consume_request(7, url, &target));
+        assert!(!runtime.consume_request(7, url, &target));
+        runtime.requests.push(attempt(true));
+        assert!(!runtime.consume_request(
+            7,
+            url,
+            &SourceTarget {
+                document_epoch: 4,
+                ..target.clone()
+            }
+        ));
+        runtime.requests.push(attempt(true));
+        assert!(!runtime.consume_request(8, url, &target));
+        assert_eq!(runtime.requests.len(), 1);
+    }
+
+    #[test]
+    fn manual_restart_reservation_prevents_duplicates_and_counts_toward_capacity() {
+        let mut runtime = Runtime::default();
+        runtime
+            .model
+            .insert(1, 7, None, "file", "내 공간", Some(restart_target()))
+            .unwrap();
+        runtime
+            .model
+            .set_restart_url(1, "https://example.test/file".into());
+        assert!(runtime.restart_request(1).is_err());
+        runtime.model.cancel(1);
+        let request = runtime.restart_request(1).unwrap();
+        assert!(request.scope.is_none());
+        runtime.restart = Some(PendingRestart {
+            request,
+            cef_id: None,
+            canceled: false,
+        });
+        for id in [1, 2, 999] {
+            assert!(!runtime.restart.as_ref().unwrap().canceled_update(id));
+        }
+        assert!(runtime.restart_request(1).is_err());
+        for id in 2..=MAX_ACTIVE as u32 {
+            runtime
+                .model
+                .insert(id, 8, None, "active", "내 공간", None)
+                .unwrap();
+        }
+        assert!(!runtime.has_capacity());
+        // Timeout is not proof that StartDownload did nothing.
+        runtime.restart.as_mut().unwrap().canceled = true;
+        // Even after a timeout, late OnUpdated callbacks from erased records
+        // cannot identify the new request before OnBeforeDownload.
+        for id in [1, 2, 999] {
+            assert!(!runtime.restart.as_ref().unwrap().canceled_update(id));
+        }
+        runtime.restart.as_mut().unwrap().cef_id = Some(999);
+        assert!(runtime.restart.as_ref().unwrap().canceled_update(999));
+        assert!(!runtime.restart.as_ref().unwrap().canceled_update(1));
+        assert!(!runtime.has_capacity());
+        assert!(runtime.restart_request(1).is_err());
+        runtime.restart.take();
+        assert!(runtime.has_capacity());
+        runtime.model.cancel(2);
+        runtime.requests.push(RequestAttempt {
+            target: restart_target(),
+            url: "https://example.test/other".into(),
+            get: true,
+        });
+        assert!(runtime.restart_request(1).is_err());
+        runtime.requests.clear();
+        assert!(runtime.restart_request(1).is_ok());
+        runtime.dialog = Some(Dialog { id: 3, sequence: 1 });
+        assert!(runtime.restart_request(1).is_err());
+        runtime.dialog = None;
+        runtime.shutting_down = true;
+        assert!(runtime.restart_request(1).is_err());
+    }
 
     #[test]
     fn source_lookup_preserves_download_and_rejects_sheet_shutdown_and_removed_record() {

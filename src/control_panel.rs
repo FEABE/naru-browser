@@ -950,6 +950,7 @@ struct DownloadRow {
     id: u32,
     can_reveal: bool,
     can_reveal_file: bool,
+    can_restart: bool,
     surface: Retained<SurfaceView>,
     name: Retained<NSTextField>,
     source: Retained<NSTextField>,
@@ -958,6 +959,7 @@ struct DownloadRow {
     cancel: Retained<NSButton>,
     reveal: Retained<NSButton>,
     reveal_file: Retained<NSButton>,
+    restart: Retained<NSButton>,
 }
 
 struct DownloadPermissionRow {
@@ -1854,6 +1856,8 @@ define_class!(
         fn reveal_download_source(&self, sender: &NSButton) { reveal_download_source(sender, false); }
         #[unsafe(method(revealDownloadFile:))]
         fn reveal_download_file(&self, sender: &NSButton) { reveal_download_file(sender); }
+        #[unsafe(method(restartDownload:))]
+        fn restart_download(&self, sender: &NSButton) { restart_download(sender); }
         #[unsafe(method(allowMultipleDownloads:))]
         fn allow_multiple_downloads(&self, sender: &NSButton) { download_permission_action(sender, true); }
         #[unsafe(method(cancelMultipleDownloadsRequest:))]
@@ -2677,6 +2681,14 @@ impl DownloadPanel {
                     "완료한 다운로드 파일의 위치를 Finder에서 보기",
                     marker,
                 );
+                let restart = button(
+                    &surface,
+                    "다시 받기",
+                    target,
+                    sel!(restartDownload:),
+                    "파일을 처음부터 다시 요청하고 저장 위치를 새로 선택",
+                    marker,
+                );
                 for control in [&choose, &cancel] {
                     unsafe {
                         let _: () = msg_send![&**control, setTag: item.id as isize];
@@ -2686,6 +2698,7 @@ impl DownloadPanel {
                     id: item.id,
                     can_reveal: item.can_reveal,
                     can_reveal_file: item.can_reveal_file,
+                    can_restart: item.can_restart,
                     surface,
                     name,
                     source,
@@ -2694,6 +2707,7 @@ impl DownloadPanel {
                     cancel,
                     reveal,
                     reveal_file,
+                    restart,
                 }
             };
             let mut row = row;
@@ -2711,10 +2725,13 @@ impl DownloadPanel {
             row.choose.setHidden(!save_visible);
             row.reveal_file.setHidden(!item.can_reveal_file);
             row.reveal_file.setEnabled(item.can_reveal_file);
+            row.restart.setHidden(!item.can_restart);
+            row.restart.setEnabled(item.can_restart);
             for (control, available) in [
                 (&row.reveal, item.can_reveal),
                 (&row.reveal_file, item.can_reveal_file),
                 (&row.choose, save_visible),
+                (&row.restart, item.can_restart),
             ] {
                 if !available {
                     let control_view: &NSView = control;
@@ -2726,10 +2743,15 @@ impl DownloadPanel {
             }
             row.can_reveal = item.can_reveal;
             row.can_reveal_file = item.can_reveal_file;
+            row.can_restart = item.can_restart;
             row.reveal.setEnabled(item.can_reveal);
             for (control, action) in [
                 (&row.choose, "저장 위치 선택"),
                 (&row.cancel, "다운로드 취소"),
+                (
+                    &row.restart,
+                    "파일을 처음부터 다시 요청하고 저장 위치를 새로 선택",
+                ),
                 (
                     &row.reveal_file,
                     "완료한 다운로드 파일의 위치를 Finder에서 보기",
@@ -2820,6 +2842,7 @@ impl DownloadPanel {
             let [reveal, choose, cancel] = download_action_frames(width, false);
             row.choose.setFrame(choose);
             row.reveal_file.setFrame(choose);
+            row.restart.setFrame(choose);
             row.cancel.setFrame(cancel);
             row.reveal.setFrame(reveal);
         }
@@ -4541,6 +4564,72 @@ fn download_row_action(sender: &NSButton, choose: bool) {
     };
     set_download_notice(result.err());
     sync();
+}
+
+fn restart_download(sender: &NSButton) {
+    let controls = SHELL.with(|slot| {
+        let slot = slot.try_borrow().ok()?;
+        let shell = slot.as_ref().filter(|shell| shell.downloads.open)?;
+        Some((shell.window.clone(), shell.downloads.surface.clone()))
+    });
+    let Some((window, surface)) = controls else {
+        return;
+    };
+    if !window.isKeyWindow()
+        || !window.isVisible()
+        || window.isMiniaturized()
+        || surface.window().as_deref() != Some(&*window)
+        || surface.isHiddenOrHasHiddenAncestor()
+        || page_find_has_marked_text()
+    {
+        return;
+    }
+    // Resolve the exact visible row after native getters, which may reenter.
+    // A delayed Save or Finder action must never become a new network request.
+    let id = SHELL.with(|slot| {
+        let slot = slot.try_borrow().ok()?;
+        let shell = slot.as_ref().filter(|shell| {
+            shell.downloads.open
+                && !shell.search.open
+                && !shell.bookmarks.state.open
+                && std::ptr::eq(&*shell.window, &*window)
+                && std::ptr::eq(&*shell.downloads.surface, &*surface)
+        })?;
+        shell
+            .downloads
+            .rows
+            .iter()
+            .find(|row| row.can_restart && std::ptr::eq(sender, &*row.restart))
+            .map(|row| row.id)
+    });
+    let Some(id) = id else { return };
+    // The runtime owns asynchronous acceptance and timeout notices. A local
+    // success message would mask those later results in the panel.
+    let notice = crate::download_runtime::restart(id).err();
+    let current = SHELL.with(|slot| {
+        let Ok(mut slot) = slot.try_borrow_mut() else {
+            return false;
+        };
+        let Some(shell) = slot.as_mut().filter(|shell| {
+            shell.downloads.open
+                && !shell.search.open
+                && !shell.bookmarks.state.open
+                && std::ptr::eq(&*shell.window, &*window)
+                && std::ptr::eq(&*shell.downloads.surface, &*surface)
+                && shell
+                    .downloads
+                    .rows
+                    .iter()
+                    .any(|row| row.id == id && std::ptr::eq(sender, &*row.restart))
+        }) else {
+            return false;
+        };
+        shell.downloads.notice = notice;
+        true
+    });
+    if current {
+        sync();
+    }
 }
 
 fn reveal_download_file(sender: &NSButton) {
@@ -8237,14 +8326,13 @@ fn navigation_control_action(sender: Option<&AnyObject>) {
         SHELL.with(|slot| {
             if let Some(shell) = slot.borrow_mut().as_mut() {
                 let tab = shell.tabs.iter().find(|tab| Some(tab.id) == shell.active);
-                let mut rebased = false;
                 if call.preserve_address {
                     if let (Some(outcome), Some(draft), Some(tab)) = (
                         navigation_address_outcome(&result),
                         &mut shell.address_draft,
                         tab,
                     ) {
-                        rebased = rebase_navigation_address(
+                        rebase_navigation_address(
                             draft,
                             &call.target,
                             &call.url,
@@ -8263,14 +8351,10 @@ fn navigation_control_action(sender: Option<&AnyObject>) {
                             shell.notice = None;
                         }
                     }
-                    (Err(error), Some(tab))
-                        if command_current
-                            && receipt_current
-                            && (tab.navigation_epoch == call.target.navigation_epoch
-                                || rebased) =>
-                    {
-                        // A rejected old target cannot attach its error to a
-                        // new page. Same-page busy/send errors remain visible.
+                    (Err(error), Some(_)) if command_current => {
+                        // The same call, controls, tab, space and URL still match.
+                        // Reporting rejection needs no address-rebase receipt:
+                        // an early stale-epoch failure has no such receipt.
                         shell.notice = Some(format!("처리하지 못했습니다: {}", error.message));
                     }
                     _ => {}

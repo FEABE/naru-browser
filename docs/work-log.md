@@ -1,5 +1,44 @@
 # Naru 작업 기록
 
+## 2026-10-20, 수동 다시 받기 구현과 우선 커밋
+
+사용자가 진행 중인 변경을 우선 커밋하고 푸시하라고 요청했다. 대상은 GitHub에서 비공개를 확인한 `FEABE/naru-browser`의 기존 `codex/navigation-readiness` 브랜치다. 원격 갱신 시 HEAD `c40bf03`과 원격은 같았다. 새 통합 앱 빌드보다 현재 소스와 검증 범위의 기록을 먼저 반영한다.
+
+`src/downloads.rs`, `src/download_runtime.rs`, `src/browser.rs`, `src/control_panel.rs`에 취소되거나 실패한 파일의 **다시 받기**를 연결했다. 유일한 HTTP(S) GET 증거가 있는 요청만 새 다운로드 ID와 새 저장 위치 선택으로 이어진다. 원본 탭, 문서와 제어권을 재검증하고 이전 경로를 저장 승인으로 재사용하지 않는다. 접수 전 예약 하나도 활성 한도 4개에 포함하며 새 항목이 접수되면 원본 항목의 재요청 URL을 소비한다. URL은 항목별 8,192바이트까지 메모리에 보관하며 목록과 후보는 각각 24개로 제한한다. 이전 작업의 탐색 거절 안내 수정도 함께 포함한다.
+
+`tests/download_fixture.py`와 `tests/fixtures/downloads.html`에는 명시적으로 복구하기 전까지 계속 불완전 응답을 보내는 `/recoverable.bin`을 추가했다. localhost `POST /recover`에 정확한 `{"ready":true}`를 전달한 뒤에는 같은 주소에서 정상 파일을 받는 구조다. `docs/downloads-design.md`, `docs/product-plan.md`, `docs/ego-parity-e2e.md`에 소스 구현과 실제 앱 미검증을 구분했다. 이전 v17 파일 UI 실행의 근거는 바로 아래 기록과 `docs/native-e2e-2026-10-20.md`에 유지한다.
+
+검증 결과는 다음과 같다.
+
+- `cargo test --locked --lib manual_restart_`: 신규 단위 검사 4개 통과, 실패 0, 나머지 393개는 필터로 제외. URL과 상태 제한, 유일한 GET과 문서 일치, 예약 중복 방지와 활성 한도, 문서별 provenance 무효화를 확인했다. 기존 미사용 코드 경고 3건이 있었으며 종료 코드는 0이다.
+- 먼저 실행한 같은 필터의 `--bin light-browser`는 검사 0개였다. 컴파일만 확인한 결과이며 단위 검사 통과 수에 포함하지 않는다.
+- 수정한 UI와 다운로드 Rust 파일의 format 검사, `git diff --check`, fixture Python AST 구문 확인을 통과했다.
+- 모의 DOM, 전체 회귀 묶음, 새 앱 번들, 이번 구현의 로컬 CEF 통합과 네이티브 UI, 외부 사이트 검증은 실행하지 않았다. 현재 설치된 v17 실행 결과를 이 구현의 성공 증거로 사용하지 않는다.
+
+다음 통합 후보에서는 실패 표시 후 서버 복구, 다시 받기, 새 저장창 취소 후 다시 받기, 실제 파일 해시, 사용자 공간과 탭 선택 보존을 확인해야 한다. `OnBeforeDownload` 없이 실패하면 30초 뒤 안내하고 원본 탭을 닫아 예약을 정리해야 한다. 같은 탭에 다른 다운로드 후보가 남아 있어도 재요청을 보수적으로 제한한다. POST, blob, data와 출처가 모호한 다운로드는 원본 페이지에서 다시 받아야 한다. Finder의 실제 파일 선택, IME, 지속 사용과 실제 로그인 검증은 기존 미완료 범위다.
+
+이번 커밋 준비에서는 앱이나 fixture 서버를 실행하지 않았고, 프로세스 목록에서 해당 프로젝트 앱과 다운로드 fixture 서버가 남아 있지 않은 것을 확인했다. 단위 검사 후 `scripts/cleanup-build.py`로 Cargo 중간 파일 2,844개, 명령 보고 기준 1.7GiB를 제거했다. 기존 release 실행 파일을 보존했으며 `target`은 3.9MiB다. 검사 로그는 Git 제외 경로 `artifacts/e2e-v18-download-restart-20261020/`에 남겼다. `dist`, `target`, `.local-data`, `artifacts`가 Git에서 제외됨을 확인했으며 사용자 프로필, 바이너리와 다운로드 파일은 커밋에 포함하지 않는다.
+
+## 2026-10-20, 파일 UI 후속 확인과 탐색 거절 안내
+
+직전 요청의 커밋 `c40bf03`과 비공개 원격 반영은 완료됐다. 이번 goal 재개는 깨끗한 같은 checkout에서 시작했다. Naru 완성을 위한 후속 작업으로 기존 v17의 파일 저장과 취소를 확인하고, 로딩 중지 조사에서 드러난 초기 거절 안내 누락을 수정했다.
+
+`src/control_panel.rs`의 `navigation_control_action`에서 오류 안내를 주소 초안 갱신 receipt와 분리했다. 같은 호출, 창과 컨트롤, 탭, 공간, URL이 유지되고 오버레이가 없으면 초기 epoch 검사에서 거절한 이유도 기존 상태줄에 표시한다. 주소 초안의 갱신 조건, 실제 명령 전송의 epoch와 소유권 검사, 중지 의도는 유지하며 자동 재전송은 추가하지 않았다. 과거 첫 중지 실패의 원인으로 이 경로를 확정한 것은 아니다. 당시 자료에는 action 도달과 epoch가 없고, 같은 `/slow`의 추가 요청도 없어 Stop이 Reload로 바뀌었다는 근거도 없다.
+
+소스 검증은 `rustfmt --edition 2024 --check`, `git diff --check`, `CEF_PATH="$PWD/.cache/cef" PATH="$PWD/.cache/bin:$PATH" cargo check --locked --bins`를 통과했다. 컴파일 확인은 28.71초, exit 0이며 기존 `Registry::remove`, `len`, `is_empty`의 dead_code 경고 1개가 있었다. 단위 테스트와 모의 DOM 검사, 전체 회귀 묶음은 실행하지 않았다. 새 앱 번들을 만들지 않아 수정된 거절 안내의 네이티브 표시와 첫 중지 경합 재현은 다음 통합 후보에서 확인해야 한다.
+
+파일 UI는 변경 전 v17 앱 해시 `909809680609d3fc847714f3be961bb0a3aa795d36af937ab7296ad1233e7d98`, CLI 해시 `da321cbfe2d47b48836c21fbaf9f89750c7e69cfc5efb23642c01b6f0a58a784`로 확인했다. 별도 합성 프로필 `.local-data/e2e-v17-files-20261020`과 기존 mock keychain 옵션, localhost `tests/download_fixture.py`를 사용했다. 새 폴더의 초기 권한 755는 `INSECURE_SOCKET_DIRECTORY`로 실행이 거절됐고, 이 검증 폴더만 700으로 설정해 실행했다. 화면 좌표로 페이지 링크를 누른 첫 시도는 요청이 없어 성공으로 계산하지 않았고, 주소창에서 attachment 주소를 입력해 파일 요청을 시작했다.
+
+- 네이티브 저장창 Cancel은 취소됨으로 끝났고 저장 대기는 0이었다.
+- 느린 파일을 저장하고 진행 중 취소했다. 화면의 40% 진행에서 취소됨으로 바뀌었으며 서버 연결 해제 1건, 활성 연결 0, 앱 다운로드와 저장 및 권한 대기 0, 저장 폴더의 부분 파일 0을 확인했다.
+- 불완전 응답은 서버 요청 6회 뒤 중단 코드 38로 표시됐다. 별도 저장창을 반복 요구하지 않았고 부분 파일은 남지 않았다. 이는 Chromium 내부 재시도 결과다. 사용자가 중단 항목에서 다시 받는 UI 버튼은 현재 구현돼 있지 않다.
+- 이후 정상 파일을 새 요청으로 저장해 131,072바이트와 fixture 원본 SHA-256 `59f410ae5e17962412e2aed4f815918f634932f2abf084f00bb638c4db017850`의 일치를 확인했다.
+- Finder 버튼 뒤 Naru의 요청 안내는 확인했다. Finder UI 조회가 2,458.67초 지연된 뒤 최근 항목 화면을 반환해 대상 파일 선택은 확인하지 못했다. 이 지연의 원인과 실제 Finder 선택 결과는 미확정이며, 관련 없는 파일 목록은 실행 자료에 저장하지 않았다.
+
+근거는 Git 제외 경로 `artifacts/e2e-v17-files-20261020/`의 AX 자료와 `09-cancel-receipt.json`, `12-file-receipt.json`, `source-check.log`, `final.json`이다. `docs/native-e2e-2026-10-20.md`, `docs/ego-parity-e2e.md`, `docs/product-plan.md`에 확인한 범위와 수동 다운로드 재요청의 미구현 상태를 반영했다. 외부 사이트나 실제 계정, IME, 장시간 반복 여정은 실행하지 않았다. Finder 조회 대기로 앱이 켜져 있던 시간을 지속 사용 검사로 계산하지 않는다.
+
+정리에서는 이번 앱과 fixture 서버를 종료 코드 0으로 끝내고 프로젝트 앱 프로세스와 제어 소켓이 남지 않은 것을 확인했다. 이번 합성 프로필의 Chromium 데이터 135,204,528바이트를 정리하고 방문 기록 JSON 138바이트와 실행 근거, 검증 파일만 남겼다. `scripts/cleanup-build.py`로 Cargo 중간 파일 3,639개, 명령 보고 기준 2.3GiB를 제거하고 기존 release 실행 파일은 보존했다. 앱과 CLI 해시는 바뀌지 않았으며 실제 사용자 프로필과 다른 검증 자료는 건드리지 않았다. 이번 변경은 커밋하거나 푸시하지 않았다.
+
 ## 2026-10-20, 현재 변경 커밋과 비공개 원격 반영
 
 사용자가 현재 작업의 커밋과 푸시를 요청했다. `FEABE/naru-browser`가 비공개 저장소임을 GitHub에서 확인했고, 대상은 기본 브랜치가 아닌 `codex/navigation-readiness`다. 원격 갱신 후 로컬에만 있는 기존 커밋 7개와 새 변경을 함께 반영하는 범위다. 이번 작업에서 제품 코드를 추가로 수정하지 않았다.
