@@ -4,6 +4,69 @@
 
 참고 기준은 [2026-10-11 실제 앱 비교](browser-comparison-2026-10-11.md)다. 당시 ego lite `0.5.1.13`에서 별도 AI 공간, 사용자 선택 유지, 작업 표시, 로컬 페이지 클릭과 입력을 관찰했다. Aside에서는 새 탭, 세로 탭, 북마크, 통합 검색과 중지 UI를 관찰했다. 당시 확인하지 않은 로그인, 모든 중지 경합, 전체 웹 호환성과 메모리 우열을 동등성 기준에 추가하지 않는다. 아래 항목은 그 관찰과 Naru의 제품 목표를 합친 지원 범위이며, 최신 ego lite의 전체 기능 목록을 복제한 표가 아니다.
 
+## 2026-10-21 M8 추가 실행 (M7과 같은 앱 SHA-256 `e36b0dd5...0ff0`, 재빌드 없음)
+
+M7 번들(`dist/Light Browser.app`, `Contents/MacOS/light-browser` SHA-256 `e36b0dd51f1374fef002f6b6d6d50b9ed4d2cc335e25d17e321b1685b8860ff0`, 시작 전 해시 일치 확인)을 `NARU_MOCK_KEYCHAIN=1`과 앱이 직접 만든 새 프로필 `.local-data/e2e-m8-j14`(60분 실행), `.local-data/e2e-m8-main`(나머지)로 두 인스턴스 실행했다. 소스는 수정하지 않았고 하네스 변경은 없다. 네이티브 AppKit·AX 자동화는 권한이 없어 시도하지 않았다. 원본은 `artifacts/m8-e2e-20261020/`(`results.tsv`, `j13_report.json`, `j14/`)다. 실행한 구분은 CLI·로컬 CEF·파일 수준이며 네이티브 UI 확인이 아니다.
+
+| 여정 | 이번에 실행한 것 | 판정 | 남은 일 |
+| --- | --- | --- | --- |
+| 12 실패한 페이지 복구 | `controls_smoke`(exit 0, 1초): 빈 응답 탐색 실패 뒤 같은 탭 복구, 204가 옛 페이지로 wait를 만족시키지 못함, 지연 탐색의 시간 초과·중복 요청 거절·stop·복구, 시험 탭만 정리. `frame_crash_smoke`(exit 0, 123초): 10개 시나리오 각 5회(frames 뒤 navigate·reload, OOPIF 교체 클릭·수집 중 교체·10회 churn, 체인 깊이 8·9·10, OOPIF 16·17개)에서 앱이 매번 응답하고 응답 코드가 모두 허용 목록, 사용자 공간·탭 불변 | pending | 식별한 시험 탭의 렌더러 강제 종료와 reload 복구는 이번 바이너리에서 실행하지 않았다. 안내 UI(네이티브)도 미확인 |
+| 13 종료와 재시작 | 파일·CLI 수준(아래 상세) | pending | 북마크는 UI에서 만든 항목의 보존과 폴백 표시를 확인하지 못했다(네이티브 필요) |
+| 14 지속 사용과 정리 | 60분 연속 실행(23:32:06~00:33:12, 24주기), 아래 상세 | pass (CLI·로컬 CEF 범위, 단서 있음) | 스크린샷 경로가 하네스 결함으로 거의 실행되지 않음, 고유 RAM 증가 판정 불가, 숨은 탭 대용량 부하 없음 |
+| 08 iframe과 Shadow DOM | `frame_journey_smoke` 56개 검사(exit 0, M7과 검사 이름 동일), `shadow_smoke`(exit 0), `scroll_target_smoke` 81개 검사 전부 ok, `native_fill_smoke`(exit 0), `frame_crash_smoke` | pending | 아래 20개 항목 대조표 |
+
+### 13번 상세 (파일 수준과 CLI 수준, 네이티브 UI 아님)
+
+모든 단계는 `j13_driver.py`가 같은 번들을 SIGTERM으로 종료하고 다시 실행하며 기록했다(`j13_report.json`).
+
+- 방문 기록(파일 수준 + 실제 앱 기록): CLI `open`으로 사용자 공간 페이지 3개를 열자 `history-v1.json`(권한 0600)에 제목과 함께 기록됐다. 같은 시점에 AI 작업이 연 `/ai/secret` 주소는 기록되지 않았다. SIGTERM 종료는 0.11초, 종료 후 control.sock 없음, 남은 자식 프로세스 0, 파일 해시는 종료 직전과 동일했다.
+- 재시작(CLI 수준): 같은 번들 재실행 뒤 `status`는 탭 1·사용자 공간·pendingWaits 0이고 이전 작업 목록은 비었다(탭 복원이나 이전 CLI 요청의 재실행 없음). 방문 기록 파일 해시는 재실행 직후 동일했고, 재시작 뒤 새로 연 페이지가 nextId를 이어(id 6) 추가됐으며 기존 항목의 id·제목·시각이 모두 같았다. 두 번째 SIGTERM 종료 0.23초, exit 0.
+- 북마크(파일 수준만): 사용자 UI 없이는 항목을 만들 수 없어 설계 형식의 유효한 `bookmarks-v1.json`(0600, 3개, 한글 제목 포함)을 종료 상태에서 심고 재시작했다. 재시작·페이지 방문·정상 종료 뒤 해시가 같았고 `.bak`이나 `.pending`이 생기지 않았다. 이것은 앱이 심은 파일을 훼손하지 않는다는 뜻이며 목록이 로드되어 화면에 표시됨은 CLI·파일로 관찰할 수 없어 확인하지 못했다.
+- 손상 복구(파일 수준만): 본문을 잘린 JSON으로 바꾸고 유효한 `.bak`을 둔 상태에서 재시작·방문 기록 쓰기·종료를 했다. 본문과 `.bak` 모두 해시가 변하지 않았고 임시 파일도 없었다(설계의 읽기 전용·자동 교체 금지와 일치). 읽기 전용 UI 표시와 백업 항목 열기는 확인하지 못했다. 방문 기록 파일을 손상시킨 경우에도 앱은 정상 실행·종료(exit 0)했고 파일 해시는 그대로였다.
+- 무한 종료 대기: 4회 종료가 0.1~0.23초에 끝났다. 쿠키·localStorage 보존은 M7 `restart_smoke`가 맡는다.
+
+### 14번 상세
+
+- 구성: 로컬 fixture 서버 하나에 대해 150초마다 1회씩 24주기. 매 주기에 작업 1개(홀수 주기 2개)를 만들어 탭 2개씩 열기·wait·read·navigate·read-page·frames, 탭 닫기, 사용자 공간 탭 열기·탐색·읽기·닫기, 작업 finish를 했다. 2분마다 `measure-memory.py`(3표본), 시작·중간·끝에는 `--footprint`를 썼다. 실행 중 맥 잠자기 방지로 `caffeinate -i`를 사용했다.
+- 오류: 24주기 모두 사용자 선택 탭 불변(`selUnchanged`). 스크린샷을 제외한 명령 오류 0건. 앱은 계속 살아 있었다.
+- 회수: 끝난 뒤 60초 안정화에서 탭 1(시작과 같은 about:blank), pendingWaits·다이얼로그·파일 선택·사이트 권한 대기 0, focusLeases·capturesInFlight·pendingTabCreations 0, 프로세스 6개(시작과 동일, 모든 표본 6)였다. 끝난 작업은 `task list`에 `finished`·탭 없음으로 남았다(41개, 약 6.5KB).
+- 메모리(RSS 합은 공유 페이지를 중복 계산하므로 고유 RAM이 아님): 시작 661MiB, 2분 간격 표본 최소 671·최대 693, 중간 692, 끝 690. 4~8분 사이 약 +21MiB(671→692) 뒤 평평했다. vmmap footprint 합은 시작 204.0, 중간 217.0, 끝 210.3MiB(프로세스를 순차 측정). 본체 RSS는 202→225→223MiB. 60분 동안 단조 증가 추세는 보이지 않았지만 이 표본으로 증가 없음을 입증하지는 않는다. ego 대비 비교는 하지 않았다.
+- 하네스 결함(제품 아님): 주기마다 같은 파일명으로 스크린샷을 저장해 첫 1회 외 23회가 `INVALID_PATH`(기존 파일 덮어쓰기 거절로 보임)였다. 실행 뒤 새 경로 두 개의 스크린샷은 성공해(`j14/shot-abs.png`) 경로 문제가 아님을 확인했다. 따라서 60분 동안 캡처 경로는 사실상 1회만 부하를 받았다.
+- 관찰: 끝난 작업 기록이 `task list`에서 정리되지 않고 주기마다 누적된다(탭 자원은 회수됨). 장기 실행에서 목록이 계속 커지는지는 설계 의도인지 확인이 필요하다.
+
+### 08번 20개 항목 대조 (M7 `artifacts/m7-20261020/`와 이번 `artifacts/m8-e2e-20261020/`)
+
+pass는 항목 전체가 같은 번들의 CLI·로컬 CEF 결과로 확인된 경우, partial은 일부만 확인된 경우다. 어느 쪽도 08번 여정 완료를 뜻하지 않는다.
+
+| 항목 | 판정 | 근거 |
+| --- | --- | --- |
+| 1 같은 출처 중첩 iframe frames와 read 공존 | partial | frame_journey_smoke(M7·M8)에서 SAME·SAMEN 포함 프레임 7개 목록, 하위 세션은 교차 사이트만. read·screenshot 응답 비혼입은 개별 확인 없음 |
+| 2 다른 site 중첩과 child session | partial | 같은 스모크: CROSS·CROSSN만 child session, frame_crash의 frames n=7·sessions=2. 합계 중복 대조는 개별 단언 없음 |
+| 3 frames 2회 조회, 선택·주소 초안 유지 | partial | "second frames call lists the same frames"와 "user space and selected tab preserved" 통과. 주소 초안은 미확인 |
+| 4 프레임 추가·삭제·탐색·교체 중 FRAME_CHANGED | pass | M8 frame_crash: 수집 중 교체에서 FRAME_CHANGED 5/5, churn 34회 관찰, 그 뒤 안정 조회가 n=3과 n=4 목록을 반환, 앱 생존. 이전 행 재사용 부재는 목록 크기 변화로만 간접 확인 |
+| 5 늦은 수집을 handoff·중지·시간 초과·탭 종료로 끝냄 | pending | 실행하지 않음 |
+| 6 연결 16·깊이 8 경계와 초과 | partial | frame_crash: OOPIF 16개 n=17 정상(5회 x3), 17개와 깊이 9·10은 FRAME_LIMIT 15/15, 깊이 8은 n=9 정상. frame 128개·트리 깊이 32·긴 메타데이터는 미실행 |
+| 7 반복 뒤 14번 연결 | partial | 14번 60분의 frames 반복(주기마다)과 정리 후 카운터 0. 프레임 collector 단독 반복은 frame_crash churn 정도 |
+| 8 read-frame이 선택 문서와 열린 shadow만 포함 | pass | frame_journey_smoke ROOT 제외 SAME·XO·CROSS·CROSSN의 "read-frame returns only its document and open shadow"와 contract 검사(M7·M8 동일 통과) |
+| 9 world 재사용과 Runtime disable→enable | pending | CLI로 관찰 불가, 실행하지 않음 |
+| 10 context 파괴·탐색·process swap 중 읽기 | partial | frame_crash swap/churn에서 다른 문서 본문 성공 반환 없음(코드는 허용 목록), SWAPPED_DOC_MARK 읽기 확인. 같은 numeric ID의 다른 unique context 이어 읽기와 FRAME_NOT_FOUND는 개별 확인 없음 |
+| 11 지연 읽기를 인계·중지·취소로 종료, ACK 구분 | pending | 실행하지 않음 |
+| 12 12,000자·120개·옵션 240개·2MiB 상한, PAGE_LOADING | partial | shadow_smoke: 120 items/12000 text와 순회 한계의 truncated 표시. frame 단위 옵션 240·2MiB는 미실행, PAGE_LOADING은 frame_crash 교체 직후에 관찰(3회) |
+| 13 root·교차 출처·OOPIF에서 fill·insert·press·check·select | pass | frame_journey_smoke SAME·XO·CROSS(OOPIF)·CROSSN 각각 6개 응답 ok, 실제 DOM 상태(fill/insert/check/select)와 hover 이동 1회·press 0, click 정확히 1회 |
+| 14 부모 숨김·inert·가림 거절 | partial | "inert parent rejects fill/click", "covered frame rejects click", "no input reached the frame" 통과. hidden·display:none·제거·탐색 조상, 열린 shadow 안 iframe은 미실행 |
+| 15 새 read-frame 뒤 이전 ref와 위조 ref | partial | "stale ref after a new read-frame"와 위조 ref 4종 거절, 진짜 ref 유지 통과. handoff/resume·process swap 뒤 참조와 시작 후 실패 경계는 미실행 |
+| 16 resolve·release·입력 사이 취소의 ACK | pending | 실행하지 않음 |
+| 17 지연 focus로 다른 요소에 포커스 이동 | pending | 실행하지 않음 |
+| 18 중첩·zoom·shadow owner 조합 geometry | pending | 실행하지 않음 |
+| 19 viewport 밖 요소의 leaf scrollIntoView와 이벤트 횟수 | partial | scroll_target_smoke 81개와 frame_journey의 hover/click 이벤트 횟수 통과. 큰 iframe 안 viewport 밖 요소 선택과 OOPIF 조상 스크롤은 미실행 |
+| 20 mouseMoved 중 이동·숨김·교체와 지원 밖 기하 | partial | "target hidden by mousemove: no button press" 통과. 이동·교체·탐색 조합과 회전·skew 등 거절 확인은 미실행 |
+
+### 요약과 한계
+
+- 이번에 pass한 것은 14번(60분 CLI 지속 사용, 단서 있음)과 08번 항목 4·8·13이다. 12번은 두 스모크가 통과했지만 렌더러 종료가 빠져 pending, 13번은 파일 수준만 통과해 pending, 08번은 pass 3·partial 11·pending 6이라 pending이다.
+- 네이티브 확인, 외부 사이트, IME, 사용자 직접 로그인은 이번에도 하지 않았다. 다른 여정(01~07, 09~11)은 이번 실행으로 판정을 바꾸지 않는다.
+- 제품 결함은 발견하지 못했다. 관찰 1건(끝난 작업 기록 누적)은 설계 확인이 필요하다.
+
 ## 2026-10-20 M7 최종 통합 검증 (release 빌드 1회, 앱 SHA-256 `e36b0dd5...0ff0`)
 
 이 절은 M0~M5 미커밋 트리에서 `NARU_MOCK_KEYCHAIN=1 scripts/dev.sh --release --build-only`로 한 번 만든 번들의 결과다. 앱 `Contents/MacOS/light-browser` SHA-256은 `e36b0dd51f1374fef002f6b6d6d50b9ed4d2cc335e25d17e321b1685b8860ff0`, 번들 CLI는 `1b0a53d515853483e7bcb7ed9a7264d014aff648c4b6dc27ff33d7887373f5fc`다([빌드 기록](../artifacts/m7-20261020/build-receipt.json)). 아래 모든 실행은 이 번들과 새 mock-keychain 프로필(`.local-data/e2e-m7-run`)로 했고 재빌드는 없었다. 이전 바이너리(v14~v24, M5 빌드)의 통과는 옮기지 않았다. 외부 사이트, 실제 프로필과 로그인은 사용하지 않았다. 결과 원본은 `artifacts/m7-20261020/`다.

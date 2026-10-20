@@ -1,5 +1,34 @@
 # Naru 작업 기록
 
+## 2026-10-21, M8 추가 E2E 실행 (M7과 같은 번들, 재빌드 없음)
+
+### 요청 범위와 변경
+
+- 요청: M7 번들(`light-browser` SHA-256 `e36b0dd51f1374fef002f6b6d6d50b9ed4d2cc335e25d17e321b1685b8860ff0`, 시작 전 일치 확인)로 자동화 가능한 남은 E2E인 12·13·14·08번을 실행하고 기록한다. 소스·테스트 스크립트 수정 없음, 재빌드 없음. 추가 파일은 실행 하네스 `artifacts/m8-e2e-20261020/j13_driver.py`, `j14_driver.py`와 결과 원본뿐이다.
+- 문서: `docs/ego-parity-e2e.md`에 "M8 추가 실행" 절(12·13·14·08 판정과 08번 20개 항목 대조표).
+
+### 검증
+
+| 구분 | 내용 | 결과 |
+| --- | --- | --- |
+| 로컬 CEF | `frame_crash_smoke`(10 시나리오 x 5회, 123초), `controls_smoke`(1초) | 둘 다 exit 0, ok true |
+| 로컬 CEF | `frame_journey_smoke`(56검사), `shadow_smoke`, `scroll_target_smoke`(81검사), `native_fill_smoke` | 모두 exit 0, 검사 전부 ok |
+| 파일·CLI 수준 | 13번: 방문 기록 기록·보존·id 이어쓰기, 심은 북마크 파일 보존, 손상 북마크(.bak 유효)·손상 방문 기록 보존, SIGTERM 4회 종료 | 모두 기대대로(종료 0.1~0.23초, exit 0, 자식 0). 북마크 로드·표시는 관찰 불가라 미확인 |
+| 60분 연속 | 14번: 24주기, 2분 간격 RSS, 시작·중간·끝 footprint | 스크린샷 제외 오류 0, 종료 후 탭·대기·권한·focus·캡처 0, 프로세스 6개 복귀. RSS 합 661→690MiB(고유 RAM 아님), footprint 합 204.0→217.0→210.3MiB |
+| 실행하지 못함 | 네이티브 AppKit·AX 전체, 렌더러 강제 종료 후 reload, 북마크 UI 보존·폴백 표시, 08번 pending 항목(5·9·11·16~18 등), 외부 사이트·로그인, IME | 미실행 |
+
+결과 원본은 `artifacts/m8-e2e-20261020/`(`results.tsv`, `*_smoke.json`, `j13_report.json`, `j13-files/`, `j14/j14_samples.jsonl`, `j14/mem-*.json`, `j14/j14_summary.json`)다.
+
+### 알려진 한계, 남은 작업
+
+- 하네스 결함(제품 아님): `j14_driver.py`가 주기마다 같은 경로로 스크린샷을 저장해 23회가 `INVALID_PATH`였다(첫 1회만 저장 성공). 새 경로의 스크린샷은 실행 뒤 성공했다. 60분 중 캡처 경로는 사실상 1회만 시험됐다.
+- 관찰: 끝난 작업 기록이 `task list`에 `finished`로 계속 남아 41개가 됐다(탭 자원은 회수됨). 설계 의도 확인 필요.
+- 08번은 pass 3·partial 11·pending 6으로 pending 유지. 12번은 렌더러 종료 미실행, 13번은 파일 수준만이라 pending. 14번은 CLI·로컬 CEF 범위 pass이며 고유 RAM 증가 판정과 ego 대비는 하지 않았다. 독립 브라우저 완성을 선언하지 않는다.
+
+### 정리
+
+앱 2개(60분용, 나머지용)는 PID로 SIGTERM 종료했고 13번의 재실행 앱도 스크립트가 SIGTERM으로 종료했다. fixture 서버는 하네스 프로세스 안에서 함께 종료됐다. `pgrep`으로 앱·헬퍼·하네스·caffeinate가 없음을 확인했다. 합성 프로필 `.local-data/e2e-m8-j14`, `.local-data/e2e-m8-main`을 삭제했다(13번의 북마크·방문 기록 사본은 증거로 `j13-files/`에 보존). 사용자 프로필은 건드리지 않았고 커밋·푸시 없음.
+
 ## 2026-10-20, M7 최종 통합 검증 (release 빌드 1회, 로컬 CEF 자동화)
 
 ### 요청 범위와 변경
