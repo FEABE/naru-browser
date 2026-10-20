@@ -97,11 +97,15 @@ lightbrowser task run ID REV press TAB REF Enter
 | `tabs`, `status`, `spaces` | `tabs`와 `spaces`는 작업 범위에서 자기 탭과 자기 공간만 보인다 |
 | `read TAB`, `read-page TAB`, `frames TAB`, `read-frame TAB FRAME` | 본문과 요소, 여러 프레임, 프레임 목록, 지정 프레임 읽기 |
 | `scroll TAB DX DY`, `scroll TAB REF DX DY` | 상대 스크롤(-10000..10000 CSS px) |
-| `hover TAB REF`, `check TAB REF true\|false`, `insert TAB REF TEXT`, `select TAB REF VALUE` | 포인터 이동, 체크박스/라디오, 캐럿 위치 삽입, 네이티브 option 선택 |
+| `hover TAB TARGET`, `check TAB TARGET true\|false`, `insert TAB TARGET TEXT`, `select TAB TARGET VALUE` | 포인터 이동, 체크박스/라디오, 캐럿 위치 삽입, 네이티브 option 선택 |
+| `click TAB TARGET [--button left\|right]`, `dblclick TAB TARGET` | 왼쪽 클릭(기본), 오른쪽 클릭(컨텍스트 클릭), 더블클릭 |
+| `wheel TAB TARGET DX DY` | 대상 중앙에서 Chromium `mouseWheel` 입력(-10000..10000, 둘 다 0 불가). DOM 스크롤인 `scroll`과 다르다 |
+| `drag TAB FROM TO` | FROM에서 누르고 중간 이동을 거쳐 TO에서 놓음 |
+| `click-at TAB X Y [--button left\|right] [--count 1..3]`, `move-at TAB X Y` | viewport CSS 픽셀 좌표 클릭·이동(정수, viewport 밖은 `INVALID_POINT`) |
 | `close TAB`, `screenshot TAB PATH` | 탭 닫기, 존재하지 않는 PNG 경로에 저장 |
 | `dialog TAB accept [TEXT]`, `dialog TAB dismiss` | 작업 탭에 대기 중인 JavaScript 대화상자 응답(아래 절). `task run` 안에서만 |
 
-- `click`은 좌표가 아니라 ref로만 한다. 좌표·더블클릭·우클릭·휠 입력은 아직 없다.
+- 요소 명령의 TARGET은 ref 또는 선택자다(아래 "선택자와 포인터 확장" 절). 좌표가 필요하면 `click-at`, `move-at`을 쓴다.
 - `press`가 받는 키는 `lightbrowser help`의 Keys 목록뿐이며 대소문자를 구분한다(`UNSUPPORTED_KEY`).
 - 인자에 공백이 있으면 따옴표로 묶는다.
 - `space show`, `space overview`는 사용자의 화면을 바꾸므로 `task run` 안에서 거부된다(`SPACE_UI_REQUIRES_UNSCOPED`). 작업 중에는 쓰지 않는다.
@@ -146,6 +150,37 @@ lightbrowser task run ID REV wait TAB text "주문이 완료되었습니다" 100
 
 ref는 페이지 이동, 다시 읽기, `handoff`/`resume` 뒤에 `STALE_REF`가 된다. 비밀번호 입력의 값은 `read`에 나오지 않는다. 프레임 안 요소의 ref는 `frame/`로 시작하며 `read-frame`/`read-page`로 읽은 것을 같은 탭에서 쓴다.
 
+### 선택자와 포인터 확장
+
+ref가 들어가는 모든 자리(`click`, `dblclick`, `hover`, `wheel`, `drag`, `fill`, `insert`, `press`, `check`, `select`, `scroll TAB TARGET DX DY`)에는 선택자도 쓸 수 있다. 읽기 없이 한 번에 요소를 지정할 때 쓴다.
+
+| 형태 | 의미 |
+| --- | --- |
+| `text=SUBSTR` | 읽기 결과의 `label`에 SUBSTR가 있음. 공백은 한 칸으로 합치고 대소문자를 구분하지 않는다. `text="정확한 문구"`처럼 따옴표로 감싸면 정규화한 `label`과 정확히 같고 대소문자를 구분한다 |
+| `css=SELECTOR` | CSS 선택자와 일치하는 요소. 올바르지 않은 문법은 `INVALID_SELECTOR` |
+| `role=ROLE[name=NAME]` | `read`가 보여 주는 `role`이 같고, `[name=NAME]`이 있으면 `label`이 정확히 같음. `[name*=NAME]`은 대소문자 무시 부분 일치. 따옴표는 선택이다 |
+
+```sh
+lightbrowser task run ID REV click TAB 'role=button[name=로그인]'
+lightbrowser task run ID REV fill TAB 'css=input[name=q]' "검색어"
+lightbrowser task run ID REV drag TAB 'text=카드' 'text=보관함'
+```
+
+- 선택자는 `read`와 같은 순회·예산(보이는 텍스트 12000단위, 노드 10000개, 열린 shadow root 64개, 상호작용 요소 120개, 접근 가능한 same-origin iframe)으로 페이지를 읽어 보이는 상호작용 요소 중 정확히 하나를 고른다. 닫힌 shadow root와 접근할 수 없는 iframe은 대상이 아니다(`read-frame`의 `frame/` ref를 쓴다). 선택자는 `read`가 돌려주는 상호작용 요소에만 일치하므로 상호작용 요소가 아닌 `div`는 `css=`로도 지정할 수 없다.
+- 일치가 없으면 `TARGET_NOT_FOUND`, 둘 이상이면 `TARGET_AMBIGUOUS`다. 두 경우 모두 입력을 보내지 않는다(`attempted:false`). `details`에 `matchCount`, 읽기 예산에 걸렸는지 `truncated`, 후보 ref 최대 5개(`candidates[{ref,role,label}]`)가 들어 있다. 후보 ref는 이어서 바로 쓸 수 있다.
+- 선택자를 쓰면 그 순간 페이지를 다시 읽으므로 이전 `read`의 ref는 `STALE_REF`가 된다. 선택자 하나를 ref로 바꾼 뒤에는 기존 ref 경로와 같다: 위치 확인(hit test), 숨김 탭 준비, 소유권 검사가 그대로 적용되고, 가려진 대상은 `CLICK_POINT_UNAVAILABLE`이다. 성공 응답의 `resolved`에 선택자별 `ref`, `role`, `label`이 들어 있다.
+- 선택자는 1024바이트 이하, NUL 불가, `text=`/`css=`/`role=` 뒤가 비어 있으면 안 된다(CLI는 종료 코드 2, 서버는 `INVALID_REQUEST`). `drag`의 FROM과 TO는 둘 다 ref이거나 둘 다 선택자여야 한다(한 번의 읽기로 두 ref를 함께 얻는다).
+- 일치 결과는 호출 시점의 스냅샷이다. 재시도를 자동으로 하지 않는다. 오류를 받으면 `read`로 확인한 뒤 선택자를 고친다.
+
+포인터 명령의 규칙:
+
+- `dblclick`은 클릭 두 번(`clickCount` 1, 2)을 보내 `dblclick` 이벤트를 만든다. `click --button right`는 오른쪽 버튼 입력이며 페이지에 `contextmenu`가 발생한다. 이 입력으로 네이티브 컨텍스트 메뉴는 열리지 않는다. 사용자 화면 위에 메뉴가 뜨지 않도록 앱이 막으며 이 보호는 오른쪽 클릭 뒤 몇 초간(한 번만), 그리고 작업이 Active인 AI 탭이거나 선택 탭이 아닌 탭의 모든 메뉴 요청에 적용된다.
+- `wheel`은 대상 중앙으로 포인터를 옮기고 위치를 확인한 뒤 `mouseWheel` 하나를 보낸다. 스크롤은 비동기로 끝날 수 있으므로 `read`로 확인한다. 중앙 아래에 링크 같은 다른 상호작용 요소가 있어도 허용한다.
+- `drag`는 FROM에서 누르고 10단계로 나눈 이동(마지막은 TO)을 이동 하나마다 엔진 응답을 기다리며 보내고 TO에서 놓는다. FROM과 TO가 한 viewport에 함께 보여야 한다. `draggable`, 이미지, 링크처럼 브라우저가 네이티브 끌어놓기를 시작할 수 있는 FROM은 `DRAG_UNSUPPORTED`로 거절한다. 마우스 이벤트(`mousedown`, `mousemove`, `mouseup`)로 구현된 끌기만 지원한다. 도착점은 누르기 전에 확인하며 끄는 동안 다시 확인하지 않는다. 누른 뒤 handoff·취소·대화상자 등으로 중단되면 마지막 좌표에서 `mouseup`을 한 번 보내 버튼을 풀고 오류 `details.pointerCleanup`(`released`/`pending`/`failed`)에 알린다. `frame/` ref(교차 출처 프레임)는 `UNSUPPORTED_TARGET`이다.
+- `click-at`, `move-at`은 정수 CSS 픽셀 좌표(root viewport 기준, 스크롤바 제외)다. 대상 요소가 없으므로 hit test와 스크롤이 없고, viewport 밖은 `INVALID_POINT`(CLI의 음수나 1000000 초과는 종료 코드 2)다. `--count`는 1..3이며 `clickCount`가 1, 2, 3으로 오른다. 좌표 아래 요소가 바뀌어도 알 수 없으므로 화면 좌표를 직접 알 때만 쓴다.
+- 성공 응답은 엔진이 입력을 받았다는 뜻(`dispatchAcknowledged:true`)이다. 페이지 효과는 `read`로 확인한다. 중간에 실패하면 눌린 버튼 상태가 남을 수 있다(자동 release 없음). `outcomeUnknown`을 보고 같은 명령을 자동으로 반복하지 않는다.
+- 교차 출처 프레임의 `frame/` ref에는 `click`, `--button right`, `dblclick`, `wheel`을 쓴다(`drag`와 선택자는 아님).
+
 ### JavaScript 대화상자
 
 작업이 소유한 탭에서 페이지가 `alert`, `confirm`, `prompt`를 띄우거나 `beforeunload` 확인이 필요하면 네이티브 대화상자 대신 브라우저가 대화상자를 대기열에 보관한다. 페이지 스크립트는 응답할 때까지 멈추지만 UI와 에이전트는 막히지 않는다. 사용자 공간 탭의 대화상자는 대기열에 들어가지 않고 기본 네이티브 대화상자로 보인다.
@@ -180,6 +215,9 @@ lightbrowser task run ID REV dialog TAB dismiss         # confirm/prompt 취소(
 | `TASK_LIMIT`, `TASK_TAB_LIMIT`, `TAB_LIMIT` | 끝난 작업을 정리하거나 탭을 놓은 뒤 재시도 |
 | `TAB_NOT_FOUND`, `TAB_CLOSING`, `TAB_CLOSED` | 탭이 없다. 사용자가 닫았을 수 있으므로 `tabs`로 확인 |
 | `STALE_REF`, `PAGE_CHANGED`, `FRAME_CHANGED`, `ELEMENT_UNAVAILABLE`, `CLICK_TARGET_CHANGED` | 페이지가 바뀜. `read` 후 새 ref로 다시 판단 |
+| `TARGET_NOT_FOUND`, `TARGET_AMBIGUOUS`, `INVALID_SELECTOR` | 선택자가 보이는 상호작용 요소 하나로 정해지지 않음(입력 없음). `details.candidates`의 ref를 쓰거나 선택자를 고친다 |
+| `INVALID_POINT`, `CLICK_POINT_UNAVAILABLE`, `UNSUPPORTED_GEOMETRY` | 좌표가 viewport 밖이거나 대상 위치를 hit test로 확인하지 못함. 입력을 보내기 전의 거절이면 `attempted:false` |
+| `DRAG_UNSUPPORTED`, `UNSUPPORTED_TARGET` | 네이티브 끌어놓기를 시작할 수 있는 FROM, 또는 `drag`에 `frame/` ref. 입력 없음 |
 | `WAIT_TIMEOUT` | 기다린 조건(`dom`/`load`/`url`/`text`)이 제한 시간 안에 오지 않음. 탭 `wait`는 탐색이 계속될 수 있고(`navigationContinues`), `task wait`는 작업이 그대로임 |
 | `NAVIGATION_FAILED`, `NAVIGATION_STOPPED`, `NAVIGATION_INCOMPLETE`, `RENDERER_TERMINATED` | 탐색 실패나 렌더러 종료. `details.state`를 보고 `reload` 후 `wait` |
 | `DIALOG_PENDING` | 탭에 JavaScript 대화상자가 대기 중이라 페이지가 멈춰 있다. `details.dialog`를 보고 `dialog TAB accept\|dismiss`로 응답한 뒤 `read` |

@@ -3180,3 +3180,302 @@ test("containsText contains getter failures without echoing page exception text"
   assert.equal(f.bridge.read().text.includes("text"), true);
   assert.equal(f.bridge.containsText("text").found, true);
 });
+
+// ---- selector resolution and pointer expansion (mock DOM; Chromium behavior needs the CEF smoke) ----
+
+function selectorPage() {
+  const f = fixture();
+  f.document.createDocumentFragment = () => ({
+    querySelector(css) { if (css.includes("[[") || css.trim() === "!") throw new SyntaxError("bad selector"); return null; },
+  });
+  // The double only knows the default interactive selector; teach it ids and classes.
+  f.styled = (element, selectors) => {
+    const base = element.matches.bind(element);
+    // Only the bridge's own interactive/:disabled probes use the stock double.
+    element.matches = (css) => css === ":disabled" || css.includes("a[href]") ? base(css) : selectors.includes(css);
+    return element;
+  };
+  return f;
+}
+
+const resolve = (f, ...selectors) => JSON.parse(JSON.stringify(f.bridge.act({ action: "resolve", selectors })));
+
+test("text selectors match the read label as a case-insensitive substring and quoted text exactly", () => {
+  const f = selectorPage();
+  f.add("BUTTON", { "aria-label": "Sign  in\n now" });
+  f.add("BUTTON", { "aria-label": "Cancel" });
+  const found = resolve(f, "text=sign in NOW");
+  assert.equal(found.ok, true);
+  assert.equal(found.targets.length, 1);
+  assert.equal(found.targets[0].label, "Sign in now");
+  assert.equal(found.targets[0].role, "button");
+  assert.match(found.targets[0].ref, /^[0-9a-f]{32}:\d+:1$/);
+  assert.equal(resolve(f, 'text="Sign in now"').ok, true);
+  assert.equal(resolve(f, 'text="sign in now"').error, "TARGET_NOT_FOUND");
+  assert.equal(resolve(f, 'text="Sign in"').error, "TARGET_NOT_FOUND");
+  assert.equal(resolve(f, "text=Nothing here").error, "TARGET_NOT_FOUND");
+});
+
+test("role selectors match role and optionally the accessible name exactly or by substring", () => {
+  const f = selectorPage();
+  f.add("BUTTON", { "aria-label": "Save draft" });
+  f.add("BUTTON", { "aria-label": "Save" });
+  f.add("A", { href: "/home", "aria-label": "Home" });
+  f.add("INPUT", { type: "checkbox", "aria-label": "Agree" });
+  assert.equal(resolve(f, "role=link").targets[0].label, "Home");
+  assert.equal(resolve(f, "role=checkbox").targets[0].label, "Agree");
+  assert.equal(resolve(f, "role=button[name=Save]").targets[0].label, "Save");
+  assert.equal(resolve(f, 'role=button[name="Save draft"]').targets[0].label, "Save draft");
+  assert.equal(resolve(f, "role=button[name='Save']").targets[0].label, "Save");
+  assert.equal(resolve(f, "role=BUTTON[name*=draft]").targets[0].label, "Save draft");
+  const ambiguous = resolve(f, "role=button");
+  assert.equal(ambiguous.error, "TARGET_AMBIGUOUS");
+  assert.equal(ambiguous.matchCount, 2);
+  assert.equal(resolve(f, "role=button[name*=save]").error, "TARGET_AMBIGUOUS");
+  assert.equal(resolve(f, "role=slider").error, "TARGET_NOT_FOUND");
+});
+
+test("css selectors match returned interactive elements only and reject invalid syntax", () => {
+  const f = selectorPage();
+  const primary = f.styled(f.add("BUTTON", { "aria-label": "Go" }), [".primary", "#go"]);
+  f.styled(f.add("BUTTON", { "aria-label": "Stop" }), [".secondary"]);
+  const plain = f.add("DIV");
+  f.styled(plain, [".primary-wrapper"]);
+  assert.equal(resolve(f, "css=#go").targets[0].label, "Go");
+  assert.equal(resolve(f, "css= .primary ").targets[0].label, "Go");
+  // A non-interactive element is not a valid target even when CSS matches it.
+  assert.equal(resolve(f, "css=.primary-wrapper").error, "TARGET_NOT_FOUND");
+  assert.equal(resolve(f, "css=[[").error, "INVALID_SELECTOR");
+  assert.equal(resolve(f, "css=!").error, "INVALID_SELECTOR");
+  primary.matches = () => { throw new Error("SELECTOR_GETTER_SENTINEL"); };
+  const failed = resolve(f, "css=#go");
+  assert.equal(failed.ok, false);
+  assert.ok(!JSON.stringify(failed).includes("SENTINEL"));
+});
+
+test("selectors reject empty, oversized, NUL and unknown forms before reading", () => {
+  const f = selectorPage();
+  const button = f.add("BUTTON", { "aria-label": "Go" });
+  const before = f.bridge.read().generation;
+  for (const selector of ["text=", "text=   ", "css=", "role=", "role=button[name=]", "role=1x", "role=button[nm=a]",
+      "xpath=//a", "#go", "text=a\u0000b", `css=${"a".repeat(1021)}`, "", 5, null]) {
+    const result = resolve(f, selector);
+    assert.equal(result.error, "INVALID_SELECTOR", String(selector));
+    assert.equal(result.attempted, false);
+  }
+  assert.equal(f.bridge.act({ action: "resolve", selectors: [] }).error, "INVALID_REQUEST");
+  assert.equal(f.bridge.act({ action: "resolve", selectors: ["text=a", "text=b", "text=c"] }).error, "INVALID_REQUEST");
+  assert.equal(f.bridge.act({ action: "resolve" }).error, "INVALID_REQUEST");
+  // Invalid selectors fail before the read pass, so refs from the earlier read survive.
+  assert.equal(f.bridge.read().generation, before + 1);
+  assert.deepEqual(button.events, []);
+});
+
+test("ambiguous selectors return at most five candidates and the total count", () => {
+  const f = selectorPage();
+  for (let n = 1; n <= 8; n += 1) f.add("BUTTON", { "aria-label": `Buy ${n}` });
+  const result = resolve(f, "text=buy");
+  assert.equal(result.error, "TARGET_AMBIGUOUS");
+  assert.equal(result.matchCount, 8);
+  assert.equal(result.candidates.length, 5);
+  assert.deepEqual(result.candidates.map((item) => item.label), ["Buy 1", "Buy 2", "Buy 3", "Buy 4", "Buy 5"]);
+  assert.ok(result.candidates.every((item) => /^[0-9a-f]{32}:\d+:\d+$/.test(item.ref) && item.role === "button"));
+  assert.equal(result.index, 0);
+  assert.equal(result.truncated, false);
+  // A candidate ref is immediately usable through the normal ref path.
+  f.pointAt(f.document.body.children.find((child) => child.tagName === "BUTTON"));
+  assert.equal(f.bridge.act({ action: "click", ref: result.candidates[0].ref }).prepared, true);
+});
+
+test("hidden, inert and zero-size elements are not selector candidates", () => {
+  const f = selectorPage();
+  f.add("BUTTON", { "aria-label": "Pay", hidden: "" }).hidden = true;
+  f.add("BUTTON", { "aria-label": "Pay", "aria-hidden": "true" });
+  const invisible = f.add("BUTTON", { "aria-label": "Pay" });
+  invisible.style.display = "none";
+  f.add("BUTTON", { "aria-label": "Pay" }).rects = [];
+  const visible = f.add("BUTTON", { "aria-label": "Pay" });
+  const result = resolve(f, "text=Pay");
+  assert.equal(result.ok, true);
+  assert.equal(result.targets.length, 1);
+  f.pointAt(visible);
+  assert.equal(f.bridge.act({ action: "click", ref: result.targets[0].ref }).prepared, true);
+});
+
+test("selector resolution reports read-budget truncation instead of guessing", () => {
+  const f = selectorPage();
+  for (let n = 0; n < 121; n += 1) f.add("BUTTON", { "aria-label": `Item ${n}` });
+  const result = resolve(f, "text=Item 120");
+  assert.equal(result.error, "TARGET_NOT_FOUND");
+  assert.equal(result.truncated, true);
+  assert.equal(resolve(f, "text=Item 119").ok, true);
+});
+
+test("selectors resolve inside same-origin frames and open shadow roots", () => {
+  const f = selectorPage();
+  const host = f.add("DIV");
+  const root = host.attachShadow({ mode: "open" });
+  f.add("BUTTON", { "aria-label": "Shadow save" }, root);
+  const { child } = embed(f, { title: "Embedded" });
+  child.add("BUTTON", { "aria-label": "Frame save" });
+  const shadow = resolve(f, "text=shadow save");
+  assert.equal(shadow.targets[0].label, "Shadow save");
+  const framed = resolve(f, "text=frame save");
+  assert.equal(framed.ok, true);
+  assert.equal(framed.targets[0].frame, "frame-1");
+  assert.equal(resolve(f, "text=save").error, "TARGET_AMBIGUOUS");
+});
+
+test("resolve renumbers refs, leaves the page untouched and never acts", () => {
+  const f = selectorPage();
+  const button = f.add("BUTTON", { "aria-label": "Go" });
+  const input = f.add("INPUT", { "aria-label": "Name" });
+  const before = f.bridge.read();
+  const oldRef = before.interactive[0].ref;
+  const result = resolve(f, "text=Go");
+  assert.equal(result.ok, true);
+  assert.equal(result.attempted, false);
+  assert.notEqual(result.targets[0].ref, oldRef);
+  assert.equal(f.bridge.act({ action: "click", ref: oldRef }).error, "STALE_REF");
+  f.pointAt(button);
+  assert.equal(f.bridge.act({ action: "click", ref: result.targets[0].ref }).prepared, true);
+  for (const element of [button, input]) {
+    assert.equal(element.focused, undefined);
+    assert.equal(element.clicked, undefined);
+    assert.equal(element.scrolls, undefined);
+    assert.deepEqual(element.events, []);
+  }
+  assert.equal(input.value, "");
+});
+
+test("two selectors resolve against one generation so a drag keeps both refs", () => {
+  const f = selectorPage();
+  f.add("BUTTON", { "aria-label": "Card" });
+  f.add("BUTTON", { "aria-label": "Slot" });
+  const result = resolve(f, "text=Card", "role=button[name=Slot]");
+  assert.equal(result.ok, true);
+  assert.equal(result.targets.length, 2);
+  const generation = (ref) => ref.split(":")[1];
+  assert.equal(generation(result.targets[0].ref), generation(result.targets[1].ref));
+  const second = resolve(f, "text=Card", "text=Missing");
+  assert.equal(second.error, "TARGET_NOT_FOUND");
+  assert.equal(second.index, 1);
+});
+
+function twoBoxes(sourceTag = "BUTTON", sourceAttributes = {}) {
+  const f = selectorPage();
+  const source = f.add(sourceTag, { "aria-label": "Source", tabindex: "0", ...sourceAttributes });
+  const target = f.add("BUTTON", { "aria-label": "Target" });
+  source.box = { left: 10, top: 10, width: 40, height: 20 };
+  target.box = { left: 300, top: 200, width: 60, height: 40 };
+  f.document.hitTest = (x, y) => (x < 100 ? source : target);
+  const items = f.bridge.read().interactive;
+  return { f, source, target, from: items[0].ref, to: items[1].ref };
+}
+
+test("drag prepares and verifies two hit-tested points without activation", () => {
+  const { f, source, target, from, to } = twoBoxes();
+  const prepared = JSON.parse(JSON.stringify(f.bridge.act({ action: "drag", ref: from, toRef: to })));
+  assert.deepEqual(prepared, { ok: true, action: "drag", prepared: true, attempted: false,
+    point: { x: 30, y: 20 }, toPoint: { x: 330, y: 220 } });
+  const verified = JSON.parse(JSON.stringify(f.bridge.act({ action: "drag", ref: from, toRef: to, verifyOnly: true,
+    point: prepared.point, toPoint: prepared.toPoint })));
+  assert.deepEqual(verified, prepared);
+  // The destination moved: the exact pair no longer passes and nothing scrolls.
+  target.box = { left: 700, top: 500, width: 60, height: 40 };
+  target.onScroll = () => assert.fail("verification never scrolls");
+  const moved = f.bridge.act({ action: "drag", ref: from, toRef: to, verifyOnly: true,
+    point: prepared.point, toPoint: prepared.toPoint });
+  assert.equal(moved.error, "CLICK_POINT_UNAVAILABLE");
+  assert.equal(moved.attempted, false);
+  for (const element of [source, target]) {
+    assert.equal(element.clicked, undefined);
+    assert.equal(element.focused, undefined);
+    assert.deepEqual(element.events, []);
+  }
+  for (const request of [{ point: null, toPoint: prepared.toPoint }, { point: prepared.point, toPoint: { x: NaN, y: 1 } }]) {
+    assert.equal(f.bridge.act({ action: "drag", ref: from, toRef: to, verifyOnly: true, ...request }).ok, false);
+  }
+});
+
+test("drag scrolls each missing endpoint once and rechecks both before returning", () => {
+  const { f, target, from, to } = twoBoxes();
+  target.box = { left: 300, top: 5000, width: 60, height: 40 };
+  target.onScroll = () => { target.box = { left: 300, top: 200, width: 60, height: 40 }; };
+  const prepared = f.bridge.act({ action: "drag", ref: from, toRef: to });
+  assert.equal(target.scrolls, 1);
+  assert.equal(prepared.prepared, true);
+  const never = twoBoxes();
+  never.target.box = { left: 300, top: 5000, width: 60, height: 40 };
+  const failed = never.f.bridge.act({ action: "drag", ref: never.from, toRef: never.to });
+  assert.equal(failed.error, "CLICK_POINT_UNAVAILABLE");
+  assert.equal(never.target.scrolls, 1);
+  assert.equal(failed.attempted, false);
+});
+
+test("drag refuses natively draggable sources, identical points and stale or missing refs", () => {
+  for (const [tag, attributes] of [["DIV", { draggable: "true" }], ["IMG", {}], ["A", { href: "/x" }]]) {
+    const { f, from, to } = twoBoxes(tag, attributes);
+    assert.equal(f.bridge.act({ action: "drag", ref: from, toRef: to }).error, "DRAG_UNSUPPORTED", tag);
+  }
+  const same = twoBoxes();
+  same.f.document.hitTest = () => same.source;
+  same.target.box = { ...same.source.box };
+  const identical = same.f.bridge.act({ action: "drag", ref: same.from, toRef: same.to });
+  assert.equal(identical.ok, false);
+  const nested = twoBoxes();
+  const inner = nested.f.add("SPAN", {}, nested.source);
+  nested.f.document.hitTest = (x) => (x < 100 ? inner : nested.target);
+  assert.equal(nested.f.bridge.act({ action: "drag", ref: nested.from, toRef: nested.to }).prepared, true,
+    "a plain child of the source may be pressed");
+  const stale = twoBoxes();
+  const oldFrom = stale.from;
+  stale.f.bridge.read();
+  assert.equal(stale.f.bridge.act({ action: "drag", ref: oldFrom, toRef: stale.to }).error, "STALE_REF");
+  assert.equal(stale.f.bridge.act({ action: "drag", ref: 5, toRef: stale.to }).error, "INVALID_REQUEST");
+});
+
+test("wheel preparation allows a nested link under the pointer where click does not", () => {
+  const f = selectorPage();
+  const list = f.add("DIV", { tabindex: "0", "aria-label": "Results" });
+  const link = f.add("A", { href: "/item" }, list);
+  f.pointAt(link);
+  const ref = f.bridge.read().interactive.find((item) => item.label === "Results").ref;
+  assert.equal(f.bridge.act({ action: "click", ref }).error, "CLICK_POINT_UNAVAILABLE");
+  const wheel = JSON.parse(JSON.stringify(f.bridge.act({ action: "click", ref, relaxed: true })));
+  assert.equal(wheel.prepared, true);
+  const verified = f.bridge.act({ action: "click", ref, relaxed: true, verifyOnly: true, point: wheel.point });
+  assert.equal(verified.prepared, true);
+  assert.equal(f.bridge.act({ action: "click", ref, verifyOnly: true, point: wheel.point }).error, "CLICK_POINT_UNAVAILABLE");
+  // A target outside the pointer's hit chain is still rejected when relaxed.
+  const other = f.add("BUTTON", { "aria-label": "Other" });
+  f.pointAt(other);
+  const again = f.bridge.read().interactive.find((item) => item.label === "Results").ref;
+  assert.equal(f.bridge.act({ action: "click", ref: again, relaxed: true }).error, "CLICK_POINT_UNAVAILABLE");
+});
+
+test("pointAt checks only the root viewport and takes no ref or hit test", () => {
+  const f = selectorPage();
+  const prepared = JSON.parse(JSON.stringify(f.bridge.act({ action: "pointAt", x: 100, y: 50 })));
+  assert.deepEqual(prepared, { ok: true, action: "pointAt", prepared: true, attempted: false,
+    point: { x: 100, y: 50 }, viewport: { width: 1280, height: 800 } });
+  assert.equal(f.bridge.act({ action: "pointAt", x: 1279, y: 799 }).prepared, true);
+  for (const [x, y] of [[1280, 0], [0, 800], [5000, 5000]]) {
+    const outside = f.bridge.act({ action: "pointAt", x, y });
+    assert.equal(outside.error, "INVALID_POINT");
+    assert.match(outside.detail, /outside the 1280x800/);
+    assert.equal(outside.attempted, false);
+  }
+  for (const [x, y] of [[-1, 0], [0, -1], [1.5, 2], ["1", 2], [NaN, 2], [2, Infinity], [1000001, 0], [undefined, 1]]) {
+    assert.equal(f.bridge.act({ action: "pointAt", x, y }).error, "INVALID_POINT");
+  }
+  assert.equal(f.metrics.hitTests, undefined);
+  const verify = (point) => f.bridge.act({ action: "pointAt", x: 100, y: 50, verifyOnly: true, point });
+  assert.equal(verify({ x: 100, y: 50 }).prepared, true);
+  assert.equal(verify({ x: 101, y: 50 }).error, "INVALID_POINT");
+  assert.equal(verify(undefined).error, "INVALID_POINT");
+  f.window.visualViewport.scale = 2;
+  assert.equal(f.bridge.act({ action: "pointAt", x: 1, y: 1 }).error, "UNSUPPORTED_GEOMETRY");
+  f.window.visualViewport.scale = 1;
+  f.document.body.children.length;
+});

@@ -1,5 +1,50 @@
 # Naru 작업 기록
 
+## 2026-10-21, M4 포인터 입력 확장과 선택자 대상 (워크트리 `worktree-agent-a2c1de8a3d0d13d29`, 기준 ea5f2de)
+
+### 요청 범위와 변경
+
+- 포인터: `dblclick TAB TARGET`, `click TAB TARGET --button right`(프로토콜 `right_click`), `wheel TAB TARGET DX DY`(실제 `mouseWheel`, `scroll`과 별개), `drag TAB FROM TO`(누름, 10단계 이동, 해제), `click-at TAB X Y [--button] [--count 1..3]`, `move-at TAB X Y`. 기존 click·hover의 ClickTarget·입력 배치·사후 hit test·임시 포커스·소유권 검사를 재사용했다. `ClickTarget.hover`는 `Gesture`로 바꿨고 입력 배치 메시지 수는 고정 2개에서 입력 종류별 `Vec`으로 일반화했다. 연속 mouseMoved가 Chromium에서 하나로 합쳐지는 것을 로컬 CEF에서 확인(첫 drag에서 이동 10개 중 페이지가 본 mousemove 1개)해 drag만 응답 하나마다 이벤트 하나를 보내는 paced 방식으로 바꿨다.
+- 오른쪽 클릭의 네이티브 메뉴: 오른쪽 누름 직전 탭별 보호 기한(5초)을 기록하고 그 안에서 `OnBeforeContextMenu`는 메뉴를 비우며 `RunContextMenu`는 `callback.cancel()` 뒤 true를 반환한다. 사용자 직접 우클릭의 기존 대상·제어권 보호는 기한 밖에서 그대로다.
+- 선택자: ref가 들어가는 모든 요소 명령(click, hover, dblclick, wheel, drag, fill, insert, press, check, select, scroll TARGET)에서 `text=`, `css=`, `role=ROLE[name=NAME]`을 받는다. DOM bridge의 `resolve` 동작이 `read`와 같은 예산으로 한 번 읽어 보이는 상호작용 요소 정확히 하나를 고르고(0개 `TARGET_NOT_FOUND`, 2개 이상 `TARGET_AMBIGUOUS`와 후보 ref 최대 5개, 문법 오류 `INVALID_SELECTOR`), Rust가 선택자를 `epoch/ref`로 바꿔 같은 `handle`을 다시 호출한다. 길이 1024바이트 이하, NUL 불가를 CLI·프로토콜에서 검증한다. 성공 응답에 `resolved`를 붙인다.
+- 교차 출처 프레임 `frame/` ref: dblclick, 오른쪽 클릭, wheel은 기존 프레임 포인터 경로의 마지막 입력만 바꿔 지원, drag와 선택자는 `UNSUPPORTED_TARGET`/불가.
+- 관련 파일: `src/protocol.rs`, `src/cli.rs`, `src/browser.rs`, `src/dom_bridge.js`, `tests/dom_bridge.test.mjs`, `tests/pointer_ext_smoke.py`(새 파일), `tests/fixtures/pointer_ext.html`(새 파일), `docs/pointer-ext.md`(새 문서), `docs/agent-cli-guide.md`, `docs/architecture.md`, `docs/pointer-input.md`.
+- 기준 커밋 정리: 워크트리가 원래 0d1ce47(시제품)이어서 변경 없이 `git reset --hard ea5f2de` 했다.
+
+### 검증
+
+| 구분 | 내용 | 결과 |
+| --- | --- | --- |
+| 단위 | `cargo test --lib` (디버그) | 472개 통과(기준 451 + 신규 21: 프로토콜 3, CLI 3, 입력 배치·재작성·선택자 오류·보호 기한·paced 등 15) |
+| 컴파일 | `cargo check --locked --bins` (기본 구성), 같은 명령 `--no-default-features` | 둘 다 통과(기본 구성 기존 dead_code 경고 1개). 릴리스 빌드도 경고 1개(기존) |
+| 모의 DOM | `node --test tests/dom_bridge.test.mjs` | 161개 중 134 통과, 27 실패. 기준선(HEAD 코드·테스트: 146개 중 119 통과, 27 실패)과 실패 이름 27개가 동일, 새 실패 없음. 신규 15개는 모두 통과(선택자 text/role/css·모호성·예산 잘림·가시성·iframe·shadow, 단일 읽기 세대, drag 준비·검증·거절, relaxed wheel, pointAt) |
+| 형식 | 변경한 `src/cli.rs`, `src/protocol.rs`는 rustfmt 적용. `src/browser.rs`는 기준에도 있던 rustfmt 차이 30곳을 되돌려 내 변경분만 정리 | 기존 차이는 그대로 |
+| 가이드 | `lightbrowser skill` 끝줄 | `[lightbrowser:skill] end of guide` 확인 |
+| 로컬 CEF (release 빌드 1개, 앱 `light-browser` SHA-256 앞 16자 `d1821f5b77181bc5`, CLI `c31d3200a6e6d8b9`, `NARU_MOCK_KEYCHAIN=1`, 새 프로필) | `tests/pointer_ext_smoke.py` | 통과. 페이지가 센 이벤트로 확인: dblclick은 trusted 누름·해제·click 두 쌍과 detail 1→2, dblclick 1; 오른쪽 클릭은 button 2 누름·해제와 contextmenu 1, click 0; 취소하지 않은 contextmenu 뒤에도 앱이 응답함; wheel은 trusted wheel 1(deltaY 120)과 scrollTop 증가, 누름·click 0, `scroll`은 wheel 이벤트 없음; drag는 누름 1, 버튼을 누른 mousemove 8개 이상, 슬롯에서 해제, 마지막 이동=해제 지점, `draggable` 출발점은 `DRAG_UNSUPPORTED`로 입력 0; click-at/move-at/`--count 2`/`--button right`가 요청 좌표에 적중하고 viewport 밖·음수는 거절돼 입력 0; 선택자 css/role/text/따옴표 text, `TARGET_NOT_FOUND`·`TARGET_AMBIGUOUS`(후보 3개)·`INVALID_SELECTOR`는 입력 0, 후보 ref로 정확히 한 번 클릭, 선택자 사용 후 이전 ref `STALE_REF`, 가려진 대상은 `CLICK_POINT_UNAVAILABLE`; fill·press·insert·check·select·scroll·wheel·dblclick·우클릭도 선택자 가능; 교차 출처(localhost↔127.0.0.1) 프레임의 `read-frame` ref로 dblclick·우클릭·wheel 통과, drag는 `UNSUPPORTED_TARGET`. 모든 단계에서 사용자 공간·선택·초기 탭 보존, 작업·탭 정리 확인 |
+| 로컬 CEF 회귀 (같은 바이너리) | `tests/native_click_smoke.py`, `tests/tasks_smoke.py`, `tests/dialog_smoke.py --quit-pid`(맨 끝) | 모두 exit 0 |
+| 실행하지 못함 | 네이티브 AppKit 전체: 오른쪽 클릭 때 네이티브 메뉴가 실제로 안 뜨는지(CLI로 관찰 불가, 앱이 멈추지 않음만 간접 확인), 실제 사용자 우클릭과 5초 보호 기한의 상호작용, 사용자 탭에서의 CLI 우클릭 화면. HTML5 끌어놓기·네이티브 텍스트 끌기. 외부 사이트. 이 변경에 대한 e2e 여정, single_window·spaces·navigation·wait·select·check·insert·frame_journey 등 다른 스모크 재실행. 진짜 OOPIF(서로 다른 사이트) 프레임에서의 새 제스처(같은 사이트의 교차 출처 프레임만 확인). `cargo fmt --check` 전체 통과(기존 차이 때문) | 미실행 |
+
+결과 원본은 이 워크트리의 스크래치 경로에만 있고 `artifacts/`에는 저장하지 않았다.
+
+### 알려진 한계, 남은 작업
+
+- 선택자는 한 번 사용할 때마다 읽기 한 번을 하므로 이전 `read`의 ref가 만료된다. `drag`는 둘 다 ref이거나 둘 다 선택자여야 한다. 읽기 예산(상호작용 요소 120개 등) 밖의 요소는 찾지 못하고 `truncated`로만 알린다. 비상호작용 요소는 `css=`로도 고를 수 없어 `drag`의 출발·도착은 tabindex나 role이 있어야 한다.
+- drag는 마우스 이벤트 기반만 지원한다. 선택된 텍스트 위에서 누르면 텍스트 끌기가 시작될 수 있으나 막지 못한다. 놓기 전에 도착점을 다시 확인하지 않고, 중간 실패 시 눌린 버튼이 남을 수 있다(자동 release 없음).
+- 오른쪽 클릭 보호 기한 5초 안에 사용자가 같은 탭을 직접 우클릭하면 메뉴가 열리지 않을 수 있다.
+- click-at/move-at은 정수 좌표이고 요소 확인이 없다.
+- 소켓 경로 길이(104바이트) 제한 때문에 요청한 `.local-data`(워크트리 내부) 대신 짧은 합성 경로 `/private/tmp/nrpe-m4`를 프로필로 썼다(심볼릭 링크는 앱이 `INSECURE_SOCKET_DIRECTORY`로 거절하고 `/tmp`는 `/private/tmp` 링크 때문에 CEF 캐시 경로 오류로 메모리 저장소가 됐다).
+
+### 리뷰 반영 (같은 날)
+
+- drag 중단 정리: 누름이 받아들여진 뒤 handoff·취소·대화상자 등으로 drag가 끝나면 마지막 좌표에서 `mouseReleased`를 정확히 한 번 보낸다(`PointerHold`, 소유권 검사 제외, 같은 Browser·렌더러 생존 조건, 대화상자 대기 중이면 `dialog` 응답 뒤). 실패 응답에 `details.pointerCleanup`(`released`/`pending`/`failed`). 처음에는 진행 중이던 이벤트의 응답이 오면 정리하게 했으나 로컬 CEF에서 그 응답이 오지 않아(handoff가 포커스 에뮬레이션을 끈 뒤 숨은 탭은 입력을 처리하지 않음) 버튼이 풀리지 않는 것을 확인했다. 그래서 포커스 lease를 끄기 전(`abort_focus_lease`, `begin_focus_cleanup`)에 해제를 보내도록 바꿨고 응답 기반 경로(`input_result`, `finish_input_batch`)는 보조로 남겼다.
+- 네이티브 메뉴 차단 상태화: 5초 기한이 지나 늦게 온 메뉴 요청도 소유 작업이 Active이거나 선택된 탭이 아니거나 개요가 열려 있으면 `OnBeforeContextMenu`가 비우고 `RunContextMenu`가 cancel 후 true를 반환한다. 기한은 한 번만 쓴다(`RunContextMenu`가 막으면 삭제).
+- 커밋 트레일러를 `Co-Authored-By: Claude Opus 5.5`만 남겼다.
+- 검증: `cargo test --locked --lib` 478개 통과(신규 6: 취소·handoff·대화상자·교체된 탭·lease abort 정리, 상태 기반 메뉴 차단과 일회성 기한), `cargo check --locked --bins` 통과(`context_click_guarded`는 테스트 전용으로 표시해 경고 제거), 모의 DOM 161개 중 134 통과·27 실패(기준선과 동일). 릴리스 빌드 1개로 `pointer_ext_smoke.py`(새 케이스: 느린 mousemove 픽스처(`?slow=250`)에서 drag 중 task handoff, 페이지가 mouseup을 정확히 한 번 봄·이후 반복 없음), `native_click_smoke.py`, `tasks_smoke.py`, `dialog_smoke.py --quit-pid` 모두 exit 0. 실행하지 못함: 네이티브 메뉴 부재(AppKit), 실제 대화상자 중 drag 중단(단위 테스트만), handoff·release 등 다른 경로로 대화상자가 정리된 뒤의 보류 해제.
+
+### 정리
+
+앱은 `dialog_smoke --quit-pid`의 SIGTERM으로 종료했고 워크트리 경로로 `ps`를 확인해 프로세스가 없음을 확인했다(메인 체크아웃의 다른 앱은 건드리지 않았다). 합성 프로필 `/private/tmp/nrpe-m4`를 삭제했다. 중간 빌드 산출물은 `dev.sh`의 `cleanup-build.py`가 정리했고 `target/debug`는 삭제했다. `dist/Light Browser.app`과 `target/release` 실행 파일은 검토용으로 남겼다. 사용자 프로필은 건드리지 않았다. 메인 체크아웃은 `.cache` 읽기 외에 수정하지 않았다. 커밋은 워크트리 브랜치에 한 개, 푸시 없음.
+
 ## 2026-10-20, M7 최종 통합 검증 (release 빌드 1회, 로컬 CEF 자동화)
 
 ### 요청 범위와 변경

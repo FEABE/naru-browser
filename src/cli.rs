@@ -1,11 +1,11 @@
 use crate::keyboard::{KeyPress, UNSUPPORTED_KEY_MESSAGE};
-use crate::protocol::{self, Command, DialogAction, Request, Response, WaitUntil};
+use crate::protocol::{self, Command, DialogAction, MouseButton, Request, Response, WaitUntil};
 use serde_json::json;
 use std::io::{self, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const USAGE: &str = "Usage: lightbrowser <command>\n\nCommands:\n  open URL                 Return a created tab immediately; navigation may still be loading\n  navigate TAB URL         Request navigation in an existing tab\n  back TAB                 Request backward navigation\n  forward TAB              Request forward navigation\n  reload TAB               Request a reload of the current page\n  stop TAB                 Request loading to stop; does not wait for load completion\n  tabs                     List tabs\n  wait TAB [dom|load] [TIMEOUT_MS]\n                           Wait for readiness (defaults: dom, 10000 ms; range: 1..30000)\n  wait TAB url PREFIX [TIMEOUT_MS]\n                           Wait until the main-frame URL starts with PREFIX (1..4096 bytes)\n  wait TAB text SUBSTR [TIMEOUT_MS]\n                           Wait until visible text of the main document, open shadow roots and accessible same-origin iframes contains SUBSTR (case-sensitive, 1..4096 bytes)\n  read TAB                 Read page text and interactive element refs\n  read-page TAB            Read discovered frame documents under a shared budget\n  frames TAB               Inspect the tab frame tree, including discovered child sessions\n                           Inventory only; does not read or control child-frame content\n  read-frame TAB FRAME     Read one current frame, including cross-origin content\n                           Refs support click, hover, fill, insert, press, check, select and targeted scroll\n  scroll TAB DX DY          Scroll the page by relative integer CSS pixels (-10000..10000)\n  scroll TAB REF DX DY      Scroll a referenced list or document by the same CSS pixel deltas\n                           Use a scrollable ref from read, read-frame or read-page\n  click TAB REF            Dispatch a Chromium pointer click to a reference\n  hover TAB REF            Move the Chromium pointer to a reference without clicking\n  check TAB REF true|false Set a native checkbox/radio checked state\n  fill TAB REF TEXT        Replace an input, textarea or editable host with text\n  insert TAB REF TEXT      Insert text at the existing caret or selection\n  select TAB REF VALUE     Select one native HTML option by exact value\n  press TAB REF KEY        Dispatch a Chromium key pair from a focused reference\n  close TAB                Close a tab\n  dialog TAB accept [TEXT] Accept the pending JavaScript dialog of an AI-owned tab (task run only)\n                           TEXT only for prompt (0..4096 bytes, no NUL); omitted TEXT uses the prompt default\n  dialog TAB dismiss       Dismiss it: cancel for confirm/prompt, stay on the page for beforeunload\n  screenshot TAB PATH      Save a screenshot to PATH\n  status                   Show browser status\n  panel                    Bring the browser window forward (compatibility alias)\n  skill                    Print the agent usage guide (works without the app running)\n  help                     Show this help\n\nSpaces:\n  spaces                   List user and task spaces (also available in task run)\n  space show user|TASK_ID  Show a space without handing off control\n  space overview           Show the space overview\n                           show and overview are global UI controls; task run rejects them\n\nTasks:\n  task create NAME         Create a named task, or return the live task with that name (resumed: true)\n  task list                List tasks\n  task info ID             Inspect a task and its current revision\n  task handoff ID REV       Hand control to the user\n  task resume ID REV        Resume agent control\n  task wait ID [TIMEOUT_MS] [--since REV]\n                           Block until the task state changes (default 10000 ms; range: 1..30000)\n                           --since REV returns at once if the current revision differs from REV\n                           A paused task wakes when the user presses the native resume button (AI에게 돌려주기)\n                           or a task tab closes (tab loss does not change the revision)\n  task adopt ID REV TAB     Attach an existing tab to a task\n  task release ID REV TAB   Release a tab from a task\n  task finish ID REV [--keep TAB ...]\n                           Finish a task, retaining only the listed tabs\n  task run ID REV COMMAND  Run an existing browser command in a task\n\nKeys:\n  Enter Tab Escape ArrowLeft ArrowUp ArrowRight ArrowDown\n  Home End PageUp PageDown Backspace Delete Space\n  Shift+ only with Enter, Tab, arrows, Home, End, PageUp or PageDown.\n  Meta+A Meta+Z Meta+Shift+Z Meta+Backspace\n  Meta+arrows Meta+Shift+arrows\n  Alt+ArrowLeft Alt+ArrowRight Alt+Shift+ArrowLeft Alt+Shift+ArrowRight\n  Alt+Backspace Alt+Delete\n  Key names are case-sensitive; only the listed combinations are supported.\n\nID uses 1..128 ASCII letters, digits, hyphens or underscores.\nSpace IDs use user or an existing task ID, at most 120 ASCII characters.\nREV is the positive revision returned by task info or a task update.\nNAME is trimmed, contains 1..120 characters, and has no control characters.\ntask run cannot contain task commands.\n\nNavigation commands return when the request is accepted; use wait for readiness.\nwait dom: document.readyState is interactive or complete.\nwait load: the browser's overall loading has ended.\nwait url: native main-frame URL prefix match; returns at once if already matching.\nwait text: bounded read-only check of the main document, open shadow roots and accessible same-origin iframes; restarts on a new document.\nTimeout returns WAIT_TIMEOUT and never cancels navigation.\nSpecify dom or load before TIMEOUT_MS. open and navigate accept HTTP(S) URLs.\nTAB is a positive integer. Quote arguments containing spaces.\nEvery command writes one JSON response to stdout. Errors also use stderr.\n";
+pub const USAGE: &str = "Usage: lightbrowser <command>\n\nCommands:\n  open URL                 Return a created tab immediately; navigation may still be loading\n  navigate TAB URL         Request navigation in an existing tab\n  back TAB                 Request backward navigation\n  forward TAB              Request forward navigation\n  reload TAB               Request a reload of the current page\n  stop TAB                 Request loading to stop; does not wait for load completion\n  tabs                     List tabs\n  wait TAB [dom|load] [TIMEOUT_MS]\n                           Wait for readiness (defaults: dom, 10000 ms; range: 1..30000)\n  wait TAB url PREFIX [TIMEOUT_MS]\n                           Wait until the main-frame URL starts with PREFIX (1..4096 bytes)\n  wait TAB text SUBSTR [TIMEOUT_MS]\n                           Wait until visible text of the main document, open shadow roots and accessible same-origin iframes contains SUBSTR (case-sensitive, 1..4096 bytes)\n  read TAB                 Read page text and interactive element refs\n  read-page TAB            Read discovered frame documents under a shared budget\n  frames TAB               Inspect the tab frame tree, including discovered child sessions\n                           Inventory only; does not read or control child-frame content\n  read-frame TAB FRAME     Read one current frame, including cross-origin content\n                           Refs support click, hover, fill, insert, press, check, select and targeted scroll\n  scroll TAB DX DY          Scroll the page by relative integer CSS pixels (-10000..10000)\n  scroll TAB REF DX DY      Scroll a referenced list or document by the same CSS pixel deltas\n                           Use a scrollable ref from read, read-frame or read-page\n  click TAB TARGET [--button left|right]\n                           Dispatch a Chromium pointer click (right = context click; no native menu is shown for AI commands)\n  dblclick TAB TARGET      Dispatch a Chromium double click (clickCount 1 then 2)\n  hover TAB TARGET         Move the Chromium pointer to a target without clicking\n  wheel TAB TARGET DX DY   Dispatch a Chromium mouseWheel at the target center (-10000..10000, not both 0)\n  drag TAB FROM TO         Press at FROM, move in steps, release at TO (both targets visible at once)\n  click-at TAB X Y [--button left|right] [--count 1..3]\n                           Click at integer viewport CSS pixels (rejected outside the viewport)\n  move-at TAB X Y          Move the Chromium pointer to integer viewport CSS pixels\n  check TAB REF true|false Set a native checkbox/radio checked state\n  fill TAB REF TEXT        Replace an input, textarea or editable host with text\n  insert TAB REF TEXT      Insert text at the existing caret or selection\n  select TAB REF VALUE     Select one native HTML option by exact value\n  press TAB REF KEY        Dispatch a Chromium key pair from a focused reference\n  close TAB                Close a tab\n  dialog TAB accept [TEXT] Accept the pending JavaScript dialog of an AI-owned tab (task run only)\n                           TEXT only for prompt (0..4096 bytes, no NUL); omitted TEXT uses the prompt default\n  dialog TAB dismiss       Dismiss it: cancel for confirm/prompt, stay on the page for beforeunload\n  screenshot TAB PATH      Save a screenshot to PATH\n  status                   Show browser status\n  panel                    Bring the browser window forward (compatibility alias)\n  skill                    Print the agent usage guide (works without the app running)\n  help                     Show this help\n\nSpaces:\n  spaces                   List user and task spaces (also available in task run)\n  space show user|TASK_ID  Show a space without handing off control\n  space overview           Show the space overview\n                           show and overview are global UI controls; task run rejects them\n\nTasks:\n  task create NAME         Create a named task, or return the live task with that name (resumed: true)\n  task list                List tasks\n  task info ID             Inspect a task and its current revision\n  task handoff ID REV       Hand control to the user\n  task resume ID REV        Resume agent control\n  task wait ID [TIMEOUT_MS] [--since REV]\n                           Block until the task state changes (default 10000 ms; range: 1..30000)\n                           --since REV returns at once if the current revision differs from REV\n                           A paused task wakes when the user presses the native resume button (AI에게 돌려주기)\n                           or a task tab closes (tab loss does not change the revision)\n  task adopt ID REV TAB     Attach an existing tab to a task\n  task release ID REV TAB   Release a tab from a task\n  task finish ID REV [--keep TAB ...]\n                           Finish a task, retaining only the listed tabs\n  task run ID REV COMMAND  Run an existing browser command in a task\n\nTARGET is a REF, or a selector: text=SUBSTR (case-insensitive; text=\"EXACT\" is exact), css=SELECTOR, role=ROLE[name=NAME] (name*= for substring).\nA selector must match exactly one visible interactive element (TARGET_NOT_FOUND or TARGET_AMBIGUOUS otherwise), is at most 1024 bytes with no NUL, and re-reads the page (earlier refs become stale).\n\nKeys:\n  Enter Tab Escape ArrowLeft ArrowUp ArrowRight ArrowDown\n  Home End PageUp PageDown Backspace Delete Space\n  Shift+ only with Enter, Tab, arrows, Home, End, PageUp or PageDown.\n  Meta+A Meta+Z Meta+Shift+Z Meta+Backspace\n  Meta+arrows Meta+Shift+arrows\n  Alt+ArrowLeft Alt+ArrowRight Alt+Shift+ArrowLeft Alt+Shift+ArrowRight\n  Alt+Backspace Alt+Delete\n  Key names are case-sensitive; only the listed combinations are supported.\n\nID uses 1..128 ASCII letters, digits, hyphens or underscores.\nSpace IDs use user or an existing task ID, at most 120 ASCII characters.\nREV is the positive revision returned by task info or a task update.\nNAME is trimmed, contains 1..120 characters, and has no control characters.\ntask run cannot contain task commands.\n\nNavigation commands return when the request is accepted; use wait for readiness.\nwait dom: document.readyState is interactive or complete.\nwait load: the browser's overall loading has ended.\nwait url: native main-frame URL prefix match; returns at once if already matching.\nwait text: bounded read-only check of the main document, open shadow roots and accessible same-origin iframes; restarts on a new document.\nTimeout returns WAIT_TIMEOUT and never cancels navigation.\nSpecify dom or load before TIMEOUT_MS. open and navigate accept HTTP(S) URLs.\nTAB is a positive integer. Quote arguments containing spaces.\nEvery command writes one JSON response to stdout. Errors also use stderr.\n";
 
 /// `args` excludes the executable name. The caller supplies the configured socket.
 pub fn run(args: &[String], socket: &Path) -> i32 {
@@ -186,6 +186,44 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
             tab: parse_tab(tab)?,
             reference: parse_ref(reference)?,
         }),
+        ["click", tab, reference, "--button", button] => {
+            let tab = parse_tab(tab)?;
+            let reference = parse_ref(reference)?;
+            match parse_button(button)? {
+                MouseButton::Left => Ok(Command::Click { tab, reference }),
+                MouseButton::Right => Ok(Command::RightClick { tab, reference }),
+            }
+        }
+        ["dblclick", tab, reference] => Ok(Command::DblClick {
+            tab: parse_tab(tab)?,
+            reference: parse_ref(reference)?,
+        }),
+        ["wheel", tab, reference, dx, dy] => Ok(Command::Wheel {
+            tab: parse_tab(tab)?,
+            reference: parse_ref(reference)?,
+            dx: parse_scroll_delta(dx)?,
+            dy: parse_scroll_delta(dy)?,
+        }),
+        ["drag", tab, from, to] => Ok(Command::Drag {
+            tab: parse_tab(tab)?,
+            from: parse_ref(from)?,
+            to: parse_ref(to)?,
+        }),
+        ["click-at", tab, x, y, options @ ..] => {
+            let (button, count) = parse_click_at_options(options)?;
+            Ok(Command::ClickAt {
+                tab: parse_tab(tab)?,
+                x: parse_coordinate(x)?,
+                y: parse_coordinate(y)?,
+                button,
+                count,
+            })
+        }
+        ["move-at", tab, x, y] => Ok(Command::MoveAt {
+            tab: parse_tab(tab)?,
+            x: parse_coordinate(x)?,
+            y: parse_coordinate(y)?,
+        }),
         ["hover", tab, reference] => Ok(Command::Hover {
             tab: parse_tab(tab)?,
             reference: parse_ref(reference)?,
@@ -283,6 +321,11 @@ fn parse_command(args: &[String]) -> Result<Command, String> {
                     | "scroll"
                     | "click"
                     | "hover"
+                    | "dblclick"
+                    | "wheel"
+                    | "drag"
+                    | "click-at"
+                    | "move-at"
                     | "check"
                     | "fill"
                     | "insert"
@@ -460,10 +503,54 @@ fn parse_scroll_delta(value: &str) -> Result<i32, String> {
 }
 
 fn parse_ref(value: &str) -> Result<String, String> {
-    if value.is_empty() || value.len() > 256 {
-        return Err("REF must contain 1 to 256 bytes.".into());
-    }
+    protocol::validate_target(value).map_err(|error| error.message)?;
     Ok(value.into())
+}
+
+fn parse_button(value: &str) -> Result<MouseButton, String> {
+    match value {
+        "left" => Ok(MouseButton::Left),
+        "right" => Ok(MouseButton::Right),
+        _ => Err("BUTTON must be exactly left or right.".into()),
+    }
+}
+
+fn parse_coordinate(value: &str) -> Result<i32, String> {
+    value
+        .parse::<i32>()
+        .ok()
+        .filter(|coordinate| (0..=protocol::MAX_POINTER_COORDINATE).contains(coordinate))
+        .ok_or_else(|| "X and Y must be integer viewport CSS pixels from 0 to 1000000.".into())
+}
+
+/// `--button left|right` and `--count 1..3`, each at most once, in any order.
+fn parse_click_at_options(options: &[&str]) -> Result<(MouseButton, u8), String> {
+    let (mut button, mut count) = (None, None);
+    let mut rest = options;
+    while let [flag, value, tail @ ..] = rest {
+        match *flag {
+            "--button" if button.is_none() => button = Some(parse_button(value)?),
+            "--count" if count.is_none() => {
+                count = Some(
+                    value
+                        .parse::<u8>()
+                        .ok()
+                        .filter(|count| (1..=protocol::MAX_CLICK_COUNT).contains(count))
+                        .ok_or("COUNT must be an integer from 1 to 3.")?,
+                );
+            }
+            _ => {
+                return Err(
+                    "click-at accepts --button left|right and --count 1..3 once each.".into(),
+                );
+            }
+        }
+        rest = tail;
+    }
+    if !rest.is_empty() {
+        return Err("click-at accepts --button left|right and --count 1..3 once each.".into());
+    }
+    Ok((button.unwrap_or_default(), count.unwrap_or(1)))
 }
 
 #[cfg(test)]
@@ -1514,5 +1601,175 @@ mod tests {
         ] {
             assert!(parse_command(&args(&input)).is_err(), "{input:?}");
         }
+    }
+
+    #[test]
+    fn pointer_expansion_commands_parse() {
+        let cases: Vec<(Vec<&str>, Command)> = vec![
+            (
+                vec!["dblclick", "3", "9/doc:1:1"],
+                Command::DblClick {
+                    tab: 3,
+                    reference: "9/doc:1:1".into(),
+                },
+            ),
+            (
+                vec!["click", "3", "text=Save", "--button", "right"],
+                Command::RightClick {
+                    tab: 3,
+                    reference: "text=Save".into(),
+                },
+            ),
+            (
+                vec!["click", "3", "text=Save", "--button", "left"],
+                Command::Click {
+                    tab: 3,
+                    reference: "text=Save".into(),
+                },
+            ),
+            (
+                vec!["wheel", "3", "css=#list", "-5", "300"],
+                Command::Wheel {
+                    tab: 3,
+                    reference: "css=#list".into(),
+                    dx: -5,
+                    dy: 300,
+                },
+            ),
+            (
+                vec!["drag", "3", "css=#a", "css=#b"],
+                Command::Drag {
+                    tab: 3,
+                    from: "css=#a".into(),
+                    to: "css=#b".into(),
+                },
+            ),
+            (
+                vec!["click-at", "3", "10", "20"],
+                Command::ClickAt {
+                    tab: 3,
+                    x: 10,
+                    y: 20,
+                    button: MouseButton::Left,
+                    count: 1,
+                },
+            ),
+            (
+                vec![
+                    "click-at", "3", "10", "20", "--count", "2", "--button", "right",
+                ],
+                Command::ClickAt {
+                    tab: 3,
+                    x: 10,
+                    y: 20,
+                    button: MouseButton::Right,
+                    count: 2,
+                },
+            ),
+            (
+                vec![
+                    "click-at", "3", "0", "0", "--button", "left", "--count", "3",
+                ],
+                Command::ClickAt {
+                    tab: 3,
+                    x: 0,
+                    y: 0,
+                    button: MouseButton::Left,
+                    count: 3,
+                },
+            ),
+            (
+                vec!["move-at", "3", "7", "8"],
+                Command::MoveAt { tab: 3, x: 7, y: 8 },
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(parse_command(&args(&input)).unwrap(), expected, "{input:?}");
+            let mut nested = vec!["task", "run", "task-1", "2"];
+            nested.extend(&input);
+            assert_eq!(
+                parse_command(&args(&nested)).unwrap(),
+                Command::TaskRun {
+                    task: "task-1".into(),
+                    revision: 2,
+                    command: Box::new(expected),
+                },
+                "{nested:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pointer_expansion_commands_reject_bad_arguments() {
+        let too_long = format!("css={}", "a".repeat(1022));
+        for input in [
+            vec!["dblclick", "3"],
+            vec!["dblclick", "0", "r"],
+            vec!["dblclick", "3", "r", "extra"],
+            vec!["click", "3", "r", "--button"],
+            vec!["click", "3", "r", "--button", "middle"],
+            vec!["click", "3", "r", "--button", "Right"],
+            vec!["click", "3", "r", "--count", "2"],
+            vec!["wheel", "3", "r", "0", "0"],
+            vec!["wheel", "3", "r", "1"],
+            vec!["wheel", "3", "r", "1.5", "2"],
+            vec!["wheel", "3", "r", "10001", "0"],
+            vec!["drag", "3", "r"],
+            vec!["drag", "3", "r", "r"],
+            vec!["drag", "3", "css=a", "9/doc:1:1"],
+            vec!["drag", "3", "css=a", &too_long],
+            vec!["click-at", "3", "1"],
+            vec!["click-at", "3", "-1", "2"],
+            vec!["click-at", "3", "1", "1000001"],
+            vec!["click-at", "3", "1.5", "2"],
+            vec!["click-at", "3", "1", "2", "--count", "0"],
+            vec!["click-at", "3", "1", "2", "--count", "4"],
+            vec!["click-at", "3", "1", "2", "--count", "2", "--count", "3"],
+            vec![
+                "click-at", "3", "1", "2", "--button", "left", "--button", "right",
+            ],
+            vec!["click-at", "3", "1", "2", "--unknown", "1"],
+            vec!["click-at", "3", "1", "2", "--button"],
+            vec!["move-at", "3", "1"],
+            vec!["move-at", "3", "1", "2", "3"],
+            vec!["move-at", "3", "a", "2"],
+        ] {
+            assert!(parse_command(&args(&input)).is_err(), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn selectors_replace_refs_in_every_element_command_with_a_bounded_length() {
+        let long_ok = format!("text={}", "x".repeat(1019));
+        let long_bad = format!("text={}", "x".repeat(1020));
+        for target in [
+            "text=Sign in",
+            "css=input[name=q]",
+            "role=button[name=OK]",
+            &long_ok,
+        ] {
+            for input in [
+                vec!["click", "3", target],
+                vec!["hover", "3", target],
+                vec!["check", "3", target, "true"],
+                vec!["fill", "3", target, "v"],
+                vec!["insert", "3", target, "v"],
+                vec!["select", "3", target, "v"],
+                vec!["press", "3", target, "Enter"],
+                vec!["scroll", "3", target, "0", "10"],
+            ] {
+                assert!(parse_command(&args(&input)).is_ok(), "{input:?}");
+            }
+        }
+        for input in [
+            vec!["click", "3", long_bad.as_str()],
+            vec!["click", "3", "css="],
+            vec!["fill", "3", "role=", "v"],
+        ] {
+            assert!(parse_command(&args(&input)).is_err(), "{input:?}");
+        }
+        assert!(parse_command(&args(&["click", "3", &"r".repeat(257)])).is_err());
+        assert!(parse_command(&args(&["click", "3", &"r".repeat(256)])).is_ok());
+        assert!(USAGE.contains("dblclick TAB TARGET") && USAGE.contains("click-at TAB X Y"));
     }
 }

@@ -211,6 +211,12 @@ read는 메인 문서와 열린 Shadow DOM의 본문, 조작 가능한 요소와
 
 접근 가능한 iframe은 최대 16개 문서 슬롯과 중첩 8단계에서 contentDocument 조회 전에 제한한다. 기존 노드, 텍스트, 참조와 옵션 예산은 전체 문서가 공유한다. ref에는 원래 소속 문서와 부모 iframe 연결을 묶고 focus, keydown 뒤에도 문서 identity와 가용성을 확인한다. document별 isolated realm과 자원 경계, 미검증 범위는 [iframe 관찰과 입력](iframe-control.md)에 기록한다.
 
+`dblclick`, `click --button right`(`Command::RightClick`), `wheel`, `drag`, `click-at`, `move-at`은 기존 `click`·`hover`와 같은 `ClickTarget`·입력 배치를 쓴다. `ClickTarget`은 `hover` 불리언 대신 `Gesture`(클릭 버튼·횟수, hover, wheel, drag)를 갖고, mouseMoved → 같은 위치의 사후 hit test → 최종 입력 순서는 그대로다. 마지막 입력만 `NativeInput::Click`(누름·해제 쌍을 횟수만큼, clickCount 1..N), `Wheel`(`mouseWheel` 하나), `Drag`(누름, 10단계 이동, 해제)로 달라진다. 입력 배치의 메시지 수는 고정 2개가 아니라 입력 종류가 정하는 `Vec`이다. 연속 `mouseMoved`는 Chromium이 하나로 합치므로 `Drag`만 `paced`로 표시해 엔진 응답 하나마다 다음 이벤트 하나를 보낸다(`continue_paced_input`). 좌표 명령은 요소가 없어 브리지의 `pointAt` 준비(root viewport 범위 확인만)를 쓴다. 자세한 계약은 [포인터 확장](pointer-ext.md)이다.
+
+오른쪽 클릭은 페이지 `contextmenu`를 일으키므로 `PageContextMenuHandler`가 네이티브 메뉴를 막는다. 입력을 보내기 직전 탭마다 짧은 보호 기한을 `State.context_click_until`에 기록하고, 이 기한 안의 `OnBeforeContextMenu`는 메뉴 모델을 비우며 `RunContextMenu`는 true와 `callback.cancel()`로 CEF 메뉴 실행기를 시작하지 않는다. 사용자가 직접 연 메뉴의 대상·제어권 보호([우클릭 메뉴 계약](context-menu-control.md))는 이 기한 밖에서 그대로 동작한다.
+
+`text=`, `css=`, `role=` 선택자는 ref 자리에서 모두 받는다. `ActionEvidence::Resolve`가 붙은 읽기 전용 첫 패스(`Evaluation::Page{mutation:false}`)가 DOM bridge의 `resolve` 동작으로 `read`와 같은 순회·예산의 한 번 읽기를 하고, 선택자마다 보이는 상호작용 요소 정확히 하나를 고른다. 결과 ref를 검증해 명령의 선택자를 `epoch/ref`로 바꾸고 같은 `handle`을 다시 호출하므로 위치 확인, 포커스 준비, 소유권·revision 검사, 사후 검증은 기존 ref 경로 그대로다. 0개는 `TARGET_NOT_FOUND`, 2개 이상은 `TARGET_AMBIGUOUS`이며 후보 ref는 최대 5개다. 두 선택자를 가진 `drag`는 한 읽기로 둘을 함께 해석한다.
+
 ## JavaScript 대화상자
 
 CEF `JsdialogHandler`(`src/dialog_runtime.rs`)가 `alert`, `confirm`, `prompt`와 `beforeunload`를 소유권으로 분기한다. 작업이 Active로 소유한 탭은 콜백을 UI 스레드의 대기열(`src/dialogs.rs`, 탭당 1개, 전체 4개)에 보관해 네이티브 대화상자를 만들지 않는다. 사용자 공간 탭과 중지된(사용자 제어) 작업 탭은 `false`를 반환해 CEF 기본 대화상자를 쓴다. 마무리 중인 작업 탭은 닫기가 멈추지 않도록 즉시 처리한다. 상세 계약과 한계는 [dialog-control.md](dialog-control.md)를 따른다.
