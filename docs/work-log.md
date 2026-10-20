@@ -1,5 +1,36 @@
 # Naru 작업 기록
 
+## 2026-10-21, M9 handoff 대화상자 사용자 소유 전환과 네이티브 패널 (워크트리 `worktree-agent-adaf35fa111b32e82`, 기준 147fbe1)
+
+### 요청 범위와 변경
+
+- 작업에 대기 중이던 JavaScript 대화상자를 handoff(`task handoff`, 사용자 페이지 입력의 `handoff_page_input`, 중지 버튼 등 네이티브 인계), `task release`, `task finish --keep` 때 취소하지 않는다. 콜백을 보관하고 항목 소유자(`Entry.owner`)만 `user`로 바꾼다. `task resume`과 "AI에게 돌려주기" 뒤에도 사용자가 답할 때까지 `user`로 남는다.
+- 사용자 소유 동안 페이지 명령은 `DIALOG_PENDING`(`details.dialog.owner:user`), `task run ... dialog`는 새 오류 `DIALOG_USER_OWNED`. 탭당 1개 한도에는 사용자 소유 항목도 포함하지만 전체 4개 한도는 작업 소유 항목만 센다(사용자가 답하지 않은 항목이 다른 작업의 자리를 막지 않도록). close, 네이티브 닫기, 종료, 렌더러 종료 정리는 이전과 같고 중지된 탭의 새 대화상자는 CEF 기본 그대로다.
+- 네이티브 AppKit 띠 `PageDialogBar`(별도 창과 웹 UI 없음): 사용자 소유 대화상자가 있는 탭이 보이는 공간의 선택 탭이고 개요·오버레이가 아닐 때만 툴바 아래에 표시. 종류·출처·메시지(600자 저장 표시, 4줄 말줄임, 툴팁에 전체), prompt는 원본 기본값(최대 65536자)을 미리 채운 입력란. 버튼 확인/취소(alert 확인만, beforeunload 떠나기/머무르기).
+- 리뷰 반영: (1) 포커스는 `focus_tab` 안의 `focus_dialog_if_visible`이 먼저 띠에 주고 띠 표면이 첫 응답자를 받으므로 탭 선택·공간 전환 경로가 막힌 페이지로 포커스를 되돌리지 않는다. (2) 버튼 key equivalent를 없애고 `handle_shortcut`에서 띠가 보이고 첫 응답자가 띠 안 또는 그 탭의 CEF 뷰 안일 때만 수정키 없는 Return/Enter(기본)와 Esc(취소)를 처리하며 IME 조합 중에는 건드리지 않는다. 판정은 순수 함수 `dialog_key_decision`, `dialog_focus_decision`으로 단위 테스트한다. (3) 사용자 소유 항목은 전체 한도에서 제외. (4) 메시지 라벨 600자. (5) 64KiB 표기를 65536자로 정정. (6) 띠가 가려졌다 같은 토큰으로 다시 보여도 입력 텍스트를 유지하고 포커스를 다시 가져가지 않는다.
+- 관련 파일: `src/dialogs.rs`, `src/dialog_runtime.rs`, `src/browser.rs`, `src/control_panel.rs`, `tests/dialog_smoke.py`, `docs/dialog-control.md`, `docs/agent-cli-guide.md`.
+
+### 검증
+
+| 구분 | 내용 | 결과 |
+|---|---|---|
+| 단위 테스트 | `cargo test --locked --lib` | 493개 통과(소유권 전환 경로별, `DIALOG_USER_OWNED`, 사용자 응답과 오래된 토큰 거절, 사용자 소유 항목의 전체 한도 제외, close/finish/종료 정리, 패널 표시 조건·레이아웃·버튼 문구, `dialog_focus_decision`, `dialog_key_decision`) |
+| 빌드·모의 DOM | `cargo check --locked --bins`, `node --test tests/` | 통과, 162개 통과 |
+| 로컬 CEF 통합 | release 빌드 1회 뒤 `tasks_smoke.py`, `pointer_ext_smoke.py`, `dialog_smoke.py --quit-pid` | 모두 통과. handoff 뒤 `tabs[].dialog.owner:user` 유지, resume 뒤 accept/dismiss가 `DIALOG_USER_OWNED`, read가 `DIALOG_PENDING`, close 완료, SIGTERM 종료 |
+| 네이티브 UI 확인 | 패널 표시·클릭, 탭 선택 직후 패널 포커스, 주소창 Return/Esc가 패널로 새지 않음, IME | 실행하지 못함(접근성 권한 없음) |
+| 외부 사이트 | 해당 없음 | 실행하지 않음 |
+
+### 알려진 한계, 남은 작업
+
+- 실행하지 못한 네이티브 UI 확인: 패널 표시와 버튼 클릭, 탭 선택 직후 패널 포커스, 주소창 Return/Esc가 패널로 새지 않는지, prompt 입력란 IME 조합, Return/Esc 키 처리. 접근성 권한이 없어 시각 확인도 없다.
+- 사용자가 보지 않는 탭의 사용자 소유 대화상자는 렌더러를 계속 멈춰 두며 시간 제한 취소는 없다(`close`와 종료는 정리).
+- `cargo fmt --check`는 기준 커밋부터 있던 무관한 차이로 실패하여 전체 포맷은 적용하지 않았다.
+- `dialog_smoke` 9단계의 `tab2`는 이후 한도 검사(10단계)의 탭으로 쓰이고 11단계 `task finish`에서 닫혀 별도 정리가 필요 없다.
+
+### 정리
+
+검증 앱(`/private/tmp/nrpe-m9` 프로필, mock keychain)은 `dialog_smoke --quit-pid`의 SIGTERM으로 종료됐고 프로필·로그·번들 `dist/`를 삭제했다. 이 워크트리의 앱 프로세스는 남지 않았다. 푸시하지 않았다.
+
 ## 2026-10-21, M8 추가 E2E 실행 (M7과 같은 번들, 재빌드 없음)
 
 ### 요청 범위와 변경

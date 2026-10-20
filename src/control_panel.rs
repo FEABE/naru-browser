@@ -51,6 +51,8 @@ pub struct ShellTab {
     pub task_status: String,
     /// A JavaScript dialog is queued for the AI to answer through the CLI.
     pub dialog_pending: bool,
+    /// The queued dialog was handed to the user; the native panel answers it.
+    pub dialog_user: bool,
     pub stop_scope: Option<TaskScope>,
     pub space: String,
     pub navigation_epoch: u64,
@@ -79,6 +81,9 @@ const RAIL_WIDTH: f64 = 76.0;
 const TOOLBAR_HEIGHT: f64 = 56.0;
 const FIND_BAR_HEIGHT: f64 = 44.0;
 const PAGE_RECOVERY_HEIGHT: f64 = 96.0;
+const PAGE_DIALOG_HEIGHT: f64 = 170.0;
+/// Display cap for untrusted dialog text; the original prompt default is kept elsewhere.
+const PAGE_DIALOG_MESSAGE_CHARS: usize = 600;
 const TAB_ROW_HEIGHT: f64 = 38.0;
 
 struct StartPage {
@@ -348,6 +353,220 @@ struct PageRecoveryBar {
     loading: bool,
 }
 
+/// Native band for a JavaScript dialog handed to the user. It exists only while
+/// the dialog's tab is the shown tab of the shown space.
+struct PageDialogBar {
+    surface: Retained<SurfaceView>,
+    title: Retained<NSTextField>,
+    message: Retained<NSTextField>,
+    field: Retained<NSTextField>,
+    cancel: Retained<NSButton>,
+    primary: Retained<NSButton>,
+    shown: Option<crate::dialog_runtime::UserDialog>,
+    /// Set when a new dialog appeared; the next layout focuses its control once.
+    focus_pending: bool,
+    /// The dialog that already received its one-time focus.
+    focused_token: Option<u64>,
+    /// Typed prompt text kept while the strip is hidden by an overlay or tab switch.
+    draft: Option<(u64, String)>,
+}
+
+/// What `focus_tab` must do for the dialog strip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DialogFocus {
+    /// No strip for this tab: the page may take focus.
+    Page,
+    /// The strip already holds focus: leave it.
+    Keep,
+    /// Move focus into the strip.
+    Take,
+}
+
+fn dialog_focus_decision(
+    strip_tab: Option<i32>,
+    requested: i32,
+    responder_in_strip: bool,
+) -> DialogFocus {
+    match strip_tab {
+        Some(tab) if tab == requested => {
+            if responder_in_strip {
+                DialogFocus::Keep
+            } else {
+                DialogFocus::Take
+            }
+        }
+        _ => DialogFocus::Page,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DialogKey {
+    Primary,
+    Cancel,
+}
+
+/// Return/Enter answer the visible dialog strip and Esc cancels it, only while
+/// focus is inside the strip or that tab's page, never in the address bar or
+/// another native field, and never while an IME composition is active.
+fn dialog_key_decision(
+    key_code: u16,
+    unmodified: bool,
+    strip_visible: bool,
+    responder_in_scope: bool,
+    marked_text: bool,
+    cancel_enabled: bool,
+) -> Option<DialogKey> {
+    if !strip_visible || !unmodified || !responder_in_scope || marked_text {
+        return None;
+    }
+    match key_code {
+        36 | 76 => Some(DialogKey::Primary),
+        53 if cancel_enabled => Some(DialogKey::Cancel),
+        _ => None,
+    }
+}
+
+/// The tab whose user-owned dialog should be presented right now.
+fn visible_user_dialog_tab(
+    tabs: &[ShellTab],
+    active_space: &str,
+    active: Option<i32>,
+    overview: bool,
+    overlay_open: bool,
+) -> Option<i32> {
+    if overview || overlay_open {
+        return None;
+    }
+    tabs.iter()
+        .find(|tab| Some(tab.id) == active && tab.space == active_space && tab.dialog_user)
+        .map(|tab| tab.id)
+}
+
+fn dialog_button_titles(kind: crate::dialogs::Kind) -> (&'static str, Option<&'static str>) {
+    use crate::dialogs::Kind;
+    match kind {
+        Kind::Alert => ("확인", None),
+        Kind::Confirm | Kind::Prompt => ("확인", Some("취소")),
+        Kind::BeforeUnload => ("떠나기", Some("머무르기")),
+    }
+}
+
+impl PageDialogBar {
+    fn new(parent: &NSView, target: &ShellTarget, marker: MainThreadMarker) -> Self {
+        let surface = surface_child(parent, SurfaceKind::Card, 0.0, true, marker);
+        surface.setHidden(true);
+        surface.set_focusable(true);
+        let title = label(&surface, "", 14.0, true, marker);
+        let message = label(&surface, "", 12.0, false, marker);
+        unsafe {
+            let _: () = msg_send![&*message, setUsesSingleLineMode: false];
+            let _: () = msg_send![&*message, setLineBreakMode: 4isize];
+            let _: () = msg_send![&*message, setMaximumNumberOfLines: 4isize];
+        }
+        message.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        let field =
+            NSTextField::initWithFrame(NSTextField::alloc(marker), rect(0.0, 0.0, 100.0, 24.0));
+        field.setEditable(true);
+        field.setSelectable(true);
+        field.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+        field.setHidden(true);
+        unsafe {
+            field.setTarget(Some(target));
+            field.setAction(Some(sel!(answerPageDialog:)));
+        }
+        surface.addSubview(&field);
+        let cancel = button(
+            &surface,
+            "취소",
+            target,
+            sel!(cancelPageDialog:),
+            "페이지 대화상자 취소 (Esc)",
+            marker,
+        );
+        let primary = button(
+            &surface,
+            "확인",
+            target,
+            sel!(answerPageDialog:),
+            "페이지 대화상자 확인 (Return)",
+            marker,
+        );
+        primary.setContentTintColor(Some(&accent_color()));
+        cancel.setEnabled(false);
+        primary.setEnabled(false);
+        Self {
+            surface,
+            title,
+            message,
+            field,
+            cancel,
+            primary,
+            shown: None,
+            focus_pending: false,
+            focused_token: None,
+            draft: None,
+        }
+    }
+
+    fn render(&mut self, dialog: Option<crate::dialog_runtime::UserDialog>) {
+        let Some(dialog) = dialog else {
+            if let Some(previous) = self.shown.take() {
+                // Hidden by an overlay or a tab switch: keep what the user typed.
+                if previous.kind == crate::dialogs::Kind::Prompt {
+                    self.draft = Some((previous.token, self.field.stringValue().to_string()));
+                }
+                self.focus_pending = false;
+                self.primary.setEnabled(false);
+                self.cancel.setEnabled(false);
+                self.field.setHidden(true);
+            }
+            return;
+        };
+        if self.shown.as_ref().map(|shown| shown.token) != Some(dialog.token) {
+            let (primary, cancel) = dialog_button_titles(dialog.kind);
+            let origin = if dialog.origin.is_empty() {
+                "알 수 없는 출처".to_owned()
+            } else {
+                compact(&dialog.origin, 120)
+            };
+            self.title.setStringValue(&NSString::from_str(&format!(
+                "이 페이지의 {} 대화상자 · {origin}",
+                dialog.kind.label()
+            )));
+            dialog_message_label(&self.message, &dialog.message);
+            let prompt = dialog.kind == crate::dialogs::Kind::Prompt;
+            self.field.setHidden(!prompt);
+            let text = match self.draft.take() {
+                Some((token, text)) if token == dialog.token => text,
+                _ if prompt => dialog.default_prompt.clone(),
+                _ => String::new(),
+            };
+            self.field.setStringValue(&NSString::from_str(&text));
+            self.primary.setTitle(&NSString::from_str(primary));
+            self.cancel.setTitle(&NSString::from_str(cancel.unwrap_or("")));
+            self.cancel.setHidden(cancel.is_none());
+            // Re-showing the same dialog never takes focus a second time.
+            self.focus_pending = self.focused_token != Some(dialog.token);
+            self.focused_token = Some(dialog.token);
+        }
+        let (_, cancel) = dialog_button_titles(dialog.kind);
+        self.primary.setEnabled(true);
+        self.cancel.setEnabled(cancel.is_some());
+        self.shown = Some(dialog);
+    }
+
+    fn layout(&self, width: f64) {
+        let text_width = (width - 32.0).max(1.0);
+        self.title.setFrame(rect(16.0, 140.0, text_width, 20.0));
+        self.message.setFrame(rect(16.0, 76.0, text_width, 60.0));
+        self.field.setFrame(rect(16.0, 46.0, text_width, 24.0));
+        self.primary
+            .setFrame(rect((width - 16.0 - 96.0).max(10.0), 6.0, 96.0, 28.0));
+        self.cancel
+            .setFrame(rect((width - 16.0 - 96.0 - 8.0 - 96.0).max(10.0), 6.0, 96.0, 28.0));
+    }
+}
+
 fn visible_page_recovery_target(
     tabs: &[ShellTab],
     active_space: &str,
@@ -373,17 +592,25 @@ struct PageVerticalLayout {
     page_height: f64,
     find_y: f64,
     recovery_y: f64,
+    dialog_y: f64,
 }
 
-fn page_vertical_layout(height: f64, find: bool, recovery: bool) -> PageVerticalLayout {
+fn page_vertical_layout(
+    height: f64,
+    find: bool,
+    recovery: bool,
+    dialog: bool,
+) -> PageVerticalLayout {
     let toolbar_bottom = (height - TOOLBAR_HEIGHT).max(1.0);
     let find_height = if find { FIND_BAR_HEIGHT } else { 0.0 };
     let recovery_height = if recovery { PAGE_RECOVERY_HEIGHT } else { 0.0 };
-    let page_height = (toolbar_bottom - find_height - recovery_height).max(1.0);
+    let dialog_height = if dialog { PAGE_DIALOG_HEIGHT } else { 0.0 };
+    let page_height = (toolbar_bottom - find_height - recovery_height - dialog_height).max(1.0);
     PageVerticalLayout {
         page_height,
-        find_y: page_height + recovery_height,
-        recovery_y: page_height,
+        dialog_y: page_height,
+        recovery_y: page_height + dialog_height,
+        find_y: page_height + dialog_height + recovery_height,
     }
 }
 
@@ -669,6 +896,7 @@ fn tab_rows_signature(
                 tab.failure,
                 &tab.task_status,
                 tab.dialog_pending,
+                tab.dialog_user,
                 tab.stop_scope.is_some()
             ))
             .collect::<Vec<_>>()
@@ -698,7 +926,9 @@ fn tab_status_description(tab: &ShellTab) -> String {
     format!(
         "{}{}{}{}{}",
         tab.task_status,
-        if tab.dialog_pending {
+        if tab.dialog_user {
+            ", 대화상자 사용자 응답 대기"
+        } else if tab.dialog_pending {
             ", 대화상자 응답 대기"
         } else {
             ""
@@ -1161,6 +1391,7 @@ struct Shell {
     file_selection_notice: Option<String>,
     find: FindBar,
     recovery: PageRecoveryBar,
+    dialog: PageDialogBar,
     start_page: StartPage,
     search_surface: Retained<SurfaceView>,
     search_title: Retained<NSTextField>,
@@ -1590,6 +1821,8 @@ struct SurfaceStyle {
     kind: Cell<SurfaceKind>,
     radius: f64,
     border: bool,
+    /// Only the page dialog strip takes keyboard focus (without Full Keyboard Access).
+    focusable: Cell<bool>,
 }
 
 define_class!(
@@ -1602,6 +1835,9 @@ define_class!(
     impl SurfaceView {
         #[unsafe(method(wantsUpdateLayer))]
         fn wants_update_layer(&self) -> bool { true }
+
+        #[unsafe(method(acceptsFirstResponder))]
+        fn accepts_first_responder(&self) -> bool { self.ivars().focusable.get() }
 
         #[unsafe(method(updateLayer))]
         fn update_layer(&self) {
@@ -1646,12 +1882,16 @@ impl SurfaceView {
             kind: Cell::new(kind),
             radius,
             border,
+            focusable: Cell::new(false),
         });
         let view: Retained<Self> =
             unsafe { msg_send![super(view), initWithFrame: rect(0.0, 0.0, 1.0, 1.0)] };
         view.setWantsLayer(true);
         view.setNeedsDisplay(true);
         view
+    }
+    fn set_focusable(&self, focusable: bool) {
+        self.ivars().focusable.set(focusable);
     }
     fn set_kind(&self, kind: SurfaceKind) {
         if self.ivars().kind.replace(kind) != kind {
@@ -2110,6 +2350,10 @@ define_class!(
         fn edit_failed_page_address(&self, sender: &NSButton) { page_recovery_action(sender, false); }
         #[unsafe(method(retryFailedPage:))]
         fn retry_failed_page(&self, sender: &NSButton) { page_recovery_action(sender, true); }
+        #[unsafe(method(answerPageDialog:))]
+        fn answer_page_dialog(&self, sender: &NSObject) { page_dialog_action(sender, true); }
+        #[unsafe(method(cancelPageDialog:))]
+        fn cancel_page_dialog(&self, sender: &NSObject) { page_dialog_action(sender, false); }
         #[unsafe(method(submitStartPage:))]
         fn submit_start_page(&self, sender: &AnyObject) { start_page_action(sender, false); }
         #[unsafe(method(openStartPageBookmarks:))]
@@ -3522,6 +3766,17 @@ fn site_permission_label(label: &NSTextField, text: &str) {
     }
 }
 
+/// Untrusted page text: at most 600 characters, controls become spaces, the
+/// label truncates with an ellipsis and the tooltip/help keep the stored text.
+fn dialog_message_label(label: &NSTextField, text: &str) {
+    label.setStringValue(&NSString::from_str(&compact(text, PAGE_DIALOG_MESSAGE_CHARS)));
+    let full = NSString::from_str(text);
+    label.setToolTip(Some(&full));
+    unsafe {
+        let _: () = msg_send![label, setAccessibilityHelp: &*full];
+    }
+}
+
 fn site_permission_wrap(label: &NSTextField, lines: isize) {
     unsafe {
         let _: () = msg_send![label, setUsesSingleLineMode: false];
@@ -4227,6 +4482,7 @@ impl Shell {
         let site_permissions = SitePermissionPanel::new(&root, &target, marker);
         let find = FindBar::new(&root, &target, marker);
         let recovery = PageRecoveryBar::new(&root, &target, marker);
+        let dialog = PageDialogBar::new(&root, &target, marker);
         let start_page = StartPage::new(&root, &target, marker);
         window.center();
         window.setDelegate(Some(ProtocolObject::from_ref(&*target)));
@@ -4272,6 +4528,7 @@ impl Shell {
             file_selection_notice: None,
             find,
             recovery,
+            dialog,
             start_page,
             search_surface,
             search_title,
@@ -4379,6 +4636,17 @@ impl Shell {
         );
         self.recovery
             .render(recovery_target, tab.is_some_and(|tab| tab.loading));
+        // Only the shown tab's user-owned dialog is presented; any other tab's
+        // dialog waits (and the page keeps rejecting commands) until it is shown.
+        let dialog = visible_user_dialog_tab(
+            &self.tabs,
+            &self.active_space,
+            self.active,
+            self.overview,
+            self.overlay_is_open(),
+        )
+        .and_then(crate::dialog_runtime::user_dialog);
+        self.dialog.render(dialog);
         self.back
             .setEnabled(browsing && tab.is_some_and(|tab| tab.can_go_back));
         self.forward
@@ -4478,6 +4746,8 @@ impl Shell {
             compact(notice, 100)
         } else if self.overview {
             "공간 보기".into()
+        } else if tab.is_some_and(|tab| tab.dialog_user) {
+            "대화상자: 직접 응답".into()
         } else if tab.is_some_and(|tab| tab.dialog_pending) {
             "대화상자 대기".into()
         } else if can_stop {
@@ -7626,6 +7896,7 @@ fn apply_selection(focus: bool) {
                 },
                 shell.overlay_is_open(),
                 shell.start_page.visible,
+                shell.dialog.shown.is_some() && !shell.overview,
                 shell
                     .views
                     .iter()
@@ -7634,7 +7905,7 @@ fn apply_selection(focus: bool) {
             )
         })
     });
-    let Some((window, active, search_open, start_visible, views)) = state else {
+    let Some((window, active, search_open, start_visible, dialog_open, views)) = state else {
         return;
     };
     if focus && active.is_none() && !search_open && !find_editing {
@@ -7653,7 +7924,8 @@ fn apply_selection(focus: bool) {
         return;
     }
     // Focus WebContents through CEF, after releasing all borrowed/retained views.
-    if focus && !search_open && !find_editing {
+    // A presented dialog keeps its own controls focused; the blocked page cannot use focus.
+    if focus && !search_open && !find_editing && !dialog_open {
         if let Some(id) = active {
             crate::browser::focus_tab(id);
         }
@@ -7685,6 +7957,8 @@ fn layout() {
                 shell.find.surface.clone(),
                 shell.recovery.target.is_some(),
                 shell.recovery.surface.clone(),
+                shell.dialog.shown.is_some(),
+                shell.dialog.surface.clone(),
                 shell.start_page.visible,
                 shell.start_page.surface.clone(),
                 shell.start_page.input.clone(),
@@ -7713,6 +7987,8 @@ fn layout() {
         find_surface,
         recovery_open,
         recovery_surface,
+        dialog_open,
+        dialog_surface,
         start_page_open,
         start_page_surface,
         start_page_input,
@@ -7736,6 +8012,7 @@ fn layout() {
         && !downloads_open;
     let find_visible = find_open && !overview && !overlay_open;
     let recovery_visible = recovery_open && !overview && !overlay_open;
+    let dialog_visible = dialog_open && !overview && !overlay_open;
     let start_page_visible = start_page_open && !overview && !overlay_open;
     let content_hidden = overview || (overlay_open && !permission_covers_page) || start_page_visible;
     let visibility_changed = sidebar.isHidden() != overlay_open
@@ -7744,12 +8021,13 @@ fn layout() {
         || overview_scroll.isHidden() != (!overview || overlay_open)
         || find_surface.isHidden() == find_visible
         || recovery_surface.isHidden() == recovery_visible
+        || dialog_surface.isHidden() == dialog_visible
         || start_page_surface.isHidden() == start_page_visible
         || search_surface.isHidden() == search_open
         || bookmarks_surface.isHidden() == bookmarks_open
         || downloads_surface.isHidden() == downloads_open
         || site_permissions_surface.isHidden() == site_permissions_open;
-    let vertical = page_vertical_layout(size.height, find_visible, recovery_visible);
+    let vertical = page_vertical_layout(size.height, find_visible, recovery_visible, dialog_visible);
     let page_height = vertical.page_height;
     sidebar.setFrame(rect(0.0, 0.0, side, size.height));
     toolbar.setFrame(rect(side, toolbar_bottom, main_width, TOOLBAR_HEIGHT));
@@ -7767,6 +8045,16 @@ fn layout() {
         clear_view_responders(&recovery_surface);
     }
     recovery_surface.setHidden(!recovery_visible);
+    dialog_surface.setFrame(rect(
+        side,
+        vertical.dialog_y,
+        main_width,
+        PAGE_DIALOG_HEIGHT,
+    ));
+    if !dialog_visible {
+        clear_view_responders(&dialog_surface);
+    }
+    dialog_surface.setHidden(!dialog_visible);
     sidebar.setHidden(overlay_open);
     toolbar.setHidden(overlay_open);
     content.setFrame(rect(side, 0.0, main_width, page_height));
@@ -7797,6 +8085,9 @@ fn layout() {
             if recovery_visible {
                 shell.recovery.layout(main_width);
             }
+            if dialog_visible {
+                shell.dialog.layout(main_width);
+            }
             if start_page_visible {
                 shell
                     .start_page
@@ -7826,6 +8117,39 @@ fn layout() {
             [None, None]
         }
     });
+    // A newly presented dialog takes keyboard focus once, and only while it is
+    // really shown. Never steal an editing native text field (address, search).
+    let dialog_focus = if dialog_visible {
+        SHELL.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let shell = slot.as_mut()?;
+            if !std::mem::take(&mut shell.dialog.focus_pending) {
+                return None;
+            }
+            // A native field editor (NSTextView, an NSText) is first responder.
+            let editing = shell.window.firstResponder().is_some_and(|responder| {
+                responder.respondsToSelector(sel!(isFieldEditor)) && {
+                    let editor: bool = unsafe { msg_send![&*responder, isFieldEditor] };
+                    editor
+                }
+            });
+            if editing {
+                return None;
+            }
+            let prompt = shell
+                .dialog
+                .shown
+                .as_ref()
+                .is_some_and(|dialog| dialog.kind == crate::dialogs::Kind::Prompt);
+            Some((
+                shell.window.clone(),
+                prompt.then(|| shell.dialog.field.clone()),
+                shell.dialog.surface.clone(),
+            ))
+        })
+    } else {
+        None
+    };
     if visibility_changed {
         // Reused native controls become eligible without being added again.
         // Update traversal only after their visibility and final frames settle.
@@ -7839,6 +8163,17 @@ fn layout() {
         }
     }
     validate_active_tab_drag();
+    if let Some((window, field, primary)) = dialog_focus {
+        window.recalculateKeyViewLoop();
+        match field {
+            Some(field) => {
+                window.makeFirstResponder(Some(&field));
+            }
+            None => {
+                window.makeFirstResponder(Some(&primary));
+            }
+        }
+    }
 }
 
 impl Shell {
@@ -8577,6 +8912,173 @@ fn start_page_action(sender: &AnyObject, bookmarks: bool) {
             });
         if focus_page {
             crate::browser::focus_tab(target.tab);
+        }
+    }
+}
+
+/// The user pressed a button of the page dialog band (or Return in its field).
+fn page_dialog_action(sender: &NSObject, accept: bool) {
+    answer_page_dialog(accept, Some(sender));
+}
+
+/// Answer the shown dialog. A click is accepted only from the matching control
+/// and only for the exact dialog and tab currently shown; the key path passes
+/// `None` after `dialog_key_decision` approved the focus scope.
+fn answer_page_dialog(accept: bool, sender: Option<&NSObject>) {
+    let request = SHELL.with(|slot| {
+        let slot = slot.borrow();
+        let shell = slot.as_ref()?;
+        let bar = &shell.dialog;
+        let shown = bar.shown.as_ref()?;
+        if bar.surface.isHidden() {
+            return None;
+        }
+        if let Some(sender) = sender {
+            let origin = std::ptr::from_ref(sender).cast::<u8>();
+            let is = |view: *const u8| std::ptr::eq(origin, view);
+            let valid = if accept {
+                is(std::ptr::from_ref(&*bar.primary).cast())
+                    || is(std::ptr::from_ref(&*bar.field).cast())
+            } else {
+                is(std::ptr::from_ref(&*bar.cancel).cast())
+            };
+            if !valid {
+                return None;
+            }
+        }
+        if !accept && !bar.cancel.isEnabled() {
+            return None;
+        }
+        let live = visible_user_dialog_tab(
+            &shell.tabs,
+            &shell.active_space,
+            shell.active,
+            shell.overview,
+            shell.overlay_is_open(),
+        )?;
+        if live != shown.tab {
+            return None;
+        }
+        let text = (accept && shown.kind == crate::dialogs::Kind::Prompt)
+            .then(|| bar.field.stringValue().to_string());
+        Some((shown.tab, shown.token, text))
+    });
+    let Some((tab, token, text)) = request else {
+        return;
+    };
+    // The callback continues here, outside every SHELL/STATE borrow.
+    let result = crate::browser::answer_user_dialog(tab, token, accept, text);
+    SHELL.with(|slot| {
+        if let Some(shell) = slot.borrow_mut().as_mut() {
+            shell.dialog.draft = None;
+            if result.is_err() {
+                shell.notice = Some("대화상자가 이미 닫혀 응답하지 않았습니다.".into());
+            }
+        }
+    });
+    refresh();
+    if result.is_ok() {
+        crate::browser::focus_tab(tab);
+    }
+}
+
+/// Return/Esc for the visible dialog strip, from `handle_shortcut`. True when
+/// the key was consumed.
+fn handle_dialog_key(event: &NSEvent) -> bool {
+    let scope = SHELL.with(|slot| {
+        let slot = slot.borrow();
+        let shell = slot.as_ref()?;
+        let shown = shell.dialog.shown.as_ref()?;
+        let visible = !shell.dialog.surface.isHidden()
+            && visible_user_dialog_tab(
+                &shell.tabs,
+                &shell.active_space,
+                shell.active,
+                shell.overview,
+                shell.overlay_is_open(),
+            ) == Some(shown.tab);
+        let responder = shell.window.firstResponder();
+        let in_scope = responder.as_ref().is_some_and(|responder| {
+            responder.downcast_ref::<NSView>().is_some_and(|view| {
+                view.isDescendantOf(&shell.dialog.surface)
+                    || shell
+                        .views
+                        .get(&shown.tab)
+                        .is_some_and(|page| view.isDescendantOf(page))
+            })
+        });
+        let marked = unsafe {
+            let editor: *mut AnyObject = msg_send![&*shell.dialog.field, currentEditor];
+            !editor.is_null() && msg_send![editor, hasMarkedText]
+        };
+        Some((visible, in_scope, marked, shell.dialog.cancel.isEnabled()))
+    });
+    let Some((visible, in_scope, marked, cancel_enabled)) = scope else {
+        return false;
+    };
+    let modifiers = event.modifierFlags();
+    let unmodified = !modifiers.intersects(
+        NSEventModifierFlags::Command
+            | NSEventModifierFlags::Control
+            | NSEventModifierFlags::Option
+            | NSEventModifierFlags::Shift,
+    );
+    match dialog_key_decision(
+        event.keyCode(),
+        unmodified,
+        visible,
+        in_scope,
+        marked,
+        cancel_enabled,
+    ) {
+        Some(DialogKey::Primary) => {
+            answer_page_dialog(true, None);
+            true
+        }
+        Some(DialogKey::Cancel) => {
+            answer_page_dialog(false, None);
+            true
+        }
+        None => false,
+    }
+}
+
+/// `focus_tab` entry: keep the keyboard on the dialog strip instead of the
+/// blocked page. True when the strip handled focus.
+pub(crate) fn focus_dialog_if_visible(tab: i32) -> bool {
+    let state = SHELL.with(|slot| {
+        let slot = slot.borrow();
+        let shell = slot.as_ref()?;
+        let shown = shell.dialog.shown.as_ref()?;
+        if shell.dialog.surface.isHidden() {
+            return None;
+        }
+        let responder_in_strip = shell.window.firstResponder().is_some_and(|responder| {
+            responder
+                .downcast_ref::<NSView>()
+                .is_some_and(|view| view.isDescendantOf(&shell.dialog.surface))
+        });
+        let prompt = shown.kind == crate::dialogs::Kind::Prompt;
+        Some((
+            shown.tab,
+            responder_in_strip,
+            shell.window.clone(),
+            shell.dialog.surface.clone(),
+            prompt.then(|| shell.dialog.field.clone()),
+        ))
+    });
+    let Some((strip_tab, in_strip, window, surface, field)) = state else {
+        return false;
+    };
+    match dialog_focus_decision(Some(strip_tab), tab, in_strip) {
+        DialogFocus::Page => false,
+        DialogFocus::Keep => true,
+        DialogFocus::Take => {
+            match field {
+                Some(field) => window.makeFirstResponder(Some(&field)),
+                None => window.makeFirstResponder(Some(&surface)),
+            };
+            true
         }
     }
 }
@@ -10794,6 +11296,9 @@ pub fn handle_shortcut(event: &NSEvent) -> bool {
     if !window.is_some_and(|window| window.isKeyWindow()) {
         return false;
     }
+    if handle_dialog_key(event) {
+        return true;
+    }
     let Some(key) = shortcut_key(event) else {
         return false;
     };
@@ -11648,6 +12153,7 @@ mod tests {
             start_page: false,
             task_status: String::new(),
             dialog_pending: false,
+            dialog_user: false,
             stop_scope: None,
             space: space.into(),
             navigation_epoch: 1,
@@ -12000,6 +12506,7 @@ mod tests {
             start_page: true,
             task_status: String::new(),
             dialog_pending: false,
+            dialog_user: false,
             stop_scope: None,
             space: "user".into(),
             navigation_epoch: 3,
@@ -12078,6 +12585,7 @@ mod tests {
             start_page: false,
             task_status: String::new(),
             dialog_pending: false,
+            dialog_user: false,
             stop_scope: None,
             space: "task-1".into(),
             navigation_epoch: 5,
@@ -12113,7 +12621,7 @@ mod tests {
     fn recovery_and_find_reserve_separate_native_bands_above_the_page() {
         for height in [520.0, 800.0] {
             for (find, recovery) in [(false, false), (true, false), (false, true), (true, true)] {
-                let layout = page_vertical_layout(height, find, recovery);
+                let layout = page_vertical_layout(height, find, recovery, false);
                 let find_height = if find { FIND_BAR_HEIGHT } else { 0.0 };
                 let recovery_height = if recovery { PAGE_RECOVERY_HEIGHT } else { 0.0 };
                 assert!(layout.page_height >= 324.0);
@@ -12122,6 +12630,77 @@ mod tests {
                 assert_eq!(layout.find_y + find_height, height - TOOLBAR_HEIGHT);
             }
         }
+    }
+
+    #[test]
+    fn dialog_band_sits_between_the_page_and_the_other_bands() {
+        for height in [520.0, 800.0] {
+            let layout = page_vertical_layout(height, true, true, true);
+            assert_eq!(layout.dialog_y, layout.page_height);
+            assert_eq!(layout.recovery_y, layout.dialog_y + PAGE_DIALOG_HEIGHT);
+            assert_eq!(layout.find_y, layout.recovery_y + PAGE_RECOVERY_HEIGHT);
+            assert_eq!(layout.find_y + FIND_BAR_HEIGHT, height - TOOLBAR_HEIGHT);
+            let only = page_vertical_layout(height, false, false, true);
+            assert_eq!(only.dialog_y + PAGE_DIALOG_HEIGHT, height - TOOLBAR_HEIGHT);
+            assert!(only.page_height >= 1.0);
+            assert_eq!(only.page_height, (height - TOOLBAR_HEIGHT - PAGE_DIALOG_HEIGHT).max(1.0));
+        }
+    }
+
+    #[test]
+    fn user_owned_dialog_is_presented_only_for_the_shown_tab() {
+        let mut tabs = vec![
+            numbered_tab_fixture(7, "task-1"),
+            numbered_tab_fixture(8, "task-1"),
+        ];
+        // AI-owned (not handed over) dialogs never get the native panel.
+        tabs[0].dialog_pending = true;
+        assert_eq!(visible_user_dialog_tab(&tabs, "task-1", Some(7), false, false), None);
+        tabs[0].dialog_user = true;
+        assert_eq!(visible_user_dialog_tab(&tabs, "task-1", Some(7), false, false), Some(7));
+        // Not the selected tab, another space, overview or an overlay: not shown, no focus.
+        assert_eq!(visible_user_dialog_tab(&tabs, "task-1", Some(8), false, false), None);
+        assert_eq!(visible_user_dialog_tab(&tabs, "user", Some(7), false, false), None);
+        assert_eq!(visible_user_dialog_tab(&tabs, "task-1", Some(7), true, false), None);
+        assert_eq!(visible_user_dialog_tab(&tabs, "task-1", Some(7), false, true), None);
+    }
+
+    #[test]
+    fn dialog_focus_stays_on_the_strip_for_its_own_tab_only() {
+        assert_eq!(dialog_focus_decision(None, 7, false), DialogFocus::Page);
+        assert_eq!(dialog_focus_decision(Some(7), 8, false), DialogFocus::Page);
+        assert_eq!(dialog_focus_decision(Some(7), 7, false), DialogFocus::Take);
+        assert_eq!(dialog_focus_decision(Some(7), 7, true), DialogFocus::Keep);
+    }
+
+    #[test]
+    fn dialog_keys_apply_only_inside_the_strip_or_its_page() {
+        use DialogKey::{Cancel, Primary};
+        let decide = |code, plain, visible, scope, marked, cancel| {
+            dialog_key_decision(code, plain, visible, scope, marked, cancel)
+        };
+        assert_eq!(decide(36, true, true, true, false, true), Some(Primary));
+        assert_eq!(decide(76, true, true, true, false, false), Some(Primary));
+        assert_eq!(decide(53, true, true, true, false, true), Some(Cancel));
+        // Alert has no cancel button: Esc does nothing.
+        assert_eq!(decide(53, true, true, true, false, false), None);
+        // Address bar or another field (focus outside the strip and page).
+        assert_eq!(decide(36, true, true, false, false, true), None);
+        assert_eq!(decide(53, true, true, false, false, true), None);
+        // Hidden strip, modifiers, IME composition, other keys.
+        assert_eq!(decide(36, true, false, true, false, true), None);
+        assert_eq!(decide(36, false, true, true, false, true), None);
+        assert_eq!(decide(36, true, true, true, true, true), None);
+        assert_eq!(decide(48, true, true, true, false, true), None);
+    }
+
+    #[test]
+    fn dialog_buttons_follow_the_dialog_kind() {
+        use crate::dialogs::Kind;
+        assert_eq!(dialog_button_titles(Kind::Alert), ("확인", None));
+        assert_eq!(dialog_button_titles(Kind::Confirm), ("확인", Some("취소")));
+        assert_eq!(dialog_button_titles(Kind::Prompt), ("확인", Some("취소")));
+        assert_eq!(dialog_button_titles(Kind::BeforeUnload), ("떠나기", Some("머무르기")));
     }
 
     #[test]
@@ -12501,6 +13080,7 @@ mod tests {
                 start_page: false,
                 task_status: String::new(),
                 dialog_pending: false,
+                dialog_user: false,
                 stop_scope: None,
                 space: handoff.space.clone(),
                 navigation_epoch: 5,
@@ -12895,6 +13475,7 @@ mod tests {
             start_page: false,
             task_status: String::new(),
             dialog_pending: false,
+            dialog_user: false,
             stop_scope: None,
             space: "user".into(),
             navigation_epoch: 1,

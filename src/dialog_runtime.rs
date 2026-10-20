@@ -1,10 +1,10 @@
 //! JavaScript dialog callbacks for AI-owned tabs, retained on the UI thread only.
 //!
 //! A queued dialog keeps its renderer blocked until an agent answers it, the
-//! task hands control back, or the tab closes. No RefCell borrow is held while
+//! user answers it in the native panel after a handoff, or the tab closes. No RefCell borrow is held while
 //! a CEF callback continues, because `cont` may reenter CEF handlers.
 
-use crate::dialogs::{DialogError, Entry, Kind, Model, accept_text};
+use crate::dialogs::{DialogError, Entry, Kind, Model, Owner, accept_text};
 use crate::protocol::DialogAction;
 use cef::*;
 use serde_json::{Value, json};
@@ -73,6 +73,48 @@ pub fn tab_json(tab: i32) -> Option<Value> {
 
 pub fn tab_overflow(tab: i32) -> u64 {
     RUNTIME.with(|slot| slot.borrow().model.overflow_for(tab))
+}
+
+/// Tabs whose queued dialog was handed to the user (answered only natively).
+pub fn user_owned_tabs() -> BTreeSet<i32> {
+    RUNTIME.with(|slot| {
+        slot.borrow()
+            .model
+            .rows()
+            .iter()
+            .filter(|row| row.owner == Owner::User)
+            .map(|row| row.tab)
+            .collect()
+    })
+}
+
+/// What the native panel shows for a user-owned dialog. Text is untrusted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserDialog {
+    pub token: u64,
+    pub tab: i32,
+    pub kind: Kind,
+    pub message: String,
+    pub origin: String,
+    /// Original prompt default (up to 65536 characters), prefilled in the text field.
+    pub default_prompt: String,
+}
+
+pub fn user_dialog(tab: i32) -> Option<UserDialog> {
+    RUNTIME.with(|slot| {
+        slot.borrow()
+            .model
+            .get(tab)
+            .filter(|entry| entry.owner == Owner::User)
+            .map(|entry| UserDialog {
+                token: entry.token,
+                tab: entry.tab,
+                kind: entry.kind,
+                message: entry.message.clone(),
+                origin: entry.origin.clone(),
+                default_prompt: entry.default_prompt_full.clone(),
+            })
+    })
 }
 
 pub fn status_json() -> Value {
@@ -185,6 +227,59 @@ pub(crate) fn test_reset_during_guard(tab: i32) {
     RUNTIME.with(|slot| slot.borrow_mut().self_continuing.remove(&tab));
 }
 
+/// Control of these tabs went to the user: keep each queued dialog (and its
+/// callback) but only the native panel may answer it from now on.
+pub(crate) fn hand_to_user(tabs: impl IntoIterator<Item = i32>) {
+    let changed = RUNTIME.with(|slot| {
+        let mut state = slot.borrow_mut();
+        let mut changed = false;
+        for tab in tabs {
+            changed |= state.model.hand_to_user(tab);
+        }
+        changed
+    });
+    if changed {
+        crate::browser::notify_panel();
+    }
+}
+
+/// The user answered the native panel. `token` pins the dialog the user saw;
+/// a replaced or settled dialog is not answered. The callback continues
+/// outside all borrows.
+pub(crate) fn answer_user(
+    tab: i32,
+    token: u64,
+    accept: bool,
+    text: Option<String>,
+) -> Result<(), DialogError> {
+    let (entry, callback) = RUNTIME.with(|slot| {
+        let mut state = slot.borrow_mut();
+        let entry = state
+            .model
+            .get(tab)
+            .filter(|entry| entry.token == token && entry.owner == Owner::User)
+            .cloned()
+            .ok_or(DialogError {
+                code: "NO_DIALOG",
+                message: "This tab has no pending JavaScript dialog for the user.",
+            })?;
+        state.model.take(tab);
+        state.resumed_at.insert(tab, Instant::now());
+        let callback = state.callbacks.remove(&entry.token);
+        Ok::<_, DialogError>((entry, callback))
+    })?;
+    if let Some(callback) = callback {
+        let reply = (accept && entry.kind == Kind::Prompt)
+            .then(|| text.unwrap_or_else(|| entry.default_prompt_full.clone()));
+        match &reply {
+            Some(value) => callback.cont(1, Some(&CefString::from(value.as_str()))),
+            None => callback.cont(i32::from(accept), None),
+        }
+    }
+    crate::browser::notify_panel();
+    Ok(())
+}
+
 /// Answer the pending dialog of `tab`. The callback continues outside all borrows.
 pub(crate) fn answer(tab: i32, action: &DialogAction) -> Result<Value, DialogError> {
     let (entry, callback, reply_text) = RUNTIME.with(|slot| {
@@ -193,6 +288,12 @@ pub(crate) fn answer(tab: i32, action: &DialogAction) -> Result<Value, DialogErr
             code: "NO_DIALOG",
             message: "This tab has no pending JavaScript dialog.",
         })?;
+        if entry.owner == Owner::User {
+            return Err(DialogError {
+                code: "DIALOG_USER_OWNED",
+                message: "This dialog was handed to the user; only the user can answer it in the browser window.",
+            });
+        }
         let reply_text = match action {
             DialogAction::Accept { text } => accept_text(&entry, text.as_deref())?,
             DialogAction::Dismiss {} => None,

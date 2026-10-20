@@ -198,7 +198,7 @@ lightbrowser task run ID REV dialog TAB dismiss         # confirm/prompt 취소(
 - 대화상자는 탭마다 1개, 전체 4개까지 보관한다. 한도를 넘으면 자동으로 취소(false)하고 `status.dialogs.overflow`와 `tabs[].dialogOverflow`를 올린다.
 - `dialog`는 `task run` 안에서만 되고 다른 작업의 탭은 `TASK_TAB_MISMATCH`다. 대기 중인 대화상자가 없으면 `NO_DIALOG`, `TEXT`를 prompt가 아닌 대화상자에 주면 `DIALOG_TEXT_NOT_ALLOWED`다(대화상자는 그대로 남는다).
 - 사용자가 직접 쓰던 탭에서 네이티브 대화상자가 떠 있는 채로 `task resume`/`task adopt`하면 페이지 명령이 멈출 수 있다(CEF는 기본 대화상자의 닫힘을 알려 주지 않는다). 응답이 없으면 사용자에게 네이티브 대화상자를 닫아 달라고 요청한다.
-- `task handoff`, `task release`, 탭을 `--keep`으로 돌려주는 `task finish`는 대기 중인 대화상자를 취소한다(beforeunload는 페이지에 남는다). `close TAB`이나 `task finish`로 닫히는 탭의 beforeunload는 자동으로 떠나기를 허용해 닫기가 멈추지 않는다.
+- `task handoff`, `task release`, 탭을 `--keep`으로 돌려주는 `task finish`(사용자의 페이지 입력·중지 버튼으로 인한 인계 포함)는 대기 중인 대화상자를 취소하지 않고 사용자에게 넘긴다. `tabs[].dialog.owner`가 `user`가 되고, 사용자가 그 탭을 볼 때 브라우저 창의 네이티브 패널에서 직접 응답한다. 그동안 `dialog`는 `DIALOG_USER_OWNED`로 실패하고 페이지 명령은 계속 `DIALOG_PENDING`이다. `task resume` 뒤에도 사용자가 답할 때까지 사용자 소유로 남으므로 대신 승인하려 하지 말고 `tabs`로 `dialog`가 `null`이 될 때까지 기다린 뒤 `read`로 다시 판단한다. 사용자 소유 항목은 탭당 1개 한도에는 포함되지만 전체 4개 한도에는 세지 않는다. `close TAB`이나 `task finish`로 닫히는 탭의 beforeunload는 자동으로 떠나기를 허용해 닫기가 멈추지 않는다.
 
 ## 오류와 복구
 
@@ -221,6 +221,7 @@ lightbrowser task run ID REV dialog TAB dismiss         # confirm/prompt 취소(
 | `WAIT_TIMEOUT` | 기다린 조건(`dom`/`load`/`url`/`text`)이 제한 시간 안에 오지 않음. 탭 `wait`는 탐색이 계속될 수 있고(`navigationContinues`), `task wait`는 작업이 그대로임 |
 | `NAVIGATION_FAILED`, `NAVIGATION_STOPPED`, `NAVIGATION_INCOMPLETE`, `RENDERER_TERMINATED` | 탐색 실패나 렌더러 종료. `details.state`를 보고 `reload` 후 `wait` |
 | `DIALOG_PENDING` | 탭에 JavaScript 대화상자가 대기 중이라 페이지가 멈춰 있다. `details.dialog`를 보고 `dialog TAB accept\|dismiss`로 응답한 뒤 `read` |
+| `DIALOG_USER_OWNED` | 대화상자가 사용자에게 넘어가 있어 AI가 응답할 수 없다. 사용자의 응답(`tabs`의 `dialog`가 `null`)을 기다리거나 `close TAB` |
 | `NO_DIALOG`, `DIALOG_TEXT_NOT_ALLOWED` | 응답할 대화상자가 없다(이미 취소됐거나 응답됨), prompt가 아닌 대화상자에 TEXT를 줌. `tabs`로 확인하고 TEXT 없이 다시 호출 |
 | `NAVIGATION_BUSY` | 직전 탐색이 아직 진행 중. 기다린 뒤 다시 판단 |
 | `INVALID_ARGUMENTS`, `INVALID_REQUEST`, `INVALID_URL`, `UNSUPPORTED_KEY` | 인자 오류. 고쳐서 다시 호출 |

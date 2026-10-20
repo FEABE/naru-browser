@@ -7,10 +7,12 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 pub const MAX_PER_TAB: usize = 1;
+/// Global cap for task-owned entries. User-owned entries (handed off) are bounded
+/// by the per-tab cap only, so a user's unanswered dialogs never starve the AI.
 pub const MAX_PENDING: usize = 4;
 pub const MAX_MESSAGE_CHARS: usize = 2048;
 pub const MAX_TEXT_BYTES: usize = 4096;
-/// Original prompt default kept for accept-without-TEXT (display copy is shorter).
+/// Original prompt default kept for accept-without-TEXT (display copy is shorter, up to 65536 characters).
 pub const MAX_DEFAULT_PROMPT_CHARS: usize = 65536;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,9 +34,28 @@ impl Kind {
     }
 }
 
+/// Who may answer a queued dialog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Owner {
+    /// The owning task answers through the CLI.
+    Task,
+    /// Control was handed to the user; only the native panel may answer.
+    User,
+}
+
+impl Owner {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Task => "task",
+            Self::User => "user",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     pub token: u64,
+    pub owner: Owner,
     pub tab: i32,
     pub kind: Kind,
     pub message: String,
@@ -52,6 +73,7 @@ impl Entry {
             "message": self.message,
             "defaultPrompt": self.default_prompt,
             "origin": self.origin,
+            "owner": self.owner.label(),
         });
         if self.default_prompt_truncated {
             value["defaultPromptTruncated"] = json!(true);
@@ -97,7 +119,13 @@ impl Model {
         let refusal = if self.entries.iter().filter(|entry| entry.tab == tab).count() >= MAX_PER_TAB
         {
             Some(Refusal::TabFull)
-        } else if self.entries.len() >= MAX_PENDING {
+        } else if self
+            .entries
+            .iter()
+            .filter(|entry| entry.owner == Owner::Task)
+            .count()
+            >= MAX_PENDING
+        {
             Some(Refusal::GlobalFull)
         } else {
             None
@@ -112,6 +140,7 @@ impl Model {
         let token = self.next_token;
         self.entries.push(Entry {
             token,
+            owner: Owner::Task,
             tab,
             kind,
             message: truncate_chars(message, MAX_MESSAGE_CHARS),
@@ -125,6 +154,17 @@ impl Model {
 
     pub fn get(&self, tab: i32) -> Option<&Entry> {
         self.entries.iter().find(|entry| entry.tab == tab)
+    }
+
+    /// Mark the tab's queued dialog as owned by the user. True when one exists.
+    pub fn hand_to_user(&mut self, tab: i32) -> bool {
+        match self.entries.iter_mut().find(|entry| entry.tab == tab) {
+            Some(entry) => {
+                entry.owner = Owner::User;
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn take(&mut self, tab: i32) -> Option<Entry> {
@@ -257,6 +297,25 @@ mod tests {
             accept_text(confirm, Some("x")).unwrap_err().code,
             "DIALOG_TEXT_NOT_ALLOWED"
         );
+    }
+
+    #[test]
+    fn user_owned_entries_keep_the_tab_cap_but_free_a_global_slot() {
+        let mut model = Model::default();
+        insert(&mut model, 1).unwrap();
+        assert_eq!(model.get(1).unwrap().owner, Owner::Task);
+        assert!(model.hand_to_user(1));
+        assert!(!model.hand_to_user(2));
+        assert_eq!(model.get(1).unwrap().owner, Owner::User);
+        assert_eq!(model.get(1).unwrap().to_json()["owner"], "user");
+        // Still one per tab, but no longer counted against the global cap.
+        assert_eq!(insert(&mut model, 1), Err(Refusal::TabFull));
+        for tab in 2..=5 {
+            insert(&mut model, tab).unwrap();
+        }
+        assert_eq!(model.len(), 5);
+        assert_eq!(insert(&mut model, 6), Err(Refusal::GlobalFull));
+        assert_eq!(model.take(1).map(|entry| entry.owner), Some(Owner::User));
     }
 
     #[test]

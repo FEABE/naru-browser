@@ -10,8 +10,8 @@ tests/fixtures/dialogs.html and tabs/tasks created here are used; the app's
 initial tab must stay open. Run without other concurrent CLI tests.
 
 Covers: queueing of alert/confirm/prompt/beforeunload in AI tabs, accept and
-dismiss, DIALOG_PENDING fast failures, overflow auto-dismiss, cleanup on
-handoff/close/finish, and that a user-space tab is NOT queued. The native
+dismiss, DIALOG_PENDING fast failures, overflow auto-dismiss, handoff keeping a user-owned dialog, cleanup on
+close/finish, and that a user-space tab is NOT queued. The native
 dialog of the user-space tab is not observable here; see docs/dialog-control.md.
 """
 
@@ -275,21 +275,35 @@ def run(args):
             require(cli.success("status")["dialogs"]["pending"] == 0, "pending dialog leaked after close")
         checks.append("task-run close completes with a pending beforeunload or alert; no dialog leaks")
 
-        # 9. handoff dismisses queued dialogs; commands then need resume.
+        # 9. handoff keeps the queued dialog for the user (it is not dismissed).
         tab2 = open_tab(task)
-        refs2 = refs(task, tab2)
-        ok_in(task, "click", tab2, refs2["Alert in timer"])
-        wait_dialog(tab2, "alert")
+        victim = open_tab(task)
+        ok_in(task, "click", victim, refs(task, victim)["Alert in timer"])
+        wait_dialog(victim, "alert")
         handed = cli.success("task", "handoff", task["id"], task["revision"])["task"]
         task = dict(task, revision=handed["revision"])
         tasks[0] = task
-        wait_until("handoff dismissal", lambda: dialog_of(tab2) is None)
-        require(cli.success("status")["dialogs"]["pending"] == 0, "handoff left a dialog queued")
+        time.sleep(0.6)
+        kept = dialog_of(victim)
+        require(kept is not None and kept["type"] == "alert" and kept["owner"] == "user",
+                f"handoff must keep the dialog as user-owned, got {kept}")
+        require(cli.success("status")["dialogs"]["pending"] == 1, "handoff dropped the pending dialog")
         resumed = cli.success("task", "resume", task["id"], task["revision"])["task"]
         task = dict(task, revision=resumed["revision"])
         tasks[0] = task
-        wait_result(task, tab2, "timer-alert-done")
-        checks.append("handoff dismisses the queued alert (page continued: timer-alert-done)")
+        # The page stays blocked (DOM cannot advance) and the CLI cannot answer for the user.
+        for command in (("accept",), ("accept", "typed"), ("dismiss",)):
+            error, _ = code_in(task, "DIALOG_USER_OWNED", "dialog", victim, *command)
+        error, elapsed = code_in(task, "DIALOG_PENDING", "read", victim)
+        require(error["details"]["dialog"]["owner"] == "user" and elapsed < 3, f"user-owned read: {error}")
+        time.sleep(0.5)
+        require(dialog_of(victim) is not None, "user-owned dialog vanished without a user answer")
+        # Closing the tab still completes and leaves nothing behind.
+        ok_in(task, "close", victim)
+        wait_until("tab with a user-owned dialog closes", lambda: victim not in tab_states(), 10)
+        owned.discard(victim)
+        require(cli.success("status")["dialogs"]["pending"] == 0, "user-owned dialog leaked after close")
+        checks.append("handoff keeps the queued alert as owner=user; after resume dialog accept/dismiss -> DIALOG_USER_OWNED, read -> DIALOG_PENDING; close completes (the native panel click is not exercised)")
 
         # 10. global cap of 4 and overflow auto-dismiss.
         second = make_task("Dialog smoke B")

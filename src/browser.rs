@@ -1959,6 +1959,21 @@ pub(crate) fn dialog_opened(tab: i32, dialog: Json) {
     }
 }
 
+/// The user answered the native dialog panel (never reachable from the CLI).
+/// The callback continues outside STATE/SHELL borrows; the deferred pointer
+/// release (if a drag was aborted behind the dialog) is flushed afterwards.
+pub(crate) fn answer_user_dialog(
+    tab: i32,
+    token: u64,
+    accept: bool,
+    text: Option<String>,
+) -> Result<(), String> {
+    crate::dialog_runtime::answer_user(tab, token, accept, text)
+        .map_err(|error| error.message.to_owned())?;
+    flush_pointer_hold(tab);
+    Ok(())
+}
+
 fn answer_dialog(tab: i32, action: &crate::protocol::DialogAction, reply: Reply) {
     // The dialog is answered only inside the task that owns the tab; access
     // (revision, ownership, status) was already checked by handle.
@@ -2676,6 +2691,7 @@ fn shell_snapshot_with(
             }
             let spaces = state.spaces.views();
             let dialog_tabs = crate::dialog_runtime::pending_tabs();
+            let dialog_user_tabs = crate::dialog_runtime::user_owned_tabs();
             Some(ShellSnapshot {
                 active_space: state.spaces.active_space().to_owned(),
                 active_tab: state.spaces.active_tab(),
@@ -2730,6 +2746,7 @@ fn shell_snapshot_with(
                             start_page: tab.start_page_ready(loading),
                             task_status,
                             dialog_pending: dialog_tabs.contains(id),
+                            dialog_user: dialog_user_tabs.contains(id),
                             stop_scope,
                         }
                     })
@@ -4877,6 +4894,11 @@ pub fn focus_tab(id: i32) {
     if crate::control_panel::focus_start_page_if_visible(id) {
         return;
     }
+    // A user-owned dialog keeps the keyboard on its native strip: the page is
+    // blocked, and the strip must not lose focus to every tab selection path.
+    if crate::control_panel::focus_dialog_if_visible(id) {
+        return;
+    }
     let browser = STATE.with(|state| state.borrow().tabs.get(&id).map(|tab| tab.browser.clone()));
     if let Some(host) = browser.and_then(|browser| browser.host()) {
         host.set_focus(1);
@@ -6151,9 +6173,10 @@ fn handle_task(command: &Command, reply: Reply) {
             if let Ok(view) = &result {
                 expire_tab_refs(view.tabs.iter().map(|tab| tab.tab));
                 revoke_task_requests(task, None);
-                // Control returns to the user; do not leave a renderer blocked
-                // on a dialog nobody can answer. Dismiss = stay on the page.
-                crate::dialog_runtime::settle_tabs(view.tabs.iter().map(|tab| tab.tab), false);
+                // Control returns to the user. A queued dialog keeps its callback
+                // and becomes user-owned; the native panel answers it when the
+                // user views the tab. The CLI can no longer answer it.
+                crate::dialog_runtime::hand_to_user(view.tabs.iter().map(|tab| tab.tab));
             }
             task_result(result, &reply);
         }
@@ -6229,7 +6252,8 @@ fn handle_task(command: &Command, reply: Reply) {
                 STATE.with(|state| state.borrow_mut().spaces.release(*tab));
                 expire_tab_refs([*tab]);
                 revoke_task_requests(task, Some(*tab));
-                crate::dialog_runtime::settle_tabs([*tab], false);
+                // The released tab belongs to the user now: keep its dialog for them.
+                crate::dialog_runtime::hand_to_user([*tab]);
                 crate::dialog_runtime::unmark_closing(*tab);
             }
             task_result(result, &reply);
@@ -6259,10 +6283,14 @@ fn handle_task(command: &Command, reply: Reply) {
                             )
                         });
                         expire_tab_refs(tabs.iter().map(|tab| tab.tab));
-                        // Closing tabs accept beforeunload; kept tabs return to the user.
+                        // Closing tabs accept beforeunload; kept tabs return to the
+                        // user together with their queued dialog.
                         for tab in &tabs {
-                            let closing = plan.close.contains(&tab.tab);
-                            crate::dialog_runtime::settle_tabs([tab.tab], closing);
+                            if plan.close.contains(&tab.tab) {
+                                crate::dialog_runtime::settle_tabs([tab.tab], true);
+                            } else {
+                                crate::dialog_runtime::hand_to_user([tab.tab]);
+                            }
                         }
                     }
                     revoke_task_requests(task, None);
@@ -6497,9 +6525,14 @@ fn handle(command: &Command, reply: Reply) {
             // hang, so fail fast. Close and Stop do not need the renderer.
             if !matches!(other, Command::Close { .. } | Command::Stop { .. }) {
                 if let Some(dialog) = crate::dialog_runtime::tab_json(tab_id) {
+                    let user_owned = dialog["owner"] == "user";
                     reply.error_details(
                         "DIALOG_PENDING",
-                        "A JavaScript dialog is blocking the page. Answer it with dialog accept|dismiss.",
+                        if user_owned {
+                            "A JavaScript dialog is waiting for the user to answer it in the browser window."
+                        } else {
+                            "A JavaScript dialog is blocking the page. Answer it with dialog accept|dismiss."
+                        },
                         json!({"tab":tab_id,"dialog":dialog,"outcomeUnknown":false}),
                     );
                     return;
@@ -21677,22 +21710,113 @@ mod tests {
         clear();
     }
 
+    fn dialog_owner(tab: i32) -> Option<String> {
+        crate::dialog_runtime::tab_json(tab)
+            .map(|dialog| dialog["owner"].as_str().unwrap_or_default().to_owned())
+    }
+
     #[test]
-    fn handoff_release_and_close_settle_queued_dialogs() {
+    fn handoff_keeps_the_queued_dialog_for_the_user() {
         use crate::dialogs::Kind;
         let (scope, _receiver, _reply) = dialog_fixture();
-        // Handoff dismisses.
-        assert!(crate::dialog_runtime::test_insert(7, Kind::Alert, "a", ""));
+        assert!(crate::dialog_runtime::test_insert(7, Kind::Prompt, "name?", "anon"));
+        assert_eq!(dialog_owner(7).as_deref(), Some("task"));
         let handed = run_task_command(Command::TaskHandoff { task: scope.task.clone(), revision: scope.revision }, 20);
         assert!(handed.ok, "{handed:?}");
-        assert!(crate::dialog_runtime::tab_json(7).is_none());
+        // Kept, not dismissed; now user-owned and shown to the panel only.
+        assert_eq!(dialog_owner(7).as_deref(), Some("user"));
+        assert_eq!(crate::dialog_runtime::pending_count(), 1);
+        assert_eq!(crate::dialog_runtime::user_owned_tabs(), [7].into_iter().collect());
+        let user = crate::dialog_runtime::user_dialog(7).unwrap();
+        assert_eq!(user.default_prompt, "anon");
+        // A resumed task still cannot answer; it keeps the page rejecting commands.
         let resumed = run_task_command(Command::TaskResume { task: scope.task.clone(), revision: scope.revision + 1 }, 21);
         assert!(resumed.ok, "{resumed:?}");
         let scope = TaskScope { task: scope.task, revision: scope.revision + 2 };
-        // Release dismisses.
+        for (token, action) in [
+            (22, crate::protocol::DialogAction::Accept { text: None }),
+            (23, crate::protocol::DialogAction::Accept { text: Some("bob".into()) }),
+            (24, crate::protocol::DialogAction::Dismiss {}),
+        ] {
+            let error = run_scoped(&scope, Command::Dialog { tab: 7, action }, token).error.unwrap();
+            assert_eq!(error.code, "DIALOG_USER_OWNED");
+        }
+        assert_eq!(dialog_owner(7).as_deref(), Some("user"));
+        let error = run_scoped(&scope, Command::Read { tab: 7 }, 25).error.unwrap();
+        assert_eq!(error.code, "DIALOG_PENDING");
+        assert_eq!(error.details.as_ref().unwrap()["dialog"]["owner"], "user");
+        assert!(error.message.contains("user"), "{}", error.message);
+        // A new dialog on the same tab is refused by the 1/tab cap (user-owned counts).
+        assert!(!crate::dialog_runtime::test_insert(7, Kind::Alert, "second", ""));
+        assert_eq!(crate::dialog_runtime::tab_overflow(7), 1);
+        // A stale token (a different dialog) is not answered by the panel.
+        assert!(answer_user_dialog(7, user.token + 100, true, None).is_err());
+        assert!(crate::dialog_runtime::user_dialog(7).is_some());
+        // The user answers exactly once.
+        assert!(answer_user_dialog(7, user.token, true, Some("bob".into())).is_ok());
+        assert!(crate::dialog_runtime::tab_json(7).is_none());
+        assert!(answer_user_dialog(7, user.token, true, None).is_err());
+        assert!(crate::dialog_runtime::focus_grace_active(7), "resumed renderer gets the ack grace");
+        assert_eq!(crate::dialog_runtime::pending_count(), 0);
+        crate::dialog_runtime::forget_tab(7);
+        clear();
+    }
+
+    #[test]
+    fn user_panel_cannot_answer_a_task_owned_dialog() {
+        use crate::dialogs::Kind;
+        let (scope, _receiver, _reply) = dialog_fixture();
+        assert!(crate::dialog_runtime::test_insert(7, Kind::Confirm, "sure?", ""));
+        let token = crate::dialog_runtime::tab_json(7).map(|_| ()).and(Some(0));
+        assert!(token.is_some());
+        assert!(crate::dialog_runtime::user_dialog(7).is_none());
+        assert!(answer_user_dialog(7, 1, true, None).is_err());
+        assert_eq!(dialog_owner(7).as_deref(), Some("task"));
+        // The CLI still answers it.
+        let result = run_scoped(&scope, Command::Dialog { tab: 7, action: crate::protocol::DialogAction::Dismiss {} }, 30);
+        assert!(result.ok, "{result:?}");
+        clear();
+    }
+
+    #[test]
+    fn page_input_handoff_keeps_the_dialog_for_the_user() {
+        use crate::dialogs::Kind;
+        let (scope, _receiver, _reply) = dialog_fixture();
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.spaces.show(&scope.task);
+            state.spaces.select_tab(7);
+        });
+        assert!(crate::dialog_runtime::test_insert(7, Kind::BeforeUnload, "leave?", ""));
+        assert!(handoff_page_input(7).unwrap());
+        assert_eq!(dialog_owner(7).as_deref(), Some("user"));
+        assert_eq!(crate::dialog_runtime::pending_count(), 1);
+        crate::dialog_runtime::forget_tab(7);
+        clear();
+    }
+
+    #[test]
+    fn native_stop_and_space_stop_keep_the_dialog_for_the_user() {
+        use crate::dialogs::Kind;
+        let (scope, _receiver, _reply) = dialog_fixture();
+        assert!(crate::dialog_runtime::test_insert(7, Kind::Alert, "a", ""));
+        shell_action(ShellAction::Stop(7, scope.clone())).unwrap();
+        assert_eq!(dialog_owner(7).as_deref(), Some("user"));
+        crate::dialog_runtime::forget_tab(7);
+        clear();
+    }
+
+    #[test]
+    fn release_and_finish_keep_hand_the_dialog_to_the_user_and_close_settles() {
+        use crate::dialogs::Kind;
+        let (scope, _receiver, _reply) = dialog_fixture();
+        // Release: the tab is the user's now, with its dialog.
         assert!(crate::dialog_runtime::test_insert(7, Kind::BeforeUnload, "leave?", ""));
         let released = run_task_command(Command::TaskRelease { task: scope.task.clone(), revision: scope.revision, tab: 7 }, 22);
         assert!(released.ok, "{released:?}");
+        assert_eq!(dialog_owner(7).as_deref(), Some("user"));
+        // The user closes the tab natively: user-owned dialogs settle (no hang).
+        crate::dialog_runtime::settle_tabs([7], false);
         assert!(crate::dialog_runtime::tab_json(7).is_none());
         // Re-adopt, then an explicit close settles and marks the tab closing.
         let adopted = run_task_command(Command::TaskAdopt { task: scope.task.clone(), revision: scope.revision, tab: 7 }, 23);
@@ -21702,16 +21826,51 @@ mod tests {
         assert!(closed.ok, "{closed:?}");
         assert!(crate::dialog_runtime::tab_json(7).is_none());
         assert!(crate::dialog_runtime::is_closing(7));
-        // Finish settles the remaining task tabs.
+        // Finish with --keep hands the kept tab's dialog to the user.
         crate::dialog_runtime::unmark_closing(7);
         assert!(crate::dialog_runtime::test_insert(7, Kind::Alert, "a", ""));
-        let finished = run_task_command(Command::TaskFinish { task: scope.task.clone(), revision: scope.revision, keep: vec![] }, 25);
+        let finished = run_task_command(Command::TaskFinish { task: scope.task.clone(), revision: scope.revision, keep: vec![7] }, 25);
+        assert!(finished.ok, "{finished:?}");
+        assert_eq!(dialog_owner(7).as_deref(), Some("user"));
+        crate::dialog_runtime::forget_tab(7);
+        assert_eq!(crate::dialog_runtime::pending_count(), 0);
+        assert!(!crate::dialog_runtime::is_closing(7));
+        clear();
+    }
+
+    #[test]
+    fn finish_without_keep_settles_the_dialog_of_a_closing_tab() {
+        use crate::dialogs::Kind;
+        let (scope, _receiver, _reply) = dialog_fixture();
+        assert!(crate::dialog_runtime::test_insert(7, Kind::Alert, "a", ""));
+        let finished = run_task_command(Command::TaskFinish { task: scope.task.clone(), revision: scope.revision, keep: vec![] }, 26);
         assert!(finished.ok, "{finished:?}");
         assert!(crate::dialog_runtime::tab_json(7).is_none());
-        assert_eq!(crate::dialog_runtime::pending_count(), 0);
-        // OnBeforeClose forgets the close flag.
+        assert!(crate::dialog_runtime::is_closing(7));
         crate::dialog_runtime::forget_tab(7);
-        assert!(!crate::dialog_runtime::is_closing(7));
+        clear();
+    }
+
+    #[test]
+    fn user_owned_dialogs_leave_the_global_cap_to_task_dialogs_and_settle_on_quit() {
+        use crate::dialogs::Kind;
+        let (scope, _receiver, _reply) = dialog_fixture();
+        assert!(crate::dialog_runtime::test_insert(7, Kind::BeforeUnload, "leave?", ""));
+        let handed = run_task_command(Command::TaskHandoff { task: scope.task.clone(), revision: scope.revision }, 27);
+        assert!(handed.ok, "{handed:?}");
+        for tab in 101..=104 {
+            assert!(crate::dialog_runtime::test_insert(tab, Kind::Alert, "a", ""));
+        }
+        assert!(!crate::dialog_runtime::test_insert(105, Kind::Alert, "a", ""), "four task-owned entries fill the global cap");
+        assert_eq!(crate::dialog_runtime::pending_count(), 5, "the user-owned entry sits outside the cap");
+        // Quit settles user-owned and task-owned entries of known tabs alike.
+        close_all();
+        assert!(crate::dialog_runtime::tab_json(7).is_none());
+        assert!(crate::dialog_runtime::is_closing(7));
+        for tab in 101..=104 {
+            crate::dialog_runtime::forget_tab(tab);
+        }
+        crate::dialog_runtime::forget_tab(7);
         clear();
     }
 
