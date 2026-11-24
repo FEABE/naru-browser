@@ -213,10 +213,11 @@ impl eframe::App for App{
         if self.tabs.iter().any(|t| t.owner!=0) {
             let tm = ctx.input(|i| i.time);
             let pulse = (0.5 + 0.5*((tm*3.2).sin())) as f32;
+            let pill_bg = if self.dark { c(0x24,0x25,0x3A) } else { c(0x2B,0x2B,0x4E) };
             egui::Area::new(egui::Id::new("agent_pill"))
                 .anchor(egui::Align2::CENTER_BOTTOM, vec2(0.0, if self.agent_open {-80.0} else {-26.0}))
                 .show(ctx, |ui| {
-                    Frame::none().fill(c(0x24,0x25,0x30)).rounding(Rounding::same(22.0))
+                    Frame::none().fill(pill_bg).rounding(Rounding::same(22.0))
                         .inner_margin(Margin::symmetric(16.0,9.0))
                         .shadow(egui::epaint::Shadow{offset:vec2(0.0,5.0),blur:20.0,spread:0.0,color:Color32::from_black_alpha(70)})
                         .show(ui,|ui|{
@@ -227,7 +228,7 @@ impl eframe::App for App{
                                 ui.label(RichText::new("· agent in control").size(12.0).color(pl.accent));
                                 ui.add_space(10.0);
                                 let _=ui.add(egui::Button::new(RichText::new("take over").size(11.5).color(c(0xCC,0xCC,0xDA)))
-                                    .fill(c(0x34,0x35,0x42)).rounding(Rounding::same(13.0)).min_size(vec2(0.0,24.0)));
+                                    .fill(c(0x3D,0x3E,0x66)).rounding(Rounding::same(13.0)).min_size(vec2(0.0,24.0)));
                                 let _=ui.add(egui::Button::new(RichText::new("stop").size(11.5).color(Color32::WHITE))
                                     .fill(c(0xCF,0x57,0x57)).rounding(Rounding::same(13.0)).min_size(vec2(0.0,24.0)));
                             });
