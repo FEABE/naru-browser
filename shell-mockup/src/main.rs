@@ -56,7 +56,7 @@ impl App {
 fn mono(z:f32)->FontId{ FontId::new(z,FontFamily::Monospace) }
 fn ico(g:&str, sz:f32)->RichText{ RichText::new(g).font(FontId::new(sz,FontFamily::Name("ico".into()))) }
 fn row(ui:&mut Ui, pl:&Pal, icol:Color32, icon:&str, label:&str, count:Option<i32>, sel:bool)->bool{
-    let w=ui.available_width(); let (rect,resp)=ui.allocate_exact_size(vec2(w,30.0),Sense::click());
+    let w=ui.available_width(); let (rect,resp)=ui.allocate_exact_size(vec2(w,33.0),Sense::click());
     let bg= if sel {pl.selr} else if resp.hovered(){pl.hover} else {Color32::TRANSPARENT};
     if bg!=Color32::TRANSPARENT { ui.painter().rect_filled(rect,Rounding::same(7.0),bg); }
     let p=ui.painter();
@@ -66,7 +66,7 @@ fn row(ui:&mut Ui, pl:&Pal, icol:Color32, icon:&str, label:&str, count:Option<i3
     resp.clicked()
 }
 fn sec(ui:&mut Ui, pl:&Pal, name:&str){
-    let w=ui.available_width(); let (rect,_)=ui.allocate_exact_size(vec2(w,30.0),Sense::hover()); let p=ui.painter();
+    let w=ui.available_width(); let (rect,_)=ui.allocate_exact_size(vec2(w,33.0),Sense::hover()); let p=ui.painter();
     p.text(Pos2::new(rect.left()+12.0,rect.center().y),egui::Align2::LEFT_CENTER,"▸",mono(10.0),pl.faint);
     p.text(Pos2::new(rect.left()+32.0,rect.center().y),egui::Align2::LEFT_CENTER,name,mono(13.0),pl.txt);
     p.text(Pos2::new(rect.right()-10.0,rect.center().y),egui::Align2::RIGHT_CENTER,"+",mono(14.0),pl.muted);
