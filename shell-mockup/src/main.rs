@@ -33,6 +33,9 @@ impl App {
         if let Ok(b)=std::fs::read("C:/Windows/Fonts/malgun.ttf"){ f.font_data.insert("kr".into(),egui::FontData::from_owned(b));
             f.families.entry(FontFamily::Monospace).or_default().push("kr".into());
             f.families.entry(FontFamily::Proportional).or_default().push("kr".into()); }
+        for p in ["C:/Windows/Fonts/SegoeIcons.ttf","C:/Windows/Fonts/SegMDL2.ttf"]{
+            if let Ok(b)=std::fs::read(p){ f.font_data.insert("ico".into(),egui::FontData::from_owned(b));
+                f.families.insert(FontFamily::Name("ico".into()), vec!["ico".into()]); break; } }
         cc.egui_ctx.set_fonts(f);
         let mut s=(*cc.egui_ctx.style()).clone();
         for (t,z) in [(TextStyle::Heading,15.0),(TextStyle::Body,13.0),(TextStyle::Button,13.0),
@@ -51,6 +54,7 @@ impl App {
 }
 
 fn mono(z:f32)->FontId{ FontId::new(z,FontFamily::Monospace) }
+fn ico(g:&str, sz:f32)->RichText{ RichText::new(g).font(FontId::new(sz,FontFamily::Name("ico".into()))) }
 fn row(ui:&mut Ui, pl:&Pal, icol:Color32, icon:&str, label:&str, count:Option<i32>, sel:bool)->bool{
     let w=ui.available_width(); let (rect,resp)=ui.allocate_exact_size(vec2(w,30.0),Sense::click());
     let bg= if sel {pl.selr} else if resp.hovered(){pl.hover} else {Color32::TRANSPARENT};
@@ -79,12 +83,12 @@ fn dashed(ui:&Ui,r:Rect,col:Color32){ let (d,g)=(4.0,3.0); let p=ui.painter(); l
 fn subhead(ui:&mut Ui, pl:&Pal, t:&str, col:Color32){ let w=ui.available_width(); let (r,_)=ui.allocate_exact_size(vec2(w,22.0),Sense::hover());
     ui.painter().text(Pos2::new(r.left()+12.0,r.center().y),egui::Align2::LEFT_CENTER,t,mono(10.5),col); }
 fn divider(ui:&mut Ui, pl:&Pal){ let w=ui.available_width(); let (r,_)=ui.allocate_exact_size(vec2(w,1.0),Sense::hover()); ui.painter().line_segment([r.left_center(),r.right_center()],Stroke::new(1.0,pl.border)); }
-fn tbtn(ui:&mut Ui, pl:&Pal, g:&str)->egui::Response{ ui.add(egui::Button::new(RichText::new(g).size(14.0).color(pl.muted)).min_size(vec2(28.0,28.0)).rounding(Rounding::same(8.0)).fill(Color32::TRANSPARENT)) }
+fn tbtn(ui:&mut Ui, pl:&Pal, g:&str)->egui::Response{ ui.add(egui::Button::new(ico(g,13.0).color(pl.muted)).min_size(vec2(30.0,28.0)).rounding(Rounding::same(8.0)).fill(Color32::TRANSPARENT)) }
 fn winbtn(ui:&mut Ui, pl:&Pal, g:&str, close:bool)->egui::Response{
-    let (rect,resp)=ui.allocate_exact_size(vec2(34.0,28.0),Sense::click());
+    let (rect,resp)=ui.allocate_exact_size(vec2(36.0,30.0),Sense::click());
     if resp.hovered(){ let bg=if close {c(0xE0,0x50,0x50)} else {pl.hover}; ui.painter().rect_filled(rect,Rounding::same(6.0),bg); }
     let col=if close&&resp.hovered(){Color32::WHITE}else{pl.muted};
-    ui.painter().text(rect.center(),egui::Align2::CENTER_CENTER,g,mono(12.5),col);
+    ui.painter().text(rect.center(),egui::Align2::CENTER_CENTER,g,FontId::new(9.5,FontFamily::Name("ico".into())),col);
     resp
 }
 fn avatar(ui:&mut Ui, pl:&Pal){
@@ -121,14 +125,14 @@ impl eframe::App for App{
             if drag.drag_started_by(egui::PointerButton::Primary){ ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag); }
             ui.horizontal(|ui|{
                 ui.spacing_mut().item_spacing.x=2.0;
-                if tbtn(ui,&pl,"≡").clicked(){ self.sidebar=!self.sidebar; }
-                tbtn(ui,&pl,"‹"); tbtn(ui,&pl,"›"); tbtn(ui,&pl,"↺");
+                if tbtn(ui,&pl,"\u{E700}").clicked(){ self.sidebar=!self.sidebar; }
+                tbtn(ui,&pl,"\u{E72B}"); tbtn(ui,&pl,"\u{E72A}"); tbtn(ui,&pl,"\u{E72C}");
                 ui.add_space(6.0);
                 ui.with_layout(Layout::right_to_left(Align::Center),|ui|{
                     ui.spacing_mut().item_spacing.x=0.0;
-                    if winbtn(ui,&pl,"×",true).clicked(){ ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
-                    if winbtn(ui,&pl,"□",false).clicked(){ let mx=ctx.input(|i| i.viewport().maximized.unwrap_or(false)); ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!mx)); }
-                    if winbtn(ui,&pl,"–",false).clicked(){ ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)); }
+                    if winbtn(ui,&pl,"\u{E8BB}",true).clicked(){ ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
+                    if winbtn(ui,&pl,"\u{E922}",false).clicked(){ let mx=ctx.input(|i| i.viewport().maximized.unwrap_or(false)); ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!mx)); }
+                    if winbtn(ui,&pl,"\u{E921}",false).clicked(){ ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)); }
                     ui.add_space(10.0);
                     avatar(ui,&pl);
                     ui.add_space(6.0);
@@ -136,11 +140,11 @@ impl eframe::App for App{
                     ui.add_space(10.0);
                     Frame::none().fill(pl.addbg).rounding(Rounding::same(16.0)).stroke(bord).inner_margin(Margin::symmetric(14.0,7.0)).show(ui,|ui|{
                         ui.horizontal(|ui|{
-                            ui.label(RichText::new("⌕").size(13.0).color(pl.muted));
+                            ui.label(ico("\u{E721}",11.5).color(pl.muted));
                             ui.add(egui::TextEdit::singleline(&mut self.address).frame(false).text_color(pl.txt)
-                                .desired_width(ui.available_width()-26.0)
+                                .desired_width(ui.available_width()-24.0)
                                 .hint_text(RichText::new("search or type a url · 검색 또는 주소").color(pl.faint)));
-                            ui.label(RichText::new("☆").size(13.0).color(pl.muted));
+                            ui.label(ico("\u{E734}",11.5).color(pl.muted));
                         });
                     });
                 });
