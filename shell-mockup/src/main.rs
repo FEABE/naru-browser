@@ -80,6 +80,13 @@ fn subhead(ui:&mut Ui, pl:&Pal, t:&str, col:Color32){ let w=ui.available_width()
     ui.painter().text(Pos2::new(r.left()+12.0,r.center().y),egui::Align2::LEFT_CENTER,t,mono(10.5),col); }
 fn divider(ui:&mut Ui, pl:&Pal){ let w=ui.available_width(); let (r,_)=ui.allocate_exact_size(vec2(w,1.0),Sense::hover()); ui.painter().line_segment([r.left_center(),r.right_center()],Stroke::new(1.0,pl.border)); }
 fn tbtn(ui:&mut Ui, pl:&Pal, g:&str)->egui::Response{ ui.add(egui::Button::new(RichText::new(g).size(14.0).color(pl.muted)).min_size(vec2(28.0,28.0)).rounding(Rounding::same(8.0)).fill(Color32::TRANSPARENT)) }
+fn winbtn(ui:&mut Ui, pl:&Pal, g:&str, close:bool)->egui::Response{
+    let (rect,resp)=ui.allocate_exact_size(vec2(34.0,28.0),Sense::click());
+    if resp.hovered(){ let bg=if close {c(0xE0,0x50,0x50)} else {pl.hover}; ui.painter().rect_filled(rect,Rounding::same(6.0),bg); }
+    let col=if close&&resp.hovered(){Color32::WHITE}else{pl.muted};
+    ui.painter().text(rect.center(),egui::Align2::CENTER_CENTER,g,mono(12.5),col);
+    resp
+}
 fn avatar(ui:&mut Ui, pl:&Pal){
     let (r,_)=ui.allocate_exact_size(vec2(46.0,28.0),Sense::click());
     ui.painter().text(Pos2::new(r.left()+7.0,r.center().y),egui::Align2::LEFT_CENTER,"1",mono(11.0),pl.muted);
@@ -108,12 +115,21 @@ impl eframe::App for App{
                 m.vertices.push(egui::epaint::Vertex{pos,uv,color:col}); }
             m.indices.extend_from_slice(&[0,1,2,0,2,3]);
             ui.painter().add(egui::Shape::mesh(m));
+            // 타이틀바 드래그(이동) + 더블클릭 최대화
+            let drag=ui.interact(ui.max_rect(), egui::Id::new("titlebar_drag"), Sense::click_and_drag());
+            if drag.double_clicked(){ let mx=ctx.input(|i| i.viewport().maximized.unwrap_or(false)); ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!mx)); }
+            if drag.drag_started_by(egui::PointerButton::Primary){ ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag); }
             ui.horizontal(|ui|{
                 ui.spacing_mut().item_spacing.x=2.0;
                 if tbtn(ui,&pl,"≡").clicked(){ self.sidebar=!self.sidebar; }
                 tbtn(ui,&pl,"‹"); tbtn(ui,&pl,"›"); tbtn(ui,&pl,"↺");
                 ui.add_space(6.0);
                 ui.with_layout(Layout::right_to_left(Align::Center),|ui|{
+                    ui.spacing_mut().item_spacing.x=0.0;
+                    if winbtn(ui,&pl,"×",true).clicked(){ ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
+                    if winbtn(ui,&pl,"□",false).clicked(){ let mx=ctx.input(|i| i.viewport().maximized.unwrap_or(false)); ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!mx)); }
+                    if winbtn(ui,&pl,"–",false).clicked(){ ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)); }
+                    ui.add_space(10.0);
                     avatar(ui,&pl);
                     ui.add_space(6.0);
                     if tbtn(ui,&pl,if self.dark{"☀"}else{"☾"}).clicked(){ self.dark=!self.dark; }
@@ -216,6 +232,6 @@ impl eframe::App for App{
 }
 
 fn main()->eframe::Result<()>{
-    let o=eframe::NativeOptions{ viewport: egui::ViewportBuilder::default().with_inner_size([1360.0,860.0]).with_min_inner_size([920.0,600.0]).with_title("Naru"), ..Default::default() };
+    let o=eframe::NativeOptions{ viewport: egui::ViewportBuilder::default().with_inner_size([1360.0,860.0]).with_min_inner_size([920.0,600.0]).with_title("Naru").with_decorations(false), ..Default::default() };
     eframe::run_native("Naru",o,Box::new(|cc| Ok(Box::new(App::new(cc)))))
 }
