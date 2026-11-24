@@ -117,14 +117,14 @@ impl eframe::App for App{
                     avatar(ui,&pl);
                     ui.add_space(6.0);
                     if tbtn(ui,&pl,if self.dark{"☀"}else{"☾"}).clicked(){ self.dark=!self.dark; }
-                    tbtn(ui,&pl,"⊕"); tbtn(ui,&pl,"☆");
                     ui.add_space(10.0);
                     Frame::none().fill(pl.addbg).rounding(Rounding::same(16.0)).stroke(bord).inner_margin(Margin::symmetric(14.0,7.0)).show(ui,|ui|{
                         ui.horizontal(|ui|{
                             ui.label(RichText::new("⌕").size(13.0).color(pl.muted));
                             ui.add(egui::TextEdit::singleline(&mut self.address).frame(false).text_color(pl.txt)
-                                .desired_width(ui.available_width()-6.0)
+                                .desired_width(ui.available_width()-26.0)
                                 .hint_text(RichText::new("search or type a url · 검색 또는 주소").color(pl.faint)));
+                            ui.label(RichText::new("☆").size(13.0).color(pl.muted));
                         });
                     });
                 });
@@ -191,8 +191,6 @@ impl eframe::App for App{
                     ui.with_layout(Layout::right_to_left(Align::Center),|ui|{
                         let lbl=if self.agent_open{"✦ agent ▾"}else{"✦ agent ▸"};
                         if ui.add(egui::Button::new(RichText::new(lbl).size(12.0).color(if self.agent_open{pl.accent}else{pl.muted}))).clicked(){ self.agent_open=!self.agent_open; }
-                        ui.add_space(10.0);
-                        for g in ["⤢","⟳","ⓘ","☆"]{ ui.label(RichText::new(g).size(13.0).color(pl.muted)); ui.add_space(8.0); }
                     });
                 });
             });
