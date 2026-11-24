@@ -167,34 +167,8 @@ impl eframe::App for App{
             });
         }
 
-        if self.agent_open {
-            egui::TopBottomPanel::bottom("agent").frame(Frame::none().fill(pl.bg).inner_margin(Margin::symmetric(16.0,10.0)).stroke(bord)).show(ctx,|ui|{
-                ui.horizontal(|ui|{
-                    Frame::none().fill(pl.addbg).rounding(Rounding::same(8.0)).stroke(bord).inner_margin(Margin::symmetric(12.0,8.0)).show(ui,|ui|{
-                        ui.set_width(ui.available_width()-48.0);
-                        ui.horizontal(|ui|{
-                            ui.label(RichText::new("✦").color(pl.accent));
-                            let mut d=String::new();
-                            ui.add(egui::TextEdit::singleline(&mut d).frame(false).desired_width(ui.available_width())
-                                .hint_text(RichText::new("ask the agent to do something · 에이전트에게 작업 요청").color(pl.faint)));
-                        });
-                    });
-                    let _=ui.add(egui::Button::new(RichText::new("→").size(16.0).color(Color32::WHITE)).fill(pl.accent).min_size(vec2(36.0,36.0)).rounding(Rounding::same(8.0)));
-                });
-            });
-        }
-
         egui::CentralPanel::default().frame(Frame::none().fill(pl.bg)).show(ctx,|ui|{
-            Frame::none().inner_margin(Margin::symmetric(16.0,12.0)).show(ui,|ui|{
-                ui.horizontal(|ui|{
-                    ui.label(RichText::new(self.tabs[self.sel].title.clone()).size(14.0).strong().color(pl.txt));
-                    ui.with_layout(Layout::right_to_left(Align::Center),|ui|{
-                        let lbl=if self.agent_open{"✦ agent ▾"}else{"✦ agent ▸"};
-                        if ui.add(egui::Button::new(RichText::new(lbl).size(12.0).color(if self.agent_open{pl.accent}else{pl.muted}))).clicked(){ self.agent_open=!self.agent_open; }
-                    });
-                });
-            });
-            Frame::none().inner_margin(Margin::symmetric(16.0,0.0)).show(ui,|ui|{
+            Frame::none().inner_margin(Margin::same(16.0)).show(ui,|ui|{
                 Frame::none().fill(pl.web).rounding(Rounding::same(10.0)).stroke(bord).show(ui,|ui|{
                     let h=ui.available_height()-16.0;
                     ui.set_min_height(h.max(120.0)); ui.set_min_width(ui.available_width());
@@ -213,7 +187,7 @@ impl eframe::App for App{
             let pulse = (0.5 + 0.5*((tm*3.2).sin())) as f32;
             let pill_bg = if self.dark { c(0x24,0x25,0x3A) } else { c(0x2B,0x2B,0x4E) };
             egui::Area::new(egui::Id::new("agent_pill"))
-                .anchor(egui::Align2::CENTER_BOTTOM, vec2(0.0, if self.agent_open {-80.0} else {-26.0}))
+                .anchor(egui::Align2::CENTER_BOTTOM, vec2(0.0, -26.0))
                 .show(ctx, |ui| {
                     Frame::none().fill(pill_bg).rounding(Rounding::same(22.0))
                         .inner_margin(Margin::symmetric(16.0,9.0))
