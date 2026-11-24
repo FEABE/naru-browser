@@ -9,3 +9,7 @@ __pycache__/
 .env
 .env.*
 !.env.example
+
+# vendored cef-rs build output
+vendor/cef-rs/target/
+vendor/cef-rs/Cargo.lock

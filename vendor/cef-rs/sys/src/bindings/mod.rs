@@ -7,3 +7,8 @@ pub use aarch64_apple_darwin::*;
 mod x86_64_apple_darwin;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 pub use x86_64_apple_darwin::*;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod x86_64_unknown_linux_gnu;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub use x86_64_unknown_linux_gnu::*;
