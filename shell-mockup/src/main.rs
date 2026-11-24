@@ -185,22 +185,26 @@ impl eframe::App for App{
         if self.tabs.iter().any(|t| t.owner!=0) {
             let tm = ctx.input(|i| i.time);
             let pulse = (0.5 + 0.5*((tm*3.2).sin())) as f32;
-            let pill_bg = if self.dark { c(0x24,0x25,0x3A) } else { c(0x2B,0x2B,0x4E) };
+            let (pill_bg, pill_txt, take_bg, take_txt, pill_bord) = if self.dark {
+                (c(0x24,0x25,0x3A), c(0xEE,0xEE,0xF6), c(0x3D,0x3E,0x66), c(0xCC,0xCC,0xDA), Stroke::NONE)
+            } else {
+                (c(0xFF,0xFF,0xFF), c(0x2B,0x2B,0x36), c(0xF0,0xF0,0xF9), pl.accent, Stroke::new(1.0, pl.border))
+            };
             egui::Area::new(egui::Id::new("agent_pill"))
                 .anchor(egui::Align2::CENTER_BOTTOM, vec2(0.0, -26.0))
                 .show(ctx, |ui| {
-                    Frame::none().fill(pill_bg).rounding(Rounding::same(22.0))
+                    Frame::none().fill(pill_bg).stroke(pill_bord).rounding(Rounding::same(22.0))
                         .inner_margin(Margin::symmetric(16.0,9.0))
                         .shadow(egui::epaint::Shadow{offset:vec2(0.0,5.0),blur:20.0,spread:0.0,color:Color32::from_black_alpha(70)})
                         .show(ui,|ui|{
                             ui.horizontal(|ui|{
                                 let (rr,_)=ui.allocate_exact_size(vec2(12.0,12.0),Sense::hover());
                                 ui.painter().circle_filled(rr.center(), 3.5+pulse*2.0, pl.accent);
-                                ui.label(RichText::new("research · sf parks").size(12.5).color(c(0xEE,0xEE,0xF6)).strong());
+                                ui.label(RichText::new("research · sf parks").size(12.5).color(pill_txt).strong());
                                 ui.label(RichText::new("· agent in control").size(12.0).color(pl.accent));
                                 ui.add_space(10.0);
-                                let _=ui.add(egui::Button::new(RichText::new("take over").size(11.5).color(c(0xCC,0xCC,0xDA)))
-                                    .fill(c(0x3D,0x3E,0x66)).rounding(Rounding::same(13.0)).min_size(vec2(0.0,24.0)));
+                                let _=ui.add(egui::Button::new(RichText::new("take over").size(11.5).color(take_txt))
+                                    .fill(take_bg).rounding(Rounding::same(13.0)).min_size(vec2(0.0,24.0)));
                                 let _=ui.add(egui::Button::new(RichText::new("stop").size(11.5).color(Color32::WHITE))
                                     .fill(c(0xCF,0x57,0x57)).rounding(Rounding::same(13.0)).min_size(vec2(0.0,24.0)));
                             });
