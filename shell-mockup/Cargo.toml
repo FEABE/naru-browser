@@ -1,0 +1,14 @@
+[package]
+name = "naru-shell-mockup"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Naru 크롬 UI 목업 (CEF 없이 egui만) — init.Tasks 디자인 언어로 레이아웃 확인용.
+# 중앙 패널은 OSR 웹뷰 자리(플레이스홀더). 추후 wgpu 텍스처로 교체.
+
+[dependencies]
+eframe = "0.29.1"
+
+[profile.release]
+opt-level = 2
