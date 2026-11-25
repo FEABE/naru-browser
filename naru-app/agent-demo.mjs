@@ -1,8 +1,13 @@
 // Naru 에이전트 데모 v2 (ego browser식) — 새 에이전트 탭을 열어 거기서 제어.
+// 사전: Naru를 에이전트 모드로 실행해야 CDP가 열림 →  $env:NARU_AGENT="1"; .\naru.exe
+//        (포트는 NARU_CDP_PORT, 기본 9222 / 메일박스는 OS temp\naru_control.txt)
 import { writeFile } from "node:fs/promises";
-const CTRL = "C:/Users/Lenovo/AppData/Local/Temp/naru_control.txt";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+const CTRL = join(tmpdir(), "naru_control.txt");
+const PORT = process.env.NARU_CDP_PORT || "9222";
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-const listTargets = async () => (await (await fetch("http://localhost:9222/json/list")).json()).filter(t => t.type === "page");
+const listTargets = async () => (await (await fetch(`http://127.0.0.1:${PORT}/json/list`)).json()).filter(t => t.type === "page");
 
 // 0. 제어 전 기존 탭 스냅샷
 const before = new Set((await listTargets()).map(t => t.id));
@@ -19,7 +24,7 @@ for (let i = 0; i < 40; i++) {
   if (target && target.webSocketDebuggerUrl) break;
   await sleep(500);
 }
-if (!target) { console.log("[agent] 새 탭 타깃 못 찾음"); process.exit(1); }
+if (!target) { console.log("[agent] 새 탭 타깃 못 찾음 (NARU_AGENT=1로 실행했는지 확인)"); process.exit(1); }
 console.log("[agent] 새 에이전트 탭 확보:", target.url);
 
 // 3. 그 탭을 CDP로 제어

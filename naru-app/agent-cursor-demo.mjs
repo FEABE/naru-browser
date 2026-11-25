@@ -1,16 +1,20 @@
 // Naru 에이전트 커서 데모 — 사람처럼 커서 이동 + 링크 클릭 (Naru가 휴먼라이크 입력 실행)
+// 사전: Naru를 에이전트 모드로 실행 →  $env:NARU_AGENT="1"; .\naru.exe  (포트 NARU_CDP_PORT, 기본 9222)
 import { writeFile } from "node:fs/promises";
-const CTRL = "C:/Users/Lenovo/AppData/Local/Temp/naru_control.txt";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+const CTRL = join(tmpdir(), "naru_control.txt");
+const PORT = process.env.NARU_CDP_PORT || "9222";
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const send = async s => { await writeFile(CTRL, s, "utf8"); };
-const listTargets = async () => (await (await fetch("http://localhost:9222/json/list")).json()).filter(t => t.type === "page");
+const listTargets = async () => (await (await fetch(`http://127.0.0.1:${PORT}/json/list`)).json()).filter(t => t.type === "page");
 
 const before = new Set((await listTargets()).map(t => t.id));
 await send("agent_tab|https://en.wikipedia.org/wiki/Web_browser|research · web browser");
 console.log("[agent] 새 에이전트 탭 요청");
 let target = null;
 for (let i = 0; i < 40; i++) { const now = await listTargets(); target = now.find(t => !before.has(t.id)); if (target && target.webSocketDebuggerUrl) break; await sleep(500); }
-if (!target) { console.log("타깃 없음"); process.exit(1); }
+if (!target) { console.log("타깃 없음 (NARU_AGENT=1로 실행했는지 확인)"); process.exit(1); }
 console.log("[agent] 탭 확보:", target.url);
 
 const ws = new WebSocket(target.webSocketDebuggerUrl);
