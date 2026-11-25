@@ -414,7 +414,9 @@ impl eframe::App for Naru {
                 if let Some(t)=&self.tabs[act].tex {
                     let resp=ui.add(egui::Image::new((t.id(),avail)).sense(egui::Sense::click_and_drag()));
                     let rect=resp.rect;
-                    if let Some(b)=&self.tabs[act].browser { if let Some(host)=b.host() {
+                    let user_owned = self.tabs[act].owner==0;
+                    // 에이전트 제어 중(owner!=0)이면 웹뷰 클릭/스크롤 차단 — 유저는 하단 pill만 사용
+                    if user_owned { if let Some(b)=&self.tabs[act].browser { if let Some(host)=b.host() {
                         ctx.input(|i|{ if let Some(pos)=i.pointer.latest_pos(){ if rect.contains(pos){
                             let x=(pos.x-rect.left()).round() as i32; let y=(pos.y-rect.top()).round() as i32;
                             const LBTN:u32=16; let md=if i.pointer.primary_down(){LBTN}else{0};
@@ -423,7 +425,7 @@ impl eframe::App for Naru {
                             if i.pointer.primary_released(){ let e=MouseEvent{x,y,modifiers:0}; host.send_mouse_click_event(Some(&e),MouseButtonType::LEFT,1,1); }
                             let sc=i.raw_scroll_delta; if sc.x!=0.0||sc.y!=0.0 { host.send_mouse_wheel_event(Some(&ev),(sc.x*3.0) as i32,(sc.y*3.0) as i32); }
                         }} });
-                    } }
+                    } } }
                 } else {
                     ui.vertical_centered(|ui|{ ui.add_space(ui.available_height()*0.44);
                         ui.label(RichText::new("naru:// 로딩 중…").color(pl.muted).size(14.0)); });
@@ -434,6 +436,7 @@ impl eframe::App for Naru {
         // ===== 에이전트 컨트롤 pill =====
         if self.tabs[act].owner != 0 {
             let title=self.tabs[act].title.clone();
+            let mut reclaim=false; let mut stop=false;
             let (pb,pt,tb,tt,pbord)= if self.dark {
                 (c(0x24,0x25,0x3A), c(0xEE,0xEE,0xF6), c(0x3D,0x3E,0x66), c(0xCC,0xCC,0xDA), Stroke::NONE)
             } else { (c(0xFF,0xFF,0xFF), c(0x2B,0x2B,0x36), c(0xF0,0xF0,0xF9), pl.accent, Stroke::new(1.0,pl.border)) };
@@ -446,10 +449,15 @@ impl eframe::App for Naru {
                         ui.label(RichText::new(title).size(12.5).color(pt).strong());
                         ui.label(RichText::new("· agent in control").size(12.0).color(pl.accent));
                         ui.add_space(10.0);
-                        let _=ui.add(egui::Button::new(RichText::new("take over").size(11.5).color(tt)).fill(tb).rounding(Rounding::same(13.0)).min_size(vec2(0.0,24.0)));
-                        let _=ui.add(egui::Button::new(RichText::new("stop").size(11.5).color(Color32::WHITE)).fill(c(0xCF,0x57,0x57)).rounding(Rounding::same(13.0)).min_size(vec2(0.0,24.0)));
+                        if ui.add(egui::Button::new(RichText::new("take over").size(11.5).color(tt)).fill(tb).rounding(Rounding::same(13.0)).min_size(vec2(0.0,24.0))).clicked(){ reclaim=true; }
+                        if ui.add(egui::Button::new(RichText::new("stop").size(11.5).color(Color32::WHITE)).fill(c(0xCF,0x57,0x57)).rounding(Rounding::same(13.0)).min_size(vec2(0.0,24.0))).clicked(){ stop=true; }
                     }); });
             });
+            // take over = 유저가 제어 회수(탭 유지), stop = 에이전트 중단(탭 유지) — 둘 다 입력 재개
+            if reclaim || stop {
+                self.tabs[act].owner=0;
+                if stop { let _=std::fs::write("C:\\Users\\Lenovo\\AppData\\Local\\Temp\\naru_agent_stop.txt","stop"); }
+            }
         }
 
         let next_ms = if got_frame { 16 } else { 66 };
