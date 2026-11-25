@@ -41,12 +41,14 @@ struct Proj { name: String, area: usize, open: bool }
 struct Tab {
     title: String, url: String, owner: u8, area: usize, proj: Option<usize>,
     browser: Option<Browser>, frame: SharedFrame, size: SharedSize, tex: Option<egui::TextureHandle>,
+    shared_url: Rc<RefCell<String>>, shared_title: Rc<RefCell<String>>,
 }
 impl Tab {
     fn new(title:&str, url:&str, owner:u8, area:usize, proj:Option<usize>)->Self{
         Tab{ title:title.into(), url:url.into(), owner, area, proj,
             browser:None, frame:Rc::new(RefCell::new(FrameBuf::default())),
-            size:Rc::new(RefCell::new((1100.0,720.0))), tex:None }
+            size:Rc::new(RefCell::new((1100.0,720.0))), tex:None,
+            shared_url:Rc::new(RefCell::new(url.into())), shared_title:Rc::new(RefCell::new(title.into())) }
     }
 }
 
@@ -162,15 +164,36 @@ wrap_render_handler! {
     }
 }
 impl RenderHandlerBuilder { pub fn build(handler: NaruRender) -> RenderHandler { Self::new(handler) } }
-wrap_client! {
-    pub(crate) struct ClientBuilder { render_handler: RenderHandler, }
-    impl Client { fn render_handler(&self) -> Option<cef::RenderHandler> { Some(self.render_handler.clone()) } }
-}
-impl ClientBuilder { pub(crate) fn build(render_handler: RenderHandler) -> cef::Client { Self::new(render_handler) } }
 
-fn create_browser(url:&str, frame:SharedFrame, size:SharedSize) -> Browser {
+// DisplayHandler: 페이지 이동/제목 변경을 공유셀에 기록 → UI 동기화 (에이전트·링크·리다이렉트 전부)
+type SharedStr = Rc<RefCell<String>>;
+#[derive(Clone)] pub struct NaruDisplay { url: SharedStr, title: SharedStr }
+wrap_display_handler! {
+    pub struct DisplayHandlerBuilder { handler: NaruDisplay, }
+    impl DisplayHandler {
+        fn on_address_change(&self, _b: Option<&mut Browser>, _f: Option<&mut cef::Frame>, url: Option<&CefString>) {
+            if let Some(u)=url { *self.handler.url.borrow_mut()=u.to_string(); }
+        }
+        fn on_title_change(&self, _b: Option<&mut Browser>, title: Option<&CefString>) {
+            if let Some(t)=title { *self.handler.title.borrow_mut()=t.to_string(); }
+        }
+    }
+}
+impl DisplayHandlerBuilder { pub fn build(h: NaruDisplay) -> DisplayHandler { Self::new(h) } }
+
+wrap_client! {
+    pub(crate) struct ClientBuilder { render_handler: RenderHandler, display_handler: DisplayHandler, }
+    impl Client {
+        fn render_handler(&self) -> Option<cef::RenderHandler> { Some(self.render_handler.clone()) }
+        fn display_handler(&self) -> Option<cef::DisplayHandler> { Some(self.display_handler.clone()) }
+    }
+}
+impl ClientBuilder { pub(crate) fn build(r: RenderHandler, d: DisplayHandler) -> cef::Client { Self::new(r, d) } }
+
+fn create_browser(url:&str, frame:SharedFrame, size:SharedSize, surl:SharedStr, stitle:SharedStr) -> Browser {
     let render = NaruRender::new(frame, size, 1.0);
-    let mut client = ClientBuilder::build(RenderHandlerBuilder::build(render));
+    let disp = NaruDisplay { url:surl, title:stitle };
+    let mut client = ClientBuilder::build(RenderHandlerBuilder::build(render), DisplayHandlerBuilder::build(disp));
     let wi = WindowInfo { windowless_rendering_enabled: true as _, ..Default::default() };
     let bs = BrowserSettings { windowless_frame_rate: 60, ..Default::default() };
     browser_host_create_browser_sync(Some(&wi), Some(&mut client), Some(&url.into()), Some(&bs), None, None)
@@ -180,14 +203,15 @@ fn create_browser(url:&str, frame:SharedFrame, size:SharedSize) -> Browser {
 // ───── eframe 앱 ─────
 struct Naru {
     areas: Vec<Area>, projs: Vec<Proj>, tabs: Vec<Tab>,
-    active: usize, shown: usize, address: String, sidebar: bool, dark: bool,
+    active: usize, shown: usize, address: String, sidebar: bool, dark: bool, editing: bool,
 }
 impl Naru {
     fn ensure_browser(&mut self, ti:usize){
         if self.tabs[ti].browser.is_none() {
             let fr=self.tabs[ti].frame.clone(); let sz=self.tabs[ti].size.clone();
+            let su=self.tabs[ti].shared_url.clone(); let st=self.tabs[ti].shared_title.clone();
             let url=self.tabs[ti].url.clone();
-            self.tabs[ti].browser = Some(create_browser(&url, fr, sz));
+            self.tabs[ti].browser = Some(create_browser(&url, fr, sz, su, st));
         }
     }
     fn load_active(&mut self, url:&str){
@@ -201,6 +225,26 @@ impl Naru {
 impl eframe::App for Naru {
     fn update(&mut self, ctx:&egui::Context, _ef:&mut eframe::Frame){
         do_message_loop_work();
+
+        // 에이전트 제어 메일박스: 외부 AI가 "새 에이전트 탭 열어줘" 요청 → 유저 탭 안 뺏고 새 탭 생성.
+        // 형식: "agent_tab|<url>|<title>"  또는 "agent_done"
+        let ctrl="C:\\Users\\Lenovo\\AppData\\Local\\Temp\\naru_control.txt";
+        if let Ok(s)=std::fs::read_to_string(ctrl) {
+            let _=std::fs::remove_file(ctrl);
+            let p:Vec<&str>=s.trim().split('|').collect();
+            match p.first().copied() {
+                Some("agent_tab") => {
+                    let url=p.get(1).copied().unwrap_or("about:blank");
+                    let title=p.get(2).copied().unwrap_or("agent");
+                    let area=self.tabs.get(self.active).map(|t|t.area).unwrap_or(0);
+                    self.tabs.push(Tab::new(title,url,1,area,None)); // owner=1 → 에이전트 제어
+                    self.active=self.tabs.len()-1;
+                }
+                Some("agent_done") => { if let Some(t)=self.tabs.get_mut(self.active){ t.owner=0; } }
+                _ => {}
+            }
+        }
+
         let act=self.active;
         self.ensure_browser(act);
 
@@ -222,6 +266,20 @@ impl eframe::App for Naru {
                   None=>self.tabs[act].tex=Some(ctx.load_texture("web",img,egui::TextureOptions::LINEAR)) }
               f.dirty=false; got_frame=true;
           } }
+
+        // CEF 이동/제목 → UI 동기화 (에이전트·링크·리다이렉트 전부 반영)
+        for t in self.tabs.iter_mut() {
+            let su=t.shared_url.borrow().clone();
+            if !su.is_empty() && su!=t.url { t.url=su; }
+            let stt=t.shared_title.borrow().clone();
+            if !stt.is_empty() && stt!=t.title {
+                t.title = if stt.chars().count()>26 { format!("{}…", stt.chars().take(25).collect::<String>()) } else { stt };
+            }
+        }
+        if !self.editing {
+            let au=self.tabs[self.active].url.clone();
+            if !au.is_empty() { self.address=au; }
+        }
 
         let pl = if self.dark { Pal::dark() } else { Pal::light() };
         let mut v = if self.dark { egui::Visuals::dark() } else { egui::Visuals::light() };
@@ -263,6 +321,7 @@ impl eframe::App for Naru {
                             let r=ui.add(egui::TextEdit::singleline(&mut self.address).frame(false).text_color(pl.txt)
                                 .desired_width(ui.available_width()-24.0)
                                 .hint_text(RichText::new("search or type a url · 검색 또는 주소").color(pl.faint)));
+                            self.editing = r.has_focus();
                             if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) { self.load_active(&self.address.clone()); }
                             ui.label(ico("\u{E734}",11.5).color(pl.muted));
                         });
@@ -440,7 +499,7 @@ fn main() -> std::process::ExitCode {
     let projs: Vec<Proj> = Vec::new();
     let tabs = vec![ Tab::new("new tab","https://duckduckgo.com",0,0,None) ];
 
-    let app_ui = Naru { areas, projs, tabs, active:0, shown:usize::MAX, address:"duckduckgo.com".into(), sidebar:true, dark:false };
+    let app_ui = Naru { areas, projs, tabs, active:0, shown:usize::MAX, address:"duckduckgo.com".into(), sidebar:true, dark:false, editing:false };
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1360.0,860.0]).with_min_inner_size([920.0,600.0])
