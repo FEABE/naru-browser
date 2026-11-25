@@ -204,6 +204,8 @@ fn create_browser(url:&str, frame:SharedFrame, size:SharedSize, surl:SharedStr, 
 struct Naru {
     areas: Vec<Area>, projs: Vec<Proj>, tabs: Vec<Tab>,
     active: usize, shown: usize, address: String, sidebar: bool, dark: bool, editing: bool,
+    // 에이전트 커서(사람처럼 움직이는 가상 커서) — 웹뷰 로컬(=CEF) 좌표
+    agent_cur: egui::Pos2, agent_tgt: Option<egui::Pos2>, agent_do_click: bool, agent_label: String,
 }
 impl Naru {
     fn ensure_browser(&mut self, ti:usize){
@@ -240,7 +242,20 @@ impl eframe::App for Naru {
                     self.tabs.push(Tab::new(title,url,1,area,None)); // owner=1 → 에이전트 제어
                     self.active=self.tabs.len()-1;
                 }
-                Some("agent_done") => { if let Some(t)=self.tabs.get_mut(self.active){ t.owner=0; } }
+                Some("agent_nav") => { let url=p.get(1).copied().unwrap_or("").to_string(); if !url.is_empty(){ self.load_active(&url); } }
+                Some("agent_move") => {
+                    if let (Some(x),Some(y))=(p.get(1).and_then(|s|s.parse::<f32>().ok()), p.get(2).and_then(|s|s.parse::<f32>().ok())){
+                        self.agent_tgt=Some(egui::pos2(x,y)); self.agent_do_click=false;
+                        self.agent_label=p.get(3).copied().unwrap_or("").to_string();
+                    }
+                }
+                Some("agent_click") => {
+                    if let (Some(x),Some(y))=(p.get(1).and_then(|s|s.parse::<f32>().ok()), p.get(2).and_then(|s|s.parse::<f32>().ok())){
+                        self.agent_tgt=Some(egui::pos2(x,y)); self.agent_do_click=true;
+                        self.agent_label=p.get(3).copied().unwrap_or("").to_string();
+                    }
+                }
+                Some("agent_done") => { if let Some(t)=self.tabs.get_mut(self.active){ t.owner=0; } self.agent_tgt=None; self.agent_label.clear(); }
                 _ => {}
             }
         }
@@ -279,6 +294,32 @@ impl eframe::App for Naru {
         if !self.editing {
             let au=self.tabs[self.active].url.clone();
             if !au.is_empty() { self.address=au; }
+        }
+
+        // 에이전트 커서: 사람처럼 감속(ease-out) 이동 + 미세 지터, 도착 시 클릭.
+        // 실제 CEF 입력(SendMouseMove/Click)도 같은 궤적으로 전송 → 페이지가 사람같은 움직임을 봄.
+        if self.tabs[act].owner!=0 {
+            if let Some(tgt)=self.agent_tgt {
+                let d=tgt - self.agent_cur;
+                if d.length()<2.5 {
+                    self.agent_cur=tgt;
+                    if let Some(b)=&self.tabs[act].browser { if let Some(h)=b.host(){
+                        let ev=MouseEvent{x:tgt.x as i32,y:tgt.y as i32,modifiers:0}; h.send_mouse_move_event(Some(&ev),0);
+                        if self.agent_do_click {
+                            let e1=MouseEvent{x:tgt.x as i32,y:tgt.y as i32,modifiers:16}; h.send_mouse_click_event(Some(&e1),MouseButtonType::LEFT,0,1);
+                            let e2=MouseEvent{x:tgt.x as i32,y:tgt.y as i32,modifiers:0}; h.send_mouse_click_event(Some(&e2),MouseButtonType::LEFT,1,1);
+                        }
+                    }}
+                    self.agent_tgt=None; self.agent_do_click=false;
+                } else {
+                    let tm=ctx.input(|i| i.time) as f32;
+                    let jit=egui::vec2((tm*9.0).sin()*0.5,(tm*7.0).cos()*0.5);
+                    self.agent_cur = self.agent_cur + d*0.16 + jit;
+                    if let Some(b)=&self.tabs[act].browser { if let Some(h)=b.host(){
+                        let ev=MouseEvent{x:self.agent_cur.x as i32,y:self.agent_cur.y as i32,modifiers:0}; h.send_mouse_move_event(Some(&ev),0);
+                    }}
+                }
+            }
         }
 
         let pl = if self.dark { Pal::dark() } else { Pal::light() };
@@ -426,6 +467,23 @@ impl eframe::App for Naru {
                             let sc=i.raw_scroll_delta; if sc.x!=0.0||sc.y!=0.0 { host.send_mouse_wheel_event(Some(&ev),(sc.x*3.0) as i32,(sc.y*3.0) as i32); }
                         }} });
                     } } }
+                    // 에이전트 커서 오버레이 (owner!=0): 화살표 + 액션 라벨
+                    if self.tabs[act].owner!=0 {
+                        let raw=rect.min+self.agent_cur.to_vec2();
+                        let cp=egui::pos2(raw.x.clamp(rect.left(),rect.right()-2.0), raw.y.clamp(rect.top(),rect.bottom()-2.0));
+                        let p=ui.painter();
+                        let a=cp; let b=cp+egui::vec2(0.0,18.0); let cc=cp+egui::vec2(12.5,12.5);
+                        p.add(egui::Shape::convex_polygon(vec![a,b,cc], pl.accent, Stroke::new(1.6,Color32::WHITE)));
+                        p.circle_filled(cp, 2.0, Color32::WHITE);
+                        if !self.agent_label.is_empty() {
+                            let gal=p.layout_no_wrap(self.agent_label.clone(), mono(11.0), Color32::WHITE);
+                            let pad=egui::vec2(9.0,5.0);
+                            let lp=cp+egui::vec2(18.0,10.0);
+                            let lr=egui::Rect::from_min_size(lp, gal.size()+pad*2.0);
+                            p.rect(lr, Rounding::same(9.0), pl.accent, Stroke::NONE);
+                            p.galley(lr.min+pad, gal, Color32::WHITE);
+                        }
+                    }
                 } else {
                     ui.vertical_centered(|ui|{ ui.add_space(ui.available_height()*0.44);
                         ui.label(RichText::new("naru:// 로딩 중…").color(pl.muted).size(14.0)); });
@@ -460,7 +518,8 @@ impl eframe::App for Naru {
             }
         }
 
-        let next_ms = if got_frame { 16 } else { 66 };
+        // 에이전트 커서 이동 중이면 부드럽게 60fps로 애니메이션
+        let next_ms = if got_frame || self.agent_tgt.is_some() { 16 } else { 66 };
         ctx.request_repaint_after(Duration::from_millis(next_ms));
     }
 }
@@ -507,7 +566,8 @@ fn main() -> std::process::ExitCode {
     let projs: Vec<Proj> = Vec::new();
     let tabs = vec![ Tab::new("new tab","https://duckduckgo.com",0,0,None) ];
 
-    let app_ui = Naru { areas, projs, tabs, active:0, shown:usize::MAX, address:"duckduckgo.com".into(), sidebar:true, dark:false, editing:false };
+    let app_ui = Naru { areas, projs, tabs, active:0, shown:usize::MAX, address:"duckduckgo.com".into(), sidebar:true, dark:false, editing:false,
+        agent_cur:egui::pos2(80.0,80.0), agent_tgt:None, agent_do_click:false, agent_label:String::new() };
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1360.0,860.0]).with_min_inner_size([920.0,600.0])
