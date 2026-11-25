@@ -10,10 +10,14 @@ Naru의 **진짜 동작하는 브라우저**. egui 셸 UI + **CEF OSR 웹 렌더
 - **사이드바(init.Tasks식 3단계 트리)**: `spaces` → 영역(space) → 프로젝트(folder) → 탭
   - 각 단계 접기/펴기, `+ new space` / `+ new tab`로 유저가 생성
 - **웹뷰**: 탭마다 독립 CEF 브라우저. 탭은 **활성화 시 lazy 생성**, 비활성은 `was_hidden`으로 렌더 중단(절전)
+- **탭 닫기**: 사이드바 행 hover 시 `✕` → `close_browser`로 CEF 서브프로세스까지 회수
 - **입력**: 마우스 이동/클릭/드래그/휠을 CEF로 전달
 - **주소창**: Enter로 이동, nav(뒤로/앞으로/새로고침)
-- **에이전트 컨트롤**: 에이전트 소유 탭이 활성화되면 하단 "agent in control" pill + 사이드바 run 배지
-- **렌더링 최적화**: 적응형 repaint (변화 시 ~60fps, 유휴 시 ~15Hz) — 정적 페이지 사실상 idle
+- **에이전트 컨트롤**: 에이전트 소유 탭이 활성화되면 하단 "agent in control" pill + 사이드바 run 배지.
+  CDP(9222)는 **opt-in**: 환경변수 `NARU_AGENT=1`로 실행할 때만 포트 노출(기본 비노출, `NARU_CDP_PORT`로 포트 지정 가능)
+- **메모리/렌더 최적화**: 숨긴 탭은 CPU 픽셀 버퍼 해제, 프레임은 BGRA→`Color32` 1패스 변환(복사 2회→1회+memcpy).
+  적응형 repaint(변화 시 ~60fps, 유휴 시 ~15Hz) — 정적 페이지 사실상 idle
+- **경로**: 임시 파일(cache·메일박스·응답)은 OS temp 디렉터리 기반(하드코딩 없음)
 
 ## 빌드 (Windows / MSVC)
 cef-rs 워크스페이스의 `examples/naru`로 빌드한다. 필요:
@@ -25,13 +29,18 @@ cef-rs 워크스페이스의 `examples/naru`로 빌드한다. 필요:
 ```powershell
 # VS Dev Shell + CEF_PATH 설정 후
 cargo +stable-x86_64-pc-windows-msvc build --release -p naru
+
+# 일반 실행 (CDP 비노출)
+.\target\release\naru.exe
+# 에이전트 모드 (CDP 9222 노출 → agent-demo.mjs 등으로 제어)
+$env:NARU_AGENT="1"; .\target\release\naru.exe
 ```
 
 ### 치명적 함정 (cef-rs)
 1. `main()` 첫머리에 `api_hash(sys::CEF_API_VERSION_LAST, 0)` 필수 — 없으면 access violation
 2. `Settings.root_cache_path`를 고유 경로로 지정 — 기본값이면 프로세스 싱글턴 충돌로 `initialize` 실패
 3. CEF 서브프로세스(`--type=`)는 `execute_process` 후 즉시 return
-4. OSR `on_paint`는 `shared_texture_enabled=false`에서 CPU 버퍼를 준다 (BGRA→RGBA 변환 후 egui 텍스처 업로드)
+4. OSR `on_paint`는 `shared_texture_enabled=false`에서 CPU BGRA 버퍼를 준다 (→ `Color32` 변환 후 egui 텍스처 업로드)
 
 ## 다음
 키보드 입력(페이지 타이핑), 탭 제목/URL 자동 반영, 세션 영속, CEF 154→Naru 본체 156.

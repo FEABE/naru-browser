@@ -9,10 +9,12 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
+// 임시 파일 경로(trace·메일박스·응답파일) — OS temp 디렉터리 기반(하드코딩 제거, 이식성)
+fn tmp(name: &str) -> std::path::PathBuf { std::env::temp_dir().join(name) }
 fn mark(s: &str) {
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
-        .open("C:\\Users\\Lenovo\\AppData\\Local\\Temp\\naru_trace.txt") { let _ = writeln!(f, "{}", s); }
+        .open(tmp("naru_trace.txt")) { let _ = writeln!(f, "{}", s); }
 }
 
 #[derive(Default)]
@@ -130,9 +132,12 @@ wrap_app! {
             cl.append_switch(Some(&"noerrdialogs".into()));
             cl.append_switch(Some(&"hide-crash-restore-bubble".into()));
             cl.append_switch(Some(&"use-mock-keychain".into()));
-            // 에이전트 제어용 CDP(Chrome DevTools Protocol) 포트 — 외부 CLI/AI가 탭 조종
-            cl.append_switch_with_value(Some(&"remote-debugging-port".into()), Some(&"9222".into()));
-            cl.append_switch_with_value(Some(&"remote-allow-origins".into()), Some(&"*".into()));
+            // 에이전트 제어용 CDP는 opt-in: NARU_AGENT 설정 시에만 포트 노출(기본 비노출 — 임의 로컬/웹 접근 차단).
+            // remote-allow-origins(=*)는 설정하지 않음 → Origin 없는 로컬 에이전트만 접속, 웹페이지발 접속(DNS rebinding) 차단.
+            if std::env::var("NARU_AGENT").is_ok() {
+                let port = std::env::var("NARU_CDP_PORT").unwrap_or_else(|_| "9222".into());
+                cl.append_switch_with_value(Some(&"remote-debugging-port".into()), Some(&port.as_str().into()));
+            }
         }
         fn browser_process_handler(&self) -> Option<cef::BrowserProcessHandler> {
             Some(BrowserProcessHandlerBuilder::build(NaruBph::new()))
@@ -251,9 +256,9 @@ impl eframe::App for Naru {
 
         // 에이전트 제어 메일박스: 외부 AI가 "새 에이전트 탭 열어줘" 요청 → 유저 탭 안 뺏고 새 탭 생성.
         // 형식: "agent_tab|<url>|<title>"  또는 "agent_done"
-        let ctrl="C:\\Users\\Lenovo\\AppData\\Local\\Temp\\naru_control.txt";
-        if let Ok(s)=std::fs::read_to_string(ctrl) {
-            let _=std::fs::remove_file(ctrl);
+        let ctrl=tmp("naru_control.txt");
+        if let Ok(s)=std::fs::read_to_string(&ctrl) {
+            let _=std::fs::remove_file(&ctrl);
             let p:Vec<&str>=s.trim_start_matches('\u{feff}').trim().split('|').collect();
             match p.first().copied() {
                 Some("agent_tab") => {
@@ -546,7 +551,7 @@ impl eframe::App for Naru {
             if stop {
                 self.tabs[act].owner=0; self.tabs[act].agent_kind=0;
                 self.agent_tgt=None; self.agent_label.clear();
-                let _=std::fs::write("C:\\Users\\Lenovo\\AppData\\Local\\Temp\\naru_agent_stop.txt","stop");
+                let _=std::fs::write(tmp("naru_agent_stop.txt"),"stop");
             }
         }
         // 유저가 take over 함 → 다시 AI에 넘기기 pill (owner==0 이지만 agent_kind 남아있을 때)
@@ -563,7 +568,7 @@ impl eframe::App for Naru {
                     }); });
             });
             if giveback { let k=self.tabs[act].agent_kind; self.tabs[act].owner=k;
-                let _=std::fs::write("C:\\Users\\Lenovo\\AppData\\Local\\Temp\\naru_agent_resume.txt","resume"); }
+                let _=std::fs::write(tmp("naru_agent_resume.txt"),"resume"); }
         }
 
         // ===== 에이전트 권한 요청 배너 (상단) =====
@@ -583,7 +588,7 @@ impl eframe::App for Naru {
                     }); });
             });
             if let Some(ok)=resp {
-                let _=std::fs::write("C:\\Users\\Lenovo\\AppData\\Local\\Temp\\naru_perm.txt", if ok {"allow"} else {"deny"});
+                let _=std::fs::write(tmp("naru_perm.txt"), if ok {"allow"} else {"deny"});
                 self.perm=None;
             }
         }
@@ -625,9 +630,11 @@ fn main() -> std::process::ExitCode {
     let ret = execute_process(Some(args.as_main_args()), Some(&mut app), std::ptr::null_mut());
     if !is_browser_process { return 0.into(); }
     assert!(ret == -1, "cannot execute browser process");
+    let cache = tmp("naru_cache");
+    let cache_s = cache.to_string_lossy().into_owned();
     let settings = Settings {
         windowless_rendering_enabled: true as _, external_message_pump: true as _,
-        root_cache_path: "C:\\Users\\Lenovo\\AppData\\Local\\Temp\\naru_cache".into(), ..Default::default() };
+        root_cache_path: cache_s.as_str().into(), ..Default::default() };
     assert_eq!(initialize(Some(args.as_main_args()), Some(&settings), Some(&mut app), std::ptr::null_mut()), 1);
     for _ in 0..10 { do_message_loop_work(); }
 
