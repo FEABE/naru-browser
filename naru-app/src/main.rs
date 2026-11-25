@@ -4,10 +4,15 @@
 use cef::{rc::Rc as _, args::Args, *};
 use eframe::egui;
 use egui::{vec2, Align, Color32, FontFamily, FontId, Frame, Layout, Margin, Pos2,
-           RichText, Rounding, Sense, Stroke, TextStyle, Ui};
+           RichText, Rounding, Sense, Stroke, TextStyle};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
+
+mod ui;
+mod web;
+use ui::*;   // Pal, c, area_color, mono, ico, item, folder, newbtn, subhead, divider, tbtn, winbtn, avatar
+use web::*;  // FrameBuf, SharedFrame/Size/Str, NaruApp/AppBuilder, create_browser
 
 // 임시 파일 경로(trace·메일박스·응답파일) — OS temp 디렉터리 기반(하드코딩 제거, 이식성)
 fn tmp(name: &str) -> std::path::PathBuf { std::env::temp_dir().join(name) }
@@ -16,27 +21,6 @@ fn mark(s: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
         .open(tmp("naru_trace.txt")) { let _ = writeln!(f, "{}", s); }
 }
-
-#[derive(Default)]
-struct FrameBuf { w: usize, h: usize, pixels: Vec<Color32>, dirty: bool }
-type SharedFrame = Rc<RefCell<FrameBuf>>;
-type SharedSize = Rc<RefCell<(f32, f32)>>;
-
-#[derive(Clone, Copy)]
-struct Pal { bg:Color32, side:Color32, txt:Color32, muted:Color32, faint:Color32, border:Color32,
-    hover:Color32, selr:Color32, addbg:Color32, web:Color32, accent:Color32, deleg:Color32, topbar:Color32 }
-fn c(r:u8,g:u8,b:u8)->Color32{ Color32::from_rgb(r,g,b) }
-impl Pal {
-    fn light()->Self{ Pal{ bg:c(0xF9,0xF9,0xFC), side:c(0xFC,0xFC,0xFE), txt:c(0x2B,0x2B,0x36),
-        muted:c(0x8C,0x8C,0x9C), faint:c(0xBE,0xBE,0xCC), border:c(0xE9,0xE9,0xF1),
-        hover:c(0xF0,0xF0,0xF7), selr:c(0xEC,0xEC,0xFB), addbg:c(0xF2,0xF2,0xF8), web:c(0xFC,0xFC,0xFE),
-        accent:c(0x5B,0x5B,0xD6), deleg:c(0xC8,0x5C,0x6E), topbar:c(0xF4,0xF4,0xFC) } }
-    fn dark()->Self{ Pal{ bg:c(0x17,0x18,0x20), side:c(0x1B,0x1C,0x25), txt:c(0xD8,0xD8,0xE4),
-        muted:c(0x87,0x88,0x98), faint:c(0x55,0x56,0x68), border:c(0x2B,0x2C,0x3A),
-        hover:c(0x25,0x26,0x33), selr:c(0x2A,0x2A,0x4E), addbg:c(0x22,0x23,0x30), web:c(0x1C,0x1D,0x27),
-        accent:c(0x86,0x86,0xF2), deleg:c(0xE0,0x82,0x95), topbar:c(0x1C,0x1D,0x2A) } }
-}
-fn area_color(pl:&Pal, ci:u8)->Color32{ match ci { 0=>pl.accent, 1=>pl.deleg, _=>c(0x6B,0xA8,0x8A) } }
 
 struct Area { name: String, color: u8, open: bool }
 struct Proj { name: String, area: usize, open: bool }
@@ -52,167 +36,6 @@ impl Tab {
             size:Rc::new(RefCell::new((1100.0,720.0))), tex:None,
             shared_url:Rc::new(RefCell::new(url.into())), shared_title:Rc::new(RefCell::new(title.into())) }
     }
-}
-
-fn mono(z:f32)->FontId{ FontId::new(z,FontFamily::Monospace) }
-fn ico(g:&str, sz:f32)->RichText{ RichText::new(g).font(FontId::new(sz,FontFamily::Name("ico".into()))) }
-// 탭/항목 행
-fn item(ui:&mut Ui, pl:&Pal, icol:Color32, icon:&str, label:&str, sel:bool, indent:f32, running:bool, closable:bool)->(bool,bool){
-    let w=ui.available_width(); let (rect,resp)=ui.allocate_exact_size(vec2(w,31.0),Sense::click());
-    let bg= if sel {pl.selr} else if resp.hovered(){pl.hover} else {Color32::TRANSPARENT};
-    if bg!=Color32::TRANSPARENT { ui.painter().rect_filled(rect,Rounding::same(7.0),bg); }
-    let p=ui.painter(); let ix=rect.left()+12.0+indent;
-    if !icon.is_empty(){ p.text(Pos2::new(ix,rect.center().y),egui::Align2::LEFT_CENTER,icon,mono(11.0),icol); }
-    p.text(Pos2::new(ix+19.0,rect.center().y),egui::Align2::LEFT_CENTER,label,mono(13.0),if sel{pl.accent}else{pl.txt});
-    let mut close=false;
-    if running {
-        let bx=rect.right()-44.0;
-        p.rect_filled(egui::Rect::from_min_size(Pos2::new(bx,rect.center().y-8.0),vec2(38.0,16.0)),Rounding::same(8.0), if sel{pl.accent}else{icol});
-        p.text(Pos2::new(bx+19.0,rect.center().y),egui::Align2::CENTER_CENTER,"run",mono(9.5),Color32::WHITE);
-    } else if closable && resp.hovered() {
-        // hover 시 닫기 × (행 우측 작은 히트존)
-        let cc=Pos2::new(rect.right()-16.0, rect.center().y);
-        let cr=egui::Rect::from_center_size(cc, vec2(20.0,20.0));
-        let cresp=ui.interact(cr, egui::Id::new(("closex", rect.top() as i32, indent as i32, label)), Sense::click());
-        if cresp.hovered(){ ui.painter().rect_filled(cr,Rounding::same(6.0),pl.border); }
-        ui.painter().text(cc,egui::Align2::CENTER_CENTER,"✕",mono(11.0),if cresp.hovered(){pl.txt}else{pl.muted});
-        if cresp.clicked(){ close=true; }
-    }
-    (resp.clicked() && !close, close)
-}
-// 폴더(영역/프로젝트) 헤더 — 접기/펴기
-fn folder(ui:&mut Ui, pl:&Pal, open:bool, icon:&str, icol:Color32, name:&str, indent:f32, header:bool)->bool{
-    let w=ui.available_width(); let (rect,resp)=ui.allocate_exact_size(vec2(w,if header{30.0}else{29.0}),Sense::click());
-    if resp.hovered(){ ui.painter().rect_filled(rect,Rounding::same(7.0),pl.hover); }
-    let p=ui.painter(); let x=rect.left()+10.0+indent;
-    p.text(Pos2::new(x,rect.center().y),egui::Align2::LEFT_CENTER,if open{"▾"}else{"▸"},mono(10.0),pl.muted);
-    p.text(Pos2::new(x+15.0,rect.center().y),egui::Align2::LEFT_CENTER,icon,mono(11.5),icol);
-    let (fsz,fcol)= if header {(12.5, icol)} else {(13.0, pl.txt)};
-    p.text(Pos2::new(x+34.0,rect.center().y),egui::Align2::LEFT_CENTER,name,mono(fsz),fcol);
-    resp.clicked()
-}
-fn newbtn(ui:&mut Ui, pl:&Pal, label:&str, indent:f32)->bool{
-    let w=ui.available_width(); let (rect,resp)=ui.allocate_exact_size(vec2(w-4.0-indent,25.0),Sense::click());
-    let rr=egui::Rect::from_min_size(Pos2::new(rect.left()+indent,rect.top()),vec2(rect.width(),rect.height())).shrink(1.0);
-    dashed(ui,rr,if resp.hovered(){pl.muted}else{pl.faint});
-    ui.painter().text(rr.center(),egui::Align2::CENTER_CENTER,format!("+ {label}"),mono(11.0),pl.muted); resp.clicked()
-}
-fn dashed(ui:&Ui,r:egui::Rect,col:Color32){ let (d,g)=(4.0,3.0); let p=ui.painter(); let st=Stroke::new(1.0,col);
-    let mut x=r.left(); while x<r.right(){let e=(x+d).min(r.right()); p.line_segment([Pos2::new(x,r.top()),Pos2::new(e,r.top())],st); p.line_segment([Pos2::new(x,r.bottom()),Pos2::new(e,r.bottom())],st); x+=d+g; }
-    let mut y=r.top(); while y<r.bottom(){let e=(y+d).min(r.bottom()); p.line_segment([Pos2::new(r.left(),y),Pos2::new(r.left(),e)],st); p.line_segment([Pos2::new(r.right(),y),Pos2::new(r.right(),e)],st); y+=d+g; }
-}
-fn subhead(ui:&mut Ui, _pl:&Pal, t:&str, col:Color32){ let w=ui.available_width(); let (r,_)=ui.allocate_exact_size(vec2(w,20.0),Sense::hover());
-    ui.painter().text(Pos2::new(r.left()+10.0,r.center().y),egui::Align2::LEFT_CENTER,t,mono(10.5),col); }
-fn divider(ui:&mut Ui, pl:&Pal){ let w=ui.available_width(); let (r,_)=ui.allocate_exact_size(vec2(w,1.0),Sense::hover()); ui.painter().line_segment([r.left_center(),r.right_center()],Stroke::new(1.0,pl.border)); }
-fn tbtn(ui:&mut Ui, pl:&Pal, g:&str)->egui::Response{ ui.add(egui::Button::new(ico(g,13.0).color(pl.muted)).min_size(vec2(30.0,28.0)).rounding(Rounding::same(8.0)).fill(Color32::TRANSPARENT)) }
-fn winbtn(ui:&mut Ui, pl:&Pal, g:&str, close:bool)->egui::Response{
-    let (rect,resp)=ui.allocate_exact_size(vec2(36.0,30.0),Sense::click());
-    if resp.hovered(){ let bg=if close {c(0xE0,0x50,0x50)} else {pl.hover}; ui.painter().rect_filled(rect,Rounding::same(6.0),bg); }
-    let col=if close&&resp.hovered(){Color32::WHITE}else{pl.muted};
-    ui.painter().text(rect.center(),egui::Align2::CENTER_CENTER,g,FontId::new(9.5,FontFamily::Name("ico".into())),col);
-    resp
-}
-fn avatar(ui:&mut Ui, pl:&Pal){
-    let (r,_)=ui.allocate_exact_size(vec2(46.0,28.0),Sense::click());
-    ui.painter().text(Pos2::new(r.left()+7.0,r.center().y),egui::Align2::LEFT_CENTER,"1",mono(11.0),pl.muted);
-    let cc=Pos2::new(r.right()-13.0,r.center().y);
-    ui.painter().circle_filled(cc,11.0,pl.accent);
-    ui.painter().text(cc,egui::Align2::CENTER_CENTER,"n",mono(12.5),Color32::WHITE);
-}
-
-// ───── CEF 스캐폴딩 ─────
-#[derive(Clone)] pub struct NaruApp {}
-impl NaruApp { pub fn new() -> Self { Self {} } }
-wrap_app! {
-    pub(crate) struct AppBuilder { app: NaruApp, }
-    impl App {
-        fn on_before_command_line_processing(&self, _p: Option<&cef::CefStringUtf16>, command_line: Option<&mut cef::CommandLine>) {
-            let Some(cl) = command_line else { return };
-            cl.append_switch(Some(&"no-startup-window".into()));
-            cl.append_switch(Some(&"noerrdialogs".into()));
-            cl.append_switch(Some(&"hide-crash-restore-bubble".into()));
-            cl.append_switch(Some(&"use-mock-keychain".into()));
-            // 에이전트 제어용 CDP는 opt-in: NARU_AGENT 설정 시에만 포트 노출(기본 비노출 — 임의 로컬/웹 접근 차단).
-            // remote-allow-origins(=*)는 설정하지 않음 → Origin 없는 로컬 에이전트만 접속, 웹페이지발 접속(DNS rebinding) 차단.
-            if std::env::var("NARU_AGENT").is_ok() {
-                let port = std::env::var("NARU_CDP_PORT").unwrap_or_else(|_| "9222".into());
-                cl.append_switch_with_value(Some(&"remote-debugging-port".into()), Some(&port.as_str().into()));
-            }
-        }
-        fn browser_process_handler(&self) -> Option<cef::BrowserProcessHandler> {
-            Some(BrowserProcessHandlerBuilder::build(NaruBph::new()))
-        }
-    }
-}
-impl AppBuilder { pub(crate) fn build(app: NaruApp) -> cef::App { Self::new(app) } }
-#[derive(Clone)] pub struct NaruBph { ready: RefCell<bool> }
-impl NaruBph { pub fn new() -> Self { Self { ready: RefCell::new(false) } } }
-wrap_browser_process_handler! {
-    pub(crate) struct BrowserProcessHandlerBuilder { handler: NaruBph, }
-    impl BrowserProcessHandler { fn on_context_initialized(&self) { *self.handler.ready.borrow_mut() = true; } }
-}
-impl BrowserProcessHandlerBuilder { pub(crate) fn build(handler: NaruBph) -> BrowserProcessHandler { Self::new(handler) } }
-#[derive(Clone)] pub struct NaruRender { frame: SharedFrame, size: SharedSize, scale: f32 }
-impl NaruRender { pub fn new(frame: SharedFrame, size: SharedSize, scale: f32) -> Self { Self { frame, size, scale } } }
-wrap_render_handler! {
-    pub struct RenderHandlerBuilder { handler: NaruRender, }
-    impl RenderHandler {
-        fn view_rect(&self, _b: Option<&mut Browser>, rect: Option<&mut Rect>) {
-            if let Some(rect) = rect { let (w,h)=*self.handler.size.borrow();
-                if w>0.0 && h>0.0 { rect.x=0; rect.y=0; rect.width=w as _; rect.height=h as _; } }
-        }
-        fn screen_info(&self, _b: Option<&mut Browser>, si: Option<&mut ScreenInfo>) -> ::std::os::raw::c_int {
-            if let Some(si)=si { si.device_scale_factor=self.handler.scale; return true as _; } false as _
-        }
-        fn on_paint(&self, _b: Option<&mut Browser>, _t: PaintElementType, _d: Option<&[Rect]>,
-                    buffer: *const u8, width: ::std::os::raw::c_int, height: ::std::os::raw::c_int) {
-            if buffer.is_null() || width<=0 || height<=0 { return; }
-            let w=width as usize; let h=height as usize; let px=w*h; let n=px*4;
-            let src=unsafe{ std::slice::from_raw_parts(buffer,n) };
-            let mut f=self.handler.frame.borrow_mut();
-            if f.pixels.len()!=px { f.pixels.resize(px,Color32::TRANSPARENT); }
-            // BGRA(unmultiplied) → Color32 1패스 변환 (기존: 바이트 스왑 + from_rgba 재변환 2패스 제거)
-            let dst=&mut f.pixels;
-            for p in 0..px { let i=p*4; dst[p]=Color32::from_rgba_unmultiplied(src[i+2],src[i+1],src[i],src[i+3]); }
-            f.w=w; f.h=h; f.dirty=true;
-        }
-    }
-}
-impl RenderHandlerBuilder { pub fn build(handler: NaruRender) -> RenderHandler { Self::new(handler) } }
-
-// DisplayHandler: 페이지 이동/제목 변경을 공유셀에 기록 → UI 동기화 (에이전트·링크·리다이렉트 전부)
-type SharedStr = Rc<RefCell<String>>;
-#[derive(Clone)] pub struct NaruDisplay { url: SharedStr, title: SharedStr }
-wrap_display_handler! {
-    pub struct DisplayHandlerBuilder { handler: NaruDisplay, }
-    impl DisplayHandler {
-        fn on_address_change(&self, _b: Option<&mut Browser>, _f: Option<&mut cef::Frame>, url: Option<&CefString>) {
-            if let Some(u)=url { *self.handler.url.borrow_mut()=u.to_string(); }
-        }
-        fn on_title_change(&self, _b: Option<&mut Browser>, title: Option<&CefString>) {
-            if let Some(t)=title { *self.handler.title.borrow_mut()=t.to_string(); }
-        }
-    }
-}
-impl DisplayHandlerBuilder { pub fn build(h: NaruDisplay) -> DisplayHandler { Self::new(h) } }
-
-wrap_client! {
-    pub(crate) struct ClientBuilder { render_handler: RenderHandler, display_handler: DisplayHandler, }
-    impl Client {
-        fn render_handler(&self) -> Option<cef::RenderHandler> { Some(self.render_handler.clone()) }
-        fn display_handler(&self) -> Option<cef::DisplayHandler> { Some(self.display_handler.clone()) }
-    }
-}
-impl ClientBuilder { pub(crate) fn build(r: RenderHandler, d: DisplayHandler) -> cef::Client { Self::new(r, d) } }
-
-fn create_browser(url:&str, frame:SharedFrame, size:SharedSize, surl:SharedStr, stitle:SharedStr) -> Browser {
-    let render = NaruRender::new(frame, size, 1.0);
-    let disp = NaruDisplay { url:surl, title:stitle };
-    let mut client = ClientBuilder::build(RenderHandlerBuilder::build(render), DisplayHandlerBuilder::build(disp));
-    let wi = WindowInfo { windowless_rendering_enabled: true as _, ..Default::default() };
-    let bs = BrowserSettings { windowless_frame_rate: 60, ..Default::default() };
-    browser_host_create_browser_sync(Some(&wi), Some(&mut client), Some(&url.into()), Some(&bs), None, None)
-        .expect("tab browser 생성 실패")
 }
 
 // ───── eframe 앱 ─────
