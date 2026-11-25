@@ -20,7 +20,7 @@ Naru의 **진짜 동작하는 브라우저**. egui 셸 UI + **CEF OSR 웹 렌더
   적응형 repaint(변화 시 ~60fps, 유휴 시 ~15Hz) — 정적 페이지 사실상 idle
 - **경로**: 메일박스·응답 등 임시 파일은 OS temp 기반(하드코딩 없음)
 - **세션 영속**: `%LOCALAPPDATA%\naru\session.txt`에 탭/스페이스 저장→재시작 시 복원. `root_cache_path`를 영구화해 쿠키/로그인 유지(정상 종료 시 flush)
-- **한글 입력 라이브 프리뷰**: 조합 중 `ime_set_composition`로 프리뷰 시도 + 확정은 CHAR로 확실히 삽입(하이브리드 — 프리뷰 미동작이어도 글자는 보장)
+- **한글 입력 라이브 프리뷰**: CEF `ime_set_composition`이 이 OSR 환경에선 화면에 안 떠서, 조합 글자를 CHAR로 미리 그리고(`ime_comp` 추적) 조합이 바뀌면 Backspace 후 재입력하는 방식으로 실시간 프리뷰 구현(ㅎ→하→한). 확정도 동일 CHAR 경로라 확실
 
 ## 빌드 (Windows / MSVC)
 cef-rs 워크스페이스의 `examples/naru`로 빌드한다. 필요:

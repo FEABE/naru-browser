@@ -103,6 +103,7 @@ struct Naru {
     agent_cur: egui::Pos2, agent_tgt: Option<egui::Pos2>, agent_do_click: bool, agent_label: String,
     perm: Option<String>, // 에이전트 권한 요청 메시지 (있으면 배너 표시)
     data_dir: std::path::PathBuf, last_sig: String, // 세션 영속: 저장 경로 + 변경 감지 시그니처
+    ime_comp: String, // 현재 화면에 CHAR로 미리 그려둔 IME 조합 글자(라이브 프리뷰용)
 }
 impl Naru {
     fn ensure_browser(&mut self, ti:usize){
@@ -423,19 +424,26 @@ impl eframe::App for Naru {
         if self.tabs[act].owner==0 && !self.editing {
             ctx.send_viewport_cmd(egui::ViewportCommand::IMEAllowed(true)); // 한글 조합 입력 허용(프레임리스 창 IME on)
             let events = ctx.input(|i| i.events.clone());
+            // CEF OSR의 ime_set_composition은 이 환경에서 화면에 안 떠서, 확실히 되는 CHAR로 라이브 프리뷰를 직접 구현:
+            // 조합 글자를 CHAR로 미리 넣어 보여주고(ime_comp), 조합이 바뀌면 그만큼 Backspace 후 새로 넣는다.
+            let mut comp = std::mem::take(&mut self.ime_comp);
             if let Some(b)=&self.tabs[act].browser { if let Some(h)=b.host() {
                 for e in &events {
                     match e {
                         egui::Event::Text(t) => for ch in t.chars() { if (ch as u32)<=0xFFFF { h.send_key_event(Some(&key_char(ch as u16))); } },
                         egui::Event::Ime(ime) => match ime {
-                            // 조합 중: 라이브 프리뷰 시도(동작 시 보임, 미동작 시 무해)
                             egui::ImeEvent::Preedit(s) => {
-                                if s.is_empty() { h.ime_cancel_composition(); }
-                                else { let n=s.encode_utf16().count() as u32;
-                                       h.ime_set_composition(Some(&s.as_str().into()), None, None, Some(&Range{from:n,to:n})); }
+                                for _ in 0..comp.chars().count() { h.send_key_event(Some(&key_vk(0x08,true,0))); h.send_key_event(Some(&key_vk(0x08,false,0))); }
+                                for ch in s.chars() { if (ch as u32)<=0xFFFF { h.send_key_event(Some(&key_char(ch as u16))); } }
+                                comp = s.clone(); // 지금 화면에 떠 있는 조합 글자
                             }
-                            // 확정: 남은 조합 프리뷰 제거 후, 확실한 CHAR 경로로 삽입(프리뷰 미동작이어도 글자는 확실히 들어감)
-                            egui::ImeEvent::Commit(s) => { h.ime_cancel_composition(); for ch in s.chars() { if (ch as u32)<=0xFFFF { h.send_key_event(Some(&key_char(ch as u16))); } } }
+                            egui::ImeEvent::Commit(s) => {
+                                for _ in 0..comp.chars().count() { h.send_key_event(Some(&key_vk(0x08,true,0))); h.send_key_event(Some(&key_vk(0x08,false,0))); }
+                                for ch in s.chars() { if (ch as u32)<=0xFFFF { h.send_key_event(Some(&key_char(ch as u16))); } }
+                                comp.clear(); // 확정됨 → 더 이상 '임시 조합'이 아님
+                            }
+                            // 조합 도중 IME 비활성(포커스 상실 등): 추적만 비움(백스페이스 금지 — 실제 텍스트 훼손 방지)
+                            egui::ImeEvent::Disabled => { comp.clear(); }
                             _ => {}
                         },
                         egui::Event::Key{ key, pressed, modifiers, .. } => {
@@ -445,6 +453,7 @@ impl eframe::App for Naru {
                     }
                 }
             }}
+            self.ime_comp = comp;
         }
 
         // ===== 에이전트 컨트롤 pill =====
@@ -581,7 +590,7 @@ fn main() -> std::process::ExitCode {
 
     let app_ui = Naru { areas, projs, tabs, active, shown:usize::MAX, address:addr0, sidebar:true, dark:false, editing:false,
         agent_cur:egui::pos2(80.0,80.0), agent_tgt:None, agent_do_click:false, agent_label:String::new(), perm:None,
-        data_dir:dir, last_sig:String::new() };
+        data_dir:dir, last_sig:String::new(), ime_comp:String::new() };
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1360.0,860.0]).with_min_inner_size([920.0,600.0])
