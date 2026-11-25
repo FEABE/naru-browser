@@ -39,13 +39,13 @@ fn area_color(pl:&Pal, ci:u8)->Color32{ match ci { 0=>pl.accent, 1=>pl.deleg, _=
 struct Area { name: String, color: u8, open: bool }
 struct Proj { name: String, area: usize, open: bool }
 struct Tab {
-    title: String, url: String, owner: u8, area: usize, proj: Option<usize>,
+    title: String, url: String, owner: u8, agent_kind: u8, area: usize, proj: Option<usize>,
     browser: Option<Browser>, frame: SharedFrame, size: SharedSize, tex: Option<egui::TextureHandle>,
     shared_url: Rc<RefCell<String>>, shared_title: Rc<RefCell<String>>,
 }
 impl Tab {
     fn new(title:&str, url:&str, owner:u8, area:usize, proj:Option<usize>)->Self{
-        Tab{ title:title.into(), url:url.into(), owner, area, proj,
+        Tab{ title:title.into(), url:url.into(), owner, agent_kind:owner, area, proj,
             browser:None, frame:Rc::new(RefCell::new(FrameBuf::default())),
             size:Rc::new(RefCell::new((1100.0,720.0))), tex:None,
             shared_url:Rc::new(RefCell::new(url.into())), shared_title:Rc::new(RefCell::new(title.into())) }
@@ -206,6 +206,7 @@ struct Naru {
     active: usize, shown: usize, address: String, sidebar: bool, dark: bool, editing: bool,
     // 에이전트 커서(사람처럼 움직이는 가상 커서) — 웹뷰 로컬(=CEF) 좌표
     agent_cur: egui::Pos2, agent_tgt: Option<egui::Pos2>, agent_do_click: bool, agent_label: String,
+    perm: Option<String>, // 에이전트 권한 요청 메시지 (있으면 배너 표시)
 }
 impl Naru {
     fn ensure_browser(&mut self, ti:usize){
@@ -233,7 +234,7 @@ impl eframe::App for Naru {
         let ctrl="C:\\Users\\Lenovo\\AppData\\Local\\Temp\\naru_control.txt";
         if let Ok(s)=std::fs::read_to_string(ctrl) {
             let _=std::fs::remove_file(ctrl);
-            let p:Vec<&str>=s.trim().split('|').collect();
+            let p:Vec<&str>=s.trim_start_matches('\u{feff}').trim().split('|').collect();
             match p.first().copied() {
                 Some("agent_tab") => {
                     let url=p.get(1).copied().unwrap_or("about:blank");
@@ -255,7 +256,8 @@ impl eframe::App for Naru {
                         self.agent_label=p.get(3).copied().unwrap_or("").to_string();
                     }
                 }
-                Some("agent_done") => { if let Some(t)=self.tabs.get_mut(self.active){ t.owner=0; } self.agent_tgt=None; self.agent_label.clear(); }
+                Some("agent_request") => { self.perm=Some(p.get(1).copied().unwrap_or("권한 요청").to_string()); }
+                Some("agent_done") => { if let Some(t)=self.tabs.get_mut(self.active){ t.owner=0; t.agent_kind=0; } self.agent_tgt=None; self.agent_label.clear(); }
                 _ => {}
             }
         }
@@ -511,10 +513,50 @@ impl eframe::App for Naru {
                         if ui.add(egui::Button::new(RichText::new("stop").size(11.5).color(Color32::WHITE)).fill(c(0xCF,0x57,0x57)).rounding(Rounding::same(13.0)).min_size(vec2(0.0,24.0))).clicked(){ stop=true; }
                     }); });
             });
-            // take over = 유저가 제어 회수(탭 유지), stop = 에이전트 중단(탭 유지) — 둘 다 입력 재개
-            if reclaim || stop {
-                self.tabs[act].owner=0;
-                if stop { let _=std::fs::write("C:\\Users\\Lenovo\\AppData\\Local\\Temp\\naru_agent_stop.txt","stop"); }
+            // take over = 유저가 제어 회수(agent_kind 유지 → 다시 넘기기 가능), stop = 에이전트 완전 종료
+            if reclaim { self.tabs[act].owner=0; self.agent_tgt=None; }
+            if stop {
+                self.tabs[act].owner=0; self.tabs[act].agent_kind=0;
+                self.agent_tgt=None; self.agent_label.clear();
+                let _=std::fs::write("C:\\Users\\Lenovo\\AppData\\Local\\Temp\\naru_agent_stop.txt","stop");
+            }
+        }
+        // 유저가 take over 함 → 다시 AI에 넘기기 pill (owner==0 이지만 agent_kind 남아있을 때)
+        else if self.tabs[act].agent_kind!=0 {
+            let mut giveback=false;
+            let (pb,pt,pbord)= if self.dark {(c(0x24,0x25,0x3A),c(0xEE,0xEE,0xF6),Stroke::NONE)} else {(c(0xFF,0xFF,0xFF),c(0x2B,0x2B,0x36),Stroke::new(1.0,pl.border))};
+            egui::Area::new(egui::Id::new("giveback_pill")).anchor(egui::Align2::CENTER_BOTTOM, vec2(0.0,-26.0)).show(ctx,|ui|{
+                Frame::none().fill(pb).stroke(pbord).rounding(Rounding::same(22.0)).inner_margin(Margin::symmetric(16.0,9.0))
+                    .shadow(egui::epaint::Shadow{offset:vec2(0.0,5.0),blur:20.0,spread:0.0,color:Color32::from_black_alpha(70)})
+                    .show(ui,|ui|{ ui.horizontal(|ui|{
+                        ui.label(RichText::new("you're in control").size(12.5).color(pt).strong());
+                        ui.add_space(10.0);
+                        if ui.add(egui::Button::new(RichText::new("give back to AI ▶").size(11.5).color(Color32::WHITE)).fill(pl.accent).rounding(Rounding::same(13.0)).min_size(vec2(0.0,24.0))).clicked(){ giveback=true; }
+                    }); });
+            });
+            if giveback { let k=self.tabs[act].agent_kind; self.tabs[act].owner=k;
+                let _=std::fs::write("C:\\Users\\Lenovo\\AppData\\Local\\Temp\\naru_agent_resume.txt","resume"); }
+        }
+
+        // ===== 에이전트 권한 요청 배너 (상단) =====
+        if let Some(msg)=self.perm.clone() {
+            let mut resp:Option<bool>=None;
+            let (bg,txt,bord)= if self.dark {(c(0x2A,0x2B,0x40),c(0xEE,0xEE,0xF6),Stroke::new(1.0,pl.accent))} else {(c(0xFF,0xFF,0xFF),c(0x2B,0x2B,0x36),Stroke::new(1.5,pl.accent))};
+            egui::Area::new(egui::Id::new("perm_banner")).anchor(egui::Align2::CENTER_TOP, vec2(0.0,64.0)).show(ctx,|ui|{
+                Frame::none().fill(bg).stroke(bord).rounding(Rounding::same(14.0)).inner_margin(Margin::symmetric(18.0,12.0))
+                    .shadow(egui::epaint::Shadow{offset:vec2(0.0,6.0),blur:24.0,spread:0.0,color:Color32::from_black_alpha(80)})
+                    .show(ui,|ui|{ ui.horizontal(|ui|{
+                        ui.painter().circle_filled(ui.cursor().min+vec2(5.0,9.0),5.0,pl.accent);
+                        ui.add_space(14.0);
+                        ui.label(RichText::new(format!("AI 권한 요청 · {}", msg)).size(12.5).color(txt).strong());
+                        ui.add_space(12.0);
+                        if ui.add(egui::Button::new(RichText::new("허용").size(11.5).color(Color32::WHITE)).fill(pl.accent).rounding(Rounding::same(13.0)).min_size(vec2(46.0,26.0))).clicked(){ resp=Some(true); }
+                        if ui.add(egui::Button::new(RichText::new("거부").size(11.5).color(txt)).fill(pl.hover).rounding(Rounding::same(13.0)).min_size(vec2(46.0,26.0))).clicked(){ resp=Some(false); }
+                    }); });
+            });
+            if let Some(ok)=resp {
+                let _=std::fs::write("C:\\Users\\Lenovo\\AppData\\Local\\Temp\\naru_perm.txt", if ok {"allow"} else {"deny"});
+                self.perm=None;
             }
         }
 
@@ -567,7 +609,7 @@ fn main() -> std::process::ExitCode {
     let tabs = vec![ Tab::new("new tab","https://duckduckgo.com",0,0,None) ];
 
     let app_ui = Naru { areas, projs, tabs, active:0, shown:usize::MAX, address:"duckduckgo.com".into(), sidebar:true, dark:false, editing:false,
-        agent_cur:egui::pos2(80.0,80.0), agent_tgt:None, agent_do_click:false, agent_label:String::new() };
+        agent_cur:egui::pos2(80.0,80.0), agent_tgt:None, agent_do_click:false, agent_label:String::new(), perm:None };
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1360.0,860.0]).with_min_inner_size([920.0,600.0])
