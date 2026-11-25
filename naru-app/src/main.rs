@@ -282,36 +282,41 @@ impl eframe::App for Naru {
                 p.text(Pos2::new(hr.right()-10.0,hr.center().y),egui::Align2::RIGHT_CENTER,"▢",mono(13.0),pl.muted);
                 ui.add_space(4.0);
                 egui::ScrollArea::vertical().auto_shrink([false,false]).show(ui,|ui|{
-                    subhead(ui,&pl,"spaces",pl.faint);
+                    // 제로셋업: 스페이스 1개면 계층 숨기고 flat 탭 목록. 2개+ 면 트리 공개.
+                    let multi = self.areas.len() > 1;
+                    if multi { subhead(ui,&pl,"spaces",pl.faint); }
+                    let ind = if multi {16.0} else {0.0};
                     for ai in 0..self.areas.len() {
                         let acol=area_color(&pl,self.areas[ai].color);
-                        let aopen=self.areas[ai].open;
-                        if folder(ui,&pl,aopen,"⌂",acol,&self.areas[ai].name.clone(),0.0,true){ toggle_area=Some(ai); }
-                        if !aopen { continue; }
+                        if multi {
+                            let aopen=self.areas[ai].open;
+                            if folder(ui,&pl,aopen,"⌂",acol,&self.areas[ai].name.clone(),0.0,true){ toggle_area=Some(ai); }
+                            if !aopen { continue; }
+                        }
                         // 영역 직속 탭 (proj=None)
                         for ti in 0..self.tabs.len() {
                             if self.tabs[ti].area!=ai || self.tabs[ti].proj.is_some() { continue; }
                             let sel=ti==self.active; let agent=self.tabs[ti].owner!=0;
                             let icol=if agent{acol}else if sel{pl.accent}else{pl.faint};
-                            if item(ui,&pl,icol,if agent{"●"}else{"○"},&self.tabs[ti].title.clone(),sel,16.0,agent && sel){ switch_to=Some(ti); }
+                            if item(ui,&pl,icol,if agent{"●"}else{"○"},&self.tabs[ti].title.clone(),sel,ind,agent && sel){ switch_to=Some(ti); }
                         }
-                        // 프로젝트들
+                        // 프로젝트들 (있을 때만)
                         for pi in 0..self.projs.len() {
                             if self.projs[pi].area!=ai { continue; }
                             let popen=self.projs[pi].open;
-                            if folder(ui,&pl,popen,"\u{E8B7}",pl.muted,&self.projs[pi].name.clone(),16.0,false){ toggle_proj=Some(pi); }
+                            if folder(ui,&pl,popen,"\u{E8B7}",pl.muted,&self.projs[pi].name.clone(),ind,false){ toggle_proj=Some(pi); }
                             if !popen { continue; }
                             for ti in 0..self.tabs.len() {
                                 if self.tabs[ti].proj!=Some(pi) { continue; }
                                 let sel=ti==self.active; let agent=self.tabs[ti].owner!=0;
                                 let icol=if agent{acol}else if sel{pl.accent}else{pl.faint};
-                                if item(ui,&pl,icol,if agent{"●"}else{"○"},&self.tabs[ti].title.clone(),sel,36.0,agent && sel){ switch_to=Some(ti); }
+                                if item(ui,&pl,icol,if agent{"●"}else{"○"},&self.tabs[ti].title.clone(),sel,ind+20.0,agent && sel){ switch_to=Some(ti); }
                             }
                         }
-                        if newbtn(ui,&pl,"new tab",16.0){ new_tab_area=Some(ai); }
-                        ui.add_space(4.0);
+                        if newbtn(ui,&pl,"new tab",ind){ new_tab_area=Some(ai); }
+                        ui.add_space(if multi {4.0} else {2.0});
                     }
-                    ui.add_space(2.0);
+                    ui.add_space(4.0);
                     if newbtn(ui,&pl,"new space",0.0){ new_space=true; }
                     ui.add_space(8.0);
                     subhead(ui,&pl,"library",pl.faint);
