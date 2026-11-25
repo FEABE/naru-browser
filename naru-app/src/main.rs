@@ -22,6 +22,36 @@ fn mark(s: &str) {
         .open(tmp("naru_trace.txt")) { let _ = writeln!(f, "{}", s); }
 }
 
+// ───── 키보드 → CEF 입력 변환 ─────
+// 문자(영어·한글 등 IME 커밋 결과)는 CHAR 이벤트로, 특수키(Enter/Backspace/화살표 등)는 RAWKEYDOWN/KEYUP로 전달.
+fn key_char(ch: u16) -> KeyEvent {
+    KeyEvent { type_: KeyEventType::CHAR, character: ch, unmodified_character: ch,
+        windows_key_code: ch as i32, ..Default::default() }
+}
+fn key_vk(vk: i32, down: bool, mods: u32) -> KeyEvent {
+    KeyEvent { type_: if down { KeyEventType::RAWKEYDOWN } else { KeyEventType::KEYUP },
+        windows_key_code: vk, native_key_code: vk, modifiers: mods, ..Default::default() }
+}
+fn mods_of(m: &egui::Modifiers) -> u32 {
+    let mut f = 0u32;
+    if m.shift { f |= 1<<1; }               // EVENTFLAG_SHIFT_DOWN
+    if m.ctrl || m.command { f |= 1<<2; }    // EVENTFLAG_CONTROL_DOWN
+    if m.alt { f |= 1<<3; }                  // EVENTFLAG_ALT_DOWN
+    f
+}
+// egui::Key → Windows 가상키코드. 문자/숫자는 name()이 "A".."Z"/"0".."9" 단일 ascii라 그 바이트가 곧 VK.
+fn vk_of(key: egui::Key) -> Option<i32> {
+    use egui::Key::*;
+    Some(match key {
+        Enter=>0x0D, Tab=>0x09, Backspace=>0x08, Delete=>0x2E, Insert=>0x2D,
+        Escape=>0x1B, Space=>0x20,
+        ArrowLeft=>0x25, ArrowUp=>0x26, ArrowRight=>0x27, ArrowDown=>0x28,
+        Home=>0x24, End=>0x23, PageUp=>0x21, PageDown=>0x22,
+        k => { let n=k.name().as_bytes();
+               if n.len()==1 && (n[0].is_ascii_uppercase()||n[0].is_ascii_digit()) { n[0] as i32 } else { return None; } }
+    })
+}
+
 struct Area { name: String, color: u8, open: bool }
 struct Proj { name: String, area: usize, open: bool }
 struct Tab {
@@ -123,7 +153,7 @@ impl eframe::App for Naru {
                     { let fr=self.tabs[i].frame.clone(); let mut f=fr.borrow_mut(); f.pixels=Vec::new(); f.w=0; f.h=0; f.dirty=false; }
                 }
             }
-            if let Some(b)=&self.tabs[act].browser { if let Some(h)=b.host(){ h.was_hidden(0); h.was_resized(); } }
+            if let Some(b)=&self.tabs[act].browser { if let Some(h)=b.host(){ h.was_hidden(0); h.was_resized(); h.set_focus(1); } }
             self.shown=act; self.address=self.tabs[act].url.clone();
         }
 
@@ -350,6 +380,25 @@ impl eframe::App for Naru {
                 }
             });
         });
+
+        // ===== 키보드 → 페이지 (유저 탭 & 옴니박스 편집중 아닐 때) =====
+        // 영어: Event::Text, 한글/CJK: OS IME 조합→Event::Ime(Commit). 둘 다 CHAR로 전달. 특수키는 VK.
+        if self.tabs[act].owner==0 && !self.editing {
+            ctx.send_viewport_cmd(egui::ViewportCommand::IMEAllowed(true)); // 한글 조합 입력 허용(프레임리스 창 IME on)
+            let events = ctx.input(|i| i.events.clone());
+            if let Some(b)=&self.tabs[act].browser { if let Some(h)=b.host() {
+                for e in &events {
+                    match e {
+                        egui::Event::Text(t) => for ch in t.chars() { if (ch as u32)<=0xFFFF { h.send_key_event(Some(&key_char(ch as u16))); } },
+                        egui::Event::Ime(egui::ImeEvent::Commit(t)) => for ch in t.chars() { if (ch as u32)<=0xFFFF { h.send_key_event(Some(&key_char(ch as u16))); } },
+                        egui::Event::Key{ key, pressed, modifiers, .. } => {
+                            if let Some(vk)=vk_of(*key) { h.send_key_event(Some(&key_vk(vk,*pressed,mods_of(modifiers)))); }
+                        }
+                        _ => {}
+                    }
+                }
+            }}
+        }
 
         // ===== 에이전트 컨트롤 pill =====
         if self.tabs[act].owner != 0 {

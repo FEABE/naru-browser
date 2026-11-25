@@ -11,7 +11,8 @@ Naru의 **진짜 동작하는 브라우저**. egui 셸 UI + **CEF OSR 웹 렌더
   - 각 단계 접기/펴기, `+ new space` / `+ new tab`로 유저가 생성
 - **웹뷰**: 탭마다 독립 CEF 브라우저. 탭은 **활성화 시 lazy 생성**, 비활성은 `was_hidden`으로 렌더 중단(절전)
 - **탭 닫기**: 사이드바 행 hover 시 `✕` → `close_browser`로 CEF 서브프로세스까지 회수
-- **입력**: 마우스 이동/클릭/드래그/휠을 CEF로 전달
+- **입력**: 마우스(이동/클릭/드래그/휠) + 키보드를 CEF로 전달. 키보드는 **영어·한글 모두** 지원 —
+  문자는 `Event::Text`/IME 커밋을 CHAR로, 특수키(Enter/Backspace/화살표 등)는 VK로. 프레임리스 창에 `IMEAllowed` 세팅해 한글 조합 입력 가능(유저 탭·옴니박스). (라이브 조합 프리뷰는 커밋 시 반영 — 향후 ime_set_composition)
 - **주소창**: Enter로 이동, nav(뒤로/앞으로/새로고침)
 - **에이전트 컨트롤**: 에이전트 소유 탭이 활성화되면 하단 "agent in control" pill + 사이드바 run 배지.
   CDP(9222)는 **opt-in**: 환경변수 `NARU_AGENT=1`로 실행할 때만 포트 노출(기본 비노출, `NARU_CDP_PORT`로 포트 지정 가능)
