@@ -32,14 +32,14 @@ pub fn item(ui:&mut Ui, pl:&Pal, icol:Color32, icon:&str, label:&str, sel:bool, 
         let bx=rect.right()-44.0;
         p.rect_filled(egui::Rect::from_min_size(Pos2::new(bx,rect.center().y-8.0),vec2(38.0,16.0)),Rounding::same(8.0), if sel{pl.accent}else{icol});
         p.text(Pos2::new(bx+19.0,rect.center().y),egui::Align2::CENTER_CENTER,"run",mono(9.5),Color32::WHITE);
-    } else if closable && resp.hovered() {
-        // hover 시 닫기 × (행 우측 작은 히트존)
+    } else if closable && resp.contains_pointer() {
+        // hover 시 닫기 × — 겹치는 위젯 없이, 행 클릭 위치가 × 영역 안인지로 판정(hover 뺏김/깜빡임 회피)
         let cc=Pos2::new(rect.right()-16.0, rect.center().y);
         let cr=egui::Rect::from_center_size(cc, vec2(20.0,20.0));
-        let cresp=ui.interact(cr, egui::Id::new(("closex", rect.top() as i32, indent as i32, label)), Sense::click());
-        if cresp.hovered(){ ui.painter().rect_filled(cr,Rounding::same(6.0),pl.border); }
-        ui.painter().text(cc,egui::Align2::CENTER_CENTER,"✕",mono(11.0),if cresp.hovered(){pl.txt}else{pl.muted});
-        if cresp.clicked(){ close=true; }
+        let hot=ui.rect_contains_pointer(cr);
+        if hot { ui.painter().rect_filled(cr,Rounding::same(6.0),pl.border); }
+        ui.painter().text(cc,egui::Align2::CENTER_CENTER,"✕",mono(11.0),if hot{pl.txt}else{pl.muted});
+        if resp.clicked() { if let Some(pp)=resp.interact_pointer_pos(){ if cr.contains(pp){ close=true; } } }
     }
     (resp.clicked() && !close, close)
 }

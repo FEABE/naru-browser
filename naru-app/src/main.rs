@@ -63,6 +63,7 @@ impl Naru {
         if self.tabs.is_empty() { self.tabs.push(Tab::new("new tab","https://duckduckgo.com",0,0,None)); }
         if self.active>ti { self.active-=1; }
         if self.active>=self.tabs.len() { self.active=self.tabs.len()-1; }
+        self.agent_tgt=None; self.agent_label.clear(); // 닫은 탭이 에이전트였다면 커서/16ms 리페인트 상태 해제
         self.shown=usize::MAX; // 강제 재표시
     }
     fn load_active(&mut self, url:&str){
@@ -110,7 +111,7 @@ impl eframe::App for Naru {
             }
         }
 
-        let act=self.active;
+        let mut act=self.active;
         self.ensure_browser(act);
 
         // 탭 전환: 비활성 숨김 + 활성 표시
@@ -292,7 +293,8 @@ impl eframe::App for Naru {
         if let Some(ai)=toggle_area { self.areas[ai].open=!self.areas[ai].open; }
         if let Some(pi)=toggle_proj { self.projs[pi].open=!self.projs[pi].open; }
         if let Some(ti)=switch_to { self.active=ti; }
-        if let Some(ti)=close_tab { self.close_tab(ti); }
+        // 닫기는 tabs를 줄여 상단에서 캡처한 act를 무효화 → 이후 중앙뷰/pill 인덱싱 전에 재동기화(패닉 방지)
+        if let Some(ti)=close_tab { self.close_tab(ti); act=self.active; }
         if let Some(ai)=new_tab_area {
             self.tabs.push(Tab::new("new tab","https://duckduckgo.com",0,ai,None));
             self.active=self.tabs.len()-1;
