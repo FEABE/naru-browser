@@ -16,6 +16,33 @@ use web::*;  // FrameBuf, SharedFrame/Size/Str, NaruApp/AppBuilder, create_brows
 
 // 임시 파일 경로(trace·메일박스·응답파일) — OS temp 디렉터리 기반(하드코딩 제거, 이식성)
 fn tmp(name: &str) -> std::path::PathBuf { std::env::temp_dir().join(name) }
+// 영구 데이터 디렉터리(세션·쿠키 캐시) — %LOCALAPPDATA%\naru (없으면 temp)
+fn data_dir() -> std::path::PathBuf {
+    let base = std::env::var("LOCALAPPDATA").ok().map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let d = base.join("naru");
+    let _ = std::fs::create_dir_all(&d);
+    d
+}
+// 세션 복원: session.txt(탭 구조 저장분) 읽어 (areas, projs, tabs, active). 없거나 비면 None → 기본 시드 사용.
+fn load_session(dir: &std::path::Path) -> Option<(Vec<Area>, Vec<Proj>, Vec<Tab>, usize)> {
+    let s = std::fs::read_to_string(dir.join("session.txt")).ok()?;
+    let (mut areas, mut projs, mut tabs, mut active) = (Vec::new(), Vec::new(), Vec::new(), 0usize);
+    for line in s.lines() {
+        let f: Vec<&str> = line.split('\t').collect();
+        match f.first().copied() {
+            Some("A") if f.len()>=4 => areas.push(Area{ name:f[1].into(), color:f[2].parse().unwrap_or(0), open:f[3]=="true" }),
+            Some("P") if f.len()>=4 => projs.push(Proj{ name:f[1].into(), area:f[2].parse().unwrap_or(0), open:f[3]=="true" }),
+            // T<TAB>url<TAB>title<TAB>area<TAB>proj(-1=없음) — 복원 시 모두 유저 소유(owner=0)
+            Some("T") if f.len()>=5 => { let proj=f[4].parse::<i64>().ok().filter(|&x|x>=0).map(|x|x as usize);
+                tabs.push(Tab::new(f[2], f[1], 0, f[3].parse().unwrap_or(0), proj)); }
+            Some("ACTIVE") if f.len()>=2 => active = f[1].parse().unwrap_or(0),
+            _ => {}
+        }
+    }
+    if areas.is_empty() || tabs.is_empty() { return None; }
+    if active >= tabs.len() { active = 0; }
+    Some((areas, projs, tabs, active))
+}
 fn mark(s: &str) {
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
@@ -75,6 +102,7 @@ struct Naru {
     // 에이전트 커서(사람처럼 움직이는 가상 커서) — 웹뷰 로컬(=CEF) 좌표
     agent_cur: egui::Pos2, agent_tgt: Option<egui::Pos2>, agent_do_click: bool, agent_label: String,
     perm: Option<String>, // 에이전트 권한 요청 메시지 (있으면 배너 표시)
+    data_dir: std::path::PathBuf, last_sig: String, // 세션 영속: 저장 경로 + 변경 감지 시그니처
 }
 impl Naru {
     fn ensure_browser(&mut self, ti:usize){
@@ -95,6 +123,15 @@ impl Naru {
         if self.active>=self.tabs.len() { self.active=self.tabs.len()-1; }
         self.agent_tgt=None; self.agent_label.clear(); // 닫은 탭이 에이전트였다면 커서/16ms 리페인트 상태 해제
         self.shown=usize::MAX; // 강제 재표시
+    }
+    fn save_session(&self){
+        let san = |s:&str| s.replace(['\t','\n'], " ");
+        let mut out = String::new();
+        for a in &self.areas { out.push_str(&format!("A\t{}\t{}\t{}\n", san(&a.name), a.color, a.open)); }
+        for p in &self.projs { out.push_str(&format!("P\t{}\t{}\t{}\n", san(&p.name), p.area, p.open)); }
+        for t in &self.tabs { out.push_str(&format!("T\t{}\t{}\t{}\t{}\n", san(&t.url), san(&t.title), t.area, t.proj.map(|x|x as i64).unwrap_or(-1))); }
+        out.push_str(&format!("ACTIVE\t{}\n", self.active));
+        let _ = std::fs::write(self.data_dir.join("session.txt"), out);
     }
     fn load_active(&mut self, url:&str){
         let mut u=url.trim().to_string(); if u.is_empty(){return;}
@@ -470,6 +507,16 @@ impl eframe::App for Naru {
 
         // 에이전트 커서 이동 중이면 부드럽게 60fps로 애니메이션
         let next_ms = if got_frame || self.agent_tgt.is_some() { 16 } else { 66 };
+        // 세션 영속: 탭/스페이스 구조가 바뀌면 session.txt 저장(매 프레임 아님, 시그니처 변화 시만)
+        let sig = {
+            let mut s = format!("act{}|", self.active);
+            for a in &self.areas { s.push_str(&format!("A{}:{};", a.name, a.open)); }
+            for p in &self.projs { s.push_str(&format!("P{}:{}:{};", p.name, p.area, p.open)); }
+            for t in &self.tabs { s.push_str(&format!("T{}:{}:{:?};", t.url, t.area, t.proj)); }
+            s
+        };
+        if sig != self.last_sig { self.last_sig = sig; self.save_session(); }
+
         ctx.request_repaint_after(Duration::from_millis(next_ms));
     }
 }
@@ -505,7 +552,8 @@ fn main() -> std::process::ExitCode {
     let ret = execute_process(Some(args.as_main_args()), Some(&mut app), std::ptr::null_mut());
     if !is_browser_process { return 0.into(); }
     assert!(ret == -1, "cannot execute browser process");
-    let cache = tmp("naru_cache");
+    let dir = data_dir();
+    let cache = dir.join("cache"); // 영구 캐시 → 쿠키/로그인 세션 재시작 후에도 유지
     let cache_s = cache.to_string_lossy().into_owned();
     let settings = Settings {
         windowless_rendering_enabled: true as _, external_message_pump: true as _,
@@ -513,13 +561,18 @@ fn main() -> std::process::ExitCode {
     assert_eq!(initialize(Some(args.as_main_args()), Some(&settings), Some(&mut app), std::ptr::null_mut()), 1);
     for _ in 0..10 { do_message_loop_work(); }
 
-    // 깡통 시작 상태: 영역 1개 + 탭 1개. 나머지는 유저가 new space/new tab로 생성.
-    let areas = vec![ Area{name:"personal".into(), color:0, open:true} ];
-    let projs: Vec<Proj> = Vec::new();
-    let tabs = vec![ Tab::new("new tab","https://duckduckgo.com",0,0,None) ];
+    // 지난 세션 복원(탭/스페이스). 없으면 깡통 시작: 영역 1개 + 탭 1개.
+    let (areas, projs, tabs, active) = load_session(&dir).unwrap_or_else(|| (
+        vec![ Area{name:"personal".into(), color:0, open:true} ],
+        Vec::new(),
+        vec![ Tab::new("new tab","https://duckduckgo.com",0,0,None) ],
+        0,
+    ));
+    let addr0 = tabs.get(active).map(|t|t.url.clone()).unwrap_or_default();
 
-    let app_ui = Naru { areas, projs, tabs, active:0, shown:usize::MAX, address:"duckduckgo.com".into(), sidebar:true, dark:false, editing:false,
-        agent_cur:egui::pos2(80.0,80.0), agent_tgt:None, agent_do_click:false, agent_label:String::new(), perm:None };
+    let app_ui = Naru { areas, projs, tabs, active, shown:usize::MAX, address:addr0, sidebar:true, dark:false, editing:false,
+        agent_cur:egui::pos2(80.0,80.0), agent_tgt:None, agent_do_click:false, agent_label:String::new(), perm:None,
+        data_dir:dir, last_sig:String::new() };
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1360.0,860.0]).with_min_inner_size([920.0,600.0])
