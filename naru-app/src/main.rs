@@ -16,7 +16,7 @@ fn mark(s: &str) {
 }
 
 #[derive(Default)]
-struct FrameBuf { w: usize, h: usize, rgba: Vec<u8>, dirty: bool }
+struct FrameBuf { w: usize, h: usize, pixels: Vec<Color32>, dirty: bool }
 type SharedFrame = Rc<RefCell<FrameBuf>>;
 type SharedSize = Rc<RefCell<(f32, f32)>>;
 
@@ -55,19 +55,28 @@ impl Tab {
 fn mono(z:f32)->FontId{ FontId::new(z,FontFamily::Monospace) }
 fn ico(g:&str, sz:f32)->RichText{ RichText::new(g).font(FontId::new(sz,FontFamily::Name("ico".into()))) }
 // 탭/항목 행
-fn item(ui:&mut Ui, pl:&Pal, icol:Color32, icon:&str, label:&str, sel:bool, indent:f32, running:bool)->bool{
+fn item(ui:&mut Ui, pl:&Pal, icol:Color32, icon:&str, label:&str, sel:bool, indent:f32, running:bool, closable:bool)->(bool,bool){
     let w=ui.available_width(); let (rect,resp)=ui.allocate_exact_size(vec2(w,31.0),Sense::click());
     let bg= if sel {pl.selr} else if resp.hovered(){pl.hover} else {Color32::TRANSPARENT};
     if bg!=Color32::TRANSPARENT { ui.painter().rect_filled(rect,Rounding::same(7.0),bg); }
     let p=ui.painter(); let ix=rect.left()+12.0+indent;
     if !icon.is_empty(){ p.text(Pos2::new(ix,rect.center().y),egui::Align2::LEFT_CENTER,icon,mono(11.0),icol); }
     p.text(Pos2::new(ix+19.0,rect.center().y),egui::Align2::LEFT_CENTER,label,mono(13.0),if sel{pl.accent}else{pl.txt});
+    let mut close=false;
     if running {
         let bx=rect.right()-44.0;
         p.rect_filled(egui::Rect::from_min_size(Pos2::new(bx,rect.center().y-8.0),vec2(38.0,16.0)),Rounding::same(8.0), if sel{pl.accent}else{icol});
         p.text(Pos2::new(bx+19.0,rect.center().y),egui::Align2::CENTER_CENTER,"run",mono(9.5),Color32::WHITE);
+    } else if closable && resp.hovered() {
+        // hover 시 닫기 × (행 우측 작은 히트존)
+        let cc=Pos2::new(rect.right()-16.0, rect.center().y);
+        let cr=egui::Rect::from_center_size(cc, vec2(20.0,20.0));
+        let cresp=ui.interact(cr, egui::Id::new(("closex", rect.top() as i32, indent as i32, label)), Sense::click());
+        if cresp.hovered(){ ui.painter().rect_filled(cr,Rounding::same(6.0),pl.border); }
+        ui.painter().text(cc,egui::Align2::CENTER_CENTER,"✕",mono(11.0),if cresp.hovered(){pl.txt}else{pl.muted});
+        if cresp.clicked(){ close=true; }
     }
-    resp.clicked()
+    (resp.clicked() && !close, close)
 }
 // 폴더(영역/프로젝트) 헤더 — 접기/펴기
 fn folder(ui:&mut Ui, pl:&Pal, open:bool, icon:&str, icol:Color32, name:&str, indent:f32, header:bool)->bool{
@@ -153,12 +162,13 @@ wrap_render_handler! {
         fn on_paint(&self, _b: Option<&mut Browser>, _t: PaintElementType, _d: Option<&[Rect]>,
                     buffer: *const u8, width: ::std::os::raw::c_int, height: ::std::os::raw::c_int) {
             if buffer.is_null() || width<=0 || height<=0 { return; }
-            let w=width as usize; let h=height as usize; let n=w*h*4;
+            let w=width as usize; let h=height as usize; let px=w*h; let n=px*4;
             let src=unsafe{ std::slice::from_raw_parts(buffer,n) };
             let mut f=self.handler.frame.borrow_mut();
-            if f.rgba.len()!=n { f.rgba.resize(n,0); }
-            let dst=&mut f.rgba; let mut i=0;
-            while i<n { dst[i]=src[i+2]; dst[i+1]=src[i+1]; dst[i+2]=src[i]; dst[i+3]=src[i+3]; i+=4; }
+            if f.pixels.len()!=px { f.pixels.resize(px,Color32::TRANSPARENT); }
+            // BGRA(unmultiplied) → Color32 1패스 변환 (기존: 바이트 스왑 + from_rgba 재변환 2패스 제거)
+            let dst=&mut f.pixels;
+            for p in 0..px { let i=p*4; dst[p]=Color32::from_rgba_unmultiplied(src[i+2],src[i+1],src[i],src[i+3]); }
             f.w=w; f.h=h; f.dirty=true;
         }
     }
@@ -217,6 +227,16 @@ impl Naru {
             self.tabs[ti].browser = Some(create_browser(&url, fr, sz, su, st));
         }
     }
+    fn close_tab(&mut self, ti:usize){
+        if ti>=self.tabs.len() { return; }
+        // CEF 브라우저 종료 → 서브프로세스/텍스처/버퍼 모두 해제
+        if let Some(b)=&self.tabs[ti].browser { if let Some(h)=b.host(){ h.close_browser(1); } }
+        self.tabs.remove(ti);
+        if self.tabs.is_empty() { self.tabs.push(Tab::new("new tab","https://duckduckgo.com",0,0,None)); }
+        if self.active>ti { self.active-=1; }
+        if self.active>=self.tabs.len() { self.active=self.tabs.len()-1; }
+        self.shown=usize::MAX; // 강제 재표시
+    }
     fn load_active(&mut self, url:&str){
         let mut u=url.trim().to_string(); if u.is_empty(){return;}
         if !u.contains("://") && !u.starts_with("naru:") { u=format!("https://{u}"); }
@@ -267,8 +287,12 @@ impl eframe::App for Naru {
 
         // 탭 전환: 비활성 숨김 + 활성 표시
         if self.shown != act {
-            for (i,t) in self.tabs.iter().enumerate() {
-                if i!=act { if let Some(b)=&t.browser { if let Some(h)=b.host(){ h.was_hidden(1); } } }
+            for i in 0..self.tabs.len() {
+                if i!=act {
+                    if let Some(b)=&self.tabs[i].browser { if let Some(h)=b.host(){ h.was_hidden(1); } }
+                    // 숨긴 탭의 CPU 픽셀 버퍼 해제 — 표시엔 texture만 쓰므로 무영향, 재표시 시 다음 paint가 다시 채움 (RAM 절약)
+                    { let fr=self.tabs[i].frame.clone(); let mut f=fr.borrow_mut(); f.pixels=Vec::new(); f.w=0; f.h=0; f.dirty=false; }
+                }
             }
             if let Some(b)=&self.tabs[act].browser { if let Some(h)=b.host(){ h.was_hidden(0); h.was_resized(); } }
             self.shown=act; self.address=self.tabs[act].url.clone();
@@ -277,8 +301,8 @@ impl eframe::App for Naru {
         // 활성 탭 프레임 업로드
         let mut got_frame=false;
         { let frame=self.tabs[act].frame.clone(); let mut f=frame.borrow_mut();
-          if f.dirty && f.w>0 && f.h>0 {
-              let img=egui::ColorImage::from_rgba_unmultiplied([f.w,f.h],&f.rgba);
+          if f.dirty && f.w>0 && f.h>0 && f.pixels.len()==f.w*f.h {
+              let img=egui::ColorImage{ size:[f.w,f.h], pixels:f.pixels.clone() };
               match &mut self.tabs[act].tex { Some(t)=>t.set(img,egui::TextureOptions::LINEAR),
                   None=>self.tabs[act].tex=Some(ctx.load_texture("web",img,egui::TextureOptions::LINEAR)) }
               f.dirty=false; got_frame=true;
@@ -378,6 +402,7 @@ impl eframe::App for Naru {
         let mut toggle_area:Option<usize>=None;
         let mut toggle_proj:Option<usize>=None;
         let mut new_tab_area:Option<usize>=None;
+        let mut close_tab:Option<usize>=None;
         let mut new_space=false;
         if self.sidebar {
             egui::SidePanel::left("side").resizable(false).exact_width(256.0)
@@ -403,7 +428,8 @@ impl eframe::App for Naru {
                             if self.tabs[ti].area!=ai || self.tabs[ti].proj.is_some() { continue; }
                             let sel=ti==self.active; let agent=self.tabs[ti].owner!=0;
                             let icol=if agent{acol}else if sel{pl.accent}else{pl.faint};
-                            if item(ui,&pl,icol,if agent{"●"}else{"○"},&self.tabs[ti].title.clone(),sel,ind,agent && sel){ switch_to=Some(ti); }
+                            let (clk,cls)=item(ui,&pl,icol,if agent{"●"}else{"○"},&self.tabs[ti].title.clone(),sel,ind,agent && sel,true);
+                            if clk{ switch_to=Some(ti); } if cls{ close_tab=Some(ti); }
                         }
                         // 프로젝트들 (있을 때만)
                         for pi in 0..self.projs.len() {
@@ -415,7 +441,8 @@ impl eframe::App for Naru {
                                 if self.tabs[ti].proj!=Some(pi) { continue; }
                                 let sel=ti==self.active; let agent=self.tabs[ti].owner!=0;
                                 let icol=if agent{acol}else if sel{pl.accent}else{pl.faint};
-                                if item(ui,&pl,icol,if agent{"●"}else{"○"},&self.tabs[ti].title.clone(),sel,ind+20.0,agent && sel){ switch_to=Some(ti); }
+                                let (clk,cls)=item(ui,&pl,icol,if agent{"●"}else{"○"},&self.tabs[ti].title.clone(),sel,ind+20.0,agent && sel,true);
+                                if clk{ switch_to=Some(ti); } if cls{ close_tab=Some(ti); }
                             }
                         }
                         if newbtn(ui,&pl,"new tab",ind){ new_tab_area=Some(ai); }
@@ -425,18 +452,19 @@ impl eframe::App for Naru {
                     if newbtn(ui,&pl,"new space",0.0){ new_space=true; }
                     ui.add_space(8.0);
                     subhead(ui,&pl,"library",pl.faint);
-                    item(ui,&pl,pl.muted,"↺","history",false,0.0,false);
-                    item(ui,&pl,pl.accent,"↓","downloads",false,0.0,false);
-                    item(ui,&pl,pl.deleg,"▤","reading list",false,0.0,false);
+                    item(ui,&pl,pl.muted,"↺","history",false,0.0,false,false);
+                    item(ui,&pl,pl.accent,"↓","downloads",false,0.0,false,false);
+                    item(ui,&pl,pl.deleg,"▤","reading list",false,0.0,false,false);
                     ui.add_space(8.0); divider(ui,&pl); ui.add_space(4.0);
-                    item(ui,&pl,pl.muted,"◉","account",false,0.0,false);
-                    item(ui,&pl,pl.muted,"◴","settings",false,0.0,false); ui.add_space(4.0);
+                    item(ui,&pl,pl.muted,"◉","account",false,0.0,false,false);
+                    item(ui,&pl,pl.muted,"◴","settings",false,0.0,false,false); ui.add_space(4.0);
                 });
             });
         }
         if let Some(ai)=toggle_area { self.areas[ai].open=!self.areas[ai].open; }
         if let Some(pi)=toggle_proj { self.projs[pi].open=!self.projs[pi].open; }
         if let Some(ti)=switch_to { self.active=ti; }
+        if let Some(ti)=close_tab { self.close_tab(ti); }
         if let Some(ai)=new_tab_area {
             self.tabs.push(Tab::new("new tab","https://duckduckgo.com",0,ai,None));
             self.active=self.tabs.len()-1;
