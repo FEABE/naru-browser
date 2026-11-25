@@ -1,0 +1,12 @@
+[package]
+name = "naru"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "naru"
+path = "src/main.rs"
+
+[dependencies]
+cef.workspace = true
+eframe = "0.29"
