@@ -18,7 +18,9 @@ Naru의 **진짜 동작하는 브라우저**. egui 셸 UI + **CEF OSR 웹 렌더
   CDP(9222)는 **opt-in**: 환경변수 `NARU_AGENT=1`로 실행할 때만 포트 노출(기본 비노출, `NARU_CDP_PORT`로 포트 지정 가능)
 - **메모리/렌더 최적화**: 숨긴 탭은 CPU 픽셀 버퍼 해제, 프레임은 BGRA→`Color32` 1패스 변환(복사 2회→1회+memcpy).
   적응형 repaint(변화 시 ~60fps, 유휴 시 ~15Hz) — 정적 페이지 사실상 idle
-- **경로**: 임시 파일(cache·메일박스·응답)은 OS temp 디렉터리 기반(하드코딩 없음)
+- **경로**: 메일박스·응답 등 임시 파일은 OS temp 기반(하드코딩 없음)
+- **세션 영속**: `%LOCALAPPDATA%\naru\session.txt`에 탭/스페이스 저장→재시작 시 복원. `root_cache_path`를 영구화해 쿠키/로그인 유지(정상 종료 시 flush)
+- **한글 입력 라이브 프리뷰**: 조합 중 `ime_set_composition`로 프리뷰 시도 + 확정은 CHAR로 확실히 삽입(하이브리드 — 프리뷰 미동작이어도 글자는 보장)
 
 ## 빌드 (Windows / MSVC)
 cef-rs 워크스페이스의 `examples/naru`로 빌드한다. 필요:

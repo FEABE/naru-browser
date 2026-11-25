@@ -426,9 +426,18 @@ impl eframe::App for Naru {
             if let Some(b)=&self.tabs[act].browser { if let Some(h)=b.host() {
                 for e in &events {
                     match e {
-                        // 문자(영어) + IME 확정 결과(한글 등): CHAR로 전달 (OSR에서 가장 확실히 삽입됨)
                         egui::Event::Text(t) => for ch in t.chars() { if (ch as u32)<=0xFFFF { h.send_key_event(Some(&key_char(ch as u16))); } },
-                        egui::Event::Ime(egui::ImeEvent::Commit(t)) => for ch in t.chars() { if (ch as u32)<=0xFFFF { h.send_key_event(Some(&key_char(ch as u16))); } },
+                        egui::Event::Ime(ime) => match ime {
+                            // 조합 중: 라이브 프리뷰 시도(동작 시 보임, 미동작 시 무해)
+                            egui::ImeEvent::Preedit(s) => {
+                                if s.is_empty() { h.ime_cancel_composition(); }
+                                else { let n=s.encode_utf16().count() as u32;
+                                       h.ime_set_composition(Some(&s.as_str().into()), None, None, Some(&Range{from:n,to:n})); }
+                            }
+                            // 확정: 남은 조합 프리뷰 제거 후, 확실한 CHAR 경로로 삽입(프리뷰 미동작이어도 글자는 확실히 들어감)
+                            egui::ImeEvent::Commit(s) => { h.ime_cancel_composition(); for ch in s.chars() { if (ch as u32)<=0xFFFF { h.send_key_event(Some(&key_char(ch as u16))); } } }
+                            _ => {}
+                        },
                         egui::Event::Key{ key, pressed, modifiers, .. } => {
                             if let Some(vk)=vk_of(*key) { h.send_key_event(Some(&key_vk(vk,*pressed,mods_of(modifiers)))); }
                         }
