@@ -119,6 +119,9 @@ wrap_app! {
             cl.append_switch(Some(&"noerrdialogs".into()));
             cl.append_switch(Some(&"hide-crash-restore-bubble".into()));
             cl.append_switch(Some(&"use-mock-keychain".into()));
+            // 에이전트 제어용 CDP(Chrome DevTools Protocol) 포트 — 외부 CLI/AI가 탭 조종
+            cl.append_switch_with_value(Some(&"remote-debugging-port".into()), Some(&"9222".into()));
+            cl.append_switch_with_value(Some(&"remote-allow-origins".into()), Some(&"*".into()));
         }
         fn browser_process_handler(&self) -> Option<cef::BrowserProcessHandler> {
             Some(BrowserProcessHandlerBuilder::build(NaruBph::new()))
