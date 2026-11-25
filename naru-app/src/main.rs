@@ -389,6 +389,7 @@ impl eframe::App for Naru {
             if let Some(b)=&self.tabs[act].browser { if let Some(h)=b.host() {
                 for e in &events {
                     match e {
+                        // 문자(영어) + IME 확정 결과(한글 등): CHAR로 전달 (OSR에서 가장 확실히 삽입됨)
                         egui::Event::Text(t) => for ch in t.chars() { if (ch as u32)<=0xFFFF { h.send_key_event(Some(&key_char(ch as u16))); } },
                         egui::Event::Ime(egui::ImeEvent::Commit(t)) => for ch in t.chars() { if (ch as u32)<=0xFFFF { h.send_key_event(Some(&key_char(ch as u16))); } },
                         egui::Event::Key{ key, pressed, modifiers, .. } => {
