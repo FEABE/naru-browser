@@ -358,7 +358,7 @@ wrap_client! {
 }
 impl ClientBuilder { pub(crate) fn build(r: RenderHandler, d: DisplayHandler, l: LifeSpanHandler, fh: FindHandler, dh: DownloadHandler, lh: LoadHandler, rh: RequestHandler, ph: PermissionHandler) -> cef::Client { Self::new(r, d, l, fh, dh, lh, rh, ph) } }
 
-pub fn create_browser(url:&str, frame:SharedFrame, size:SharedSize, scale:SharedScale, io:BrowserIo) -> Browser {
+pub fn create_browser(url:&str, frame:SharedFrame, size:SharedSize, scale:SharedScale, io:BrowserIo, private:bool) -> Browser {
     let render = NaruRender::new(frame, size, scale);
     let disp = NaruDisplay { url:io.url, title:io.title, cursor:io.cursor, progress:io.progress, status:io.status, icon:io.icon };
     let ls = NaruLifeSpan { popups:io.popups };
@@ -370,6 +370,8 @@ pub fn create_browser(url:&str, frame:SharedFrame, size:SharedSize, scale:Shared
     let mut client = ClientBuilder::build(RenderHandlerBuilder::build(render), DisplayHandlerBuilder::build(disp), LifeSpanHandlerBuilder::build(ls), FindHandlerBuilder::build(fh), DownloadHandlerBuilder::build(dh), LoadHandlerBuilder::build(lh), RequestHandlerBuilder::build(rh), PermissionHandlerBuilder::build(ph));
     let wi = WindowInfo { windowless_rendering_enabled: true as _, ..Default::default() };
     let bs = BrowserSettings { windowless_frame_rate: 60, ..Default::default() };
-    browser_host_create_browser_sync(Some(&wi), Some(&mut client), Some(&url.into()), Some(&bs), None, None)
+    // 시크릿: cache_path 빈 문자열 → 비영구(in-memory) 컨텍스트, 쿠키/캐시 디스크 미기록. 일반: 전역 영구 컨텍스트(None)
+    let mut rc = if private { request_context_create_context(Some(&RequestContextSettings{ cache_path:"".into(), ..Default::default() }), None) } else { None };
+    browser_host_create_browser_sync(Some(&wi), Some(&mut client), Some(&url.into()), Some(&bs), None, rc.as_mut())
         .expect("tab browser 생성 실패")
 }

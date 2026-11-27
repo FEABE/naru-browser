@@ -92,6 +92,7 @@ struct Tab {
     load_err: SharedErr, crashed: SharedFlag, // 로드 에러 / 렌더러 크래시 → 복구 오버레이
     web_perm: SharedPerm, // 사이트 권한 요청(위치/카메라 등) → 배너
     zoom: f64, // CEF 줌 레벨(0=100%, +1≈120%) — Ctrl±/0로 조절, 브라우저별 유지
+    private: bool, // 시크릿 탭(비영구 컨텍스트, 세션 저장 제외)
 }
 impl Tab {
     fn new(title:&str, url:&str, owner:u8, area:usize, proj:Option<usize>)->Self{
@@ -105,7 +106,7 @@ impl Tab {
             icon:Rc::new(RefCell::new(IconCell::default())), icon_tex:None,
             load_err:Rc::new(RefCell::new(None)), crashed:Rc::new(RefCell::new(false)),
             web_perm:Rc::new(RefCell::new(None)),
-            zoom:0.0 }
+            zoom:0.0, private:false }
     }
 }
 
@@ -135,8 +136,8 @@ impl Naru {
                 icon:self.tabs[ti].icon.clone(),
                 load_err:self.tabs[ti].load_err.clone(), crashed:self.tabs[ti].crashed.clone(),
                 perm:self.tabs[ti].web_perm.clone() };
-            let sc=self.scale.clone(); let url=self.tabs[ti].url.clone();
-            self.tabs[ti].browser = Some(create_browser(&url, fr, sz, sc, io));
+            let sc=self.scale.clone(); let url=self.tabs[ti].url.clone(); let private=self.tabs[ti].private;
+            self.tabs[ti].browser = Some(create_browser(&url, fr, sz, sc, io, private));
         }
     }
     fn close_tab(&mut self, ti:usize){
@@ -155,8 +156,11 @@ impl Naru {
         let mut out = String::new();
         for a in &self.areas { out.push_str(&format!("A\t{}\t{}\t{}\n", san(&a.name), a.color, a.open)); }
         for p in &self.projs { out.push_str(&format!("P\t{}\t{}\t{}\n", san(&p.name), p.area, p.open)); }
-        for t in &self.tabs { out.push_str(&format!("T\t{}\t{}\t{}\t{}\n", san(&t.url), san(&t.title), t.area, t.proj.map(|x|x as i64).unwrap_or(-1))); }
-        out.push_str(&format!("ACTIVE\t{}\n", self.active));
+        // 시크릿 탭은 저장 제외. active는 비시크릿 목록 기준 인덱스로 remap.
+        for t in self.tabs.iter().filter(|t|!t.private) {
+            out.push_str(&format!("T\t{}\t{}\t{}\t{}\n", san(&t.url), san(&t.title), t.area, t.proj.map(|x|x as i64).unwrap_or(-1))); }
+        let active_saved = self.tabs.iter().take(self.active+1).filter(|t|!t.private).count().saturating_sub(1);
+        out.push_str(&format!("ACTIVE\t{}\n", active_saved));
         let _ = std::fs::write(self.data_dir.join("session.txt"), out);
     }
     fn load_active(&mut self, url:&str){
@@ -220,6 +224,11 @@ impl eframe::App for Naru {
                 let area=self.tabs.get(self.active).map(|t|t.area).unwrap_or(0);
                 self.tabs.push(Tab::new("new tab","https://duckduckgo.com",0,area,None));
                 self.active=self.tabs.len()-1;
+            }
+            if ctx.input_mut(|i| i.consume_key(cmd_shift, Key::N)) { // 시크릿 탭
+                let area=self.tabs.get(self.active).map(|t|t.area).unwrap_or(0);
+                let mut t=Tab::new("private","https://duckduckgo.com",0,area,None); t.private=true;
+                self.tabs.push(t); self.active=self.tabs.len()-1;
             }
             if ctx.input_mut(|i| i.consume_key(cmd, Key::W)) { let a=self.active; self.close_tab(a); }
             if ctx.input_mut(|i| i.consume_key(cmd, Key::Tab)) && self.tabs.len()>1 { self.active=(self.active+1)%self.tabs.len(); }
@@ -452,9 +461,9 @@ impl eframe::App for Naru {
                         // 영역 직속 탭 (proj=None)
                         for ti in 0..self.tabs.len() {
                             if self.tabs[ti].area!=ai || self.tabs[ti].proj.is_some() { continue; }
-                            let sel=ti==self.active; let agent=self.tabs[ti].owner!=0;
-                            let icol=if agent{acol}else if sel{pl.accent}else{pl.faint};
-                            let (clk,cls)=item(ui,&pl,icol,if agent{"●"}else{"○"},&self.tabs[ti].title.clone(),sel,ind,agent && sel,true);
+                            let sel=ti==self.active; let agent=self.tabs[ti].owner!=0; let priv_=self.tabs[ti].private;
+                            let icol=if agent{acol}else if priv_{pl.deleg}else if sel{pl.accent}else{pl.faint};
+                            let (clk,cls)=item(ui,&pl,icol,if agent{"●"}else if priv_{"◐"}else{"○"},&self.tabs[ti].title.clone(),sel,ind,agent && sel,true);
                             if clk{ switch_to=Some(ti); } if cls{ close_tab=Some(ti); }
                         }
                         // 프로젝트들 (있을 때만)
@@ -465,9 +474,9 @@ impl eframe::App for Naru {
                             if !popen { continue; }
                             for ti in 0..self.tabs.len() {
                                 if self.tabs[ti].proj!=Some(pi) { continue; }
-                                let sel=ti==self.active; let agent=self.tabs[ti].owner!=0;
-                                let icol=if agent{acol}else if sel{pl.accent}else{pl.faint};
-                                let (clk,cls)=item(ui,&pl,icol,if agent{"●"}else{"○"},&self.tabs[ti].title.clone(),sel,ind+20.0,agent && sel,true);
+                                let sel=ti==self.active; let agent=self.tabs[ti].owner!=0; let priv_=self.tabs[ti].private;
+                                let icol=if agent{acol}else if priv_{pl.deleg}else if sel{pl.accent}else{pl.faint};
+                                let (clk,cls)=item(ui,&pl,icol,if agent{"●"}else if priv_{"◐"}else{"○"},&self.tabs[ti].title.clone(),sel,ind+20.0,agent && sel,true);
                                 if clk{ switch_to=Some(ti); } if cls{ close_tab=Some(ti); }
                             }
                         }
