@@ -13,12 +13,14 @@ pub type SharedScale = Rc<RefCell<f32>>;          // 디바이스 배율(HiDPI) 
 pub type SharedCursor = Rc<RefCell<CursorIcon>>;  // 웹페이지가 요청한 커서 모양(OSR은 OS가 모르니 직접 받음)
 pub type SharedPopups = Rc<RefCell<Vec<String>>>; // on_before_popup으로 취소한 팝업 URL 큐 → Naru 탭으로 열림
 pub type SharedF32 = Rc<RefCell<f32>>;            // 로딩 진행도(0~1)
+pub type SharedFind = Rc<RefCell<(i32, i32)>>;    // 페이지 내 찾기 결과 (현재 매치 순번, 총 매치 수)
 
 // 탭별 공유 I/O 묶음 — create_browser에 넘길 핸들러↔UI 공유셀들(위치 인자 폭발·오삽입 방지)
 #[derive(Clone)]
 pub struct BrowserIo {
     pub url: SharedStr, pub title: SharedStr, pub cursor: SharedCursor,
     pub popups: SharedPopups, pub progress: SharedF32, pub status: SharedStr,
+    pub find_result: SharedFind,
 }
 
 // CEF 커서 타입 → egui 커서 아이콘 (링크=손가락, 입력=I-beam, 리사이즈 방향 등)
@@ -163,21 +165,36 @@ wrap_life_span_handler! {
 }
 impl LifeSpanHandlerBuilder { pub fn build(h: NaruLifeSpan) -> LifeSpanHandler { Self::new(h) } }
 
+// FindHandler: 페이지 내 찾기 결과(현재 순번/총 개수)를 공유셀에 기록 → 찾기바에 "n/m" 표시
+#[derive(Clone)] pub struct NaruFind { result: SharedFind }
+wrap_find_handler! {
+    pub struct FindHandlerBuilder { handler: NaruFind, }
+    impl FindHandler {
+        fn on_find_result(&self, _b: Option<&mut Browser>, _id: ::std::os::raw::c_int, count: ::std::os::raw::c_int,
+                          _rect: Option<&Rect>, active: ::std::os::raw::c_int, _final: ::std::os::raw::c_int) {
+            *self.handler.result.borrow_mut() = (active, count);
+        }
+    }
+}
+impl FindHandlerBuilder { pub fn build(h: NaruFind) -> FindHandler { Self::new(h) } }
+
 wrap_client! {
-    pub(crate) struct ClientBuilder { render_handler: RenderHandler, display_handler: DisplayHandler, life_span_handler: LifeSpanHandler, }
+    pub(crate) struct ClientBuilder { render_handler: RenderHandler, display_handler: DisplayHandler, life_span_handler: LifeSpanHandler, find_handler: FindHandler, }
     impl Client {
         fn render_handler(&self) -> Option<cef::RenderHandler> { Some(self.render_handler.clone()) }
         fn display_handler(&self) -> Option<cef::DisplayHandler> { Some(self.display_handler.clone()) }
         fn life_span_handler(&self) -> Option<cef::LifeSpanHandler> { Some(self.life_span_handler.clone()) }
+        fn find_handler(&self) -> Option<cef::FindHandler> { Some(self.find_handler.clone()) }
     }
 }
-impl ClientBuilder { pub(crate) fn build(r: RenderHandler, d: DisplayHandler, l: LifeSpanHandler) -> cef::Client { Self::new(r, d, l) } }
+impl ClientBuilder { pub(crate) fn build(r: RenderHandler, d: DisplayHandler, l: LifeSpanHandler, fh: FindHandler) -> cef::Client { Self::new(r, d, l, fh) } }
 
 pub fn create_browser(url:&str, frame:SharedFrame, size:SharedSize, scale:SharedScale, io:BrowserIo) -> Browser {
     let render = NaruRender::new(frame, size, scale);
     let disp = NaruDisplay { url:io.url, title:io.title, cursor:io.cursor, progress:io.progress, status:io.status };
     let ls = NaruLifeSpan { popups:io.popups };
-    let mut client = ClientBuilder::build(RenderHandlerBuilder::build(render), DisplayHandlerBuilder::build(disp), LifeSpanHandlerBuilder::build(ls));
+    let fh = NaruFind { result:io.find_result };
+    let mut client = ClientBuilder::build(RenderHandlerBuilder::build(render), DisplayHandlerBuilder::build(disp), LifeSpanHandlerBuilder::build(ls), FindHandlerBuilder::build(fh));
     let wi = WindowInfo { windowless_rendering_enabled: true as _, ..Default::default() };
     let bs = BrowserSettings { windowless_frame_rate: 60, ..Default::default() };
     browser_host_create_browser_sync(Some(&wi), Some(&mut client), Some(&url.into()), Some(&bs), None, None)

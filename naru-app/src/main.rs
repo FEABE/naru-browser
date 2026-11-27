@@ -87,6 +87,7 @@ struct Tab {
     shared_url: Rc<RefCell<String>>, shared_title: Rc<RefCell<String>>,
     cursor: SharedCursor, popups: SharedPopups, // 웹 커서 모양 + 취소된 팝업 URL 큐(→새 탭)
     progress: SharedF32, status: SharedStr,     // 로딩 진행도(0~1) + 상태바(링크 호버 URL 등)
+    find_result: SharedFind,                    // 페이지 내 찾기 결과 (현재 순번, 총 개수)
     zoom: f64, // CEF 줌 레벨(0=100%, +1≈120%) — Ctrl±/0로 조절, 브라우저별 유지
 }
 impl Tab {
@@ -97,6 +98,7 @@ impl Tab {
             shared_url:Rc::new(RefCell::new(url.into())), shared_title:Rc::new(RefCell::new(title.into())),
             cursor:Rc::new(RefCell::new(egui::CursorIcon::Default)), popups:Rc::new(RefCell::new(Vec::new())),
             progress:Rc::new(RefCell::new(0.0)), status:Rc::new(RefCell::new(String::new())),
+            find_result:Rc::new(RefCell::new((0,0))),
             zoom:0.0 }
     }
 }
@@ -112,6 +114,7 @@ struct Naru {
     ime_comp: String, // 현재 화면에 CHAR로 미리 그려둔 IME 조합 글자(라이브 프리뷰용)
     scale: SharedScale, // 디바이스 배율(HiDPI) — 모든 탭이 공유, 매 프레임 ctx.pixels_per_point로 갱신
     focus_addr: bool, // Ctrl+L → 다음 프레임에 주소창 포커스 요청
+    find_open: bool, find_query: String, find_focus: bool, find_last: String, // 페이지 내 찾기 바 상태
 }
 impl Naru {
     fn ensure_browser(&mut self, ti:usize){
@@ -120,7 +123,8 @@ impl Naru {
             let io = BrowserIo {
                 url:self.tabs[ti].shared_url.clone(), title:self.tabs[ti].shared_title.clone(),
                 cursor:self.tabs[ti].cursor.clone(), popups:self.tabs[ti].popups.clone(),
-                progress:self.tabs[ti].progress.clone(), status:self.tabs[ti].status.clone() };
+                progress:self.tabs[ti].progress.clone(), status:self.tabs[ti].status.clone(),
+                find_result:self.tabs[ti].find_result.clone() };
             let sc=self.scale.clone(); let url=self.tabs[ti].url.clone();
             self.tabs[ti].browser = Some(create_browser(&url, fr, sz, sc, io));
         }
@@ -209,6 +213,16 @@ impl eframe::App for Naru {
             if ctx.input_mut(|i| i.consume_key(cmd, Key::Tab)) && self.tabs.len()>1 { self.active=(self.active+1)%self.tabs.len(); }
             if ctx.input_mut(|i| i.consume_key(cmd_shift, Key::Tab)) && self.tabs.len()>1 { self.active=(self.active+self.tabs.len()-1)%self.tabs.len(); }
             if ctx.input_mut(|i| i.consume_key(cmd, Key::L)) { self.focus_addr=true; }
+            // 페이지 내 찾기: Ctrl+F 토글, Escape 닫기
+            if ctx.input_mut(|i| i.consume_key(cmd, Key::F)) {
+                self.find_open = !self.find_open;
+                if self.find_open { self.find_focus=true; self.find_last.clear(); }
+                else { if let Some(b)=&self.tabs[self.active].browser { if let Some(h)=b.host(){ h.stop_finding(1); } } self.find_query.clear(); }
+            }
+            if self.find_open && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                self.find_open=false; self.find_query.clear();
+                if let Some(b)=&self.tabs[self.active].browser { if let Some(h)=b.host(){ h.stop_finding(1); } }
+            }
             // 확대/축소: Ctrl +/= (일부 자판은 Shift 동반) 확대, Ctrl - 축소, Ctrl 0 리셋
             let zin  = ctx.input_mut(|i| i.consume_key(cmd, Key::Plus)) | ctx.input_mut(|i| i.consume_key(cmd, Key::Equals))
                      | ctx.input_mut(|i| i.consume_key(cmd_shift, Key::Plus)) | ctx.input_mut(|i| i.consume_key(cmd_shift, Key::Equals));
@@ -498,6 +512,43 @@ impl eframe::App for Naru {
             });
         });
 
+        // ===== 페이지 내 찾기 바 (Ctrl+F) =====
+        if self.find_open {
+            let mut do_find: Option<bool> = None; // Some(forward)
+            let mut close=false;
+            let (a,cnt)=*self.tabs[act].find_result.borrow();
+            egui::Area::new(egui::Id::new("find_bar")).anchor(egui::Align2::RIGHT_TOP, vec2(-18.0,66.0)).show(ctx,|ui|{
+                Frame::none().fill(pl.topbar).stroke(bord).rounding(Rounding::same(10.0)).inner_margin(Margin::symmetric(10.0,7.0))
+                    .shadow(egui::epaint::Shadow{offset:vec2(0.0,4.0),blur:16.0,spread:0.0,color:Color32::from_black_alpha(60)})
+                    .show(ui,|ui|{ ui.horizontal(|ui|{
+                        ui.spacing_mut().item_spacing.x=6.0;
+                        let r=ui.add(egui::TextEdit::singleline(&mut self.find_query).frame(false).desired_width(170.0).text_color(pl.txt)
+                            .hint_text(RichText::new("find · 찾기").color(pl.faint)));
+                        if self.find_focus { r.request_focus(); self.find_focus=false; }
+                        if r.has_focus() { self.editing=true; }
+                        if r.changed() { do_find=Some(true); }
+                        if r.lost_focus() && ui.input(|i|i.key_pressed(egui::Key::Enter)) { do_find=Some(true); r.request_focus(); }
+                        let label=if self.find_query.is_empty(){String::new()}else{format!("{}/{}",a,cnt)};
+                        ui.label(RichText::new(label).size(11.0).color(pl.muted));
+                        if ui.add(egui::Button::new(RichText::new("↑").size(12.0).color(pl.txt)).frame(false)).clicked(){ do_find=Some(false); }
+                        if ui.add(egui::Button::new(RichText::new("↓").size(12.0).color(pl.txt)).frame(false)).clicked(){ do_find=Some(true); }
+                        if ui.add(egui::Button::new(RichText::new("✕").size(12.0).color(pl.muted)).frame(false)).clicked(){ close=true; }
+                    }); });
+            });
+            if let Some(fwd)=do_find {
+                if self.find_query.is_empty() {
+                    if let Some(b)=&self.tabs[act].browser { if let Some(h)=b.host(){ h.stop_finding(1); } }
+                    self.find_last.clear();
+                } else {
+                    let find_next = self.find_last==self.find_query; // 쿼리 그대로면 다음 매치, 바뀌면 새 검색
+                    self.find_last=self.find_query.clone();
+                    if let Some(b)=&self.tabs[act].browser { if let Some(h)=b.host(){ h.find(Some(&self.find_query.as_str().into()), fwd as i32, 0, find_next as i32); } }
+                }
+            }
+            if close { self.find_open=false; self.find_query.clear();
+                if let Some(b)=&self.tabs[act].browser { if let Some(h)=b.host(){ h.stop_finding(1); } } }
+        }
+
         // ===== 키보드 → 페이지 (유저 탭 & 옴니박스 편집중 아닐 때) =====
         // 영어: Event::Text, 한글/CJK: OS IME 조합→Event::Ime(Commit). 둘 다 CHAR로 전달. 특수키는 VK.
         if self.tabs[act].owner==0 && !self.editing {
@@ -669,7 +720,8 @@ fn main() -> std::process::ExitCode {
 
     let app_ui = Naru { areas, projs, tabs, active, shown:usize::MAX, address:addr0, sidebar:true, dark:false, editing:false,
         agent_cur:egui::pos2(80.0,80.0), agent_tgt:None, agent_do_click:false, agent_label:String::new(), perm:None,
-        data_dir:dir, last_sig:String::new(), ime_comp:String::new(), scale:Rc::new(RefCell::new(1.0)), focus_addr:false };
+        data_dir:dir, last_sig:String::new(), ime_comp:String::new(), scale:Rc::new(RefCell::new(1.0)), focus_addr:false,
+        find_open:false, find_query:String::new(), find_focus:false, find_last:String::new() };
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1360.0,860.0]).with_min_inner_size([920.0,600.0])
