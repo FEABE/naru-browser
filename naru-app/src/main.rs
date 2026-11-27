@@ -237,6 +237,22 @@ impl eframe::App for Naru {
                     if let Some(b)=&t.browser { if let Some(h)=b.host(){ h.set_zoom_level(t.zoom); } }
                 }
             }
+            // 편집 단축키 → CEF Frame 명령 (OSR은 Ctrl+C/V 접근자 패스스루가 불안정 → 명시 호출).
+            // 주소창/찾기 편집 중(editing)엔 egui가 처리하도록 가로채지 않음. 유저 탭에서만.
+            if !self.editing && self.tabs.get(self.active).map(|t|t.owner==0).unwrap_or(false) {
+                let edit = if ctx.input_mut(|i| i.consume_key(cmd, Key::C)) {Some(0u8)}
+                    else if ctx.input_mut(|i| i.consume_key(cmd, Key::V)) {Some(1)}
+                    else if ctx.input_mut(|i| i.consume_key(cmd, Key::X)) {Some(2)}
+                    else if ctx.input_mut(|i| i.consume_key(cmd, Key::A)) {Some(3)}
+                    else if ctx.input_mut(|i| i.consume_key(cmd, Key::Z)) {Some(4)}
+                    else if ctx.input_mut(|i| i.consume_key(cmd, Key::Y)) || ctx.input_mut(|i| i.consume_key(cmd_shift, Key::Z)) {Some(5)}
+                    else { None };
+                if let Some(e)=edit {
+                    if let Some(b)=&self.tabs[self.active].browser { if let Some(fr)=b.main_frame(){
+                        match e {0=>fr.copy(),1=>fr.paste(),2=>fr.cut(),3=>fr.select_all(),4=>fr.undo(),_=>fr.redo()}
+                    }}
+                }
+            }
         }
 
         // 팝업 큐 비우기: on_before_popup이 취소한 target=_blank/window.open URL을 새 탭으로 연다.
@@ -380,6 +396,8 @@ impl eframe::App for Naru {
         let mut toggle_downloads=false;
         let dl_label = { let d=self.downloads.borrow(); let a=d.iter().filter(|x|!x.done && !x.canceled).count();
             if a>0 { format!("downloads ({})", a) } else { "downloads".to_string() } };
+        let mut ctx_nav: Option<u8> = None;  // 우클릭 메뉴 네비 (0 뒤로, 1 앞으로, 2 새로고침)
+        let mut ctx_edit: Option<u8> = None; // 우클릭 메뉴 편집 (0 복사, 1 붙여넣기, 2 잘라내기, 3 전체선택)
         if self.sidebar {
             egui::SidePanel::left("side").resizable(false).exact_width(256.0)
                 .frame(Frame::none().fill(pl.side).inner_margin(Margin::symmetric(8.0,10.0)).stroke(bord)).show(ctx,|ui|{
@@ -481,6 +499,20 @@ impl eframe::App for Naru {
                         let over = ctx.input(|i| i.pointer.latest_pos().map_or(false,|p| rect.contains(p)));
                         if over { ctx.set_cursor_icon(*self.tabs[act].cursor.borrow()); }
                     }
+                    // 우클릭 컨텍스트 메뉴 (유저 탭) — OSR은 CEF 기본 메뉴가 안 뜨므로 egui로 직접
+                    if user_owned {
+                        resp.context_menu(|ui|{
+                            ui.set_min_width(140.0);
+                            if ui.button("뒤로").clicked(){ ctx_nav=Some(0); ui.close_menu(); }
+                            if ui.button("앞으로").clicked(){ ctx_nav=Some(1); ui.close_menu(); }
+                            if ui.button("새로고침").clicked(){ ctx_nav=Some(2); ui.close_menu(); }
+                            ui.separator();
+                            if ui.button("복사").clicked(){ ctx_edit=Some(0); ui.close_menu(); }
+                            if ui.button("붙여넣기").clicked(){ ctx_edit=Some(1); ui.close_menu(); }
+                            if ui.button("잘라내기").clicked(){ ctx_edit=Some(2); ui.close_menu(); }
+                            if ui.button("전체 선택").clicked(){ ctx_edit=Some(3); ui.close_menu(); }
+                        });
+                    }
                     // 에이전트 커서 오버레이 (owner!=0): 화살표 + 액션 라벨
                     if self.tabs[act].owner!=0 {
                         let raw=rect.min+self.agent_cur.to_vec2();
@@ -518,6 +550,10 @@ impl eframe::App for Naru {
                 }
             });
         });
+
+        // 우클릭 메뉴 액션 실행 (뒤로/앞으로/새로고침, 복사/붙여넣기/잘라내기/전체선택)
+        if let Some(n)=ctx_nav { if let Some(b)=&self.tabs[act].browser { match n {0=>b.go_back(),1=>b.go_forward(),_=>b.reload()} } }
+        if let Some(e)=ctx_edit { if let Some(b)=&self.tabs[act].browser { if let Some(fr)=b.main_frame(){ match e {0=>fr.copy(),1=>fr.paste(),2=>fr.cut(),_=>fr.select_all()} } } }
 
         // ===== 페이지 내 찾기 바 (Ctrl+F) =====
         if self.find_open {
