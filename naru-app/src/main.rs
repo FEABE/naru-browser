@@ -90,6 +90,7 @@ struct Tab {
     find_result: SharedFind,                    // 페이지 내 찾기 결과 (현재 순번, 총 개수)
     icon: SharedIcon, icon_tex: Option<egui::TextureHandle>, // 파비콘 디코드 셀 + 업로드된 텍스처
     load_err: SharedErr, crashed: SharedFlag, // 로드 에러 / 렌더러 크래시 → 복구 오버레이
+    web_perm: SharedPerm, // 사이트 권한 요청(위치/카메라 등) → 배너
     zoom: f64, // CEF 줌 레벨(0=100%, +1≈120%) — Ctrl±/0로 조절, 브라우저별 유지
 }
 impl Tab {
@@ -103,6 +104,7 @@ impl Tab {
             find_result:Rc::new(RefCell::new((0,0))),
             icon:Rc::new(RefCell::new(IconCell::default())), icon_tex:None,
             load_err:Rc::new(RefCell::new(None)), crashed:Rc::new(RefCell::new(false)),
+            web_perm:Rc::new(RefCell::new(None)),
             zoom:0.0 }
     }
 }
@@ -131,7 +133,8 @@ impl Naru {
                 progress:self.tabs[ti].progress.clone(), status:self.tabs[ti].status.clone(),
                 find_result:self.tabs[ti].find_result.clone(), downloads:self.downloads.clone(),
                 icon:self.tabs[ti].icon.clone(),
-                load_err:self.tabs[ti].load_err.clone(), crashed:self.tabs[ti].crashed.clone() };
+                load_err:self.tabs[ti].load_err.clone(), crashed:self.tabs[ti].crashed.clone(),
+                perm:self.tabs[ti].web_perm.clone() };
             let sc=self.scale.clone(); let url=self.tabs[ti].url.clone();
             self.tabs[ti].browser = Some(create_browser(&url, fr, sz, sc, io));
         }
@@ -779,6 +782,30 @@ impl eframe::App for Naru {
             if let Some(ok)=resp {
                 let _=std::fs::write(tmp("naru_perm.txt"), if ok {"allow"} else {"deny"});
                 self.perm=None;
+            }
+        }
+
+        // ===== 웹 사이트 권한 요청 배너 (위치/카메라/마이크/알림) =====
+        if self.tabs[act].web_perm.borrow().is_some() {
+            let origin = self.tabs[act].web_perm.borrow().as_ref().map(|p|p.origin.clone()).unwrap_or_default();
+            let mut decision:Option<bool>=None;
+            let (bg,txt,wb)= if self.dark {(c(0x2A,0x2B,0x40),c(0xEE,0xEE,0xF6),Stroke::new(1.0,pl.accent))} else {(c(0xFF,0xFF,0xFF),c(0x2B,0x2B,0x36),Stroke::new(1.5,pl.accent))};
+            let site = if origin.is_empty() {"이 사이트".to_string()} else {origin};
+            egui::Area::new(egui::Id::new("webperm_banner")).anchor(egui::Align2::CENTER_TOP, vec2(0.0,64.0)).show(ctx,|ui|{
+                Frame::none().fill(bg).stroke(wb).rounding(Rounding::same(14.0)).inner_margin(Margin::symmetric(18.0,12.0))
+                    .shadow(egui::epaint::Shadow{offset:vec2(0.0,6.0),blur:24.0,spread:0.0,color:Color32::from_black_alpha(80)})
+                    .show(ui,|ui|{ ui.horizontal(|ui|{
+                        ui.painter().circle_filled(ui.cursor().min+vec2(5.0,9.0),5.0,pl.accent); ui.add_space(14.0);
+                        ui.label(RichText::new(format!("{} 에서 권한을 요청합니다", site)).size(12.5).color(txt).strong());
+                        ui.add_space(12.0);
+                        if ui.add(egui::Button::new(RichText::new("허용").size(11.5).color(Color32::WHITE)).fill(pl.accent).rounding(Rounding::same(13.0)).min_size(vec2(46.0,26.0))).clicked(){ decision=Some(true); }
+                        if ui.add(egui::Button::new(RichText::new("거부").size(11.5).color(txt)).fill(pl.hover).rounding(Rounding::same(13.0)).min_size(vec2(46.0,26.0))).clicked(){ decision=Some(false); }
+                    }); });
+            });
+            if let Some(ok)=decision {
+                // 셀을 먼저 비우고 cont 호출 — cont가 on_dismiss를 동기 재진입해도 RefCell 중복대여 패닉 방지
+                let wp = self.tabs[act].web_perm.borrow_mut().take();
+                if let Some(wp)=wp { wp.cb.cont(if ok { PermissionRequestResult::ACCEPT } else { PermissionRequestResult::DENY }); }
             }
         }
 

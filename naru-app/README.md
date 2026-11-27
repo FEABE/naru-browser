@@ -24,6 +24,7 @@ Naru의 **진짜 동작하는 브라우저**. egui 셸 UI + **CEF OSR 웹 렌더
 - **파비콘**: `on_favicon_urlchange`→`host.download_image`(32px)→콜백이 `Image.as_bitmap`(RGBA)로 디코드→주소창 왼쪽에 아이콘 표시(없으면 검색 아이콘)
 - **크래시 복구 / 에러 페이지**: `RequestHandler.on_render_process_terminated`(렌더러 다운)·`LoadHandler.on_load_error`(로드 실패, ERR_ABORTED 무시) 감지 → 웹뷰에 복구 오버레이(사유/URL + "다시 시도"=reload). 새 로드 시작 시 에러 해제
 - **주소창**: Enter로 이동, nav(뒤로/앞으로/새로고침)
+- **사이트 권한 프롬프트**: `PermissionHandler.on_show_permission_prompt`(위치/카메라/마이크/알림 등)을 가로채 상단 배너로 표시(출처 + 허용/거부) → `PermissionPromptCallback.cont(ACCEPT/DENY)`. cont 전에 셀을 비워 on_dismiss 동기 재진입에도 안전
 - **에이전트 컨트롤**: 에이전트 소유 탭이 활성화되면 하단 "agent in control" pill + 사이드바 run 배지.
   CDP(9222)는 **opt-in**: 환경변수 `NARU_AGENT=1`로 실행할 때만 포트 노출(기본 비노출, `NARU_CDP_PORT`로 포트 지정 가능)
 - **메모리/렌더 최적화**: 숨긴 탭은 CPU 픽셀 버퍼 해제, 프레임은 BGRA→`Color32` 1패스 변환(복사 2회→1회+memcpy).

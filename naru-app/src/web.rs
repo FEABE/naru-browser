@@ -34,6 +34,10 @@ pub type SharedIcon = Rc<RefCell<IconCell>>;
 pub type SharedErr = Rc<RefCell<Option<String>>>;  // 로드 에러 "url|reason" (없으면 None)
 pub type SharedFlag = Rc<RefCell<bool>>;            // 렌더러 크래시 여부
 
+// 웹 권한 요청 대기 (위치/카메라/마이크/알림 등) — UI가 허용/거부로 cb.cont 호출
+pub struct WebPerm { pub origin: String, pub perms: u32, pub cb: PermissionPromptCallback }
+pub type SharedPerm = Rc<RefCell<Option<WebPerm>>>;
+
 // CefStringList에서 첫 유효 URL 추출 (sys 함수 — IntoIterator는 소유권을 먹어 &mut에서 못 씀)
 fn first_string(list: &CefStringList) -> Option<String> {
     let raw: *const sys::_cef_string_list_t = list.into();
@@ -56,7 +60,7 @@ pub struct BrowserIo {
     pub url: SharedStr, pub title: SharedStr, pub cursor: SharedCursor,
     pub popups: SharedPopups, pub progress: SharedF32, pub status: SharedStr,
     pub find_result: SharedFind, pub downloads: SharedDownloads, pub icon: SharedIcon,
-    pub load_err: SharedErr, pub crashed: SharedFlag,
+    pub load_err: SharedErr, pub crashed: SharedFlag, pub perm: SharedPerm,
 }
 
 // CEF 커서 타입 → egui 커서 아이콘 (링크=손가락, 입력=I-beam, 리사이즈 방향 등)
@@ -319,8 +323,28 @@ wrap_request_handler! {
 }
 impl RequestHandlerBuilder { pub fn build(h: NaruRequest) -> RequestHandler { Self::new(h) } }
 
+// PermissionHandler: 사이트의 권한 요청(위치/카메라/마이크/알림)을 가로채 우리가 직접 프롬프트
+#[derive(Clone)] pub struct NaruPerm { pending: SharedPerm }
+wrap_permission_handler! {
+    pub struct PermissionHandlerBuilder { handler: NaruPerm, }
+    impl PermissionHandler {
+        fn on_show_permission_prompt(&self, _b: Option<&mut Browser>, _id: u64, origin: Option<&CefString>,
+                                     perms: u32, callback: Option<&mut PermissionPromptCallback>) -> ::std::os::raw::c_int {
+            if let Some(cb)=callback {
+                let o = origin.map(|o|o.to_string()).unwrap_or_default();
+                *self.handler.pending.borrow_mut() = Some(WebPerm{ origin: o, perms, cb: cb.clone() });
+                1 // 우리가 직접 프롬프트 표시(기본 CEF 프롬프트는 OSR에서 안 뜸)
+            } else { 0 }
+        }
+        fn on_dismiss_permission_prompt(&self, _b: Option<&mut Browser>, _id: u64, _result: PermissionRequestResult) {
+            *self.handler.pending.borrow_mut() = None; // 외부 해제 시 배너 제거
+        }
+    }
+}
+impl PermissionHandlerBuilder { pub fn build(h: NaruPerm) -> PermissionHandler { Self::new(h) } }
+
 wrap_client! {
-    pub(crate) struct ClientBuilder { render_handler: RenderHandler, display_handler: DisplayHandler, life_span_handler: LifeSpanHandler, find_handler: FindHandler, download_handler: DownloadHandler, load_handler: LoadHandler, request_handler: RequestHandler, }
+    pub(crate) struct ClientBuilder { render_handler: RenderHandler, display_handler: DisplayHandler, life_span_handler: LifeSpanHandler, find_handler: FindHandler, download_handler: DownloadHandler, load_handler: LoadHandler, request_handler: RequestHandler, permission_handler: PermissionHandler, }
     impl Client {
         fn render_handler(&self) -> Option<cef::RenderHandler> { Some(self.render_handler.clone()) }
         fn display_handler(&self) -> Option<cef::DisplayHandler> { Some(self.display_handler.clone()) }
@@ -329,9 +353,10 @@ wrap_client! {
         fn download_handler(&self) -> Option<cef::DownloadHandler> { Some(self.download_handler.clone()) }
         fn load_handler(&self) -> Option<cef::LoadHandler> { Some(self.load_handler.clone()) }
         fn request_handler(&self) -> Option<cef::RequestHandler> { Some(self.request_handler.clone()) }
+        fn permission_handler(&self) -> Option<cef::PermissionHandler> { Some(self.permission_handler.clone()) }
     }
 }
-impl ClientBuilder { pub(crate) fn build(r: RenderHandler, d: DisplayHandler, l: LifeSpanHandler, fh: FindHandler, dh: DownloadHandler, lh: LoadHandler, rh: RequestHandler) -> cef::Client { Self::new(r, d, l, fh, dh, lh, rh) } }
+impl ClientBuilder { pub(crate) fn build(r: RenderHandler, d: DisplayHandler, l: LifeSpanHandler, fh: FindHandler, dh: DownloadHandler, lh: LoadHandler, rh: RequestHandler, ph: PermissionHandler) -> cef::Client { Self::new(r, d, l, fh, dh, lh, rh, ph) } }
 
 pub fn create_browser(url:&str, frame:SharedFrame, size:SharedSize, scale:SharedScale, io:BrowserIo) -> Browser {
     let render = NaruRender::new(frame, size, scale);
@@ -341,7 +366,8 @@ pub fn create_browser(url:&str, frame:SharedFrame, size:SharedSize, scale:Shared
     let dh = NaruDownload { list:io.downloads };
     let lh = NaruLoad { err:io.load_err };
     let rh = NaruRequest { crashed:io.crashed };
-    let mut client = ClientBuilder::build(RenderHandlerBuilder::build(render), DisplayHandlerBuilder::build(disp), LifeSpanHandlerBuilder::build(ls), FindHandlerBuilder::build(fh), DownloadHandlerBuilder::build(dh), LoadHandlerBuilder::build(lh), RequestHandlerBuilder::build(rh));
+    let ph = NaruPerm { pending:io.perm };
+    let mut client = ClientBuilder::build(RenderHandlerBuilder::build(render), DisplayHandlerBuilder::build(disp), LifeSpanHandlerBuilder::build(ls), FindHandlerBuilder::build(fh), DownloadHandlerBuilder::build(dh), LoadHandlerBuilder::build(lh), RequestHandlerBuilder::build(rh), PermissionHandlerBuilder::build(ph));
     let wi = WindowInfo { windowless_rendering_enabled: true as _, ..Default::default() };
     let bs = BrowserSettings { windowless_frame_rate: 60, ..Default::default() };
     browser_host_create_browser_sync(Some(&wi), Some(&mut client), Some(&url.into()), Some(&bs), None, None)
