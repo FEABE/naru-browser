@@ -16,7 +16,8 @@ Naru의 **진짜 동작하는 브라우저**. egui 셸 UI + **CEF OSR 웹 렌더
 - **커서 동기화**: OSR은 OS가 웹 커서를 모르므로 `on_cursor_change`(DisplayHandler)로 받아 egui 커서로 매핑(링크=손가락, 입력=I-beam, 리사이즈 방향 등)
 - **팝업/새 창 → 새 탭**: `on_before_popup`(LifeSpanHandler)으로 CEF 팝업을 취소하고 대상 URL을 새 탭으로 연다. 사용자 제스처(클릭)로 연 것만 승격(스크립트 자동 팝업 차단). 새 탭은 연 탭의 owner/area/proj 상속
 - **HiDPI**: `ctx.pixels_per_point()`를 매 프레임 추적해 `screen_info`의 device_scale_factor로 보고 → 고배율 디스플레이에서 선명(배율 변경 시 notify_screen_info_changed). view_rect·마우스 좌표는 논리 단위 유지, paint 버퍼만 배율²로 커짐
-- **단축키/확대축소**: Ctrl+T 새 탭, Ctrl+W 닫기, Ctrl+Tab/Ctrl+Shift+Tab 전환, Ctrl+L 주소창 포커스, Ctrl +/-/0 확대·축소(CEF `set_zoom_level`, 탭별 유지). egui `consume_key`로 CEF 전달 전에 가로챔
+- **단축키/확대축소**: Ctrl+T 새 탭, Ctrl+Shift+N 시크릿 탭, Ctrl+W 닫기, Ctrl+Tab/Ctrl+Shift+Tab 전환, Ctrl+L 주소창 포커스, Ctrl +/-/0 확대·축소(CEF `set_zoom_level`, 탭별 유지), Ctrl+\ 분할 뷰. egui `consume_key`로 CEF 전달 전에 가로챔
+- **분할 뷰(Ctrl+\)**: 오른쪽 `SidePanel`에 둘째 탭을 나란히 표시(중앙 패널이 자동으로 왼쪽 절반으로 축소 — 기존 렌더 경로 불변). 두 탭 모두 `was_hidden(0)`로 살려 렌더, 오른쪽 패널은 마우스·커서 입력 처리(키보드는 활성=왼쪽)
 - **로딩 진행바 + 상태바**: `on_loading_progress_change`로 웹뷰 상단에 얇은 진행바(0<진행<1일 때), `on_status_message`로 좌하단에 링크 호버 URL 등 상태 표시
 - **페이지 내 찾기(Ctrl+F)**: 우상단 찾기 바(입력·n/m 매치수·↑↓·✕), `host.find`/`stop_finding` + `FindHandler.on_find_result`로 매치 수 표시. Enter/↓ 다음·↑ 이전, Esc 닫기
 - **다운로드**: `DownloadHandler`(can_download=1로 허용) — OS 다운로드 폴더(`%USERPROFILE%\Downloads`)에 대화상자 없이 저장, 진행도를 전 탭 공유 목록에 기록. 사이드바 `↓ downloads`(진행 중 개수 표시)로 우하단 패널 토글, 새 다운로드 시작 시 자동 열림(이름·%·✓완료)

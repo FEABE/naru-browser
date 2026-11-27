@@ -122,6 +122,7 @@ struct Naru {
     scale: SharedScale, // 디바이스 배율(HiDPI) — 모든 탭이 공유, 매 프레임 ctx.pixels_per_point로 갱신
     focus_addr: bool, // Ctrl+L → 다음 프레임에 주소창 포커스 요청
     find_open: bool, find_query: String, find_focus: bool, find_last: String, // 페이지 내 찾기 바 상태
+    split: bool, split_other: usize, shown_split: usize, // 분할 뷰(오른쪽 패널에 둘째 탭)
     downloads: SharedDownloads, downloads_open: bool, dl_count: usize, // 모든 탭 공유 다운로드 목록 + 패널 열림 + 새 다운로드 감지용 이전 개수
 }
 impl Naru {
@@ -234,6 +235,10 @@ impl eframe::App for Naru {
             if ctx.input_mut(|i| i.consume_key(cmd, Key::Tab)) && self.tabs.len()>1 { self.active=(self.active+1)%self.tabs.len(); }
             if ctx.input_mut(|i| i.consume_key(cmd_shift, Key::Tab)) && self.tabs.len()>1 { self.active=(self.active+self.tabs.len()-1)%self.tabs.len(); }
             if ctx.input_mut(|i| i.consume_key(cmd, Key::L)) { self.focus_addr=true; }
+            if ctx.input_mut(|i| i.consume_key(cmd, Key::Backslash)) { // 분할 뷰 토글
+                self.split = !self.split && self.tabs.len()>=2;
+                self.shown=usize::MAX;
+            }
             // 페이지 내 찾기: Ctrl+F 토글, Escape 닫기
             if ctx.input_mut(|i| i.consume_key(cmd, Key::F)) {
                 self.find_open = !self.find_open;
@@ -291,17 +296,28 @@ impl eframe::App for Naru {
         // 배율이 바뀌었으면 활성 브라우저에 알려 재질의/재레이아웃 (view_rect·좌표는 논리 단위 유지, paint 버퍼만 배율²로 커짐)
         if scale_changed { if let Some(b)=&self.tabs[act].browser { if let Some(h)=b.host(){ h.notify_screen_info_changed(); h.was_resized(); } } }
 
-        // 탭 전환: 비활성 숨김 + 활성 표시
-        if self.shown != act {
+        // 분할 뷰 유효성: 탭 2개 미만이면 해제, split_other가 범위밖/활성과 같으면 재선택
+        if self.split {
+            if self.tabs.len()<2 { self.split=false; }
+            else if self.split_other>=self.tabs.len() || self.split_other==act {
+                self.split_other=(0..self.tabs.len()).find(|&i|i!=act).unwrap_or(0); self.shown=usize::MAX;
+            }
+        }
+        if self.split { let so=self.split_other; self.ensure_browser(so); }
+        let want_split = if self.split { self.split_other } else { usize::MAX };
+
+        // 탭 전환: 비활성 숨김 + 활성(및 분할 상대) 표시
+        if self.shown != act || self.shown_split != want_split {
             for i in 0..self.tabs.len() {
-                if i!=act {
+                if i!=act && i!=want_split {
                     if let Some(b)=&self.tabs[i].browser { if let Some(h)=b.host(){ h.was_hidden(1); } }
                     // 숨긴 탭의 CPU 픽셀 버퍼 해제 — 표시엔 texture만 쓰므로 무영향, 재표시 시 다음 paint가 다시 채움 (RAM 절약)
                     { let fr=self.tabs[i].frame.clone(); let mut f=fr.borrow_mut(); f.pixels=Vec::new(); f.w=0; f.h=0; f.dirty=false; }
                 }
             }
             if let Some(b)=&self.tabs[act].browser { if let Some(h)=b.host(){ h.was_hidden(0); h.notify_screen_info_changed(); h.was_resized(); h.set_focus(1); } }
-            self.shown=act; self.address=self.tabs[act].url.clone();
+            if want_split!=usize::MAX { if let Some(b)=&self.tabs[want_split].browser { if let Some(h)=b.host(){ h.was_hidden(0); h.was_resized(); } } }
+            self.shown=act; self.shown_split=want_split; self.address=self.tabs[act].url.clone();
         }
 
         // 활성 탭 프레임 업로드
@@ -323,6 +339,24 @@ impl eframe::App for Naru {
               }
               f.dirty=false; f.rects.clear(); got_frame=true;
           } }
+
+        // 분할 상대 탭 프레임 업로드 (오른쪽 패널용 텍스처)
+        if self.split && self.split_other<self.tabs.len() && self.split_other!=act {
+            let so=self.split_other; let frame=self.tabs[so].frame.clone(); let mut f=frame.borrow_mut();
+            if f.dirty && f.w>0 && f.h>0 && f.pixels.len()==f.w*f.h {
+                if f.full || self.tabs[so].tex.is_none() {
+                    let img=egui::ColorImage{ size:[f.w,f.h], pixels:f.pixels.clone() };
+                    match &mut self.tabs[so].tex { Some(t)=>t.set(img,egui::TextureOptions::LINEAR),
+                        None=>self.tabs[so].tex=Some(ctx.load_texture("web2",img,egui::TextureOptions::LINEAR)) }
+                } else if let Some(t)=&mut self.tabs[so].tex {
+                    let (w,rects)=(f.w, f.rects.clone());
+                    for [x0,y0,rw,rh] in rects { let mut sub=Vec::with_capacity(rw*rh);
+                        for yy in y0..y0+rh { let row=yy*w+x0; sub.extend_from_slice(&f.pixels[row..row+rw]); }
+                        t.set_partial([x0,y0], egui::ColorImage{size:[rw,rh],pixels:sub}, egui::TextureOptions::LINEAR); }
+                }
+                f.dirty=false; f.rects.clear();
+            }
+        }
 
         // 파비콘 텍스처 업로드 (활성 탭) — 콜백이 dirty로 표시하면 ColorImage로 올림
         { let cell=self.tabs[act].icon.clone(); let mut c=cell.borrow_mut();
@@ -509,6 +543,41 @@ impl eframe::App for Naru {
         if new_space {
             let n=self.areas.len();
             self.areas.push(Area{name:format!("space {}",n+1), color:(n%3) as u8, open:true});
+        }
+
+        // ===== 분할 뷰: 오른쪽 패널(둘째 탭) — 중앙 패널보다 먼저 추가해 중앙이 왼쪽 절반으로 줄게 함 =====
+        if self.split && self.split_other<self.tabs.len() && self.split_other!=act {
+            let so=self.split_other;
+            let sw=ctx.screen_rect().width(); let side=if self.sidebar {256.0} else {0.0};
+            let half=((sw-side)*0.5 - 10.0).max(220.0);
+            egui::SidePanel::right("splitpane").resizable(false).exact_width(half)
+                .frame(Frame::none().fill(pl.bg).inner_margin(Margin{left:0.0,right:12.0,top:12.0,bottom:12.0})).show(ctx,|ui|{
+                Frame::none().fill(pl.web).rounding(Rounding::same(10.0)).stroke(bord).show(ui,|ui|{
+                    let avail=ui.available_size();
+                    { let mut s=self.tabs[so].size.borrow_mut(); let nw=avail.x.max(1.0); let nh=avail.y.max(1.0);
+                      if (s.0-nw).abs()>0.5||(s.1-nh).abs()>0.5 { *s=(nw,nh);
+                          if let Some(b)=&self.tabs[so].browser { if let Some(h)=b.host(){ h.was_resized(); } } } }
+                    if let Some(t)=&self.tabs[so].tex {
+                        let resp=ui.add(egui::Image::new((t.id(),avail)).sense(egui::Sense::click_and_drag()));
+                        let rect=resp.rect;
+                        if self.tabs[so].owner==0 { if let Some(b)=&self.tabs[so].browser { if let Some(host)=b.host() {
+                            ctx.input(|i|{ if let Some(pos)=i.pointer.latest_pos(){ if rect.contains(pos){
+                                let x=(pos.x-rect.left()).round() as i32; let y=(pos.y-rect.top()).round() as i32;
+                                const LBTN:u32=16; let md=if i.pointer.primary_down(){LBTN}else{0};
+                                let ev=MouseEvent{x,y,modifiers:md}; host.send_mouse_move_event(Some(&ev),0);
+                                if i.pointer.primary_pressed(){ let e=MouseEvent{x,y,modifiers:LBTN}; host.send_mouse_click_event(Some(&e),MouseButtonType::LEFT,0,1); }
+                                if i.pointer.primary_released(){ let e=MouseEvent{x,y,modifiers:0}; host.send_mouse_click_event(Some(&e),MouseButtonType::LEFT,1,1); }
+                                let sc=i.raw_scroll_delta; if sc.x!=0.0||sc.y!=0.0 { host.send_mouse_wheel_event(Some(&ev),(sc.x*3.0) as i32,(sc.y*3.0) as i32); }
+                            }} });
+                            let over=ctx.input(|i| i.pointer.latest_pos().map_or(false,|p|rect.contains(p)));
+                            if over { ctx.set_cursor_icon(*self.tabs[so].cursor.borrow()); }
+                        } } }
+                    } else {
+                        ui.vertical_centered(|ui|{ ui.add_space(ui.available_height()*0.44);
+                            ui.label(RichText::new("naru:// …").color(pl.muted).size(13.0)); });
+                    }
+                });
+            });
         }
 
         // ===== 중앙 웹뷰 =====
@@ -887,6 +956,7 @@ fn main() -> std::process::ExitCode {
         agent_cur:egui::pos2(80.0,80.0), agent_tgt:None, agent_do_click:false, agent_label:String::new(), perm:None,
         data_dir:dir, last_sig:String::new(), ime_comp:String::new(), scale:Rc::new(RefCell::new(1.0)), focus_addr:false,
         find_open:false, find_query:String::new(), find_focus:false, find_last:String::new(),
+        split:false, split_other:0, shown_split:usize::MAX,
         downloads:Rc::new(RefCell::new(Vec::new())), downloads_open:false, dl_count:0 };
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
