@@ -22,6 +22,8 @@ pub type SharedDownloads = Rc<RefCell<Vec<DlItem>>>;
 // 파비콘 — 디코드된 RGBA 이미지(dirty면 UI가 텍스처로 업로드)
 #[derive(Default)] pub struct IconCell { pub dirty: bool, pub img: Option<(u32, u32, Vec<u8>)> }
 pub type SharedIcon = Rc<RefCell<IconCell>>;
+pub type SharedErr = Rc<RefCell<Option<String>>>;  // 로드 에러 "url|reason" (없으면 None)
+pub type SharedFlag = Rc<RefCell<bool>>;            // 렌더러 크래시 여부
 
 // CefStringList에서 첫 유효 URL 추출 (sys 함수 — IntoIterator는 소유권을 먹어 &mut에서 못 씀)
 fn first_string(list: &CefStringList) -> Option<String> {
@@ -45,6 +47,7 @@ pub struct BrowserIo {
     pub url: SharedStr, pub title: SharedStr, pub cursor: SharedCursor,
     pub popups: SharedPopups, pub progress: SharedF32, pub status: SharedStr,
     pub find_result: SharedFind, pub downloads: SharedDownloads, pub icon: SharedIcon,
+    pub load_err: SharedErr, pub crashed: SharedFlag,
 }
 
 // CEF 커서 타입 → egui 커서 아이콘 (링크=손가락, 입력=I-beam, 리사이즈 방향 등)
@@ -262,17 +265,52 @@ wrap_download_handler! {
 }
 impl DownloadHandlerBuilder { pub fn build(h: NaruDownload) -> DownloadHandler { Self::new(h) } }
 
+// LoadHandler: 로드 에러 기록 + 새 로드 시작 시 에러 해제
+#[derive(Clone)] pub struct NaruLoad { err: SharedErr }
+wrap_load_handler! {
+    pub struct LoadHandlerBuilder { handler: NaruLoad, }
+    impl LoadHandler {
+        fn on_loading_state_change(&self, _b: Option<&mut Browser>, is_loading: ::std::os::raw::c_int,
+                                   _can_back: ::std::os::raw::c_int, _can_fwd: ::std::os::raw::c_int) {
+            if is_loading!=0 { *self.handler.err.borrow_mut()=None; } // 새 로드 시작 → 이전 에러 해제
+        }
+        fn on_load_error(&self, _b: Option<&mut Browser>, _f: Option<&mut Frame>, error_code: Errorcode,
+                         error_text: Option<&CefString>, failed_url: Option<&CefString>) {
+            if error_code==Errorcode::ABORTED { return; } // 페이지 이탈 등 정상 중단은 무시
+            let txt = error_text.map(|t|t.to_string()).unwrap_or_default();
+            let url = failed_url.map(|u|u.to_string()).unwrap_or_default();
+            *self.handler.err.borrow_mut() = Some(format!("{}|{}", url, txt));
+        }
+    }
+}
+impl LoadHandlerBuilder { pub fn build(h: NaruLoad) -> LoadHandler { Self::new(h) } }
+
+// RequestHandler: 렌더러 프로세스 종료(크래시) 감지 → UI가 복구 오버레이 표시
+#[derive(Clone)] pub struct NaruRequest { crashed: SharedFlag }
+wrap_request_handler! {
+    pub struct RequestHandlerBuilder { handler: NaruRequest, }
+    impl RequestHandler {
+        fn on_render_process_terminated(&self, _b: Option<&mut Browser>, _status: TerminationStatus,
+                                        _ec: ::std::os::raw::c_int, _es: Option<&CefString>) {
+            *self.handler.crashed.borrow_mut() = true;
+        }
+    }
+}
+impl RequestHandlerBuilder { pub fn build(h: NaruRequest) -> RequestHandler { Self::new(h) } }
+
 wrap_client! {
-    pub(crate) struct ClientBuilder { render_handler: RenderHandler, display_handler: DisplayHandler, life_span_handler: LifeSpanHandler, find_handler: FindHandler, download_handler: DownloadHandler, }
+    pub(crate) struct ClientBuilder { render_handler: RenderHandler, display_handler: DisplayHandler, life_span_handler: LifeSpanHandler, find_handler: FindHandler, download_handler: DownloadHandler, load_handler: LoadHandler, request_handler: RequestHandler, }
     impl Client {
         fn render_handler(&self) -> Option<cef::RenderHandler> { Some(self.render_handler.clone()) }
         fn display_handler(&self) -> Option<cef::DisplayHandler> { Some(self.display_handler.clone()) }
         fn life_span_handler(&self) -> Option<cef::LifeSpanHandler> { Some(self.life_span_handler.clone()) }
         fn find_handler(&self) -> Option<cef::FindHandler> { Some(self.find_handler.clone()) }
         fn download_handler(&self) -> Option<cef::DownloadHandler> { Some(self.download_handler.clone()) }
+        fn load_handler(&self) -> Option<cef::LoadHandler> { Some(self.load_handler.clone()) }
+        fn request_handler(&self) -> Option<cef::RequestHandler> { Some(self.request_handler.clone()) }
     }
 }
-impl ClientBuilder { pub(crate) fn build(r: RenderHandler, d: DisplayHandler, l: LifeSpanHandler, fh: FindHandler, dh: DownloadHandler) -> cef::Client { Self::new(r, d, l, fh, dh) } }
+impl ClientBuilder { pub(crate) fn build(r: RenderHandler, d: DisplayHandler, l: LifeSpanHandler, fh: FindHandler, dh: DownloadHandler, lh: LoadHandler, rh: RequestHandler) -> cef::Client { Self::new(r, d, l, fh, dh, lh, rh) } }
 
 pub fn create_browser(url:&str, frame:SharedFrame, size:SharedSize, scale:SharedScale, io:BrowserIo) -> Browser {
     let render = NaruRender::new(frame, size, scale);
@@ -280,7 +318,9 @@ pub fn create_browser(url:&str, frame:SharedFrame, size:SharedSize, scale:Shared
     let ls = NaruLifeSpan { popups:io.popups };
     let fh = NaruFind { result:io.find_result };
     let dh = NaruDownload { list:io.downloads };
-    let mut client = ClientBuilder::build(RenderHandlerBuilder::build(render), DisplayHandlerBuilder::build(disp), LifeSpanHandlerBuilder::build(ls), FindHandlerBuilder::build(fh), DownloadHandlerBuilder::build(dh));
+    let lh = NaruLoad { err:io.load_err };
+    let rh = NaruRequest { crashed:io.crashed };
+    let mut client = ClientBuilder::build(RenderHandlerBuilder::build(render), DisplayHandlerBuilder::build(disp), LifeSpanHandlerBuilder::build(ls), FindHandlerBuilder::build(fh), DownloadHandlerBuilder::build(dh), LoadHandlerBuilder::build(lh), RequestHandlerBuilder::build(rh));
     let wi = WindowInfo { windowless_rendering_enabled: true as _, ..Default::default() };
     let bs = BrowserSettings { windowless_frame_rate: 60, ..Default::default() };
     browser_host_create_browser_sync(Some(&wi), Some(&mut client), Some(&url.into()), Some(&bs), None, None)

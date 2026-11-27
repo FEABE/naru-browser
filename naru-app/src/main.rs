@@ -89,6 +89,7 @@ struct Tab {
     progress: SharedF32, status: SharedStr,     // 로딩 진행도(0~1) + 상태바(링크 호버 URL 등)
     find_result: SharedFind,                    // 페이지 내 찾기 결과 (현재 순번, 총 개수)
     icon: SharedIcon, icon_tex: Option<egui::TextureHandle>, // 파비콘 디코드 셀 + 업로드된 텍스처
+    load_err: SharedErr, crashed: SharedFlag, // 로드 에러 / 렌더러 크래시 → 복구 오버레이
     zoom: f64, // CEF 줌 레벨(0=100%, +1≈120%) — Ctrl±/0로 조절, 브라우저별 유지
 }
 impl Tab {
@@ -101,6 +102,7 @@ impl Tab {
             progress:Rc::new(RefCell::new(0.0)), status:Rc::new(RefCell::new(String::new())),
             find_result:Rc::new(RefCell::new((0,0))),
             icon:Rc::new(RefCell::new(IconCell::default())), icon_tex:None,
+            load_err:Rc::new(RefCell::new(None)), crashed:Rc::new(RefCell::new(false)),
             zoom:0.0 }
     }
 }
@@ -128,7 +130,8 @@ impl Naru {
                 cursor:self.tabs[ti].cursor.clone(), popups:self.tabs[ti].popups.clone(),
                 progress:self.tabs[ti].progress.clone(), status:self.tabs[ti].status.clone(),
                 find_result:self.tabs[ti].find_result.clone(), downloads:self.downloads.clone(),
-                icon:self.tabs[ti].icon.clone() };
+                icon:self.tabs[ti].icon.clone(),
+                load_err:self.tabs[ti].load_err.clone(), crashed:self.tabs[ti].crashed.clone() };
             let sc=self.scale.clone(); let url=self.tabs[ti].url.clone();
             self.tabs[ti].browser = Some(create_browser(&url, fr, sz, sc, io));
         }
@@ -563,6 +566,32 @@ impl eframe::App for Naru {
                     let r=egui::Rect::from_min_size(web_rect.left_bottom()-vec2(0.0,gal.size().y+pad.y*2.0), gal.size()+pad*2.0);
                     p.rect(r, Rounding{nw:0.0,ne:7.0,sw:0.0,se:0.0}, pl.topbar, Stroke::new(1.0,pl.border));
                     p.galley(r.min+pad, gal, pl.txt);
+                }
+                // 크래시/로드 에러 복구 오버레이
+                let crashed=*self.tabs[act].crashed.borrow();
+                let lerr=self.tabs[act].load_err.borrow().clone();
+                if crashed || lerr.is_some() {
+                    ui.painter().rect_filled(web_rect, Rounding::same(10.0), Color32::from_rgba_unmultiplied(0,0,0, if self.dark {150} else {110}));
+                    let (title, body) = if crashed { ("페이지가 다운됐어요".to_string(), "렌더러 프로세스가 종료됐습니다. 새로고침으로 복구하세요.".to_string()) }
+                        else { let e=lerr.unwrap_or_default(); let mut it=e.splitn(2,'|');
+                            let url=it.next().unwrap_or("").to_string(); let reason=it.next().unwrap_or("").to_string();
+                            ("페이지를 열 수 없습니다".to_string(), format!("{}\n{}", reason, url)) };
+                    let mut retry=false;
+                    egui::Area::new(egui::Id::new("err_overlay")).fixed_pos(web_rect.center()-vec2(170.0,74.0)).show(ctx,|ui|{
+                        Frame::none().fill(pl.topbar).stroke(bord).rounding(Rounding::same(14.0)).inner_margin(Margin::symmetric(22.0,18.0))
+                            .shadow(egui::epaint::Shadow{offset:vec2(0.0,6.0),blur:24.0,spread:0.0,color:Color32::from_black_alpha(90)})
+                            .show(ui,|ui|{ ui.set_width(300.0); ui.vertical(|ui|{
+                                ui.label(RichText::new(title).size(14.5).color(pl.txt).strong());
+                                ui.add_space(7.0);
+                                ui.label(RichText::new(body).size(11.5).color(pl.muted));
+                                ui.add_space(12.0);
+                                if ui.add(egui::Button::new(RichText::new("다시 시도").size(12.0).color(Color32::WHITE)).fill(pl.accent).rounding(Rounding::same(10.0)).min_size(vec2(90.0,30.0))).clicked(){ retry=true; }
+                            }); });
+                    });
+                    if retry {
+                        *self.tabs[act].crashed.borrow_mut()=false; *self.tabs[act].load_err.borrow_mut()=None;
+                        if let Some(b)=&self.tabs[act].browser { b.reload(); }
+                    }
                 }
             });
         });
