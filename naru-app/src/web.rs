@@ -15,12 +15,16 @@ pub type SharedPopups = Rc<RefCell<Vec<String>>>; // on_before_popup으로 취�
 pub type SharedF32 = Rc<RefCell<f32>>;            // 로딩 진행도(0~1)
 pub type SharedFind = Rc<RefCell<(i32, i32)>>;    // 페이지 내 찾기 결과 (현재 매치 순번, 총 매치 수)
 
+// 다운로드 항목 (모든 탭이 공유하는 하나의 목록에 쌓임 → 다운로드 패널 표시)
+pub struct DlItem { pub id: u32, pub name: String, pub pct: i32, pub done: bool, pub canceled: bool }
+pub type SharedDownloads = Rc<RefCell<Vec<DlItem>>>;
+
 // 탭별 공유 I/O 묶음 — create_browser에 넘길 핸들러↔UI 공유셀들(위치 인자 폭발·오삽입 방지)
 #[derive(Clone)]
 pub struct BrowserIo {
     pub url: SharedStr, pub title: SharedStr, pub cursor: SharedCursor,
     pub popups: SharedPopups, pub progress: SharedF32, pub status: SharedStr,
-    pub find_result: SharedFind,
+    pub find_result: SharedFind, pub downloads: SharedDownloads,
 }
 
 // CEF 커서 타입 → egui 커서 아이콘 (링크=손가락, 입력=I-beam, 리사이즈 방향 등)
@@ -178,23 +182,54 @@ wrap_find_handler! {
 }
 impl FindHandlerBuilder { pub fn build(h: NaruFind) -> FindHandler { Self::new(h) } }
 
+// DownloadHandler: 다운로드를 OS 다운로드 폴더에 대화상자 없이 저장 + 진행도를 공유목록에 upsert.
+#[derive(Clone)] pub struct NaruDownload { list: SharedDownloads }
+wrap_download_handler! {
+    pub struct DownloadHandlerBuilder { handler: NaruDownload, }
+    impl DownloadHandler {
+        // 기본값이 0(차단)이라 반드시 1 반환해야 다운로드가 시작됨
+        fn can_download(&self, _b: Option<&mut Browser>, _url: Option<&CefString>, _m: Option<&CefString>) -> ::std::os::raw::c_int { 1 }
+        fn on_before_download(&self, _b: Option<&mut Browser>, item: Option<&mut DownloadItem>,
+                              suggested_name: Option<&CefString>, callback: Option<&mut BeforeDownloadCallback>) -> ::std::os::raw::c_int {
+            let name = suggested_name.map(|s|s.to_string()).filter(|s|!s.is_empty()).unwrap_or_else(||"download".into());
+            let id = item.as_ref().map(|i|i.id()).unwrap_or(0);
+            { let mut l=self.handler.list.borrow_mut();
+              if !l.iter().any(|d|d.id==id) { l.push(DlItem{ id, name:name.clone(), pct:0, done:false, canceled:false }); } }
+            // OS 다운로드 폴더에 저장(대화상자 0). 경로를 못 구하면 빈 문자열 → CEF 기본 처리.
+            let path = std::env::var("USERPROFILE").ok().map(|p| format!("{}\\Downloads\\{}", p, name)).unwrap_or_default();
+            if let Some(cb)=callback { cb.cont(Some(&path.as_str().into()), 0); }
+            1
+        }
+        fn on_download_updated(&self, _b: Option<&mut Browser>, item: Option<&mut DownloadItem>, _cb: Option<&mut DownloadItemCallback>) {
+            let Some(it)=item else { return };
+            let (id,pct,done,canceled)=(it.id(), it.percent_complete(), it.is_complete()!=0, it.is_canceled()!=0);
+            let mut l=self.handler.list.borrow_mut();
+            if let Some(e)=l.iter_mut().find(|d|d.id==id) { e.pct=pct; e.done=done; e.canceled=canceled; }
+            else { l.push(DlItem{ id, name:"download".into(), pct, done, canceled }); }
+        }
+    }
+}
+impl DownloadHandlerBuilder { pub fn build(h: NaruDownload) -> DownloadHandler { Self::new(h) } }
+
 wrap_client! {
-    pub(crate) struct ClientBuilder { render_handler: RenderHandler, display_handler: DisplayHandler, life_span_handler: LifeSpanHandler, find_handler: FindHandler, }
+    pub(crate) struct ClientBuilder { render_handler: RenderHandler, display_handler: DisplayHandler, life_span_handler: LifeSpanHandler, find_handler: FindHandler, download_handler: DownloadHandler, }
     impl Client {
         fn render_handler(&self) -> Option<cef::RenderHandler> { Some(self.render_handler.clone()) }
         fn display_handler(&self) -> Option<cef::DisplayHandler> { Some(self.display_handler.clone()) }
         fn life_span_handler(&self) -> Option<cef::LifeSpanHandler> { Some(self.life_span_handler.clone()) }
         fn find_handler(&self) -> Option<cef::FindHandler> { Some(self.find_handler.clone()) }
+        fn download_handler(&self) -> Option<cef::DownloadHandler> { Some(self.download_handler.clone()) }
     }
 }
-impl ClientBuilder { pub(crate) fn build(r: RenderHandler, d: DisplayHandler, l: LifeSpanHandler, fh: FindHandler) -> cef::Client { Self::new(r, d, l, fh) } }
+impl ClientBuilder { pub(crate) fn build(r: RenderHandler, d: DisplayHandler, l: LifeSpanHandler, fh: FindHandler, dh: DownloadHandler) -> cef::Client { Self::new(r, d, l, fh, dh) } }
 
 pub fn create_browser(url:&str, frame:SharedFrame, size:SharedSize, scale:SharedScale, io:BrowserIo) -> Browser {
     let render = NaruRender::new(frame, size, scale);
     let disp = NaruDisplay { url:io.url, title:io.title, cursor:io.cursor, progress:io.progress, status:io.status };
     let ls = NaruLifeSpan { popups:io.popups };
     let fh = NaruFind { result:io.find_result };
-    let mut client = ClientBuilder::build(RenderHandlerBuilder::build(render), DisplayHandlerBuilder::build(disp), LifeSpanHandlerBuilder::build(ls), FindHandlerBuilder::build(fh));
+    let dh = NaruDownload { list:io.downloads };
+    let mut client = ClientBuilder::build(RenderHandlerBuilder::build(render), DisplayHandlerBuilder::build(disp), LifeSpanHandlerBuilder::build(ls), FindHandlerBuilder::build(fh), DownloadHandlerBuilder::build(dh));
     let wi = WindowInfo { windowless_rendering_enabled: true as _, ..Default::default() };
     let bs = BrowserSettings { windowless_frame_rate: 60, ..Default::default() };
     browser_host_create_browser_sync(Some(&wi), Some(&mut client), Some(&url.into()), Some(&bs), None, None)

@@ -19,6 +19,7 @@ Naru의 **진짜 동작하는 브라우저**. egui 셸 UI + **CEF OSR 웹 렌더
 - **단축키/확대축소**: Ctrl+T 새 탭, Ctrl+W 닫기, Ctrl+Tab/Ctrl+Shift+Tab 전환, Ctrl+L 주소창 포커스, Ctrl +/-/0 확대·축소(CEF `set_zoom_level`, 탭별 유지). egui `consume_key`로 CEF 전달 전에 가로챔
 - **로딩 진행바 + 상태바**: `on_loading_progress_change`로 웹뷰 상단에 얇은 진행바(0<진행<1일 때), `on_status_message`로 좌하단에 링크 호버 URL 등 상태 표시
 - **페이지 내 찾기(Ctrl+F)**: 우상단 찾기 바(입력·n/m 매치수·↑↓·✕), `host.find`/`stop_finding` + `FindHandler.on_find_result`로 매치 수 표시. Enter/↓ 다음·↑ 이전, Esc 닫기
+- **다운로드**: `DownloadHandler`(can_download=1로 허용) — OS 다운로드 폴더(`%USERPROFILE%\Downloads`)에 대화상자 없이 저장, 진행도를 전 탭 공유 목록에 기록. 사이드바 `↓ downloads`(진행 중 개수 표시)로 우하단 패널 토글, 새 다운로드 시작 시 자동 열림(이름·%·✓완료)
 - **주소창**: Enter로 이동, nav(뒤로/앞으로/새로고침)
 - **에이전트 컨트롤**: 에이전트 소유 탭이 활성화되면 하단 "agent in control" pill + 사이드바 run 배지.
   CDP(9222)는 **opt-in**: 환경변수 `NARU_AGENT=1`로 실행할 때만 포트 노출(기본 비노출, `NARU_CDP_PORT`로 포트 지정 가능)

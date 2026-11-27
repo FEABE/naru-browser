@@ -115,6 +115,7 @@ struct Naru {
     scale: SharedScale, // 디바이스 배율(HiDPI) — 모든 탭이 공유, 매 프레임 ctx.pixels_per_point로 갱신
     focus_addr: bool, // Ctrl+L → 다음 프레임에 주소창 포커스 요청
     find_open: bool, find_query: String, find_focus: bool, find_last: String, // 페이지 내 찾기 바 상태
+    downloads: SharedDownloads, downloads_open: bool, dl_count: usize, // 모든 탭 공유 다운로드 목록 + 패널 열림 + 새 다운로드 감지용 이전 개수
 }
 impl Naru {
     fn ensure_browser(&mut self, ti:usize){
@@ -124,7 +125,7 @@ impl Naru {
                 url:self.tabs[ti].shared_url.clone(), title:self.tabs[ti].shared_title.clone(),
                 cursor:self.tabs[ti].cursor.clone(), popups:self.tabs[ti].popups.clone(),
                 progress:self.tabs[ti].progress.clone(), status:self.tabs[ti].status.clone(),
-                find_result:self.tabs[ti].find_result.clone() };
+                find_result:self.tabs[ti].find_result.clone(), downloads:self.downloads.clone() };
             let sc=self.scale.clone(); let url=self.tabs[ti].url.clone();
             self.tabs[ti].browser = Some(create_browser(&url, fr, sz, sc, io));
         }
@@ -165,6 +166,8 @@ impl eframe::App for Naru {
         let ppp = ctx.pixels_per_point();
         let mut scale_changed = false;
         { let mut s=self.scale.borrow_mut(); if (*s-ppp).abs()>0.01 { *s=ppp; scale_changed=true; } }
+        // 새 다운로드 시작 감지 → 다운로드 패널 자동 열기
+        { let n=self.downloads.borrow().len(); if n>self.dl_count { self.downloads_open=true; } self.dl_count=n; }
 
         // 에이전트 제어 메일박스: 외부 AI가 "새 에이전트 탭 열어줘" 요청 → 유저 탭 안 뺏고 새 탭 생성.
         // 형식: "agent_tab|<url>|<title>"  또는 "agent_done"
@@ -374,6 +377,9 @@ impl eframe::App for Naru {
         let mut new_tab_area:Option<usize>=None;
         let mut close_tab:Option<usize>=None;
         let mut new_space=false;
+        let mut toggle_downloads=false;
+        let dl_label = { let d=self.downloads.borrow(); let a=d.iter().filter(|x|!x.done && !x.canceled).count();
+            if a>0 { format!("downloads ({})", a) } else { "downloads".to_string() } };
         if self.sidebar {
             egui::SidePanel::left("side").resizable(false).exact_width(256.0)
                 .frame(Frame::none().fill(pl.side).inner_margin(Margin::symmetric(8.0,10.0)).stroke(bord)).show(ctx,|ui|{
@@ -423,7 +429,7 @@ impl eframe::App for Naru {
                     ui.add_space(8.0);
                     subhead(ui,&pl,"library",pl.faint);
                     item(ui,&pl,pl.muted,"↺","history",false,0.0,false,false);
-                    item(ui,&pl,pl.accent,"↓","downloads",false,0.0,false,false);
+                    if item(ui,&pl,pl.accent,"↓",&dl_label,self.downloads_open,0.0,false,false).0 { toggle_downloads=true; }
                     item(ui,&pl,pl.deleg,"▤","reading list",false,0.0,false,false);
                     ui.add_space(8.0); divider(ui,&pl); ui.add_space(4.0);
                     item(ui,&pl,pl.muted,"◉","account",false,0.0,false,false);
@@ -431,6 +437,7 @@ impl eframe::App for Naru {
                 });
             });
         }
+        if toggle_downloads { self.downloads_open=!self.downloads_open; }
         if let Some(ai)=toggle_area { self.areas[ai].open=!self.areas[ai].open; }
         if let Some(pi)=toggle_proj { self.projs[pi].open=!self.projs[pi].open; }
         if let Some(ti)=switch_to { self.active=ti; }
@@ -547,6 +554,37 @@ impl eframe::App for Naru {
             }
             if close { self.find_open=false; self.find_query.clear();
                 if let Some(b)=&self.tabs[act].browser { if let Some(h)=b.host(){ h.stop_finding(1); } } }
+        }
+
+        // ===== 다운로드 패널 (우하단) =====
+        if self.downloads_open {
+            let mut close=false;
+            let items: Vec<(String,i32,bool,bool)> = self.downloads.borrow().iter().rev().take(8)
+                .map(|d|(d.name.clone(), d.pct, d.done, d.canceled)).collect();
+            egui::Area::new(egui::Id::new("dl_panel")).anchor(egui::Align2::RIGHT_BOTTOM, vec2(-18.0,-18.0)).show(ctx,|ui|{
+                Frame::none().fill(pl.topbar).stroke(bord).rounding(Rounding::same(12.0)).inner_margin(Margin::symmetric(14.0,11.0))
+                    .shadow(egui::epaint::Shadow{offset:vec2(0.0,6.0),blur:22.0,spread:0.0,color:Color32::from_black_alpha(70)})
+                    .show(ui,|ui|{ ui.set_width(250.0); ui.vertical(|ui|{
+                        ui.horizontal(|ui|{
+                            ui.label(RichText::new("다운로드").size(12.5).color(pl.txt).strong());
+                            ui.with_layout(Layout::right_to_left(Align::Center),|ui|{
+                                if ui.add(egui::Button::new(RichText::new("✕").size(12.0).color(pl.muted)).frame(false)).clicked(){ close=true; } });
+                        });
+                        ui.add_space(5.0);
+                        if items.is_empty() { ui.label(RichText::new("다운로드 없음").size(11.5).color(pl.faint)); }
+                        for (name,pct,done,canceled) in &items {
+                            let nm=if name.chars().count()>28 { format!("{}…",name.chars().take(27).collect::<String>()) } else { name.clone() };
+                            let st=if *canceled {"취소됨".to_string()} else if *done {"✓ 완료".to_string()} else {format!("{}%",pct)};
+                            ui.horizontal(|ui|{
+                                ui.label(RichText::new(nm).size(11.5).color(pl.txt));
+                                ui.with_layout(Layout::right_to_left(Align::Center),|ui|{
+                                    ui.label(RichText::new(st).size(11.0).color(if *done {pl.accent} else if *canceled {pl.muted} else {pl.muted})); });
+                            });
+                            ui.add_space(3.0);
+                        }
+                    }); });
+            });
+            if close { self.downloads_open=false; }
         }
 
         // ===== 키보드 → 페이지 (유저 탭 & 옴니박스 편집중 아닐 때) =====
@@ -721,7 +759,8 @@ fn main() -> std::process::ExitCode {
     let app_ui = Naru { areas, projs, tabs, active, shown:usize::MAX, address:addr0, sidebar:true, dark:false, editing:false,
         agent_cur:egui::pos2(80.0,80.0), agent_tgt:None, agent_do_click:false, agent_label:String::new(), perm:None,
         data_dir:dir, last_sig:String::new(), ime_comp:String::new(), scale:Rc::new(RefCell::new(1.0)), focus_addr:false,
-        find_open:false, find_query:String::new(), find_focus:false, find_last:String::new() };
+        find_open:false, find_query:String::new(), find_focus:false, find_last:String::new(),
+        downloads:Rc::new(RefCell::new(Vec::new())), downloads_open:false, dl_count:0 };
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1360.0,860.0]).with_min_inner_size([920.0,600.0])
