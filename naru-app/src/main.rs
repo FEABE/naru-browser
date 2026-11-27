@@ -88,6 +88,7 @@ struct Tab {
     cursor: SharedCursor, popups: SharedPopups, // 웹 커서 모양 + 취소된 팝업 URL 큐(→새 탭)
     progress: SharedF32, status: SharedStr,     // 로딩 진행도(0~1) + 상태바(링크 호버 URL 등)
     find_result: SharedFind,                    // 페이지 내 찾기 결과 (현재 순번, 총 개수)
+    icon: SharedIcon, icon_tex: Option<egui::TextureHandle>, // 파비콘 디코드 셀 + 업로드된 텍스처
     zoom: f64, // CEF 줌 레벨(0=100%, +1≈120%) — Ctrl±/0로 조절, 브라우저별 유지
 }
 impl Tab {
@@ -99,6 +100,7 @@ impl Tab {
             cursor:Rc::new(RefCell::new(egui::CursorIcon::Default)), popups:Rc::new(RefCell::new(Vec::new())),
             progress:Rc::new(RefCell::new(0.0)), status:Rc::new(RefCell::new(String::new())),
             find_result:Rc::new(RefCell::new((0,0))),
+            icon:Rc::new(RefCell::new(IconCell::default())), icon_tex:None,
             zoom:0.0 }
     }
 }
@@ -125,7 +127,8 @@ impl Naru {
                 url:self.tabs[ti].shared_url.clone(), title:self.tabs[ti].shared_title.clone(),
                 cursor:self.tabs[ti].cursor.clone(), popups:self.tabs[ti].popups.clone(),
                 progress:self.tabs[ti].progress.clone(), status:self.tabs[ti].status.clone(),
-                find_result:self.tabs[ti].find_result.clone(), downloads:self.downloads.clone() };
+                find_result:self.tabs[ti].find_result.clone(), downloads:self.downloads.clone(),
+                icon:self.tabs[ti].icon.clone() };
             let sc=self.scale.clone(); let url=self.tabs[ti].url.clone();
             self.tabs[ti].browser = Some(create_browser(&url, fr, sz, sc, io));
         }
@@ -296,6 +299,17 @@ impl eframe::App for Naru {
               f.dirty=false; got_frame=true;
           } }
 
+        // 파비콘 텍스처 업로드 (활성 탭) — 콜백이 dirty로 표시하면 ColorImage로 올림
+        { let cell=self.tabs[act].icon.clone(); let mut c=cell.borrow_mut();
+          if c.dirty { if let Some((w,h,rgba))=&c.img {
+              if *w>0 && *h>0 && rgba.len()==(*w as usize * *h as usize *4) {
+                  let img=egui::ColorImage{ size:[*w as usize,*h as usize],
+                      pixels: rgba.chunks_exact(4).map(|p|Color32::from_rgba_unmultiplied(p[0],p[1],p[2],p[3])).collect() };
+                  match &mut self.tabs[act].icon_tex { Some(t)=>t.set(img,egui::TextureOptions::LINEAR),
+                      None=>self.tabs[act].icon_tex=Some(ctx.load_texture("favicon",img,egui::TextureOptions::LINEAR)) }
+              }
+          } c.dirty=false; } }
+
         // CEF 이동/제목 → UI 동기화 (에이전트·링크·리다이렉트 전부 반영)
         for t in self.tabs.iter_mut() {
             let su=t.shared_url.borrow().clone();
@@ -372,7 +386,9 @@ impl eframe::App for Naru {
                     ui.add_space(10.0);
                     Frame::none().fill(pl.addbg).rounding(Rounding::same(16.0)).stroke(bord).inner_margin(Margin::symmetric(14.0,7.0)).show(ui,|ui|{
                         ui.horizontal(|ui|{
-                            ui.label(ico("\u{E721}",11.5).color(pl.muted));
+                            // 파비콘(있으면) 아니면 검색 아이콘
+                            if let Some(t)=&self.tabs[act].icon_tex { ui.add(egui::Image::new((t.id(), vec2(14.0,14.0)))); }
+                            else { ui.label(ico("\u{E721}",11.5).color(pl.muted)); }
                             let r=ui.add(egui::TextEdit::singleline(&mut self.address).frame(false).text_color(pl.txt)
                                 .desired_width(ui.available_width()-24.0)
                                 .hint_text(RichText::new("search or type a url · 검색 또는 주소").color(pl.faint)));

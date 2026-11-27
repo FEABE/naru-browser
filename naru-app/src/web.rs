@@ -19,12 +19,32 @@ pub type SharedFind = Rc<RefCell<(i32, i32)>>;    // 페이지 내 찾기 결과
 pub struct DlItem { pub id: u32, pub name: String, pub pct: i32, pub done: bool, pub canceled: bool }
 pub type SharedDownloads = Rc<RefCell<Vec<DlItem>>>;
 
+// 파비콘 — 디코드된 RGBA 이미지(dirty면 UI가 텍스처로 업로드)
+#[derive(Default)] pub struct IconCell { pub dirty: bool, pub img: Option<(u32, u32, Vec<u8>)> }
+pub type SharedIcon = Rc<RefCell<IconCell>>;
+
+// CefStringList에서 첫 유효 URL 추출 (sys 함수 — IntoIterator는 소유권을 먹어 &mut에서 못 씀)
+fn first_string(list: &CefStringList) -> Option<String> {
+    let raw: *const sys::_cef_string_list_t = list.into();
+    if raw.is_null() { return None; }
+    let p = raw as *mut sys::_cef_string_list_t;
+    let count = unsafe { sys::cef_string_list_size(p) };
+    for i in 0..count {
+        unsafe { let mut v = std::mem::zeroed();
+            if sys::cef_string_list_value(p, i, &mut v) > 0 {
+                let s = CefString::from(std::ptr::from_ref(&v)).to_string();
+                if !s.is_empty() { return Some(s); }
+            } }
+    }
+    None
+}
+
 // 탭별 공유 I/O 묶음 — create_browser에 넘길 핸들러↔UI 공유셀들(위치 인자 폭발·오삽입 방지)
 #[derive(Clone)]
 pub struct BrowserIo {
     pub url: SharedStr, pub title: SharedStr, pub cursor: SharedCursor,
     pub popups: SharedPopups, pub progress: SharedF32, pub status: SharedStr,
-    pub find_result: SharedFind, pub downloads: SharedDownloads,
+    pub find_result: SharedFind, pub downloads: SharedDownloads, pub icon: SharedIcon,
 }
 
 // CEF 커서 타입 → egui 커서 아이콘 (링크=손가락, 입력=I-beam, 리사이즈 방향 등)
@@ -119,8 +139,30 @@ wrap_render_handler! {
 }
 impl RenderHandlerBuilder { pub fn build(handler: NaruRender) -> RenderHandler { Self::new(handler) } }
 
-// DisplayHandler: 페이지 이동/제목/커서/로딩진행/상태메시지를 공유셀에 기록 → UI 동기화
-#[derive(Clone)] pub struct NaruDisplay { url: SharedStr, title: SharedStr, cursor: SharedCursor, progress: SharedF32, status: SharedStr }
+// 파비콘 다운로드 콜백: CEF가 받은 아이콘 이미지를 RGBA로 디코드해 공유셀에 저장
+#[derive(Clone)] pub struct NaruImageCb { icon: SharedIcon }
+wrap_download_image_callback! {
+    pub struct ImageCbBuilder { handler: NaruImageCb, }
+    impl DownloadImageCallback {
+        fn on_download_image_finished(&self, _url: Option<&CefString>, _status: ::std::os::raw::c_int, image: Option<&mut Image>) {
+            let Some(img)=image else { return };
+            if img.is_empty()!=0 { return; }
+            let (mut w, mut h) = (0i32, 0i32);
+            if let Some(bin)=img.as_bitmap(1.0, ColorType::RGBA_8888, AlphaType::POSTMULTIPLIED, Some(&mut w), Some(&mut h)) {
+                if w>0 && h>0 {
+                    let n=bin.size(); let mut buf=vec![0u8;n]; bin.data(Some(&mut buf), 0);
+                    if buf.len()==(w as usize*h as usize*4) {
+                        *self.handler.icon.borrow_mut() = IconCell{ dirty:true, img:Some((w as u32, h as u32, buf)) };
+                    }
+                }
+            }
+        }
+    }
+}
+impl ImageCbBuilder { pub fn build(h: NaruImageCb) -> DownloadImageCallback { Self::new(h) } }
+
+// DisplayHandler: 페이지 이동/제목/커서/로딩진행/상태메시지/파비콘을 공유셀에 기록 → UI 동기화
+#[derive(Clone)] pub struct NaruDisplay { url: SharedStr, title: SharedStr, cursor: SharedCursor, progress: SharedF32, status: SharedStr, icon: SharedIcon }
 wrap_display_handler! {
     pub struct DisplayHandlerBuilder { handler: NaruDisplay, }
     impl DisplayHandler {
@@ -135,6 +177,15 @@ wrap_display_handler! {
         }
         fn on_status_message(&self, _b: Option<&mut Browser>, value: Option<&CefString>) {
             *self.handler.status.borrow_mut() = value.map(|v|v.to_string()).unwrap_or_default();
+        }
+        // 파비콘 URL이 바뀌면 첫 아이콘을 CEF에 다운로드 요청(32px) → 콜백이 디코드
+        fn on_favicon_urlchange(&self, browser: Option<&mut Browser>, icon_urls: Option<&mut CefStringList>) {
+            let Some(urls)=icon_urls else { return };
+            let Some(url)=first_string(urls) else { return };
+            if let Some(b)=browser { if let Some(h)=b.host() {
+                let mut cb = ImageCbBuilder::build(NaruImageCb{ icon:self.handler.icon.clone() });
+                h.download_image(Some(&url.as_str().into()), 1, 32, 0, Some(&mut cb));
+            } }
         }
         // OSR은 OS 창이 없어 웹 커서를 직접 받아 egui 쪽에 반영해야 함. true 반환 = 우리가 처리함.
         fn on_cursor_change(&self, _b: Option<&mut Browser>, _cursor: sys::HCURSOR, type_: CursorType,
@@ -225,7 +276,7 @@ impl ClientBuilder { pub(crate) fn build(r: RenderHandler, d: DisplayHandler, l:
 
 pub fn create_browser(url:&str, frame:SharedFrame, size:SharedSize, scale:SharedScale, io:BrowserIo) -> Browser {
     let render = NaruRender::new(frame, size, scale);
-    let disp = NaruDisplay { url:io.url, title:io.title, cursor:io.cursor, progress:io.progress, status:io.status };
+    let disp = NaruDisplay { url:io.url, title:io.title, cursor:io.cursor, progress:io.progress, status:io.status, icon:io.icon };
     let ls = NaruLifeSpan { popups:io.popups };
     let fh = NaruFind { result:io.find_result };
     let dh = NaruDownload { list:io.downloads };
