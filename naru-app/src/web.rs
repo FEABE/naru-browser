@@ -12,6 +12,14 @@ pub type SharedStr = Rc<RefCell<String>>;
 pub type SharedScale = Rc<RefCell<f32>>;          // 디바이스 배율(HiDPI) — 매 프레임 ctx.pixels_per_point로 갱신
 pub type SharedCursor = Rc<RefCell<CursorIcon>>;  // 웹페이지가 요청한 커서 모양(OSR은 OS가 모르니 직접 받음)
 pub type SharedPopups = Rc<RefCell<Vec<String>>>; // on_before_popup으로 취소한 팝업 URL 큐 → Naru 탭으로 열림
+pub type SharedF32 = Rc<RefCell<f32>>;            // 로딩 진행도(0~1)
+
+// 탭별 공유 I/O 묶음 — create_browser에 넘길 핸들러↔UI 공유셀들(위치 인자 폭발·오삽입 방지)
+#[derive(Clone)]
+pub struct BrowserIo {
+    pub url: SharedStr, pub title: SharedStr, pub cursor: SharedCursor,
+    pub popups: SharedPopups, pub progress: SharedF32, pub status: SharedStr,
+}
 
 // CEF 커서 타입 → egui 커서 아이콘 (링크=손가락, 입력=I-beam, 리사이즈 방향 등)
 fn cef_cursor_to_egui(t: CursorType) -> CursorIcon {
@@ -105,8 +113,8 @@ wrap_render_handler! {
 }
 impl RenderHandlerBuilder { pub fn build(handler: NaruRender) -> RenderHandler { Self::new(handler) } }
 
-// DisplayHandler: 페이지 이동/제목/커서 변경을 공유셀에 기록 → UI 동기화
-#[derive(Clone)] pub struct NaruDisplay { url: SharedStr, title: SharedStr, cursor: SharedCursor }
+// DisplayHandler: 페이지 이동/제목/커서/로딩진행/상태메시지를 공유셀에 기록 → UI 동기화
+#[derive(Clone)] pub struct NaruDisplay { url: SharedStr, title: SharedStr, cursor: SharedCursor, progress: SharedF32, status: SharedStr }
 wrap_display_handler! {
     pub struct DisplayHandlerBuilder { handler: NaruDisplay, }
     impl DisplayHandler {
@@ -115,6 +123,12 @@ wrap_display_handler! {
         }
         fn on_title_change(&self, _b: Option<&mut Browser>, title: Option<&CefString>) {
             if let Some(t)=title { *self.handler.title.borrow_mut()=t.to_string(); }
+        }
+        fn on_loading_progress_change(&self, _b: Option<&mut Browser>, progress: f64) {
+            *self.handler.progress.borrow_mut() = progress as f32;
+        }
+        fn on_status_message(&self, _b: Option<&mut Browser>, value: Option<&CefString>) {
+            *self.handler.status.borrow_mut() = value.map(|v|v.to_string()).unwrap_or_default();
         }
         // OSR은 OS 창이 없어 웹 커서를 직접 받아 egui 쪽에 반영해야 함. true 반환 = 우리가 처리함.
         fn on_cursor_change(&self, _b: Option<&mut Browser>, _cursor: sys::HCURSOR, type_: CursorType,
@@ -159,12 +173,10 @@ wrap_client! {
 }
 impl ClientBuilder { pub(crate) fn build(r: RenderHandler, d: DisplayHandler, l: LifeSpanHandler) -> cef::Client { Self::new(r, d, l) } }
 
-#[allow(clippy::too_many_arguments)]
-pub fn create_browser(url:&str, frame:SharedFrame, size:SharedSize, scale:SharedScale,
-                      surl:SharedStr, stitle:SharedStr, cursor:SharedCursor, popups:SharedPopups) -> Browser {
+pub fn create_browser(url:&str, frame:SharedFrame, size:SharedSize, scale:SharedScale, io:BrowserIo) -> Browser {
     let render = NaruRender::new(frame, size, scale);
-    let disp = NaruDisplay { url:surl, title:stitle, cursor };
-    let ls = NaruLifeSpan { popups };
+    let disp = NaruDisplay { url:io.url, title:io.title, cursor:io.cursor, progress:io.progress, status:io.status };
+    let ls = NaruLifeSpan { popups:io.popups };
     let mut client = ClientBuilder::build(RenderHandlerBuilder::build(render), DisplayHandlerBuilder::build(disp), LifeSpanHandlerBuilder::build(ls));
     let wi = WindowInfo { windowless_rendering_enabled: true as _, ..Default::default() };
     let bs = BrowserSettings { windowless_frame_rate: 60, ..Default::default() };

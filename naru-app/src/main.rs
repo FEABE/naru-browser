@@ -86,6 +86,7 @@ struct Tab {
     browser: Option<Browser>, frame: SharedFrame, size: SharedSize, tex: Option<egui::TextureHandle>,
     shared_url: Rc<RefCell<String>>, shared_title: Rc<RefCell<String>>,
     cursor: SharedCursor, popups: SharedPopups, // 웹 커서 모양 + 취소된 팝업 URL 큐(→새 탭)
+    progress: SharedF32, status: SharedStr,     // 로딩 진행도(0~1) + 상태바(링크 호버 URL 등)
     zoom: f64, // CEF 줌 레벨(0=100%, +1≈120%) — Ctrl±/0로 조절, 브라우저별 유지
 }
 impl Tab {
@@ -95,6 +96,7 @@ impl Tab {
             size:Rc::new(RefCell::new((1100.0,720.0))), tex:None,
             shared_url:Rc::new(RefCell::new(url.into())), shared_title:Rc::new(RefCell::new(title.into())),
             cursor:Rc::new(RefCell::new(egui::CursorIcon::Default)), popups:Rc::new(RefCell::new(Vec::new())),
+            progress:Rc::new(RefCell::new(0.0)), status:Rc::new(RefCell::new(String::new())),
             zoom:0.0 }
     }
 }
@@ -115,10 +117,12 @@ impl Naru {
     fn ensure_browser(&mut self, ti:usize){
         if self.tabs[ti].browser.is_none() {
             let fr=self.tabs[ti].frame.clone(); let sz=self.tabs[ti].size.clone();
-            let su=self.tabs[ti].shared_url.clone(); let st=self.tabs[ti].shared_title.clone();
-            let cur=self.tabs[ti].cursor.clone(); let pops=self.tabs[ti].popups.clone(); let sc=self.scale.clone();
-            let url=self.tabs[ti].url.clone();
-            self.tabs[ti].browser = Some(create_browser(&url, fr, sz, sc, su, st, cur, pops));
+            let io = BrowserIo {
+                url:self.tabs[ti].shared_url.clone(), title:self.tabs[ti].shared_title.clone(),
+                cursor:self.tabs[ti].cursor.clone(), popups:self.tabs[ti].popups.clone(),
+                progress:self.tabs[ti].progress.clone(), status:self.tabs[ti].status.clone() };
+            let sc=self.scale.clone(); let url=self.tabs[ti].url.clone();
+            self.tabs[ti].browser = Some(create_browser(&url, fr, sz, sc, io));
         }
     }
     fn close_tab(&mut self, ti:usize){
@@ -435,6 +439,7 @@ impl eframe::App for Naru {
                 { let mut s=self.tabs[act].size.borrow_mut(); let nw=avail.x.max(1.0); let nh=avail.y.max(1.0);
                   if (s.0-nw).abs()>0.5||(s.1-nh).abs()>0.5 { *s=(nw,nh); changed=true; } }
                 if changed { if let Some(b)=&self.tabs[act].browser { if let Some(h)=b.host(){ h.was_resized(); } } }
+                let web_rect = egui::Rect::from_min_size(ui.cursor().min, avail); // 진행바·상태바 배치용 웹영역 사각형
                 if let Some(t)=&self.tabs[act].tex {
                     let resp=ui.add(egui::Image::new((t.id(),avail)).sense(egui::Sense::click_and_drag()));
                     let rect=resp.rect;
@@ -475,6 +480,20 @@ impl eframe::App for Naru {
                 } else {
                     ui.vertical_centered(|ui|{ ui.add_space(ui.available_height()*0.44);
                         ui.label(RichText::new("naru:// 로딩 중…").color(pl.muted).size(14.0)); });
+                }
+                // 로딩 진행바(상단 얇은 바, 0<진행<1일 때만)
+                let prog=*self.tabs[act].progress.borrow();
+                if prog>0.0 && prog<1.0 {
+                    ui.painter().rect_filled(egui::Rect::from_min_size(web_rect.left_top(), vec2(web_rect.width()*prog,3.0)), Rounding::ZERO, pl.accent);
+                }
+                // 상태바: 링크 호버 등 상태 메시지(좌하단, 비었으면 숨김)
+                let stt=self.tabs[act].status.borrow().clone();
+                if !stt.is_empty() {
+                    let txt=if stt.chars().count()>90 { format!("{}…", stt.chars().take(90).collect::<String>()) } else { stt };
+                    let p=ui.painter(); let gal=p.layout_no_wrap(txt, mono(11.0), pl.txt); let pad=vec2(8.0,3.5);
+                    let r=egui::Rect::from_min_size(web_rect.left_bottom()-vec2(0.0,gal.size().y+pad.y*2.0), gal.size()+pad*2.0);
+                    p.rect(r, Rounding{nw:0.0,ne:7.0,sw:0.0,se:0.0}, pl.topbar, Stroke::new(1.0,pl.border));
+                    p.galley(r.min+pad, gal, pl.txt);
                 }
             });
         });
