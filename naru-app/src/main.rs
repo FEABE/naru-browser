@@ -86,6 +86,7 @@ struct Tab {
     browser: Option<Browser>, frame: SharedFrame, size: SharedSize, tex: Option<egui::TextureHandle>,
     shared_url: Rc<RefCell<String>>, shared_title: Rc<RefCell<String>>,
     cursor: SharedCursor, popups: SharedPopups, // 웹 커서 모양 + 취소된 팝업 URL 큐(→새 탭)
+    zoom: f64, // CEF 줌 레벨(0=100%, +1≈120%) — Ctrl±/0로 조절, 브라우저별 유지
 }
 impl Tab {
     fn new(title:&str, url:&str, owner:u8, area:usize, proj:Option<usize>)->Self{
@@ -93,7 +94,8 @@ impl Tab {
             browser:None, frame:Rc::new(RefCell::new(FrameBuf::default())),
             size:Rc::new(RefCell::new((1100.0,720.0))), tex:None,
             shared_url:Rc::new(RefCell::new(url.into())), shared_title:Rc::new(RefCell::new(title.into())),
-            cursor:Rc::new(RefCell::new(egui::CursorIcon::Default)), popups:Rc::new(RefCell::new(Vec::new())) }
+            cursor:Rc::new(RefCell::new(egui::CursorIcon::Default)), popups:Rc::new(RefCell::new(Vec::new())),
+            zoom:0.0 }
     }
 }
 
@@ -107,6 +109,7 @@ struct Naru {
     data_dir: std::path::PathBuf, last_sig: String, // 세션 영속: 저장 경로 + 변경 감지 시그니처
     ime_comp: String, // 현재 화면에 CHAR로 미리 그려둔 IME 조합 글자(라이브 프리뷰용)
     scale: SharedScale, // 디바이스 배율(HiDPI) — 모든 탭이 공유, 매 프레임 ctx.pixels_per_point로 갱신
+    focus_addr: bool, // Ctrl+L → 다음 프레임에 주소창 포커스 요청
 }
 impl Naru {
     fn ensure_browser(&mut self, ti:usize){
@@ -185,6 +188,33 @@ impl eframe::App for Naru {
                 Some("agent_request") => { self.perm=Some(p.get(1).copied().unwrap_or("권한 요청").to_string()); }
                 Some("agent_done") => { if let Some(t)=self.tabs.get_mut(self.active){ t.owner=0; t.agent_kind=0; } self.agent_tgt=None; self.agent_label.clear(); }
                 _ => {}
+            }
+        }
+
+        // ===== 단축키 (CEF로 넘기기 전에 소비 — consume_key로 egui 이벤트 큐에서 제거) =====
+        {
+            use egui::{Key, Modifiers};
+            let cmd = Modifiers::COMMAND;              // Windows/Linux=Ctrl, mac=Cmd
+            let cmd_shift = Modifiers::COMMAND | Modifiers::SHIFT;
+            if ctx.input_mut(|i| i.consume_key(cmd, Key::T)) {
+                let area=self.tabs.get(self.active).map(|t|t.area).unwrap_or(0);
+                self.tabs.push(Tab::new("new tab","https://duckduckgo.com",0,area,None));
+                self.active=self.tabs.len()-1;
+            }
+            if ctx.input_mut(|i| i.consume_key(cmd, Key::W)) { let a=self.active; self.close_tab(a); }
+            if ctx.input_mut(|i| i.consume_key(cmd, Key::Tab)) && self.tabs.len()>1 { self.active=(self.active+1)%self.tabs.len(); }
+            if ctx.input_mut(|i| i.consume_key(cmd_shift, Key::Tab)) && self.tabs.len()>1 { self.active=(self.active+self.tabs.len()-1)%self.tabs.len(); }
+            if ctx.input_mut(|i| i.consume_key(cmd, Key::L)) { self.focus_addr=true; }
+            // 확대/축소: Ctrl +/= (일부 자판은 Shift 동반) 확대, Ctrl - 축소, Ctrl 0 리셋
+            let zin  = ctx.input_mut(|i| i.consume_key(cmd, Key::Plus)) | ctx.input_mut(|i| i.consume_key(cmd, Key::Equals))
+                     | ctx.input_mut(|i| i.consume_key(cmd_shift, Key::Plus)) | ctx.input_mut(|i| i.consume_key(cmd_shift, Key::Equals));
+            let zout = ctx.input_mut(|i| i.consume_key(cmd, Key::Minus));
+            let zrst = ctx.input_mut(|i| i.consume_key(cmd, Key::Num0));
+            if zin || zout || zrst {
+                if let Some(t)=self.tabs.get_mut(self.active) {
+                    t.zoom = if zrst {0.0} else {(t.zoom + if zin {0.5} else {-0.5}).clamp(-5.0,5.0)};
+                    if let Some(b)=&t.browser { if let Some(h)=b.host(){ h.set_zoom_level(t.zoom); } }
+                }
             }
         }
 
@@ -309,6 +339,7 @@ impl eframe::App for Naru {
                             let r=ui.add(egui::TextEdit::singleline(&mut self.address).frame(false).text_color(pl.txt)
                                 .desired_width(ui.available_width()-24.0)
                                 .hint_text(RichText::new("search or type a url · 검색 또는 주소").color(pl.faint)));
+                            if self.focus_addr { r.request_focus(); self.focus_addr=false; }
                             self.editing = r.has_focus();
                             if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) { self.load_active(&self.address.clone()); }
                             ui.label(ico("\u{E734}",11.5).color(pl.muted));
@@ -619,7 +650,7 @@ fn main() -> std::process::ExitCode {
 
     let app_ui = Naru { areas, projs, tabs, active, shown:usize::MAX, address:addr0, sidebar:true, dark:false, editing:false,
         agent_cur:egui::pos2(80.0,80.0), agent_tgt:None, agent_do_click:false, agent_label:String::new(), perm:None,
-        data_dir:dir, last_sig:String::new(), ime_comp:String::new(), scale:Rc::new(RefCell::new(1.0)) };
+        data_dir:dir, last_sig:String::new(), ime_comp:String::new(), scale:Rc::new(RefCell::new(1.0)), focus_addr:false };
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1360.0,860.0]).with_min_inner_size([920.0,600.0])
