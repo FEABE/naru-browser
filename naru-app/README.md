@@ -12,7 +12,10 @@ Naru의 **진짜 동작하는 브라우저**. egui 셸 UI + **CEF OSR 웹 렌더
 - **웹뷰**: 탭마다 독립 CEF 브라우저. 탭은 **활성화 시 lazy 생성**, 비활성은 `was_hidden`으로 렌더 중단(절전)
 - **탭 닫기**: 사이드바 행 hover 시 `✕` → `close_browser`로 CEF 서브프로세스까지 회수
 - **입력**: 마우스(이동/클릭/드래그/휠) + 키보드를 CEF로 전달. 키보드는 **영어·한글 모두** 지원 —
-  문자는 `Event::Text`/IME 커밋을 CHAR로, 특수키(Enter/Backspace/화살표 등)는 VK로. 프레임리스 창에 `IMEAllowed` 세팅해 한글 조합 입력 가능(유저 탭·옴니박스). (라이브 조합 프리뷰는 커밋 시 반영 — 향후 ime_set_composition)
+  문자는 `Event::Text`/IME 커밋을 CHAR로, 특수키(Enter/Backspace/화살표 등)는 VK로. 프레임리스 창에 `IMEAllowed` 세팅해 한글 조합 입력 가능(유저 탭·옴니박스). 라이브 조합 프리뷰는 CHAR 에코 방식(아래 참조)
+- **커서 동기화**: OSR은 OS가 웹 커서를 모르므로 `on_cursor_change`(DisplayHandler)로 받아 egui 커서로 매핑(링크=손가락, 입력=I-beam, 리사이즈 방향 등)
+- **팝업/새 창 → 새 탭**: `on_before_popup`(LifeSpanHandler)으로 CEF 팝업을 취소하고 대상 URL을 새 탭으로 연다. 사용자 제스처(클릭)로 연 것만 승격(스크립트 자동 팝업 차단). 새 탭은 연 탭의 owner/area/proj 상속
+- **HiDPI**: `ctx.pixels_per_point()`를 매 프레임 추적해 `screen_info`의 device_scale_factor로 보고 → 고배율 디스플레이에서 선명(배율 변경 시 notify_screen_info_changed). view_rect·마우스 좌표는 논리 단위 유지, paint 버퍼만 배율²로 커짐
 - **주소창**: Enter로 이동, nav(뒤로/앞으로/새로고침)
 - **에이전트 컨트롤**: 에이전트 소유 탭이 활성화되면 하단 "agent in control" pill + 사이드바 run 배지.
   CDP(9222)는 **opt-in**: 환경변수 `NARU_AGENT=1`로 실행할 때만 포트 노출(기본 비노출, `NARU_CDP_PORT`로 포트 지정 가능)

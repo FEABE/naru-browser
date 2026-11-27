@@ -85,13 +85,15 @@ struct Tab {
     title: String, url: String, owner: u8, agent_kind: u8, area: usize, proj: Option<usize>,
     browser: Option<Browser>, frame: SharedFrame, size: SharedSize, tex: Option<egui::TextureHandle>,
     shared_url: Rc<RefCell<String>>, shared_title: Rc<RefCell<String>>,
+    cursor: SharedCursor, popups: SharedPopups, // 웹 커서 모양 + 취소된 팝업 URL 큐(→새 탭)
 }
 impl Tab {
     fn new(title:&str, url:&str, owner:u8, area:usize, proj:Option<usize>)->Self{
         Tab{ title:title.into(), url:url.into(), owner, agent_kind:owner, area, proj,
             browser:None, frame:Rc::new(RefCell::new(FrameBuf::default())),
             size:Rc::new(RefCell::new((1100.0,720.0))), tex:None,
-            shared_url:Rc::new(RefCell::new(url.into())), shared_title:Rc::new(RefCell::new(title.into())) }
+            shared_url:Rc::new(RefCell::new(url.into())), shared_title:Rc::new(RefCell::new(title.into())),
+            cursor:Rc::new(RefCell::new(egui::CursorIcon::Default)), popups:Rc::new(RefCell::new(Vec::new())) }
     }
 }
 
@@ -104,14 +106,16 @@ struct Naru {
     perm: Option<String>, // 에이전트 권한 요청 메시지 (있으면 배너 표시)
     data_dir: std::path::PathBuf, last_sig: String, // 세션 영속: 저장 경로 + 변경 감지 시그니처
     ime_comp: String, // 현재 화면에 CHAR로 미리 그려둔 IME 조합 글자(라이브 프리뷰용)
+    scale: SharedScale, // 디바이스 배율(HiDPI) — 모든 탭이 공유, 매 프레임 ctx.pixels_per_point로 갱신
 }
 impl Naru {
     fn ensure_browser(&mut self, ti:usize){
         if self.tabs[ti].browser.is_none() {
             let fr=self.tabs[ti].frame.clone(); let sz=self.tabs[ti].size.clone();
             let su=self.tabs[ti].shared_url.clone(); let st=self.tabs[ti].shared_title.clone();
+            let cur=self.tabs[ti].cursor.clone(); let pops=self.tabs[ti].popups.clone(); let sc=self.scale.clone();
             let url=self.tabs[ti].url.clone();
-            self.tabs[ti].browser = Some(create_browser(&url, fr, sz, su, st));
+            self.tabs[ti].browser = Some(create_browser(&url, fr, sz, sc, su, st, cur, pops));
         }
     }
     fn close_tab(&mut self, ti:usize){
@@ -146,6 +150,11 @@ impl eframe::App for Naru {
     fn update(&mut self, ctx:&egui::Context, _ef:&mut eframe::Frame){
         do_message_loop_work();
 
+        // HiDPI: 창이 올라간 모니터 배율(또는 egui zoom) 변화를 매 프레임 추적 → screen_info가 보고하는 값 갱신.
+        let ppp = ctx.pixels_per_point();
+        let mut scale_changed = false;
+        { let mut s=self.scale.borrow_mut(); if (*s-ppp).abs()>0.01 { *s=ppp; scale_changed=true; } }
+
         // 에이전트 제어 메일박스: 외부 AI가 "새 에이전트 탭 열어줘" 요청 → 유저 탭 안 뺏고 새 탭 생성.
         // 형식: "agent_tab|<url>|<title>"  또는 "agent_done"
         let ctrl=tmp("naru_control.txt");
@@ -179,8 +188,23 @@ impl eframe::App for Naru {
             }
         }
 
+        // 팝업 큐 비우기: on_before_popup이 취소한 target=_blank/window.open URL을 새 탭으로 연다.
+        // 새 탭은 연 탭의 owner/agent_kind/area/proj를 물려받음(에이전트 탭이 연 팝업이 유저 탭으로 새서 메일박스 타깃이 어긋나는 것 방지).
+        let mut spawn: Vec<(usize,String)> = Vec::new();
+        for ti in 0..self.tabs.len() {
+            let mut q=self.tabs[ti].popups.borrow_mut();
+            if !q.is_empty() { for u in q.drain(..) { spawn.push((ti,u)); } }
+        }
+        for (ti,u) in spawn {
+            let (owner,kind,area,proj)={ let t=&self.tabs[ti]; (t.owner,t.agent_kind,t.area,t.proj) };
+            let mut nt=Tab::new("new tab",&u,owner,area,proj); nt.agent_kind=kind;
+            self.tabs.push(nt); self.active=self.tabs.len()-1;
+        }
+
         let mut act=self.active;
         self.ensure_browser(act);
+        // 배율이 바뀌었으면 활성 브라우저에 알려 재질의/재레이아웃 (view_rect·좌표는 논리 단위 유지, paint 버퍼만 배율²로 커짐)
+        if scale_changed { if let Some(b)=&self.tabs[act].browser { if let Some(h)=b.host(){ h.notify_screen_info_changed(); h.was_resized(); } } }
 
         // 탭 전환: 비활성 숨김 + 활성 표시
         if self.shown != act {
@@ -191,7 +215,7 @@ impl eframe::App for Naru {
                     { let fr=self.tabs[i].frame.clone(); let mut f=fr.borrow_mut(); f.pixels=Vec::new(); f.w=0; f.h=0; f.dirty=false; }
                 }
             }
-            if let Some(b)=&self.tabs[act].browser { if let Some(h)=b.host(){ h.was_hidden(0); h.was_resized(); h.set_focus(1); } }
+            if let Some(b)=&self.tabs[act].browser { if let Some(h)=b.host(){ h.was_hidden(0); h.notify_screen_info_changed(); h.was_resized(); h.set_focus(1); } }
             self.shown=act; self.address=self.tabs[act].url.clone();
         }
 
@@ -395,6 +419,11 @@ impl eframe::App for Naru {
                             let sc=i.raw_scroll_delta; if sc.x!=0.0||sc.y!=0.0 { host.send_mouse_wheel_event(Some(&ev),(sc.x*3.0) as i32,(sc.y*3.0) as i32); }
                         }} });
                     } } }
+                    // 웹 커서 모양 동기화: 포인터가 웹뷰 위 & 유저 소유일 때, 페이지가 요청한 커서(손가락/I-beam 등) 적용
+                    if user_owned {
+                        let over = ctx.input(|i| i.pointer.latest_pos().map_or(false,|p| rect.contains(p)));
+                        if over { ctx.set_cursor_icon(*self.tabs[act].cursor.borrow()); }
+                    }
                     // 에이전트 커서 오버레이 (owner!=0): 화살표 + 액션 라벨
                     if self.tabs[act].owner!=0 {
                         let raw=rect.min+self.agent_cur.to_vec2();
@@ -590,7 +619,7 @@ fn main() -> std::process::ExitCode {
 
     let app_ui = Naru { areas, projs, tabs, active, shown:usize::MAX, address:addr0, sidebar:true, dark:false, editing:false,
         agent_cur:egui::pos2(80.0,80.0), agent_tgt:None, agent_do_click:false, agent_label:String::new(), perm:None,
-        data_dir:dir, last_sig:String::new(), ime_comp:String::new() };
+        data_dir:dir, last_sig:String::new(), ime_comp:String::new(), scale:Rc::new(RefCell::new(1.0)) };
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1360.0,860.0]).with_min_inner_size([920.0,600.0])
