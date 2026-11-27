@@ -27,7 +27,8 @@ Naru의 **진짜 동작하는 브라우저**. egui 셸 UI + **CEF OSR 웹 렌더
 - **에이전트 컨트롤**: 에이전트 소유 탭이 활성화되면 하단 "agent in control" pill + 사이드바 run 배지.
   CDP(9222)는 **opt-in**: 환경변수 `NARU_AGENT=1`로 실행할 때만 포트 노출(기본 비노출, `NARU_CDP_PORT`로 포트 지정 가능)
 - **메모리/렌더 최적화**: 숨긴 탭은 CPU 픽셀 버퍼 해제, 프레임은 BGRA→`Color32` 1패스 변환(복사 2회→1회+memcpy).
-  적응형 repaint(변화 시 ~60fps, 유휴 시 ~15Hz) — 정적 페이지 사실상 idle
+  적응형 repaint(변화 시 ~60fps, 유휴 시 ~15Hz) — 정적 페이지 사실상 idle.
+  **더티렉트**: `on_paint`의 변경 영역만 변환하고 egui `TextureHandle.set_partial`로 부분 업로드(리사이즈·첫 페인트는 전체). 전체 w×h 루프/복제 회피
 - **경로**: 메일박스·응답 등 임시 파일은 OS temp 기반(하드코딩 없음)
 - **세션 영속**: `%LOCALAPPDATA%\naru\session.txt`에 탭/스페이스 저장→재시작 시 복원. `root_cache_path`를 영구화해 쿠키/로그인 유지(정상 종료 시 flush)
 - **한글 입력 라이브 프리뷰**: CEF `ime_set_composition`이 이 OSR 환경에선 화면에 안 떠서, 조합 글자를 CHAR로 미리 그리고(`ime_comp` 추적) 조합이 바뀌면 Backspace 후 재입력하는 방식으로 실시간 프리뷰 구현(ㅎ→하→한). 확정도 동일 CHAR 경로라 확실
@@ -56,4 +57,5 @@ $env:NARU_AGENT="1"; .\target\release\naru.exe
 4. OSR `on_paint`는 `shared_texture_enabled=false`에서 CPU BGRA 버퍼를 준다 (→ `Color32` 변환 후 egui 텍스처 업로드)
 
 ## 다음
-키보드 입력(페이지 타이핑), 탭 제목/URL 자동 반영, 세션 영속, CEF 154→Naru 본체 156.
+- **GPU 가속 페인트(accelerated_osr)**: `on_accelerated_paint`로 공유 D3D11 텍스처를 받아 egui GPU 백엔드와 인터op하면 CPU 복사가 사라져 스크롤이 더 매끄럽다. 다만 feature 플래그 + D3D11/`osr_texture_import` + 렌더러 교체가 필요한 큰 작업이고, 현재 소프트웨어 경로(+더티렉트)가 release에서 잘 동작하므로 별도 과제로 둠.
+- 권한 프롬프트 심화, 메일박스→정식 IPC/소켓, CEF 154→Naru 본체 156.

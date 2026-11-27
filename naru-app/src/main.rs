@@ -296,10 +296,20 @@ impl eframe::App for Naru {
         let mut got_frame=false;
         { let frame=self.tabs[act].frame.clone(); let mut f=frame.borrow_mut();
           if f.dirty && f.w>0 && f.h>0 && f.pixels.len()==f.w*f.h {
-              let img=egui::ColorImage{ size:[f.w,f.h], pixels:f.pixels.clone() };
-              match &mut self.tabs[act].tex { Some(t)=>t.set(img,egui::TextureOptions::LINEAR),
-                  None=>self.tabs[act].tex=Some(ctx.load_texture("web",img,egui::TextureOptions::LINEAR)) }
-              f.dirty=false; got_frame=true;
+              if f.full || self.tabs[act].tex.is_none() {
+                  let img=egui::ColorImage{ size:[f.w,f.h], pixels:f.pixels.clone() };
+                  match &mut self.tabs[act].tex { Some(t)=>t.set(img,egui::TextureOptions::LINEAR),
+                      None=>self.tabs[act].tex=Some(ctx.load_texture("web",img,egui::TextureOptions::LINEAR)) }
+              } else if let Some(t)=&mut self.tabs[act].tex {
+                  // 더티렉트만 부분 업로드 (전체 복제·업로드 회피)
+                  let (w,rects)=(f.w, f.rects.clone());
+                  for [x0,y0,rw,rh] in rects {
+                      let mut sub=Vec::with_capacity(rw*rh);
+                      for yy in y0..y0+rh { let row=yy*w+x0; sub.extend_from_slice(&f.pixels[row..row+rw]); }
+                      t.set_partial([x0,y0], egui::ColorImage{ size:[rw,rh], pixels:sub }, egui::TextureOptions::LINEAR);
+                  }
+              }
+              f.dirty=false; f.rects.clear(); got_frame=true;
           } }
 
         // 파비콘 텍스처 업로드 (활성 탭) — 콜백이 dirty로 표시하면 ColorImage로 올림

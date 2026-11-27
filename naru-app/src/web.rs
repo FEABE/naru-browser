@@ -5,7 +5,16 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 #[derive(Default)]
-pub struct FrameBuf { pub w: usize, pub h: usize, pub pixels: Vec<Color32>, pub dirty: bool }
+pub struct FrameBuf { pub w: usize, pub h: usize, pub pixels: Vec<Color32>, pub dirty: bool,
+    pub full: bool, pub rects: Vec<[usize;4]> } // full=전체 업로드 필요, rects=부분 업로드할 영역들(x,y,w,h)
+
+// BGRA(unmultiplied) 소스의 [x0,y0,rw,rh] 영역만 Color32 dst로 변환(더티렉트 부분 변환)
+#[inline]
+fn blit(dst: &mut [Color32], src: &[u8], w: usize, x0: usize, y0: usize, rw: usize, rh: usize) {
+    for yy in y0..y0+rh { let base=yy*w;
+        for xx in x0..x0+rw { let p=base+xx; let i=p*4;
+            dst[p]=Color32::from_rgba_unmultiplied(src[i+2],src[i+1],src[i],src[i+3]); } }
+}
 pub type SharedFrame = Rc<RefCell<FrameBuf>>;
 pub type SharedSize = Rc<RefCell<(f32, f32)>>;
 pub type SharedStr = Rc<RefCell<String>>;
@@ -123,19 +132,31 @@ wrap_render_handler! {
         fn screen_info(&self, _b: Option<&mut Browser>, si: Option<&mut ScreenInfo>) -> ::std::os::raw::c_int {
             if let Some(si)=si { si.device_scale_factor=*self.handler.scale.borrow(); return true as _; } false as _
         }
-        fn on_paint(&self, _b: Option<&mut Browser>, t: PaintElementType, _d: Option<&[Rect]>,
+        fn on_paint(&self, _b: Option<&mut Browser>, t: PaintElementType, dirty: Option<&[Rect]>,
                     buffer: *const u8, width: ::std::os::raw::c_int, height: ::std::os::raw::c_int) {
             // VIEW 페인트만 처리 — POPUP(<select> 드롭다운 등)은 작은 버퍼라 전체 프레임을 덮어쓰면 깨짐.
-            // (팝업 합성은 추후 과제 — 지금은 드롭다운 오버레이만 미표시)
             if t != PaintElementType::VIEW { return; }
             if buffer.is_null() || width<=0 || height<=0 { return; }
             let w=width as usize; let h=height as usize; let px=w*h; let n=px*4;
             let src=unsafe{ std::slice::from_raw_parts(buffer,n) };
             let mut f=self.handler.frame.borrow_mut();
-            if f.pixels.len()!=px { f.pixels.resize(px,Color32::TRANSPARENT); }
-            // BGRA(unmultiplied) → Color32 1패스 변환 (기존: 바이트 스왑 + from_rgba 재변환 2패스 제거)
-            let dst=&mut f.pixels;
-            for p in 0..px { let i=p*4; dst[p]=Color32::from_rgba_unmultiplied(src[i+2],src[i+1],src[i],src[i+3]); }
+            let resized = f.pixels.len()!=px;
+            if resized { f.pixels.resize(px, Color32::TRANSPARENT); }
+            f.rects.clear();
+            // 더티렉트가 있고 리사이즈가 아니면 바뀐 영역만 변환(전체 w*h 루프 회피) + 부분 업로드 목록 기록.
+            // 리사이즈/렉트없음/전부클램프0이면 전체 변환(안전 폴백).
+            let partial = !resized && dirty.map(|r| !r.is_empty()).unwrap_or(false);
+            if partial {
+                for r in dirty.unwrap() {
+                    let x0=(r.x.max(0) as usize).min(w); let y0=(r.y.max(0) as usize).min(h);
+                    let rw=(r.width.max(0) as usize).min(w-x0); let rh=(r.height.max(0) as usize).min(h-y0);
+                    if rw==0||rh==0 { continue; }
+                    blit(&mut f.pixels, src, w, x0,y0,rw,rh);
+                    f.rects.push([x0,y0,rw,rh]);
+                }
+            }
+            if !partial || f.rects.is_empty() { blit(&mut f.pixels, src, w, 0,0,w,h); f.full=true; f.rects.clear(); }
+            else { f.full=false; }
             f.w=w; f.h=h; f.dirty=true;
         }
     }
